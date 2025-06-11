@@ -583,7 +583,6 @@ impl Sender {
     }
 }
 
-
 impl Clone for Sender {
     fn clone(&self) -> Self {
         Self {
