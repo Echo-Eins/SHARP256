@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut, Buf};
 use std::net::SocketAddr;
-use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration};
 use rand::Rng;
+use tokio::net::{lookup_host, UdpSocket};
 
 // STUN константы
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
@@ -52,8 +52,17 @@ impl StunClient {
 
     /// Запрос к STUN серверу
     async fn query_stun_server(&self, socket: &UdpSocket, server: &str) -> Result<SocketAddr> {
-        let server_addr: SocketAddr = server.parse()
-            .with_context(|| format!("Invalid STUN server address: {}", server))?;
+        let server_addr: SocketAddr = match server.parse() {
+            Ok(addr) => addr,
+            Err(_) => {
+                let mut addrs = lookup_host(server)
+                    .await
+                    .with_context(|| format!("Invalid STUN server address: {}", server))?;
+                addrs
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("DNS lookup failed for {}", server))?
+            }
+        };
 
         // Создаем STUN Binding Request
         let transaction_id = self.generate_transaction_id();

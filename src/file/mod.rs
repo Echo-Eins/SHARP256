@@ -66,6 +66,7 @@ impl FileManager {
     pub fn open_for_send(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
+            .write(true)
             .open(path)
             .with_context(|| format!("Failed to open file: {:?}", path))?;
         
