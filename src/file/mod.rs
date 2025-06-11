@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use memmap2::MmapMut;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::RwLock;

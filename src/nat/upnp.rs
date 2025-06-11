@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::IpAddr;
 use std::time::Duration;
 use igd::{PortMappingProtocol, SearchOptions};
 use parking_lot::RwLock;

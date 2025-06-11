@@ -1,9 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{interval, timeout};
-use bytes::Bytes;
 
 /// UDP hole punching для установления P2P соединения через NAT
 pub struct HolePuncher {

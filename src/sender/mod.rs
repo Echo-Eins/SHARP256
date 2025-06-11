@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use blake3::Hasher;
 use bytes::BytesMut;
 use parking_lot::RwLock;
@@ -420,7 +420,7 @@ impl Sender {
     /// Задача обработки входящих ACK
     async fn ack_handler_task(self) -> Result<()> {
         let mut buffer = vec![0u8; 65536];
-        let mut last_sao_update = 0u32;
+        let last_sao_update = 0u32;
         
         loop {
             match self.socket.recv_from(&mut buffer).await {

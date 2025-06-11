@@ -1,9 +1,8 @@
-use bytes::BytesMut;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
-use crate::protocol::packet::{Packet, PacketHeader};
+use crate::protocol::packet::Packet;
 use crate::protocol::constants::*;
 
 /// Буфер для хранения последних отправленных пакетов

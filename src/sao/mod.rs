@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use crate::protocol::ack::SaoParams;
 use crate::protocol::constants::*;
 
