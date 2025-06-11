@@ -240,7 +240,8 @@ impl eframe::App for SenderApp {
             
             // Кнопки управления
             ui.horizontal(|ui| {
-                match &*self.state.read() {
+                let current = self.state.read().clone();
+                match current {
                     TransferState::Idle | TransferState::Completed { .. } | TransferState::Failed(_) => {
                         if ui.button("Start Transfer").clicked() {
                             self.error_message = None;

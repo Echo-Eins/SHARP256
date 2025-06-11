@@ -236,16 +236,17 @@ impl Receiver {
         let write_complete = Arc::new(Notify::new());
 
         // Запускаем поток проверки и записи
-        let verifier_handle = tokio::spawn(self.clone().verifier_task(
-            rx_verify,
-            write_complete.clone(),
-        ));
+        let verifier_self = self.clone();
+        let write_complete_ver = write_complete.clone();
+        let verifier_handle = tokio::spawn(async move {
+            verifier_self.verifier_task(rx_verify, write_complete_ver).await
+        });
 
         // Запускаем поток сборки партий
-        let assembler_handle = tokio::spawn(self.clone().batch_assembler_task(
-            tx_verify,
-            write_complete,
-        ));
+        let assembler_self = self.clone();
+        let assembler_handle = tokio::spawn(async move {
+            assembler_self.batch_assembler_task(tx_verify, write_complete).await
+        });
 
         // Ждем завершения
         let _ = tokio::try_join!(verifier_handle, assembler_handle)?;
@@ -331,13 +332,18 @@ impl Receiver {
             }
 
             // Проверяем, завершена ли передача
-            if let Some(state) = &*self.transfer_state.read() {
-                if let Some(fm) = &*self.file_manager.read() {
-                    if state.bytes_transferred >= fm.size() {
-                        self.finalize_transfer().await?;
-                        return Ok(());
-                    }
+            let should_finalize = {
+                let state_opt = self.transfer_state.read();
+                let fm_opt = self.file_manager.read();
+                if let (Some(state), Some(fm)) = (&*state_opt, &*fm_opt) {
+                    state.bytes_transferred >= fm.size()
+                } else {
+                    false
                 }
+            };
+            if should_finalize {
+                self.finalize_transfer().await?;
+                return Ok(());
             }
         }
     }
@@ -358,7 +364,8 @@ impl Receiver {
         let file_manager = self.file_manager.clone();
         let write_handle = tokio::spawn(async move {
             while let Some(task) = write_rx.recv().await {
-                if let Some(fm) = &*file_manager.read() {
+                let fm_opt = file_manager.read().clone();
+                if let Some(fm) = fm_opt {
                     match fm.write_at_async(task.offset, &task.data).await {
                         Ok(()) => {
                             // Периодически синхронизируем на диск
@@ -470,14 +477,15 @@ impl Receiver {
         lost_packets: &[LostPacket],
         lost_hashes: &[u32],
     ) -> Result<()> {
-        if let Some(peer) = *self.peer_addr.read() {
+        let peer_opt = *self.peer_addr.read();
+        if let Some(peer) = peer_opt {
             let mut control_ack = ControlAck::new(batch_start, batch_end, self.sao_system.get_params());
 
             // Добавляем потерянные пакеты
             control_ack.lost_packets = lost_packets.to_vec();
             control_ack.lost_hashes = lost_hashes.to_vec();
 
-            // Измеряем ping (RTT)
+            // Измеряем ping (RTT). Для простоты оцениваем его как нулевой
             control_ack.ping_ms = 0.0; // TODO: Реализовать измерение
 
             let ack_bytes = bincode::serialize(&control_ack)?;
@@ -582,11 +590,11 @@ impl Receiver {
 
     /// Финализация передачи
     async fn finalize_transfer(&self) -> Result<()> {
-        if let (Some(fm), Some(peer), Some(start_time)) = (
-            &*self.file_manager.read(),
-            *self.peer_addr.read(),
-            *self.start_time.read()
-        ) {
+        let fm_opt = self.file_manager.read().clone();
+        let peer_opt = *self.peer_addr.read();
+        let start_opt = *self.start_time.read();
+        if let (Some(fm), Some(peer), Some(start_time)) = (fm_opt, peer_opt, start_opt) {
+
             // Вычисляем финальный хеш файла
             let file_data = fm.read_at(0, fm.size() as usize)?;
             let mut hasher = Hasher::new();
@@ -678,14 +686,11 @@ impl Drop for Receiver {
         {
             // Очищаем NAT маппинги
             if let Some(nat_manager) = &self.nat_manager {
-                let manager = nat_manager.clone();
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = rt {
-                    handle.spawn(async move {
-                        if let Err(e) = manager.write().cleanup().await {
-                            tracing::warn!("Failed to cleanup NAT mappings: {}", e);
-                        }
-                    });
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let manager = nat_manager.clone();
+                    handle.block_on(async move {
+                        let _ = manager.write().cleanup().await;
+                    })
                 }
             }
         }

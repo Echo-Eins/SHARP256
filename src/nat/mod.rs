@@ -315,6 +315,11 @@ impl NatManager {
         }
         Ok(())
     }
+
+    /// Извлекает UPnP клиент для внешней очистки
+    pub fn take_upnp_client(&mut self) -> Option<UpnpClient> {
+        self.upnp_client.take()
+    }
 }
 
 impl Drop for NatManager {

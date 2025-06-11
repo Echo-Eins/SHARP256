@@ -105,7 +105,7 @@ async fn run_headless(
     println!("Starting transfer in headless mode...");
 
     // Создаем отправителя
-    let sender;
+    let sender = sender::Sender::new(bind, receiver, &file, encrypt).await?;;
 
     // Показываем доступный адрес для подключения
     match sender.get_connectable_address().await {

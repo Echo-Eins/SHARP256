@@ -17,6 +17,7 @@ dependencies = [
  "eframe",
  "egui",
  "igd",
+ "libc",
  "memmap2 0.9.5",
  "parking_lot",
  "rand",
@@ -32,7 +33,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "um",
  "uuid",
  "winapi",
 ]
@@ -3558,12 +3558,6 @@ dependencies = [
  "tempfile",
  "winapi",
 ]
-
-[[package]]
-name = "um"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "620be1fc9a9ae7c317e3002debfc2895627f9a2f7fbfd5ca9a2a0f12fb37979a"
 
 [[package]]
 name = "unicode-ident"

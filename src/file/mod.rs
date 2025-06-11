@@ -12,6 +12,11 @@ use std::os::windows::fs::OpenOptionsExt;
 
 use winapi::um::winbase::FILE_FLAG_RANDOM_ACCESS;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
+use libc;
+
 /// Менеджер файлов с поддержкой sparse файлов
 pub struct FileManager {
     file_path: PathBuf,
@@ -42,8 +47,11 @@ impl FileManager {
         // На Linux делаем файл sparse явно
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::fs::FileExt;
-            let _ = file.punch_hole(0, size); // Игнорируем ошибку, если не поддерживается
+            use libc::{fallocate, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_KEEP_SIZE};
+            let fd = file.as_raw_fd();
+            unsafe {
+                fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, size as i64);
+            }
         }
         
         Ok(Self {
@@ -201,6 +209,7 @@ impl FileManager {
         #[cfg(target_os = "windows")]
         {
             use winapi::um::fileapi::GetDiskFreeSpaceExW;
+            use winapi::shared::ntdef::ULARGE_INTEGER;
             use std::ptr;
             use std::ffi::OsStr;
             use std::os::windows::ffi::OsStrExt;
@@ -210,12 +219,12 @@ impl FileManager {
                 .chain(Some(0))
                 .collect();
             
-            let mut free_bytes = 0u64;
+            let mut free_bytes: u64 = 0;
             
             unsafe {
                 if GetDiskFreeSpaceExW(
                     path.as_ptr(),
-                    &mut free_bytes as *mut u64,
+                    &mut free_bytes as *mut u64 as *mut ULARGE_INTEGER,
                     ptr::null_mut(),
                     ptr::null_mut()
                 ) == 0 {

@@ -239,21 +239,26 @@ impl Sender {
         let hash_complete = Arc::new(Notify::new());
         
         // Запускаем поток сборки и отправки пакетов
-        let sender_handle = tokio::spawn(self.clone().packet_sender_task(
-            rx_packets,
-            rx_hashes,
-            packet_complete.clone(),
-            hash_complete.clone(),
-        ));
+        let sender_self = self.clone();
+        let packet_complete_sender = packet_complete.clone();
+        let hash_complete_sender = hash_complete.clone();
+        let sender_handle = tokio::spawn(async move {
+            sender_self
+                .packet_sender_task(rx_packets, rx_hashes, packet_complete_sender, hash_complete_sender)
+                .await
+        });
         
         // Запускаем поток хеширования
-        let hasher_handle = tokio::spawn(self.clone().hasher_task(
-            tx_hashes,
-            packet_complete,
-        ));
+        let hasher_self = self.clone();
+        let hasher_handle = tokio::spawn(async move {
+            hasher_self.hasher_task(tx_hashes, packet_complete).await
+        });
         
         // Запускаем поток обработки ACK
-        let ack_handle = tokio::spawn(self.clone().ack_handler_task());
+        let ack_self = self.clone();
+        let ack_handle = tokio::spawn(async move {
+            ack_self.ack_handler_task().await
+        });
         
         // Основной цикл чтения и фрагментации файла
         self.file_reader_task(tx_packets, hash_complete).await?;
@@ -263,7 +268,6 @@ impl Sender {
         
         Ok(())
     }
-    
     /// Задача хеширования данных с пайплайнингом
     async fn hasher_task(
         self,
@@ -273,9 +277,6 @@ impl Sender {
         let mut current_batch = 0u32;
         let mut batch_hashes = Vec::new();
         let mut hasher = Hasher::new();
-        
-        // Буфер для упреждающего хеширования
-        let mut prefetch_buffer = Vec::new();
         
         loop {
             // Ждем сигнал о готовности пакетов партии
@@ -313,13 +314,15 @@ impl Sender {
             // Сохраняем хеши в буфер
             self.packet_buffer.add_batch_hashes(current_batch, batch_hashes.clone());
             
-            // Отправляем хеши без блокировки
+            // Отправляем хеши
             let hashes_to_send = batch_hashes.clone();
             let batch_to_send = current_batch;
+            let tx = tx_hashes.clone();
+
             tokio::spawn(async move {
-                let _ = tx_hashes.send((batch_to_send, hashes_to_send)).await;
+                let _ = tx.send((batch_to_send, hashes_to_send)).await;
             });
-            
+
             batch_hashes.clear();
             current_batch += 1;
         }
@@ -528,7 +531,58 @@ impl Sender {
         tracing::info!("Transfer state saved to {:?}", state_path);
         Ok(())
     }
+
+    /// Чтение файла и отправка пакетов партиями
+    async fn file_reader_task(
+        &self,
+        tx_packets: mpsc::Sender<Packet>,
+        hash_complete: Arc<Notify>,
+    ) -> Result<()> {
+        let file_size = self.file_manager.size();
+        let mut offset = 0u64;
+        let mut batch_number = 0u32;
+
+        while offset < file_size {
+            let batch_size = self.sao_system.batch_size();
+            for packet_idx in 0..batch_size {
+                if offset >= file_size {
+                    break;
+                }
+
+                let payload_limit = if *self.use_gso.read() {
+                    MAX_PAYLOAD_SIZE_GSO
+                } else {
+                    MAX_PAYLOAD_SIZE_MTU
+                };
+
+                let remaining = file_size - offset;
+                let to_read = remaining.min(payload_limit as u64) as usize;
+                let data = self.file_manager.read_at(offset, to_read)?;
+
+                let mut header = PacketHeader::new(PacketType::Data);
+                header.batch_number = batch_number;
+                header.packet_in_batch = packet_idx;
+                header.total_packets = batch_size;
+                header.payload_length = data.len() as u32;
+                if packet_idx == batch_size - 1 || offset + to_read as u64 >= file_size {
+                    header.set_last_in_batch();
+                }
+
+                let packet = Packet::new(header.clone(), data);
+                self.packet_buffer.add_packet(batch_number, packet_idx, packet.clone());
+                tx_packets.send(packet).await?;
+                offset += to_read as u64;
+            }
+
+            // Ждем отправки хешей перед продолжением
+            hash_complete.notified().await;
+            batch_number += 1;
+        }
+
+        Ok(())
+    }
 }
+
 
 impl Clone for Sender {
     fn clone(&self) -> Self {
@@ -555,14 +609,15 @@ impl Drop for Sender {
         {
             // Очищаем NAT маппинги
             if let Some(nat_manager) = &self.nat_manager {
-                let manager = nat_manager.clone();
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = rt {
-                    handle.spawn(async move {
-                        if let Err(e) = manager.write().cleanup().await {
-                            tracing::warn!("Failed to cleanup NAT mappings: {}", e);
-                        }
-                    });
+                let client = nat_manager.write().take_upnp_client();
+                if let Some(mut c) = client {
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Err(e) = c.cleanup_all().await {
+                                tracing::warn!("Failed to cleanup NAT mappings: {}", e);
+                            }
+                        });
+                    }
                 }
             }
         }

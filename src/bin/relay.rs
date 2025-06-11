@@ -124,23 +124,28 @@ impl RelayServer {
                 
                 if let (Some(client), Some(peer)) = (clients.get(client_id), clients.get(peer_id)) {
                     if client.addr == from {
+
+                        let client_addr = client.addr;
+                        let peer_addr = peer.addr;
+                        drop(clients);
+
                         // Отправляем информацию о адресах обоим клиентам
-                        let msg_to_client = format!("PEER_INFO:{}:{}", peer_id, peer.addr);
-                        let msg_to_peer = format!("PEER_INFO:{}:{}", client_id, client.addr);
-                        
-                        let _ = self.socket.send_to(msg_to_client.as_bytes(), client.addr).await;
-                        let _ = self.socket.send_to(msg_to_peer.as_bytes(), peer.addr).await;
+                        let msg_to_client = format!("PEER_INFO:{}:{}", peer_id, peer_addr);
+                        let msg_to_peer = format!("PEER_INFO:{}:{}", client_id, client_addr);
+
+                        let _ = self.socket.send_to(msg_to_client.as_bytes(), client_addr).await;
+                        let _ = self.socket.send_to(msg_to_peer.as_bytes(), peer_addr).await;
                         
                         tracing::info!("Facilitating connection between {} and {}", client_id, peer_id);
                         
                         // Обновляем информацию о пирах
-                        drop(clients);
+
                         let mut clients_mut = self.clients.write();
                         if let Some(client_mut) = clients_mut.get_mut(client_id) {
-                            client_mut.peer_addr = Some(peer.addr);
+                            client_mut.peer_addr = Some(peer_addr);
                         }
                         if let Some(peer_mut) = clients_mut.get_mut(peer_id) {
-                            peer_mut.peer_addr = Some(client.addr);
+                            peer_mut.peer_addr = Some(client_addr);
                         }
                     }
                 }
