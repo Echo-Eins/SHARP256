@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use sharp_256::{init_logging, system_info, Receiver};
+use SHARP3::{init_logging, system_info, Receiver};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         // GUI режим
         #[cfg(feature = "gui")]
         {
-            crate::gui::run_receiver_gui(args.output, args.bind)?;
+            SHARP3::gui::run_receiver_gui(args.output, args.bind)?;
             Ok(())
         }
 
@@ -84,25 +84,4 @@ async fn run_headless(args: Args) -> Result<()> {
 
     // Запускаем прием
     receiver.start().await
-}
-
-#[cfg(feature = "gui")]
-mod gui {
-    use super::*;
-    use sharp_256::gui::ReceiverApp;
-
-    pub fn run_receiver_gui(output: PathBuf, bind: SocketAddr) -> Result<()> {
-        let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([800.0, 600.0])
-                .with_title("SHARP-256 Receiver"),
-            ..Default::default()
-        };
-
-        eframe::run_native(
-            "SHARP-256 Receiver",
-            options,
-            Box::new(|_cc| Box::new(ReceiverApp::new())),
-        ).map_err(|e| anyhow::anyhow!("GUI error: {}", e))
-    }
 }

@@ -125,11 +125,9 @@ impl CoordinatorClient {
             }
             _ => {}
         }
-        
-        Err(anyhow::anyhow!("Direct connection failed to {}", addr))
+        Err(anyhow::anyhow!("Failed to coordinate hole punch"))
     }
-}yhow!("Failed to coordinate hole punch"))
-    }
+
 }
 
 /// Стратегия для обхода сложных NAT
@@ -224,5 +222,6 @@ impl AdvancedNatTraversal {
             }
             _ => {}
         }
-        
-        Err(anyhow::an
+        Err(anyhow::anyhow!("Direct connection to {} failed", addr))
+    }
+}

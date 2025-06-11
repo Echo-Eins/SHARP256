@@ -2,7 +2,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use clap::Parser;
 use parking_lot::RwLock;
-use sharp_256::init_logging;
+use SHARP3::init_logging;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

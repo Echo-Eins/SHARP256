@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 #[cfg(target_os = "windows")]
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(target_os = "windows")]
+
 use winapi::um::winbase::FILE_FLAG_RANDOM_ACCESS;
 
 /// Менеджер файлов с поддержкой sparse файлов

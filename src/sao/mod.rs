@@ -79,7 +79,7 @@ impl SaoSystem {
     /// Обновление параметров на основе полученного ACK
     pub fn update_from_ack(&self, control_ack: &crate::protocol::ack::ControlAck) {
         let mut params = self.params.write();
-        params.ping_ms = control_ack.ping_ms;
+        params.avg_rtt_ms = control_ack.ping_ms;
 
         // Обновляем метрики для партий в диапазоне ACK
         let mut history = self.metrics_history.write();

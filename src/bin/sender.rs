@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use sharp_256::{init_logging, system_info, Sender};
+use SHARP3::{init_logging, system_info, sender};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -105,7 +105,7 @@ async fn run_headless(
     println!("Starting transfer in headless mode...");
 
     // Создаем отправителя
-    let sender = Sender::new(bind, receiver, &file, encrypt).await?;
+    let sender;
 
     // Показываем доступный адрес для подключения
     match sender.get_connectable_address().await {
@@ -129,7 +129,7 @@ async fn run_headless(
 #[cfg(feature = "gui")]
 mod gui {
     use super::*;
-    use sharp_256::gui::SenderApp;
+    use SHARP3::gui::SenderApp;
 
     pub fn run_sender_gui() -> Result<()> {
         let options = eframe::NativeOptions {
