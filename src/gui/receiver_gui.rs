@@ -57,7 +57,7 @@ struct IncomingTransfer {
 enum Command {
     AcceptTransfer,
     RejectTransfer,
-    ChangeOutputDir(()),
+    ChangeOutputDir(PathBuf),
 }
 
 struct Update {
