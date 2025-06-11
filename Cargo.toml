@@ -26,6 +26,8 @@ base64 = "0.21"
 eframe = { version = "0.24", optional = true }
 egui = { version = "0.24", optional = true }
 rfd = { version = "0.12", optional = true }  # For file dialogs
+gli = "0.2.0"
+glib = "0.20.10"
 
 # TLS (optional)
 rustls = { version = "0.22", optional = true }
