@@ -37,6 +37,7 @@ pub enum PacketType {
     Hash = 0x02,
     Ack = 0x03,
     Control = 0x04,
+    Resume = 0x05
 }
 
 // Флаги пакетов
