@@ -143,7 +143,7 @@ impl ReceiveBuffer {
             }
             None => {
                 // Создаем буфер для партии, если его еще нет
-                let mut batch_buffer = BatchBuffer {
+                let batch_buffer = BatchBuffer {
                     packets: HashMap::new(),
                     expected_count: 0,
                     received_hashes: Some(hashes),

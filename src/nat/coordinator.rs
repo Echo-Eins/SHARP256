@@ -56,7 +56,7 @@ impl CoordinatorClient {
         
         // Ждем подтверждение
         let mut buffer = vec![0u8; 1024];
-        let (size, _) = timeout(
+        let (_size, _) = timeout(
             Duration::from_secs(5),
             socket.recv_from(&mut buffer)
         ).await??;

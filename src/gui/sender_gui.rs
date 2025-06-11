@@ -271,7 +271,7 @@ async fn transfer_task(
     bind_addr: SocketAddr,
     use_encryption: bool,
     state: Arc<RwLock<TransferState>>,
-    mut command_rx: Receiver<Command>,
+    command_rx: Receiver<Command>,
     ctx: egui::Context,
 ) {
     // Обновляем состояние
@@ -284,7 +284,7 @@ async fn transfer_task(
     
     // Создаем sender
     match SharpSender::new(bind_addr, receiver_addr, &file_path, use_encryption).await {
-        Ok(sender) => {
+        Ok(_sender) => {
             // Получаем размер файла
             let file_size = match std::fs::metadata(&file_path) {
                 Ok(meta) => meta.len(),

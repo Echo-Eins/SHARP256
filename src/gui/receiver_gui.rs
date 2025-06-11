@@ -57,7 +57,7 @@ struct IncomingTransfer {
 enum Command {
     AcceptTransfer,
     RejectTransfer,
-    ChangeOutputDir(PathBuf),
+    ChangeOutputDir(()),
 }
 
 struct Update {
@@ -285,7 +285,7 @@ async fn receiver_task(
     transfers: Arc<RwLock<Vec<TransferInfo>>>,
     incoming_dialog: Arc<RwLock<Option<IncomingTransfer>>>,
     update_tx: Sender<Update>,
-    mut command_rx: Receiver<Command>,
+    command_rx: Receiver<Command>,
 ) {
     match SharpReceiver::new(bind_addr, output_dir).await {
         Ok(receiver) => {

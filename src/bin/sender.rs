@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         // GUI режим
         #[cfg(feature = "gui")]
         {
-            crate::gui::run_sender_gui()?;
+            gui::run_sender_gui()?;
             Ok(())
         }
 
@@ -105,7 +105,7 @@ async fn run_headless(
     println!("Starting transfer in headless mode...");
 
     // Создаем отправителя
-    let sender = sender::Sender::new(bind, receiver, &file, encrypt).await?;;
+    let sender = sender::Sender::new(bind, receiver, &file, encrypt).await?;
 
     // Показываем доступный адрес для подключения
     match sender.get_connectable_address().await {
