@@ -1,0 +1,44 @@
+Компиляция:
+# Полная сборка со всеми функциями
+cargo build --release
+
+# Только headless (без GUI)
+cargo build --release --no-default-features --features nat-traversal
+
+# С шифрованием TLS
+cargo build --release --features tls
+
+
+Запуск получателя:
+# GUI режим (откроется окно)
+./target/release/sharp-receiver
+
+# Headless режим
+./target/release/sharp-receiver --headless
+
+# С указанием порта и директории
+./target/release/sharp-receiver --bind 0.0.0.0:7777 --output ~/Downloads --headless
+
+Запуск отправителя:
+# GUI режим (откроется окно для выбора файла)
+./target/release/sharp-sender
+
+# Headless с файлом
+./target/release/sharp-sender /path/to/file.zip 192.168.1.100:5555
+
+# С дополнительными опциями
+./target/release/sharp-sender file.zip 89.123.45.67:5555 --encrypt --bind 0.0.0.0:5556
+
+
+Использование GUI:
+1)Отправитель:
+Нажмите "Browse..." для выбора файла
+Введите IP:порт получателя
+Нажмите "Start Transfer"
+
+
+2)Получатель:
+Запустите и ждите
+При входящей передаче появится диалог
+Нажмите "Accept" или "Reject"
+

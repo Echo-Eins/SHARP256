@@ -1,0 +1,84 @@
+[package]
+name = "SHARP3"
+version = "0.1.0"
+edition = "2021"
+authors = ["SHARP Protocol Team"]
+description = "Swift Hash Assurance Rust Protocol - High-performance file transfer protocol"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Networking
+tokio-util = { version = "0.7", features = ["codec", "net"] }
+bytes = "1.5"
+
+# Hashing
+blake3 = "1.5"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+base64 = "0.21"
+
+# GUI
+eframe = "0.24"
+egui = "0.24"
+rfd = "0.12"  # For file dialogs
+
+# TLS (optional)
+rustls = { version = "0.22", optional = true }
+tokio-rustls = { version = "0.25", optional = true }
+rustls-pemfile = { version = "2.0", optional = true }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Command line
+clap = { version = "4.4", features = ["derive"] }
+
+# System info
+sysinfo = "0.30"
+
+# Path handling
+dirs = "5.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Memory mapping for sparse files
+memmap2 = "0.9"
+
+# NAT traversal
+rand = { version = "0.8", optional = true }
+igd = { version = "0.12", features = ["aio"], optional = true }
+uuid = { version = "1.6", features = ["v4"], optional = true }
+
+# Metrics
+parking_lot = "0.12"
+
+[features]
+default = ["gui", "nat-traversal"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+nat-traversal = ["dep:rand", "dep:igd", "dep:uuid"]
+
+[[bin]]
+name = "sharp-sender"
+path = "src/bin/sender.rs"
+
+[[bin]]
+name = "sharp-receiver"
+path = "src/bin/receiver.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
