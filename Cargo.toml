@@ -62,7 +62,9 @@ uuid = { version = "1.6", features = ["v4"], optional = true }
 
 # Metrics
 parking_lot = "0.12"
-winapi = "0.3.9"
+winapi = { version = "0.3.9", features = ["winbase", "winnt", "winuser"] }
+
+um = "0.1.0"
 
 [features]
 default = ["gui", "nat-traversal"]

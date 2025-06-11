@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
-use igd::aio::tokio::{search_gateway, Gateway};
 use igd::{PortMappingProtocol, SearchOptions};
 use parking_lot::RwLock;
 use std::sync::Arc;
+use igd::aio::{search_gateway, Gateway};
 
 /// UPnP клиент для управления port forwarding на роутере
 pub struct UpnpClient {
@@ -38,7 +38,7 @@ impl UpnpClient {
         // Ищем gateway
         match search_gateway(search_options).await {
             Ok(gateway) => {
-                tracing::info!("UPnP gateway found: {}", gateway.addr());
+                tracing::info!("UPnP gateway found: {}", gateway.addr);
                 
                 // Получаем информацию о внешнем IP
                 if let Ok(external_ip) = gateway.get_external_ip().await {
@@ -79,13 +79,23 @@ impl UpnpClient {
         let mut attempts = 0;
         
         loop {
-            match gateway.add_port(
-                PortMappingProtocol::UDP,
-                external_port,
-                SocketAddr::new(self.local_ip, local_port),
-                lease_duration,
-                description,
-            ).await {
+            let local_addr = match self.local_ip {
+                IpAddr::V4(ip) => std::net::SocketAddrV4::new(ip, local_port),
+                IpAddr::V6(_) => {
+                    return Err(anyhow::anyhow!("UPnP requires an IPv4 local address"));
+                }
+            };
+
+            match gateway
+                .add_port(
+                    PortMappingProtocol::UDP,
+                    external_port,
+                    local_addr,
+                    lease_duration,
+                    description,
+                )
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(
                         "UPnP port mapping created: {} -> {}:{} ({}s lease)",
@@ -154,13 +164,24 @@ impl UpnpClient {
         let mappings = self.active_mappings.read().clone();
         
         for mapping in mappings {
-            match gateway.add_port(
-                mapping.protocol,
-                mapping.external_port,
-                SocketAddr::new(self.local_ip, mapping.internal_port),
-                lease_duration,
-                &mapping.description,
-            ).await {
+            let local_addr = match self.local_ip {
+                IpAddr::V4(ip) => std::net::SocketAddrV4::new(ip, mapping.internal_port),
+                IpAddr::V6(_) => {
+                    tracing::warn!("Cannot refresh mapping for IPv6 local address");
+                    continue;
+                }
+            };
+
+            match gateway
+                .add_port(
+                    mapping.protocol,
+                    mapping.external_port,
+                    local_addr,
+                    lease_duration,
+                    &mapping.description,
+                )
+                .await
+            {
                 Ok(()) => {
                     tracing::debug!("Refreshed mapping for port {}", mapping.external_port);
                 }

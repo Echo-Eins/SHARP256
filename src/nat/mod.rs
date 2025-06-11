@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use bytes::{BufMut, BytesMut, Buf};
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
 
 pub mod stun;
 pub mod upnp;

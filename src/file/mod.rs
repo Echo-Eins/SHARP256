@@ -77,15 +77,12 @@ impl FileManager {
         let file = self.file.read();
         
         // Безопасное создание mmap
-        let mmap = unsafe { 
-            MmapMut::map_mut(file.try_clone()?)
-                .with_context(|| "Failed to create memory map")?
-        };
+        let mmap = unsafe { MmapMut::map_mut(&file.try_clone()?) }
+            .with_context(|| "Failed to create memory map")?;
         
         *self.mmap.write() = Some(mmap);
         Ok(())
     }
-    
     /// Запись данных в определенную позицию файла
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
         if offset + data.len() as u64 > self.file_size {
