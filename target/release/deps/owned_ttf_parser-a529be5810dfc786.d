@@ -1,0 +1,10 @@
+C:\Users\julio\OneDrive\Рабочий стол\Quaranta\Rust\SHARP_3\target\release\deps\libowned_ttf_parser-a529be5810dfc786.rmeta: C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\lib.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\convert.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\owned.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\preparse.rs
+
+C:\Users\julio\OneDrive\Рабочий стол\Quaranta\Rust\SHARP_3\target\release\deps\libowned_ttf_parser-a529be5810dfc786.rlib: C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\lib.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\convert.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\owned.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\preparse.rs
+
+C:\Users\julio\OneDrive\Рабочий стол\Quaranta\Rust\SHARP_3\target\release\deps\owned_ttf_parser-a529be5810dfc786.d: C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\lib.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\convert.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\owned.rs C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\preparse.rs
+
+C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\lib.rs:
+C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\convert.rs:
+C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\owned.rs:
+C:\Users\julio\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\owned_ttf_parser-0.25.0\src\preparse.rs:
