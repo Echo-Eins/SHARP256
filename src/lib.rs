@@ -11,7 +11,6 @@ pub mod state;
 pub mod progress;
 pub mod sender;
 pub mod receiver;
-pub mod fragmentation;
 
 #[cfg(feature = "nat-traversal")]
 pub mod nat;

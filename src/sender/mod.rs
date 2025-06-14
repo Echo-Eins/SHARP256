@@ -169,19 +169,17 @@ impl Sender {
         });
     }
 
-    //// Проверка допустимой фрагментации на пути до получателя
+    /// Проверка поддержки GSO/GRO
     async fn check_gso_support(&self) -> bool {
-        match crate::fragmentation::check_fragmentation(&self.socket, self.peer_addr).await {
-            Ok(size) if size > MAX_PAYLOAD_SIZE_MTU => {
-                tracing::info!("Allowed fragmentation size {} bytes - using GSO/GRO", size);
+        // Попытка отправки большого пакета для проверки GSO
+        let test_packet = vec![0u8; MAX_PACKET_SIZE];
+        match self.socket.send_to(&test_packet, self.peer_addr).await {
+            Ok(_) => {
+                tracing::info!("GSO/GRO support detected");
                 true
             }
-            Ok(size) => {
-                tracing::info!("Fragmentation limited to {} bytes", size);
-                false
-            }
-            Err(e) => {
-                tracing::warn!("Fragmentation check failed: {}", e);
+            Err(_) => {
+                tracing::info!("GSO/GRO not supported, using standard MTU");
                 false
             }
         }
@@ -189,12 +187,8 @@ impl Sender {
 
     /// Начало передачи файла
     pub async fn start_transfer(&self) -> Result<()> {
-        // Проверяем максимальную допустимую фрагментацию
-        let info = crate::fragmentation::detect_max_payload(&self.socket, self.peer_addr).await?;
-        *self.max_payload_size.write() = info.max_payload_size;
-        let gso = info.max_payload_size > MAX_PAYLOAD_SIZE_MTU;
-        *self.use_gso.write() = gso;
-        tracing::info!("Selected payload size: {} bytes", info.max_payload_size);
+        // Проверяем поддержку GSO
+        *self.use_gso.write() = self.check_gso_support().await;
 
         // Проверяем, есть ли сохраненное состояние
         let file_name = self
@@ -728,7 +722,11 @@ impl Sender {
                     break;
                 }
 
-                let payload_limit = *self.max_payload_size.read();
+                let payload_limit = if *self.use_gso.read() {
+                    MAX_PAYLOAD_SIZE_GSO
+                } else {
+                    MAX_PAYLOAD_SIZE_MTU
+                };
 
                 let remaining = file_size - offset;
                 let to_read = remaining.min(payload_limit as u64) as usize;
