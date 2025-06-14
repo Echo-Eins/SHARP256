@@ -58,7 +58,8 @@ memmap2 = "0.9"
 # NAT traversal
 rand = { version = "0.8", optional = true }
 igd = { version = "0.12", features = ["aio"], optional = true }
-uuid = { version = "1.6", features = ["v4"], optional = true }
+uuid = { version = "1.6", features = ["v4"] }
+if-addrs = { version = "0.6", optional = true }
 
 # Metrics
 parking_lot = "0.12"
@@ -69,7 +70,7 @@ libc = "0.2.0"
 default = ["gui", "nat-traversal"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
-nat-traversal = ["dep:rand", "dep:igd", "dep:uuid"]
+nat-traversal = ["dep:rand", "dep:igd", "dep:if-addrs"]
 
 [[bin]]
 name = "sharp-sender"

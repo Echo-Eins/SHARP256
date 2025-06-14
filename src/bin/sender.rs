@@ -60,9 +60,16 @@ async fn main() -> Result<()> {
 
             let file_size = std::fs::metadata(&file)?.len();
             println!("File: {:?}", file);
-            println!("Size: {} bytes ({:.2} MB)", file_size, file_size as f64 / 1024.0 / 1024.0);
+            println!(
+                "Size: {} bytes ({:.2} MB)",
+                file_size,
+                file_size as f64 / 1024.0 / 1024.0
+            );
             println!("Receiver: {}", receiver);
-            println!("Encryption: {}", if args.encrypt { "enabled" } else { "disabled" });
+            println!(
+                "Encryption: {}",
+                if args.encrypt { "enabled" } else { "disabled" }
+            );
 
             #[cfg(feature = "nat-traversal")]
             {
@@ -106,6 +113,12 @@ async fn run_headless(
 
     // Создаем отправителя
     let sender = sender::Sender::new(bind, receiver, &file, encrypt).await?;
+
+    // Проверяем допустимую фрагментацию и выводим результат
+    match sender.detect_fragmentation().await {
+        Ok(size) => println!("Selected payload size: {} bytes", size),
+        Err(e) => println!("Fragmentation check failed: {}", e),
+    }
 
     // Показываем доступный адрес для подключения
     match sender.get_connectable_address().await {

@@ -24,26 +24,50 @@ impl StunClient {
 
     /// Получение mapped address через STUN
     pub async fn get_mapped_address(&self, socket: &UdpSocket) -> Result<SocketAddr> {
-        for server in &self.servers {
-            match self.query_stun_server(socket, server).await {
-                Ok(addr) => return Ok(addr),
-                Err(e) => {
-                    tracing::warn!("STUN server {} failed: {}", server, e);
-                    continue;
+        let servers: Vec<_> = self.servers.iter().take(3).collect();
+
+        for attempt in 0..3 {
+            let mut tids = Vec::new();
+
+            // Отправляем запросы ко всем серверам
+            for server in &servers {
+                if let Ok(addr) = self.resolve_server(server).await {
+                    let tid = self.generate_transaction_id();
+                    let req = self.create_binding_request(&tid);
+                    if socket.send_to(&req, addr).await.is_ok() {
+                        tids.push(tid);
+                    }
                 }
             }
+
+            let mut buf = vec![0u8; 1024];
+            if let Ok(Ok((size, _))) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+                for tid in tids {
+                    if let Ok(addr) = self.parse_binding_response(&buf[..size], &tid) {
+                        return Ok(addr);
+                    }
+                }
+            }
+            tracing::debug!("STUN attempt {} failed", attempt + 1);
         }
         
         anyhow::bail!("All STUN servers failed")
     }
 
     /// Определение типа NAT через несколько STUN серверов
-    pub async fn detect_nat_type(&self, socket: &UdpSocket) -> Result<Vec<SocketAddr>> {
+    pub async fn detect_nat_type(&self, socket: &UdpSocket) -> Result<Vec<(SocketAddr, bool)>> {
         let mut results = Vec::new();
-        
-        for server in &self.servers[..3.min(self.servers.len())] {
+
+        let servers: Vec<_> = self.servers.iter().take(3).collect();
+
+        for (idx, server) in servers.iter().enumerate() {
             if let Ok(addr) = self.query_stun_server(socket, server).await {
-                results.push(addr);
+                if idx == 0 {
+                    results.push((addr, false));
+                } else {
+                    let changed = results.first().map(|(first, _)| first.ip() != addr.ip() || first.port() != addr.port()).unwrap_or(false);
+                    results.push((addr, changed));
+                }
             }
         }
         
@@ -52,17 +76,7 @@ impl StunClient {
 
     /// Запрос к STUN серверу
     async fn query_stun_server(&self, socket: &UdpSocket, server: &str) -> Result<SocketAddr> {
-        let server_addr: SocketAddr = match server.parse() {
-            Ok(addr) => addr,
-            Err(_) => {
-                let mut addrs = lookup_host(server)
-                    .await
-                    .with_context(|| format!("Invalid STUN server address: {}", server))?;
-                addrs
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("DNS lookup failed for {}", server))?
-            }
-        };
+        let server_addr = self.resolve_server(server).await?;
 
         // Создаем STUN Binding Request
         let transaction_id = self.generate_transaction_id();
@@ -74,13 +88,27 @@ impl StunClient {
         // Ждем ответ
         let mut buffer = vec![0u8; 1024];
         let (size, _) = timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(2),
             socket.recv_from(&mut buffer)
         ).await
         .context("STUN response timeout")??;
         
         // Парсим ответ
         self.parse_binding_response(&buffer[..size], &transaction_id)
+    }
+
+    async fn resolve_server(&self, server: &str) -> Result<SocketAddr> {
+        match server.parse() {
+            Ok(addr) => Ok(addr),
+            Err(_) => {
+                let mut addrs = lookup_host(server)
+                    .await
+                    .with_context(|| format!("Invalid STUN server address: {}", server))?;
+                addrs
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("DNS lookup failed for {}", server))
+            }
+        }
     }
 
     /// Создание STUN Binding Request
@@ -115,7 +143,11 @@ impl StunClient {
         
         let msg_length = buf.get_u16() as usize;
         let magic = buf.get_u32();
-        
+
+        if msg_length > buf.remaining() {
+            anyhow::bail!("STUN message length invalid");
+        }
+
         if magic != STUN_MAGIC_COOKIE {
             anyhow::bail!("Invalid magic cookie");
         }

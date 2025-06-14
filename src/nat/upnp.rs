@@ -6,6 +6,10 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use igd::aio::{search_gateway, Gateway};
 
+use std::time::Instant;
+use rand::Rng;
+use if_addrs::get_if_addrs;
+
 /// UPnP клиент для управления port forwarding на роутере
 pub struct UpnpClient {
     gateway: Option<Gateway>,
@@ -19,6 +23,8 @@ struct PortMapping {
     internal_port: u16,
     protocol: PortMappingProtocol,
     description: String,
+    created_at: Instant,
+    lease_duration: u32,
 }
 
 impl UpnpClient {
@@ -108,6 +114,8 @@ impl UpnpClient {
                         internal_port: local_port,
                         protocol: PortMappingProtocol::UDP,
                         description: description.to_string(),
+                        created_at: Instant::now(),
+                        lease_duration,
                     };
                     self.active_mappings.write().push(mapping);
                     
@@ -119,6 +127,11 @@ impl UpnpClient {
                         attempts += 1;
                         external_port = local_port + attempts;
                         tracing::debug!("Port {} busy, trying {}", external_port - 1, external_port);
+                        continue;
+                    } else if attempts >= 10 && e.to_string().contains("ConflictInMappingEntry") {
+                        external_port = rand::thread_rng().gen_range(30000..60000);
+                        tracing::debug!("Switching to random port {}", external_port);
+                        attempts = 0;
                         continue;
                     }
                     
@@ -230,25 +243,42 @@ impl UpnpClient {
 
     /// Получение локального IP адреса
     async fn get_local_ip() -> Result<IpAddr> {
-        // Создаем временное соединение для определения локального IP
+        // Пробуем определить IP через список интерфейсов
+        if let Ok(addrs) = get_if_addrs() {
+            for iface in addrs {
+                if !iface.is_loopback() {
+                    return Ok(iface.ip());
+                }
+            }
+        }
+
+        // Фолбек через подключение к публичному адресу
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect("8.8.8.8:80").await?;
-        let local_addr = socket.local_addr()?;
-        Ok(local_addr.ip())
+        if socket.connect("8.8.8.8:80").await.is_ok() {
+            return Ok(socket.local_addr()?.ip());
+        }
+
+        anyhow::bail!("Failed to determine local IP")
     }
 }
 
 impl Drop for UpnpClient {
     fn drop(&mut self) {
-        // При удалении клиента пытаемся очистить mappings
-        if !self.active_mappings.read().is_empty() {
-            tracing::debug!("UPnP client dropping with active mappings");
-            
-            // Создаем задачу для асинхронной очистки
-            let mappings = self.active_mappings.read().clone();
-            if let Some(gateway) = self.gateway.clone() {
-                tokio::spawn(async move {
-                    for mapping in mappings {
+        if self.active_mappings.read().is_empty() {
+            return;
+        }
+
+        let mappings = self.active_mappings.read().clone();
+        if let Some(gateway) = self.gateway.clone() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.block_on(async {
+                    for mapping in &mappings {
+                        let _ = gateway.remove_port(mapping.protocol, mapping.external_port).await;
+                    }
+                });
+            } else if let Ok(rt) = tokio::runtime::Runtime::new() {
+                rt.block_on(async {
+                    for mapping in &mappings {
                         let _ = gateway.remove_port(mapping.protocol, mapping.external_port).await;
                     }
                 });

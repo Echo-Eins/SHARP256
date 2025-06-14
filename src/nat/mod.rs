@@ -226,15 +226,11 @@ impl NatManager {
             return Ok(NatType::Unknown);
         }
 
-        let first_addr = results[0];
-        let all_same = results.iter().all(|&addr| addr == first_addr);
-
-        if all_same {
-            // Все STUN серверы видят один и тот же адрес - Full Cone или Restricted
-            Ok(NatType::RestrictedCone)
-        } else {
-            // Разные адреса - Symmetric NAT
+        let changed = results.iter().skip(1).any(|(_, changed)| *changed);
+        if changed {
             Ok(NatType::Symmetric)
+        } else {
+            Ok(NatType::RestrictedCone)
         }
     }
 

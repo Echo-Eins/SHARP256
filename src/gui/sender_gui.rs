@@ -23,6 +23,7 @@ pub struct SenderApp {
     // UI состояние
     show_file_picker: bool,
     error_message: Option<String>,
+    frag_size: Arc<RwLock<Option<usize>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +72,7 @@ impl SenderApp {
             update_rx,
             show_file_picker: false,
             error_message: None,
+            frag_size: Arc::new(RwLock::new(None)),
         }
     }
     
@@ -102,6 +104,8 @@ impl SenderApp {
             let encrypt = self.use_encryption;
             let state = self.state.clone();
             let ctx_clone = ctx.clone();
+
+            let frag_info = self.frag_size.clone();
             
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -163,7 +167,10 @@ impl eframe::App for SenderApp {
                     if let Some(path) = &self.file_path {
                         ui.label(path.file_name().unwrap_or_default().to_string_lossy());
                         if let Ok(metadata) = std::fs::metadata(path) {
-                            ui.label(format!("({:.2} MB)", metadata.len() as f64 / 1024.0 / 1024.0));
+                            ui.label(format!(
+                                "({:.2} MB)",
+                                metadata.len() as f64 / 1024.0 / 1024.0
+                            ));
                         }
                     } else {
                         ui.label("No file selected");
@@ -198,8 +205,17 @@ impl eframe::App for SenderApp {
                     ui.label("Connecting to receiver...");
                     ui.spinner();
                 }
-                TransferState::Transferring { progress, speed_mbps, eta_seconds, bytes_sent, total_bytes } => {
-                    ui.label(format!("Transferring: {}/{} bytes", bytes_sent, total_bytes));
+                TransferState::Transferring {
+                    progress,
+                    speed_mbps,
+                    eta_seconds,
+                    bytes_sent,
+                    total_bytes,
+                } => {
+                    ui.label(format!(
+                        "Transferring: {}/{} bytes",
+                        bytes_sent, total_bytes
+                    ));
                     
                     let progress_bar = egui::ProgressBar::new(*progress)
                         .text(format!("{:.1}%", progress * 100.0))
@@ -220,7 +236,10 @@ impl eframe::App for SenderApp {
                         ui.label(format!("ETA: {}", eta_str));
                     });
                 }
-                TransferState::Completed { total_time_s, average_speed_mbps } => {
+                TransferState::Completed {
+                    total_time_s,
+                    average_speed_mbps,
+                } => {
                     ui.colored_label(egui::Color32::GREEN, "✓ Transfer completed!");
                     ui.label(format!("Time: {:.1}s", total_time_s));
                     ui.label(format!("Average speed: {:.2} MB/s", average_speed_mbps));
@@ -229,7 +248,11 @@ impl eframe::App for SenderApp {
                     ui.colored_label(egui::Color32::RED, format!("✗ Transfer failed: {}", error));
                 }
             }
-            
+
+            if let Some(size) = *self.frag_size.read() {
+                ui.label(format!("Selected payload size: {} bytes", size));
+            }
+
             // Сообщения об ошибках
             if let Some(error) = &self.error_message {
                 ui.add_space(10.0);
@@ -270,6 +293,7 @@ async fn transfer_task(
     receiver_addr: SocketAddr,
     bind_addr: SocketAddr,
     use_encryption: bool,
+    frag_info: Arc<RwLock<Option<usize>>>,
     state: Arc<RwLock<TransferState>>,
     command_rx: Receiver<Command>,
     ctx: egui::Context,
@@ -284,7 +308,18 @@ async fn transfer_task(
     
     // Создаем sender
     match SharpSender::new(bind_addr, receiver_addr, &file_path, use_encryption).await {
-        Ok(_sender) => {
+        Ok(sender) => {
+            match sender.detect_fragmentation().await {
+                Ok(size) => *frag_info.write() = Some(size),
+                Err(e) => {
+                    *frag_info.write() = None;
+                    update_state(TransferState::Failed(format!(
+                        "Fragmentation check failed: {}",
+                        e
+                    )));
+                    return;
+                }
+            }
             // Получаем размер файла
             let file_size = match std::fs::metadata(&file_path) {
                 Ok(meta) => meta.len(),

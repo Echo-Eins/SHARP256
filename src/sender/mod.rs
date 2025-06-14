@@ -38,6 +38,7 @@ pub struct Sender {
     max_payload_size: Arc<RwLock<usize>>,
     /// Last activity timestamp for keep-alive
     last_activity: Arc<RwLock<Instant>>,
+    fragmentation_checked: Arc<RwLock<bool>>,
     #[cfg(feature = "nat-traversal")]
     nat_manager: Option<Arc<RwLock<NatManager>>>,
 }
@@ -120,6 +121,21 @@ impl Sender {
         })
     }
 
+    /// Determine maximum allowed payload size and log the result.
+    pub async fn detect_fragmentation(&self) -> Result<usize> {
+        if *self.fragmentation_checked.read() {
+            return Ok(*self.max_payload_size.read());
+        }
+
+        let info = crate::fragmentation::detect_max_payload(&self.socket, self.peer_addr).await?;
+        *self.max_payload_size.write() = info.max_payload_size;
+        let gso = info.max_payload_size > MAX_PAYLOAD_SIZE_MTU;
+        *self.use_gso.write() = gso;
+        *self.fragmentation_checked.write() = true;
+        tracing::info!("Selected payload size: {} bytes", info.max_payload_size);
+        Ok(info.max_payload_size)
+    }
+
     /// Получение адреса для подключения (с учетом NAT)
     pub async fn get_connectable_address(&self) -> Result<SocketAddr> {
         #[cfg(feature = "nat-traversal")]
@@ -187,8 +203,8 @@ impl Sender {
 
     /// Начало передачи файла
     pub async fn start_transfer(&self) -> Result<()> {
-        // Проверяем поддержку GSO
-        *self.use_gso.write() = self.check_gso_support().await;
+        // Проверяем максимальную допустимую фрагментацию
+        self.detect_fragmentation().await?;
 
         // Проверяем, есть ли сохраненное состояние
         let file_name = self
@@ -772,6 +788,7 @@ impl Clone for Sender {
             use_gso: self.use_gso.clone(),
             max_payload_size: self.max_payload_size.clone(),
             last_activity: self.last_activity.clone(),
+            fragmentation_checked: self.fragmentation_checked.clone(),
             #[cfg(feature = "nat-traversal")]
             nat_manager: self.nat_manager.clone(),
         }

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{interval, timeout};
+use rand::RngCore;
 
 /// UDP hole punching для установления P2P соединения через NAT
 pub struct HolePuncher {
@@ -24,11 +25,14 @@ impl HolePuncher {
         tracing::info!("Starting hole punch to {} (initiator: {})", peer_addr, is_initiator);
 
         // Hole punching пакет - небольшой идентификатор
-        let punch_packet = if is_initiator {
-            b"SHARP_PUNCH_INIT"
+        let mut punch_packet = if is_initiator {
+            b"SHARP_PUNCH_INIT".to_vec()
         } else {
-            b"SHARP_PUNCH_RESP"
+            b"SHARP_PUNCH_RESP".to_vec()
         };
+        let mut salt = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut salt);
+        punch_packet.extend_from_slice(&salt);
 
         let mut attempt = 0;
         let mut punch_interval = interval(Duration::from_millis(200));
@@ -38,7 +42,7 @@ impl HolePuncher {
             punch_interval.tick().await;
             
             // Отправляем punch пакет
-            if let Err(e) = socket.send_to(punch_packet, peer_addr).await {
+            if let Err(e) = socket.send_to(&punch_packet, peer_addr).await {
                 tracing::warn!("Hole punch send failed: {}", e);
             } else {
                 tracing::debug!("Sent hole punch packet {} to {}", attempt + 1, peer_addr);
