@@ -115,6 +115,7 @@ impl SenderApp {
                         receiver_addr,
                         bind_addr,
                         encrypt,
+                        frag_info,
                         state,
                         command_rx,
                         ctx_clone,
