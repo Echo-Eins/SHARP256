@@ -9,8 +9,12 @@ pub const BLOCK_SIZE: usize = 256 * 1024; // 256 KB
 pub const MAX_PACKET_SIZE: usize = 64 * 1024; // 64 KB для GSO/GRO
 pub const MTU_SIZE: usize = 1500;
 pub const UDP_HEADER_SIZE: usize = 8;
+pub const IPV4_HEADER_SIZE: usize = 20;
+pub const IPV6_HEADER_SIZE: usize = 40;
+
 pub const SHARP_HEADER_SIZE: usize = 30;
-pub const MAX_PAYLOAD_SIZE_MTU: usize = MTU_SIZE - UDP_HEADER_SIZE - SHARP_HEADER_SIZE; // ~1462 bytes
+pub const MAX_PAYLOAD_SIZE_MTU: usize =
+    MTU_SIZE - IPV4_HEADER_SIZE - UDP_HEADER_SIZE - SHARP_HEADER_SIZE; // ~1442 bytes
 pub const MAX_PAYLOAD_SIZE_GSO: usize = MAX_PACKET_SIZE - SHARP_HEADER_SIZE; // ~65506 bytes
 
 // Параметры партий (batch)

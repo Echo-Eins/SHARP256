@@ -35,6 +35,7 @@ pub struct Sender {
     transfer_state: Arc<RwLock<TransferState>>,
     use_encryption: bool,
     use_gso: Arc<RwLock<bool>>,
+    max_payload_size: Arc<RwLock<usize>>,
     /// Last activity timestamp for keep-alive
     last_activity: Arc<RwLock<Instant>>,
     #[cfg(feature = "nat-traversal")]
@@ -112,6 +113,7 @@ impl Sender {
             transfer_state: Arc::new(RwLock::new(transfer_state)),
             use_encryption,
             use_gso: Arc::new(RwLock::new(false)),
+            max_payload_size: Arc::new(RwLock::new(MAX_PAYLOAD_SIZE_MTU)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
             #[cfg(feature = "nat-traversal")]
             nat_manager,
@@ -167,17 +169,19 @@ impl Sender {
         });
     }
 
-    /// Проверка поддержки GSO/GRO
+    //// Проверка допустимой фрагментации на пути до получателя
     async fn check_gso_support(&self) -> bool {
-        // Попытка отправки большого пакета для проверки GSO
-        let test_packet = vec![0u8; MAX_PACKET_SIZE];
-        match self.socket.send_to(&test_packet, self.peer_addr).await {
-            Ok(_) => {
-                tracing::info!("GSO/GRO support detected");
+        match crate::fragmentation::check_fragmentation(&self.socket, self.peer_addr).await {
+            Ok(size) if size > MAX_PAYLOAD_SIZE_MTU => {
+                tracing::info!("Allowed fragmentation size {} bytes - using GSO/GRO", size);
                 true
             }
-            Err(_) => {
-                tracing::info!("GSO/GRO not supported, using standard MTU");
+            Ok(size) => {
+                tracing::info!("Fragmentation limited to {} bytes", size);
+                false
+            }
+            Err(e) => {
+                tracing::warn!("Fragmentation check failed: {}", e);
                 false
             }
         }
@@ -185,12 +189,17 @@ impl Sender {
 
     /// Начало передачи файла
     pub async fn start_transfer(&self) -> Result<()> {
-        // Проверяем поддержку GSO
-        *self.use_gso.write() = self.check_gso_support().await;
+        // Проверяем максимальную допустимую фрагментацию
+        let info = crate::fragmentation::detect_max_payload(&self.socket, self.peer_addr).await?;
+        *self.max_payload_size.write() = info.max_payload_size;
+        let gso = info.max_payload_size > MAX_PAYLOAD_SIZE_MTU;
+        *self.use_gso.write() = gso;
+        tracing::info!("Selected payload size: {} bytes", info.max_payload_size);
 
         // Проверяем, есть ли сохраненное состояние
         let file_name = self
-            .file_manager.path()
+            .file_manager
+            .path()
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
@@ -649,12 +658,18 @@ impl Sender {
     
     /// Обработка запроса на перезапрос пакетов
     async fn handle_retransmit_request(&self, control_ack: &ControlAck) -> Result<()> {
-        tracing::info!("Retransmitting {} packets and {} hash batches", 
-            control_ack.lost_packets.len(), control_ack.lost_hashes.len());
+        tracing::info!(
+            "Retransmitting {} packets and {} hash batches",
+            control_ack.lost_packets.len(),
+            control_ack.lost_hashes.len()
+        );
         
         // Перезапрашиваем потерянные пакеты
         for lost in &control_ack.lost_packets {
-            if let Some(packet) = self.packet_buffer.get_packet(lost.batch_number, lost.packet_number) {
+            if let Some(packet) = self
+                .packet_buffer
+                .get_packet(lost.batch_number, lost.packet_number)
+            {
                 // Устанавливаем флаг перезапроса
                 let mut retransmit_packet = packet.clone();
                 retransmit_packet.header.flags |= packet_flags::RETRANSMIT;
@@ -713,11 +728,7 @@ impl Sender {
                     break;
                 }
 
-                let payload_limit = if *self.use_gso.read() {
-                    MAX_PAYLOAD_SIZE_GSO
-                } else {
-                    MAX_PAYLOAD_SIZE_MTU
-                };
+                let payload_limit = *self.max_payload_size.read();
 
                 let remaining = file_size - offset;
                 let to_read = remaining.min(payload_limit as u64) as usize;
@@ -761,6 +772,7 @@ impl Clone for Sender {
             transfer_state: self.transfer_state.clone(),
             use_encryption: self.use_encryption,
             use_gso: self.use_gso.clone(),
+            max_payload_size: self.max_payload_size.clone(),
             last_activity: self.last_activity.clone(),
             #[cfg(feature = "nat-traversal")]
             nat_manager: self.nat_manager.clone(),

@@ -19,6 +19,7 @@ use crate::state::{StateManager, TransferState};
 
 #[cfg(feature = "nat-traversal")]
 use crate::nat::{NatManager, NatConfig};
+use crate::fragmentation;
 
 pub struct Receiver {
     socket: Arc<UdpSocket>,
@@ -153,6 +154,9 @@ impl Receiver {
                         }
                     }
 
+                    if fragmentation::handle_fragmentation_packet(&self.socket, &buffer[..size], addr).await? {
+                        continue;
+                    }
 
                     let mut buf = BytesMut::from(&buffer[..size]);
 

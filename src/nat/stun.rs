@@ -139,7 +139,7 @@ impl StunClient {
             
             match attr_type {
                 XOR_MAPPED_ADDRESS => {
-                    return self.parse_xor_mapped_address(&mut buf, attr_length);
+                    return self.parse_xor_mapped_address(&mut buf, attr_length, &tid);
                 }
                 MAPPED_ADDRESS => {
                     return self.parse_mapped_address(&mut buf, attr_length);
@@ -163,7 +163,7 @@ impl StunClient {
     }
 
     /// Парсинг XOR-MAPPED-ADDRESS
-    fn parse_xor_mapped_address(&self, buf: &mut BytesMut, length: usize) -> Result<SocketAddr> {
+    fn parse_xor_mapped_address(&self, buf: &mut BytesMut, length: usize, transaction_id: &[u8; 12]) -> Result<SocketAddr> {
         if length < 8 {
             anyhow::bail!("XOR-MAPPED-ADDRESS too short");
         }
@@ -187,12 +187,17 @@ impl StunClient {
                 
                 let mut addr_bytes = [0u8; 16];
                 buf.copy_to_slice(&mut addr_bytes);
-                
-                // XOR с magic cookie и transaction ID
+
+                // XOR all 16 bytes with magic cookie and transaction ID
+                // RFC 5389: first 4 bytes are XORed with the magic cookie,
+                // the remaining 12 bytes are XORed with the transaction ID
+
                 for i in 0..4 {
-                    addr_bytes[i] ^= ((STUN_MAGIC_COOKIE >> (24 - i * 8)) & 0xFF) as u8;
+                    addr_bytes[i] ^= ((STUN_MAGIC_COOKIE >> (8 * (3 - i))) & 0xFF) as u8;
                 }
-                // Для простоты пропускаем XOR с transaction ID для остальных байтов
+                for i in 0..12 {
+                    addr_bytes[i + 4] ^= transaction_id[i];
+                }
                 
                 let ip = std::net::Ipv6Addr::from(addr_bytes);
                 Ok(SocketAddr::new(ip.into(), port))
@@ -236,5 +241,51 @@ impl StunClient {
         let mut tid = [0u8; 12];
         rand::thread_rng().fill(&mut tid);
         tid
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv6Addr};
+    use bytes::BytesMut;
+
+    #[test]
+    fn parse_ipv6_xor_mapped_address() {
+        let client = StunClient::new(vec![]);
+
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let port: u16 = 54321;
+
+        // Create XOR-MAPPED-ADDRESS attribute value
+        let mut attr_value = BytesMut::with_capacity(20);
+        attr_value.put_u8(0); // reserved
+        attr_value.put_u8(0x02); // family
+        attr_value.put_u16(port ^ ((STUN_MAGIC_COOKIE >> 16) as u16));
+        let ip_bytes = ip.octets();
+        let mut xored_ip = [0u8; 16];
+        for i in 0..4 {
+            xored_ip[i] = ip_bytes[i] ^ ((STUN_MAGIC_COOKIE >> (8 * (3 - i))) & 0xFF) as u8;
+        }
+        for i in 0..12 {
+            xored_ip[i + 4] = ip_bytes[i + 4] ^ transaction_id[i];
+        }
+        attr_value.extend_from_slice(&xored_ip);
+
+        // Build STUN message
+        let msg_len = 4 + attr_value.len();
+        let mut msg = BytesMut::with_capacity(20 + msg_len);
+        msg.put_u16(BINDING_RESPONSE);
+        msg.put_u16(msg_len as u16);
+        msg.put_u32(STUN_MAGIC_COOKIE);
+        msg.put_slice(&transaction_id);
+        msg.put_u16(XOR_MAPPED_ADDRESS);
+        msg.put_u16(attr_value.len() as u16);
+        msg.put_slice(&attr_value);
+
+        let result = client.parse_binding_response(&msg, &transaction_id).unwrap();
+        assert_eq!(result, SocketAddr::new(ip.into(), port));
     }
 }
