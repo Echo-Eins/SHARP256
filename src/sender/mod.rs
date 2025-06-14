@@ -10,6 +10,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::{sleep, timeout, interval};
 
+use uuid::Uuid;
+
 use crate::buffer::PacketBuffer;
 use crate::file::FileManager;
 use crate::protocol::{ack::*, constants::*, packet::*};
@@ -24,6 +26,8 @@ pub struct Sender {
     peer_addr: SocketAddr,
     /// Effective address after NAT discovery
     effective_peer_addr: Arc<RwLock<SocketAddr>>,
+    /// Unique connection identifier
+    connection_id: String,
     file_manager: Arc<FileManager>,
     packet_buffer: Arc<PacketBuffer>,
     sao_system: Arc<SaoSystem>,
@@ -47,6 +51,14 @@ impl Sender {
         let socket = UdpSocket::bind(local_addr).await?;
         let actual_local = socket.local_addr()?;
         tracing::info!("Sender socket bound to {}", actual_local);
+
+        let connection_id = Uuid::new_v4().to_string();
+        tracing::info!(
+            "Connection {}: establishing from {} to {}",
+            connection_id,
+            actual_local,
+            peer_addr
+        );
 
         let file_manager = FileManager::open_for_send(file_path)?;
         file_manager.init_mmap()?;
@@ -92,6 +104,7 @@ impl Sender {
             socket: Arc::new(socket),
             peer_addr,
             effective_peer_addr: Arc::new(RwLock::new(peer_addr)),
+            connection_id,
             file_manager: Arc::new(file_manager),
             packet_buffer: Arc::new(PacketBuffer::new()),
             sao_system: Arc::new(SaoSystem::new()),
@@ -176,7 +189,8 @@ impl Sender {
         *self.use_gso.write() = self.check_gso_support().await;
 
         // Проверяем, есть ли сохраненное состояние
-        let file_name = self.file_manager.path()
+        let file_name = self
+            .file_manager.path()
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
@@ -232,12 +246,18 @@ impl Sender {
         if !same_network {
             if let Some(nat_manager) = &self.nat_manager {
                 tracing::info!("Preparing NAT traversal to {}", self.peer_addr);
-                if let Err(e) = nat_manager
+                match nat_manager
                     .read()
                     .prepare_connection(&self.socket, self.peer_addr, true)
                     .await
                 {
-                    tracing::warn!("NAT preparation failed: {}", e);
+                    Ok(()) => {
+                        tracing::info!("Waiting for hole punch confirmation...");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("NAT preparation failed: {}", e);
+                    }
                 }
             }
         }
@@ -253,6 +273,7 @@ impl Sender {
             self.file_manager.size(),
             sender_addr,
             self.peer_addr,
+            self.connection_id.clone(),
             local_sender_addr,
             self.sao_system.batch_size(),
             self.use_encryption,
@@ -274,7 +295,8 @@ impl Sender {
         // Отправляем и ждем ответ
         for attempt in 0..5 {
             tracing::info!("Sending initial ACK (attempt {})", attempt + 1);
-            self.socket.send_to(&packet.to_bytes(), self.peer_addr).await?;
+            let peer = *self.effective_peer_addr.read();
+            self.socket.send_to(&packet.to_bytes(), peer).await?;
 
             let mut buffer = vec![0u8; 65536];
             match timeout(Duration::from_secs(5), self.socket.recv_from(&mut buffer)).await {
@@ -332,7 +354,8 @@ impl Sender {
         }
 
         // Находим позицию в файле
-        let resume_position = saved_state.find_resume_position(&self.file_manager)?
+        let resume_position = saved_state
+            .find_resume_position(&self.file_manager)?
             .unwrap_or(saved_state.bytes_transferred);
 
         tracing::info!("Resuming transfer from position {}", resume_position);
@@ -357,15 +380,19 @@ impl Sender {
         let hash_complete_sender = hash_complete.clone();
         let sender_handle = tokio::spawn(async move {
             sender_self
-                .packet_sender_task(rx_packets, rx_hashes, packet_complete_sender, hash_complete_sender)
+                .packet_sender_task(
+                    rx_packets,
+                    rx_hashes,
+                    packet_complete_sender,
+                    hash_complete_sender,
+                )
                 .await
         });
 
         // Запускаем поток хеширования
         let hasher_self = self.clone();
-        let hasher_handle = tokio::spawn(async move {
-            hasher_self.hasher_task(tx_hashes, packet_complete).await
-        });
+        let hasher_handle =
+            tokio::spawn(async move { hasher_self.hasher_task(tx_hashes, packet_complete).await });
 
         // Запускаем поток обработки ACK
         let ack_self = self.clone();
@@ -459,7 +486,8 @@ impl Sender {
                     let is_last = packet.header.is_last_in_batch();
 
                     // Отправляем пакет
-                    self.socket.send_to(&packet.to_bytes(), self.peer_addr).await?;
+                    let peer = *self.effective_peer_addr.read();
+                    self.socket.send_to(&packet.to_bytes(), peer).await?;
 
                     packets_in_batch += 1;
 
@@ -496,7 +524,8 @@ impl Sender {
                     let hash_packet = Packet::new(header, hash_bytes);
 
                     // Отправляем пакет с хешами
-                    self.socket.send_to(&hash_packet.to_bytes(), self.peer_addr).await?;
+                    let peer = *self.effective_peer_addr.read();
+                    self.socket.send_to(&hash_packet.to_bytes(), peer).await?;
 
                     // Сигнализируем о готовности к следующей партии
                     hash_complete.notify_one();
@@ -517,7 +546,8 @@ impl Sender {
     /// Отправка контрольного ACK
     async fn send_control_ack(&self, last_batch: u32) -> Result<()> {
         let batch_start = last_batch.saturating_sub(BATCHES_BEFORE_ACK - 1);
-        let mut control_ack = ControlAck::new(batch_start, last_batch, self.sao_system.get_params());
+        let mut control_ack =
+            ControlAck::new(batch_start, last_batch, self.sao_system.get_params());
 
         // Измеряем ping
         let ping_start = Instant::now();
@@ -528,7 +558,8 @@ impl Sender {
         header.payload_length = ack_bytes.len() as u32;
 
         let packet = Packet::new(header, ack_bytes);
-        self.socket.send_to(&packet.to_bytes(), self.peer_addr).await?;
+        let peer = *self.effective_peer_addr.read();
+        self.socket.send_to(&packet.to_bytes(), peer).await?;
 
         Ok(())
     }
@@ -544,7 +575,11 @@ impl Sender {
 
                     let expected_peer = *self.effective_peer_addr.read();
                     if addr != expected_peer {
-                        tracing::warn!("Received packet from unexpected address: {} (expected {})", addr, expected_peer);
+                        tracing::warn!(
+                            "Received packet from unexpected address: {} (expected {})",
+                            addr,
+                            expected_peer
+                        );
 
                         if addr.ip() == expected_peer.ip() || addr.ip() == self.peer_addr.ip() {
                             tracing::info!("Updating peer address to {}", addr);
@@ -623,8 +658,10 @@ impl Sender {
                 // Устанавливаем флаг перезапроса
                 let mut retransmit_packet = packet.clone();
                 retransmit_packet.header.flags |= packet_flags::RETRANSMIT;
-                
-                self.socket.send_to(&retransmit_packet.to_bytes(), self.peer_addr).await?;
+
+                let peer = *self.effective_peer_addr.read();
+                self.socket.send_to(&retransmit_packet.to_bytes(), peer).await?;
+
                 sleep(Duration::from_micros(100)).await; // Небольшая задержка между пакетами
             }
         }
@@ -643,7 +680,8 @@ impl Sender {
                 header.flags |= packet_flags::RETRANSMIT;
                 
                 let hash_packet = Packet::new(header, hash_bytes);
-                self.socket.send_to(&hash_packet.to_bytes(), self.peer_addr).await?;
+                let peer = *self.effective_peer_addr.read();
+                self.socket.send_to(&hash_packet.to_bytes(), peer).await?;
             }
         }
         
@@ -715,6 +753,7 @@ impl Clone for Sender {
             socket: self.socket.clone(),
             peer_addr: self.peer_addr,
             effective_peer_addr: self.effective_peer_addr.clone(),
+            connection_id: self.connection_id.clone(),
             file_manager: self.file_manager.clone(),
             packet_buffer: self.packet_buffer.clone(),
             sao_system: self.sao_system.clone(),

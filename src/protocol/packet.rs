@@ -164,6 +164,13 @@ impl Packet {
         }
 
         let payload = buf.split_to(header.payload_length as usize).to_vec();
+
+        if !buf.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Trailing data after packet"
+            ));
+        }
         
         Ok(Self { header, payload })
     }

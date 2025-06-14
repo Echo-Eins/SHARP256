@@ -140,13 +140,23 @@ impl Receiver {
                         tracing::debug!("Packet #{} from {} ({} bytes)", packet_count, addr, size);
                     }
 
+                    if size == 15 && &buffer[..15] == b"SHARP_KEEPALIVE" {
+                        tracing::trace!("Keep-alive received from {}", addr);
+                        continue;
+                    }
+
+                    if size >= 16 && size <= 20 {
+                        if &buffer[..12] == b"SHARP_PUNCH_" {
+                            tracing::debug!("Hole punch packet from {}", addr);
+                            let _ = self.socket.send_to(b"SHARP_PUNCH_ACK", addr).await;
+                            continue;
+                        }
+                    }
+
+
                     let mut buf = BytesMut::from(&buffer[..size]);
 
                     if let Ok(packet) = Packet::from_bytes(&mut buf) {
-                        if size == 15 && &buffer[..15] == b"SHARP_KEEPALIVE" {
-                            tracing::trace!("Keep-alive received from {}", addr);
-                            continue
-                        }
 
                         match packet.header.packet_type {
                             PacketType::Ack => {
@@ -164,11 +174,21 @@ impl Receiver {
                                 let peer_opt = *self.peer_addr.read();
                                 let peer_local_opt = *self.peer_local_addr.read();
 
-                                let is_valid_peer = if let Some(peer) = peer_opt {
-                                    addr == peer || (peer_local_opt.is_some() && addr == peer_local_opt.unwrap()) || addr.ip() == peer.ip()
+                                let mut is_valid_peer = if let Some(peer) = peer_opt {
+                                    addr == peer || (peer_local_opt.is_some() && addr == peer_local_opt.unwrap())
                                 } else {
                                     false
                                 };
+
+                                if !is_valid_peer {
+                                    if let Some(peer) = peer_opt {
+                                        if addr.ip() == peer.ip() && packet.header.magic_number == MAGIC_NUMBER {
+                                            tracing::info!("Updating peer port from {} to {}", peer, addr);
+                                            *self.peer_addr.write() = Some(addr);
+                                            is_valid_peer = true;
+                                        }
+                                    }
+                                }
 
                                 if is_valid_peer {
                                     if Some(addr) != peer_opt {
@@ -210,6 +230,13 @@ impl Receiver {
     /// Обработка первичного ACK
     async fn handle_initial_ack(&self, packet: Packet, sender_addr: SocketAddr) -> Result<()> {
         let initial_ack: InitialAck = bincode::deserialize(&packet.payload)?;
+
+        tracing::info!(
+            "Connection {}: establishing from {} to {}",
+            initial_ack.connection_id,
+            sender_addr,
+            self.socket.local_addr()?
+        );
 
         tracing::info!("=== Transfer Request ===");
         tracing::info!("From: {}", sender_addr);
