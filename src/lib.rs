@@ -12,17 +12,19 @@ pub mod progress;
 pub mod sender;
 pub mod receiver;
 
+pub mod fragmentation;
 #[cfg(feature = "nat-traversal")]
 pub mod nat;
 
 #[cfg(feature = "gui")]
 pub mod gui;
 
+
 // Re-export основных типов
 pub use sender::Sender;
 pub use receiver::Receiver;
 pub use protocol::constants::*;
-
+pub use fragmentation::*;
 /// Инициализация логирования
 pub fn init_logging(level: &str) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};

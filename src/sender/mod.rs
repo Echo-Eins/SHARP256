@@ -116,6 +116,7 @@ impl Sender {
             use_gso: Arc::new(RwLock::new(false)),
             max_payload_size: Arc::new(RwLock::new(MAX_PAYLOAD_SIZE_MTU)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+            fragmentation_checked: Arc::new(RwLock::new(false)),
             #[cfg(feature = "nat-traversal")]
             nat_manager,
         })
