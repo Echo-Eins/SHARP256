@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, interval};
 
 use crate::buffer::PacketBuffer;
 use crate::file::FileManager;
@@ -22,6 +22,8 @@ use crate::nat::{NatManager, NatConfig};
 pub struct Sender {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
+    /// Effective address after NAT discovery
+    effective_peer_addr: Arc<RwLock<SocketAddr>>,
     file_manager: Arc<FileManager>,
     packet_buffer: Arc<PacketBuffer>,
     sao_system: Arc<SaoSystem>,
@@ -29,6 +31,8 @@ pub struct Sender {
     transfer_state: Arc<RwLock<TransferState>>,
     use_encryption: bool,
     use_gso: Arc<RwLock<bool>>,
+    /// Last activity timestamp for keep-alive
+    last_activity: Arc<RwLock<Instant>>,
     #[cfg(feature = "nat-traversal")]
     nat_manager: Option<Arc<RwLock<NatManager>>>,
 }
@@ -41,41 +45,40 @@ impl Sender {
         use_encryption: bool,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(local_addr).await?;
+        let actual_local = socket.local_addr()?;
+        tracing::info!("Sender socket bound to {}", actual_local);
+
         let file_manager = FileManager::open_for_send(file_path)?;
         file_manager.init_mmap()?;
-        
-        let file_name = file_path.file_name()
+
+        let file_name = file_path
+            .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        
+
         let transfer_state = TransferState::new(
             file_name,
             file_manager.size(),
             true,
             peer_addr.to_string(),
         );
-        
+
         // Инициализация NAT manager если включен
         #[cfg(feature = "nat-traversal")]
         let nat_manager = {
             let config = NatConfig::default();
             let mut manager = NatManager::new(config);
-            
+
             match manager.initialize(&socket).await {
                 Ok(network_info) => {
-                    tracing::info!("Network info: {:?}", network_info);
-                    
-                    // Если у нас есть публичный адрес, сообщаем его
-                    if let Some(public_addr) = network_info.public_addr {
-                        tracing::info!("Public address available: {}", public_addr);
-                    }
-                    
-                    // Подготавливаем соединение с пиром
-                    if let Err(e) = manager.prepare_connection(&socket, peer_addr, true).await {
-                        tracing::warn!("Failed to prepare connection: {}", e);
-                    }
-                    
+                    tracing::info!("=== NAT Detection Results ===");
+                    tracing::info!("Local address: {}", network_info.local_addr);
+                    tracing::info!("Public address: {:?}", network_info.public_addr);
+                    tracing::info!("NAT type: {:?}", network_info.nat_type);
+                    tracing::info!("UPnP available: {}", network_info.upnp_available);
+                    tracing::info!("============================");
+
                     Some(Arc::new(RwLock::new(manager)))
                 }
                 Err(e) => {
@@ -84,10 +87,11 @@ impl Sender {
                 }
             }
         };
-        
+
         Ok(Self {
             socket: Arc::new(socket),
             peer_addr,
+            effective_peer_addr: Arc::new(RwLock::new(peer_addr)),
             file_manager: Arc::new(file_manager),
             packet_buffer: Arc::new(PacketBuffer::new()),
             sao_system: Arc::new(SaoSystem::new()),
@@ -95,11 +99,12 @@ impl Sender {
             transfer_state: Arc::new(RwLock::new(transfer_state)),
             use_encryption,
             use_gso: Arc::new(RwLock::new(false)),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
             #[cfg(feature = "nat-traversal")]
             nat_manager,
         })
     }
-    
+
     /// Получение адреса для подключения (с учетом NAT)
     pub async fn get_connectable_address(&self) -> Result<SocketAddr> {
         #[cfg(feature = "nat-traversal")]
@@ -110,11 +115,45 @@ impl Sender {
                 }
             }
         }
-        
+
         // Fallback на локальный адрес
         Ok(self.socket.local_addr()?)
     }
-    
+
+    fn ip_is_private(ip: &std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => v4.is_private(),
+            std::net::IpAddr::V6(v6) => v6.is_unique_local(),
+        }
+    }
+
+    /// Запуск keep-alive механизма
+    async fn start_keep_alive(&self) {
+        let socket = self.socket.clone();
+        let peer_addr = self.effective_peer_addr.clone();
+        let last_activity = self.last_activity.clone();
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(30));
+
+            loop {
+                interval.tick().await;
+
+                let last = *last_activity.read();
+                if last.elapsed() > Duration::from_secs(25) {
+                    let keep_alive = b"SHARP_KEEPALIVE";
+                    let peer = *peer_addr.read();
+
+                    if let Err(e) = socket.send_to(keep_alive, peer).await {
+                        tracing::warn!("Keep-alive send failed: {}", e);
+                    } else {
+                        tracing::trace!("Keep-alive sent to {}", peer);
+                    }
+                }
+            }
+        });
+    }
+
     /// Проверка поддержки GSO/GRO
     async fn check_gso_support(&self) -> bool {
         // Попытка отправки большого пакета для проверки GSO
@@ -130,18 +169,18 @@ impl Sender {
             }
         }
     }
-    
+
     /// Начало передачи файла
     pub async fn start_transfer(&self) -> Result<()> {
         // Проверяем поддержку GSO
         *self.use_gso.write() = self.check_gso_support().await;
-        
+
         // Проверяем, есть ли сохраненное состояние
         let file_name = self.file_manager.path()
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        
+
         if let Some(saved_state) = self.state_manager.find_state(&file_name, true)? {
             // Предлагаем возобновить передачу
             tracing::info!("Found saved transfer state from {}", saved_state.timestamp);
@@ -150,48 +189,116 @@ impl Sender {
             // Начинаем новую передачу
             self.new_transfer().await?;
         }
-        
+
         Ok(())
     }
-    
-    /// Начало новой передачи
+
+    /// Начало новой передачи с учетом NAT и возможным изменением адреса
     async fn new_transfer(&self) -> Result<()> {
-        let local_ip = self.socket.local_addr()?.ip();
-        
-        // Получаем адрес для подключения (может быть публичным через NAT)
-        let connectable_addr = self.get_connectable_address().await?;
-        
+        let local_addr = self.socket.local_addr()?;
+
+        // Определяем адреса для использования
+        let (sender_addr, local_sender_addr) = {
+            #[cfg(feature = "nat-traversal")]
+            if let Some(nat_manager) = &self.nat_manager {
+                match nat_manager.read().get_connectable_address() {
+                    Ok(connectable) => {
+                        tracing::info!("Using connectable address: {}", connectable);
+                        (connectable, Some(local_addr))
+                    }
+                    Err(_) => {
+                        tracing::info!("Using local address: {}", local_addr);
+                        (local_addr, None)
+                    }
+                }
+            } else {
+                (local_addr, None)
+            }
+
+            #[cfg(not(feature = "nat-traversal"))]
+            (local_addr, None)
+        };
+
+        // Проверяем, не в одной ли мы сети
+        let same_network = sender_addr.ip() == self.peer_addr.ip()
+            || (Self::ip_is_private(&local_addr.ip()) && Self::ip_is_private(&self.peer_addr.ip()));
+
+        if same_network {
+            tracing::info!("Detected same network configuration");
+        }
+
+        // Подготавливаем NAT traversal при необходимости
+        #[cfg(feature = "nat-traversal")]
+        if !same_network {
+            if let Some(nat_manager) = &self.nat_manager {
+                tracing::info!("Preparing NAT traversal to {}", self.peer_addr);
+                if let Err(e) = nat_manager
+                    .read()
+                    .prepare_connection(&self.socket, self.peer_addr, true)
+                    .await
+                {
+                    tracing::warn!("NAT preparation failed: {}", e);
+                }
+            }
+        }
+
         // Отправляем первичный ACK
         let initial_ack = InitialAck::new(
-            self.file_manager.path().file_name().unwrap_or_default().to_string_lossy().to_string(),
+            self.file_manager
+                .path()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
             self.file_manager.size(),
-            connectable_addr.ip(), // Используем connectable адрес вместо локального
-            self.peer_addr.ip(),
+            sender_addr,
+            self.peer_addr,
+            local_sender_addr,
             self.sao_system.batch_size(),
             self.use_encryption,
         );
-        
-        tracing::info!("Sending initial ACK with connectable address: {}", connectable_addr);
-        
+
+        tracing::info!("=== Initial Connection ===");
+        tracing::info!("Sender address: {}", sender_addr);
+        tracing::info!("Target receiver: {}", self.peer_addr);
+        if let Some(local) = local_sender_addr {
+            tracing::info!("Local address: {}", local);
+        }
+        tracing::info!("========================");
+
         let ack_bytes = bincode::serialize(&initial_ack)?;
         let mut header = PacketHeader::new(PacketType::Ack);
         header.payload_length = ack_bytes.len() as u32;
-        
         let packet = Packet::new(header, ack_bytes);
-        
+
         // Отправляем и ждем ответ
-        for attempt in 0..3 {
+        for attempt in 0..5 {
+            tracing::info!("Sending initial ACK (attempt {})", attempt + 1);
             self.socket.send_to(&packet.to_bytes(), self.peer_addr).await?;
-            
+
             let mut buffer = vec![0u8; 65536];
-            match timeout(Duration::from_secs(10), self.socket.recv_from(&mut buffer)).await {
-                Ok(Ok((size, addr))) if addr == self.peer_addr => {
+            match timeout(Duration::from_secs(5), self.socket.recv_from(&mut buffer)).await {
+                Ok(Ok((size, addr))) => {
+                    tracing::info!("Received response from {} ({} bytes)", addr, size);
+
+                    // Обновляем effective peer address если NAT поменял
+                    if addr != self.peer_addr {
+                        tracing::info!(
+                            "Peer address changed from {} to {} (NAT detected)",
+                            self.peer_addr,
+                            addr
+                        );
+                        *self.effective_peer_addr.write() = addr;
+                    }
+
                     let mut buf = BytesMut::from(&buffer[..size]);
                     if let Ok(response_packet) = Packet::from_bytes(&mut buf) {
                         if response_packet.header.packet_type == PacketType::Ack {
                             let response: InitialAckResponse = bincode::deserialize(&response_packet.payload)?;
                             if response.accept_transfer {
                                 tracing::info!("Transfer accepted by receiver");
+                                *self.last_activity.write() = Instant::now();
+                                self.start_keep_alive().await;
                                 self.transfer_file().await?;
                                 return Ok(());
                             } else {
@@ -200,44 +307,50 @@ impl Sender {
                         }
                     }
                 }
-                _ => {
-                    tracing::warn!("Initial ACK attempt {} failed", attempt + 1);
+                Err(_) => {
+                    tracing::warn!("Timeout waiting for initial ACK response");
+                    if attempt == 2 && local_sender_addr.is_some() {
+                        tracing::info!("Trying direct local connection...");
+                    }
                 }
+                _ => {}
             }
+
+            sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
         }
-        
-        anyhow::bail!("Failed to establish connection with receiver")
+
+        anyhow::bail!("Failed to establish connection with receiver after 5 attempts")
     }
-    
+
     /// Возобновление передачи
     async fn resume_transfer(&self, saved_state: TransferState) -> Result<()> {
         // Восстанавливаем состояние
         *self.transfer_state.write() = saved_state.clone();
-        
+
         if let Some(sao_params) = saved_state.sao_params {
             self.sao_system.set_params(sao_params);
         }
-        
+
         // Находим позицию в файле
         let resume_position = saved_state.find_resume_position(&self.file_manager)?
             .unwrap_or(saved_state.bytes_transferred);
-        
+
         tracing::info!("Resuming transfer from position {}", resume_position);
-        
+
         // Отправляем специальный ACK о возобновлении
         // TODO: Реализовать протокол возобновления
-        
+
         self.transfer_file().await
     }
-    
+
     /// Основной процесс передачи файла
     async fn transfer_file(&self) -> Result<()> {
         let (tx_packets, rx_packets) = mpsc::channel::<Packet>(100);
         let (tx_hashes, rx_hashes) = mpsc::channel::<(u32, Vec<blake3::Hash>)>(10);
-        
+
         let packet_complete = Arc::new(Notify::new());
         let hash_complete = Arc::new(Notify::new());
-        
+
         // Запускаем поток сборки и отправки пакетов
         let sender_self = self.clone();
         let packet_complete_sender = packet_complete.clone();
@@ -247,25 +360,25 @@ impl Sender {
                 .packet_sender_task(rx_packets, rx_hashes, packet_complete_sender, hash_complete_sender)
                 .await
         });
-        
+
         // Запускаем поток хеширования
         let hasher_self = self.clone();
         let hasher_handle = tokio::spawn(async move {
             hasher_self.hasher_task(tx_hashes, packet_complete).await
         });
-        
+
         // Запускаем поток обработки ACK
         let ack_self = self.clone();
         let ack_handle = tokio::spawn(async move {
             ack_self.ack_handler_task().await
         });
-        
+
         // Основной цикл чтения и фрагментации файла
         self.file_reader_task(tx_packets, hash_complete).await?;
-        
+
         // Ждем завершения всех задач
         let _ = tokio::try_join!(sender_handle, hasher_handle, ack_handle)?;
-        
+
         Ok(())
     }
     /// Задача хеширования данных с пайплайнингом
@@ -277,13 +390,13 @@ impl Sender {
         let mut current_batch = 0u32;
         let mut batch_hashes = Vec::new();
         let mut hasher = Hasher::new();
-        
+
         loop {
             // Ждем сигнал о готовности пакетов партии
             packet_complete.notified().await;
-            
+
             let batch_size = self.sao_system.batch_size();
-            
+
             // Хешируем все пакеты текущей партии
             for packet_num in 0..batch_size {
                 if let Some(packet) = self.packet_buffer.get_packet(current_batch, packet_num) {
@@ -291,7 +404,7 @@ impl Sender {
                     let hash = hasher.finalize();
                     batch_hashes.push(hash);
                     hasher.reset();
-                    
+
                     // Начинаем упреждающее хеширование следующей партии
                     if packet_num == batch_size - 1 {
                         tokio::spawn({
@@ -307,13 +420,13 @@ impl Sender {
                     }
                 }
             }
-            
+
             // Переворачиваем стек хешей для удобства проверки
             batch_hashes.reverse();
-            
+
             // Сохраняем хеши в буфер
             self.packet_buffer.add_batch_hashes(current_batch, batch_hashes.clone());
-            
+
             // Отправляем хеши
             let hashes_to_send = batch_hashes.clone();
             let batch_to_send = current_batch;
@@ -327,7 +440,7 @@ impl Sender {
             current_batch += 1;
         }
     }
-    
+
     /// Задача отправки пакетов и хешей
     async fn packet_sender_task(
         self,
@@ -338,23 +451,23 @@ impl Sender {
     ) -> Result<()> {
         let mut packets_in_batch = 0u16;
         let mut current_batch = 0u32;
-        
+
         loop {
             tokio::select! {
                 // Обработка пакетов данных
                 Some(packet) = rx_packets.recv() => {
                     let is_last = packet.header.is_last_in_batch();
-                    
+
                     // Отправляем пакет
                     self.socket.send_to(&packet.to_bytes(), self.peer_addr).await?;
-                    
+
                     packets_in_batch += 1;
-                    
+
                     // Если это последний пакет в партии
                     if is_last {
                         // Сигнализируем потоку хеширования
                         packet_complete.notify_one();
-                        
+
                         // Добавляем метрику партии
                         let metrics = BatchMetrics::new(
                             current_batch,
@@ -362,12 +475,12 @@ impl Sender {
                             packets_in_batch as u64 * packet.header.payload_length as u64,
                         );
                         self.sao_system.add_batch_metrics(metrics);
-                        
+
                         packets_in_batch = 0;
                         current_batch += 1;
                     }
                 }
-                
+
                 // Обработка хешей
                 Some((batch_num, hashes)) = rx_hashes.recv() => {
                     // Создаем пакет с хешами
@@ -375,107 +488,120 @@ impl Sender {
                         .flat_map(|h| h.as_bytes())
                         .copied()
                         .collect();
-                    
+
                     let mut header = PacketHeader::new(PacketType::Hash);
                     header.batch_number = batch_num;
                     header.payload_length = hash_bytes.len() as u32;
-                    
+
                     let hash_packet = Packet::new(header, hash_bytes);
-                    
+
                     // Отправляем пакет с хешами
                     self.socket.send_to(&hash_packet.to_bytes(), self.peer_addr).await?;
-                    
+
                     // Сигнализируем о готовности к следующей партии
                     hash_complete.notify_one();
-                    
+
                     // Проверяем, нужно ли отправить контрольный ACK
                     if (batch_num + 1) % BATCHES_BEFORE_ACK == 0 {
                         self.send_control_ack(batch_num).await?;
                     }
                 }
-                
+
                 else => break,
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Отправка контрольного ACK
     async fn send_control_ack(&self, last_batch: u32) -> Result<()> {
         let batch_start = last_batch.saturating_sub(BATCHES_BEFORE_ACK - 1);
         let mut control_ack = ControlAck::new(batch_start, last_batch, self.sao_system.get_params());
-        
+
         // Измеряем ping
         let ping_start = Instant::now();
         control_ack.ping_ms = 0.0; // Будет обновлено при получении ответа
-        
+
         let ack_bytes = bincode::serialize(&control_ack)?;
         let mut header = PacketHeader::new(PacketType::Control);
         header.payload_length = ack_bytes.len() as u32;
-        
+
         let packet = Packet::new(header, ack_bytes);
         self.socket.send_to(&packet.to_bytes(), self.peer_addr).await?;
-        
+
         Ok(())
     }
-    
+
     /// Задача обработки входящих ACK
     async fn ack_handler_task(self) -> Result<()> {
         let mut buffer = vec![0u8; 65536];
-        let last_sao_update = 0u32;
-        
+
         loop {
             match self.socket.recv_from(&mut buffer).await {
-                Ok((size, addr)) if addr == self.peer_addr => {
+                Ok((size, addr)) => {
+                    *self.last_activity.write() = Instant::now();
+
+                    let expected_peer = *self.effective_peer_addr.read();
+                    if addr != expected_peer {
+                        tracing::warn!("Received packet from unexpected address: {} (expected {})", addr, expected_peer);
+
+                        if addr.ip() == expected_peer.ip() || addr.ip() == self.peer_addr.ip() {
+                            tracing::info!("Updating peer address to {}", addr);
+                            *self.effective_peer_addr.write() = addr;
+                        } else {
+                            continue;
+                        }
+                    }
+
                     let mut buf = BytesMut::from(&buffer[..size]);
-                    
+
                     if let Ok(packet) = Packet::from_bytes(&mut buf) {
                         match packet.header.packet_type {
                             PacketType::Control => {
                                 let control_ack: ControlAck = bincode::deserialize(&packet.payload)?;
-                                
+
                                 // Обновляем SAO с данными от получателя
                                 self.sao_system.update_from_ack(&control_ack);
-                                
+
                                 if control_ack.is_all_received() {
                                     // Все пакеты получены, очищаем буфер
                                     self.packet_buffer.clear_before_batch(control_ack.batch_range_end);
-                                    tracing::info!("Batches {}-{} confirmed", 
+                                    tracing::info!("Batches {}-{} confirmed",
                                         control_ack.batch_range_start, control_ack.batch_range_end);
                                 } else {
                                     // Есть потерянные пакеты, перезапрашиваем
                                     self.handle_retransmit_request(&control_ack).await?;
                                 }
-                                
+
                                 // Пересчитываем параметры SAO при необходимости
                                 if self.sao_system.recalculate(control_ack.batch_range_end) {
                                     tracing::info!("SAO parameters updated");
                                 }
                             }
-                            
+
                             PacketType::Ack => {
                                 let final_ack: FinalAck = bincode::deserialize(&packet.payload)?;
                                 if final_ack.transfer_complete {
                                     tracing::info!("Transfer completed successfully");
                                     tracing::info!("Average speed: {:.2} Mbps", final_ack.average_speed_mbps);
-                                    
+
                                     // Удаляем файл состояния
                                     if let Ok(state_path) = self.state_manager.save_state(&self.transfer_state.read()) {
                                         TransferState::cleanup(&state_path)?;
                                     }
-                                    
+
                                     return Ok(());
                                 }
                             }
-                            
+
                             _ => {}
                         }
                     }
                 }
-                
+
                 Ok(_) => {} // Игнорируем пакеты от других адресов
-                
+
                 Err(e) => {
                     tracing::error!("Socket error: {}", e);
                     // Сохраняем состояние при ошибке
@@ -588,6 +714,7 @@ impl Clone for Sender {
         Self {
             socket: self.socket.clone(),
             peer_addr: self.peer_addr,
+            effective_peer_addr: self.effective_peer_addr.clone(),
             file_manager: self.file_manager.clone(),
             packet_buffer: self.packet_buffer.clone(),
             sao_system: self.sao_system.clone(),
@@ -595,6 +722,7 @@ impl Clone for Sender {
             transfer_state: self.transfer_state.clone(),
             use_encryption: self.use_encryption,
             use_gso: self.use_gso.clone(),
+            last_activity: self.last_activity.clone(),
             #[cfg(feature = "nat-traversal")]
             nat_manager: self.nat_manager.clone(),
         }

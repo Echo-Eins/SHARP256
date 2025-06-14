@@ -126,7 +126,12 @@ impl SaoSystem {
         // Рассчитываем пропускную способность
         let elapsed_secs = self.start_time.elapsed().as_secs_f64();
         let total_bytes: u64 = history.iter().map(|m| m.bytes_sent).sum();
-        let bandwidth_mbps = (total_bytes as f64 * 8.0) / (elapsed_secs * 1_000_000.0);
+        let bandwidth_mbps = if elapsed_secs > 0.0 {
+            (total_bytes as f64 * 8.0) / (elapsed_secs * 1_000_000.0)
+        } else {
+            0.0
+        };
+
         let bandwidth_utilization = (bandwidth_mbps / 1000.0).min(1.0); // Предполагаем 1 Гбит/с максимум
 
         // Рассчитываем score по формуле

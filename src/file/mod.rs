@@ -84,13 +84,21 @@ impl FileManager {
     /// Инициализация memory-mapped доступа
     pub fn init_mmap(&self) -> Result<()> {
         let file = self.file.read();
-        
-        // Безопасное создание mmap
-        let mmap = unsafe { MmapMut::map_mut(&file.try_clone()?) }
-            .with_context(|| "Failed to create memory map")?;
-        
-        *self.mmap.write() = Some(mmap);
-        Ok(())
+        if self.file_size == 0 {
+            tracing::warn!("Cannot mmap empty file");
+            return Ok(());
+        }
+
+        match unsafe { MmapMut::map_mut(&file.try_clone()?) } {
+            Ok(mmap) => {
+                *self.mmap.write() = Some(mmap);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create mmap, will use regular I/O: {}", e);
+                Ok(())
+            }
+        }
     }
     /// Запись данных в определенную позицию файла
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {

@@ -1,26 +1,28 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use crate::protocol::constants::PROTOCOL_VERSION;
-
+use std::net::SocketAddr;
 /// Первичный ACK от отправителя к получателю
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitialAck {
     pub version: u8,
     pub file_name: String,
     pub file_size: u64,
-    pub sender_ip: IpAddr,
-    pub receiver_ip: IpAddr,
+    pub sender_addr: SocketAddr,
+    pub receiver_addr: SocketAddr,
+    /// Optional local address of the sender for direct connections behind NAT
+    pub local_sender_addr: Option<SocketAddr>,
     pub packet_size: u32,
     pub batch_size: u16,
     pub use_encryption: bool,
 }
-
 impl InitialAck {
     pub fn new(
         file_name: String,
         file_size: u64,
-        sender_ip: IpAddr,
-        receiver_ip: IpAddr,
+        sender_addr: SocketAddr,
+        receiver_addr: SocketAddr,
+        local_sender_addr: Option<SocketAddr>,
         batch_size: u16,
         use_encryption: bool,
     ) -> Self {
@@ -28,8 +30,9 @@ impl InitialAck {
             version: PROTOCOL_VERSION,
             file_name,
             file_size,
-            sender_ip,
-            receiver_ip,
+            sender_addr,
+            receiver_addr,
+            local_sender_addr,
             packet_size: 256 * 1024, // SHARP-256
             batch_size,
             use_encryption,

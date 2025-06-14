@@ -121,8 +121,15 @@ impl PacketHeader {
 
     /// Рассчет позиции данных в файле
     pub fn calculate_file_offset(&self, batch_size: u16) -> u64 {
+        // ИСПРАВЛЕНО: учитывать фактический размер пакетов
+        let block_size = if self.payload_length < BLOCK_SIZE as u32 {
+            self.payload_length as u64
+        } else {
+            BLOCK_SIZE as u64
+        };
+
         let packets_before = self.batch_number as u64 * batch_size as u64 + self.packet_in_batch as u64;
-        packets_before * self.payload_length as u64
+        packets_before * block_size
     }
 }
 

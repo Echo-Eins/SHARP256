@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 
+use tokio::time::interval;
+
 use crate::buffer::ReceiveBuffer;
 use crate::file::FileManager;
 use crate::protocol::{ack::*, constants::*, packet::*};
@@ -21,6 +23,7 @@ use crate::nat::{NatManager, NatConfig};
 pub struct Receiver {
     socket: Arc<UdpSocket>,
     peer_addr: Arc<RwLock<Option<SocketAddr>>>,
+    peer_local_addr: Arc<RwLock<Option<SocketAddr>>>,
     file_manager: Arc<RwLock<Option<Arc<FileManager>>>>,
     receive_buffer: Arc<ReceiveBuffer>,
     sao_system: Arc<SaoSystem>,
@@ -28,6 +31,7 @@ pub struct Receiver {
     transfer_state: Arc<RwLock<Option<TransferState>>>,
     output_dir: PathBuf,
     start_time: Arc<RwLock<Option<Instant>>>,
+    last_activity: Arc<RwLock<Option<Instant>>>,
     #[cfg(feature = "nat-traversal")]
     nat_manager: Option<Arc<RwLock<NatManager>>>,
 }
@@ -35,6 +39,9 @@ pub struct Receiver {
 impl Receiver {
     pub async fn new(local_addr: SocketAddr, output_dir: PathBuf) -> Result<Self> {
         let socket = UdpSocket::bind(local_addr).await?;
+        let actual_local = socket.local_addr()?;
+
+        tracing::info!("Receiver socket bound to {}", actual_local);
 
         // Создаем директорию для приема файлов
         tokio::fs::create_dir_all(&output_dir).await?;
@@ -67,6 +74,7 @@ impl Receiver {
         Ok(Self {
             socket: Arc::new(socket),
             peer_addr: Arc::new(RwLock::new(None)),
+            peer_local_addr: Arc::new(RwLock::new(None)),
             file_manager: Arc::new(RwLock::new(None)),
             receive_buffer: Arc::new(ReceiveBuffer::new()),
             sao_system: Arc::new(SaoSystem::new()),
@@ -74,6 +82,7 @@ impl Receiver {
             transfer_state: Arc::new(RwLock::new(None)),
             output_dir,
             start_time: Arc::new(RwLock::new(None)),
+            last_activity: Arc::new(RwLock::new(None)),
             #[cfg(feature = "nat-traversal")]
             nat_manager,
         })
@@ -97,52 +106,98 @@ impl Receiver {
     /// Запуск приема файлов
     pub async fn start(&self) -> Result<()> {
         let listen_addr = self.socket.local_addr()?;
-        tracing::info!("Receiver listening on {}", listen_addr);
+        tracing::info!("=== Receiver Status ===");
+        tracing::info!("Listening on: {}", listen_addr);
 
-        // Выводим информацию о доступных адресах
         #[cfg(feature = "nat-traversal")]
         {
             if let Ok(connectable) = self.get_connectable_address().await {
+                tracing::info!("External address: {}", connectable);
                 if connectable != listen_addr {
-                    tracing::info!("External address available: {}", connectable);
+                    tracing::info!("Behind NAT - external connections should use: {}", connectable);
                 }
             }
         }
+        tracing::info!("Waiting for incoming transfers...");
+        tracing::info!("======================");
 
         let mut buffer = vec![0u8; 65536];
+        let mut packet_count = 0u64;
+        let mut last_log = Instant::now();
 
         loop {
             match self.socket.recv_from(&mut buffer).await {
                 Ok((size, addr)) => {
+                    packet_count += 1;
+
+                    if last_log.elapsed() > Duration::from_secs(5) {
+                        if let Some(peer) = *self.peer_addr.read() {
+                            tracing::info!("Active transfer - packets recieved: {}, current reer: {}", packet_count, peer);
+                        }
+                        last_log = Instant::now();
+                    }
+                    if packet_count <= 10 {
+                        tracing::debug!("Packet #{} from {} ({} bytes)", packet_count, addr, size);
+                    }
+
                     let mut buf = BytesMut::from(&buffer[..size]);
 
                     if let Ok(packet) = Packet::from_bytes(&mut buf) {
+                        if size == 15 && &buffer[..15] == b"SHARP_KEEPALIVE" {
+                            tracing::trace!("Keep-alive received from {}", addr);
+                            continue
+                        }
+
                         match packet.header.packet_type {
                             PacketType::Ack => {
                                 // Получен первичный ACK - начало новой передачи
                                 if self.peer_addr.read().is_none() {
+                                    tracing::info!("New transfer request from {}", addr);
                                     self.handle_initial_ack(packet, addr).await?;
+                                } else {
+                                    tracing::debug!("Ignoring ACK - transfer already in progress!")
+
                                 }
                             }
 
                             PacketType::Data | PacketType::Hash | PacketType::Control => {
-                                // Проверяем, что пакет от ожидаемого отправителя
-                                if let Some(peer) = *self.peer_addr.read() {
-                                    if addr == peer {
-                                        self.handle_transfer_packet(packet).await?;
+                                let peer_opt = *self.peer_addr.read();
+                                let peer_local_opt = *self.peer_local_addr.read();
+
+                                let is_valid_peer = if let Some(peer) = peer_opt {
+                                    addr == peer || (peer_local_opt.is_some() && addr == peer_local_opt.unwrap()) || addr.ip() == peer.ip()
+                                } else {
+                                    false
+                                };
+
+                                if is_valid_peer {
+                                    if Some(addr) != peer_opt {
+                                        tracing::info!("Peer address updated from {:?} to {}", peer_opt, addr);
+                                        *self.peer_addr.write() = Some(addr);
                                     }
+
+                                    *self.last_activity.write() = Some(Instant::now());
+                                    self.handle_transfer_packet(packet).await?;
+                                } else {
+                                    tracing::trace!("Ignoring packet from unexpected address: {}", addr);
+
                                 }
                             }
 
                             PacketType::Resume => {
                                 // Обработка запроса на возобновление
+                                tracing::info!("Resume request from {}", addr);
                                 self.handle_resume_request(packet, addr).await?;
                             }
 
-                            _ => {}
+                            _ => {
+                                tracing::debug!("Unknown packet type from {}", addr);
+                            }
+                        }
+                    } else {
+                        tracing::trace!("Failed to parse packet from {}", addr);
                         }
                     }
-                }
 
                 Err(e) => {
                     tracing::error!("Socket error: {}", e);
@@ -156,15 +211,29 @@ impl Receiver {
     async fn handle_initial_ack(&self, packet: Packet, sender_addr: SocketAddr) -> Result<()> {
         let initial_ack: InitialAck = bincode::deserialize(&packet.payload)?;
 
-        tracing::info!("Received transfer request from {}", sender_addr);
-        tracing::info!("File: {}, Size: {} bytes", initial_ack.file_name, initial_ack.file_size);
+        tracing::info!("=== Transfer Request ===");
+        tracing::info!("From: {}", sender_addr);
+        tracing::info!("Sender claims address: {}", initial_ack.sender_addr);
+        if let Some(local) = initial_ack.local_sender_addr {
+            tracing::info!("Sender local address: {}", local);
+        }
+        tracing::info!("File: {}", initial_ack.file_name);
+        tracing::info!("Size: {} bytes ({:.2} MB)", initial_ack.file_size, initial_ack.file_size as f64 / 1024.0 / 1024.0);
+        tracing::info!("=======================");
+
+        let response_addr = if sender_addr != initial_ack.sender_addr {
+            tracing::info!("NAT detected: actual address {} differs from claimed {}", sender_addr, initial_ack.sender_addr);
+            sender_addr
+        } else {
+            sender_addr
+        };
 
         // Подготавливаем NAT для соединения с отправителем
         #[cfg(feature = "nat-traversal")]
         {
             if let Some(nat_manager) = &self.nat_manager {
-                if let Err(e) = nat_manager.read()
-                    .prepare_connection(&self.socket, sender_addr, false).await {
+                tracing::info!("Preparing NAT connection to {}", response_addr);
+                if let Err(e) = nat_manager.read().prepare_connection(&self.socket, response_addr, false).await {
                     tracing::warn!("Failed to prepare NAT connection: {}", e);
                 }
             }
@@ -187,16 +256,18 @@ impl Receiver {
         file_manager.init_mmap()?;
 
         // Сохраняем информацию о передаче
-        *self.peer_addr.write() = Some(sender_addr);
+        *self.peer_addr.write() = Some(response_addr);
+        *self.peer_local_addr.write() = initial_ack.local_sender_addr;
         *self.file_manager.write() = Some(Arc::new(file_manager));
         *self.start_time.write() = Some(Instant::now());
+        *self.last_activity.write() = Some(Instant::now());
 
         // Инициализируем состояние передачи
         let transfer_state = TransferState::new(
-            initial_ack.file_name,
+            initial_ack.file_name.clone(),
             initial_ack.file_size,
             false,
-            sender_addr.to_string(),
+            response_addr.to_string(),
         );
         *self.transfer_state.write() = Some(transfer_state);
 
@@ -210,7 +281,10 @@ impl Receiver {
             accept_transfer: true,
             reason: None,
         };
-        self.send_initial_response(response, sender_addr).await?;
+        tracing::info!("Accepting transfer, sending response to {}", response_addr);
+        self.send_initial_response(response, response_addr).await?;
+
+        self.start_connection_monitor().await;
 
         // Запускаем обработку передачи
         self.start_transfer_processing().await?;
@@ -228,6 +302,29 @@ impl Receiver {
         self.socket.send_to(&packet.to_bytes(), addr).await?;
 
         Ok(())
+    }
+
+    /// Мониторинг активности соединения
+    async fn start_connection_monitor(&self) {
+        let last_activity = self.last_activity.clone();
+        let peer_addr = self.peer_addr.clone();
+
+        tokio::spawn(async move {
+            let mut check_interval = interval(Duration::from_secs(10));
+
+            loop {
+                check_interval.tick().await;
+
+                if let Some(last) = *last_activity.read() {
+                    let elapsed = last.elapsed();
+                    if elapsed > Duration::from_secs(60) {
+                        if let Some(peer) = *peer_addr.read() {
+                            tracing::warn!("No activity from {} for {} seconds", peer, elapsed.as_secs());
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Запуск обработки передачи
@@ -666,6 +763,7 @@ impl Clone for Receiver {
         Self {
             socket: self.socket.clone(),
             peer_addr: self.peer_addr.clone(),
+            peer_local_addr: self.peer_local_addr.clone(),
             file_manager: self.file_manager.clone(),
             receive_buffer: self.receive_buffer.clone(),
             sao_system: self.sao_system.clone(),
@@ -673,6 +771,7 @@ impl Clone for Receiver {
             transfer_state: self.transfer_state.clone(),
             output_dir: self.output_dir.clone(),
             start_time: self.start_time.clone(),
+            last_activity: self.last_activity.clone(),
             #[cfg(feature = "nat-traversal")]
             nat_manager: self.nat_manager.clone(),
         }
