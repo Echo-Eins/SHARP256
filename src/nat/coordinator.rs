@@ -1,10 +1,11 @@
-use anyhow::Result;
+use super::NatResult as Result;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use serde::{Deserialize, Serialize};
 
+use super::NatError;
 /// Клиент для координации P2P соединений через сервер
 pub struct CoordinatorClient {
     server_addr: SocketAddr,
@@ -92,7 +93,7 @@ impl CoordinatorClient {
             CoordinatorMessage::PeerInfo { addresses, nat_type, .. } => {
                 Ok((addresses, nat_type))
             }
-            _ => Err(anyhow::anyhow!("Unexpected response from coordinator")),
+            _ => Err(super::NatError::transient("Unexpected response from coordinator")),
         }
     }
 
@@ -125,7 +126,7 @@ impl CoordinatorClient {
             }
             _ => {}
         }
-        Err(anyhow::anyhow!("Failed to coordinate hole punch"))
+        Err(super::NatError::transient("Failed to coordinate hole punch"))
     }
 
 }
@@ -197,8 +198,8 @@ impl AdvancedNatTraversal {
             tracing::info!("Falling back to relay server");
             return Ok(self.relay_servers[0]); // Используем первый доступный relay
         }
-        
-        Err(anyhow::anyhow!("Failed to establish connection with peer"))
+
+        Err(super::NatError::transient("Failed to establish connection with peer"))
     }
 
     /// Попытка прямого соединения
@@ -222,6 +223,6 @@ impl AdvancedNatTraversal {
             }
             _ => {}
         }
-        Err(anyhow::anyhow!("Direct connection to {} failed", addr))
+        Err(super::NatError::transient(format!("Direct connection to {} failed", addr)))
     }
 }

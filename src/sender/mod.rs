@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::{sleep, timeout, interval};
 
 use uuid::Uuid;
+use rand::Rng;
 
 use crate::buffer::PacketBuffer;
 use crate::file::FileManager;
@@ -71,12 +72,8 @@ impl Sender {
             .to_string_lossy()
             .to_string();
 
-        let transfer_state = TransferState::new(
-            file_name,
-            file_manager.size(),
-            true,
-            peer_addr.to_string(),
-        );
+        let transfer_state =
+            TransferState::new(file_name, file_manager.size(), true, peer_addr.to_string());
 
         // Инициализация NAT manager если включен
         #[cfg(feature = "nat-traversal")]
@@ -96,8 +93,22 @@ impl Sender {
                     Some(Arc::new(RwLock::new(manager)))
                 }
                 Err(e) => {
-                    tracing::warn!("NAT traversal initialization failed: {}. Continuing without it.", e);
-                    None
+                    if e.is_transient() {
+                        tracing::warn!("Transient NAT init error: {}. Retrying once...", e);
+                        match manager.initialize(&socket).await {
+                            Ok(_) => {
+                                tracing::info!("Retry succeeded");
+                                Some(Arc::new(RwLock::new(manager)))
+                            }
+                            Err(e2) => {
+                                tracing::warn!("NAT initialization retry failed: {}. Continuing without it.", e2);
+                                None
+                            }
+                        }
+                    } else {
+                        tracing::error!("Permanent NAT init error: {}. Disabling NAT features.", e);
+                        None
+                    }
                 }
             }
         };
@@ -276,7 +287,11 @@ impl Sender {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                     Err(e) => {
-                        tracing::warn!("NAT preparation failed: {}", e);
+                        if e.is_transient() {
+                            tracing::warn!("Transient NAT preparation error: {}", e);
+                        } else {
+                            tracing::error!("Permanent NAT preparation error: {}", e);
+                        }
                     }
                 }
             }
@@ -312,8 +327,11 @@ impl Sender {
         header.payload_length = ack_bytes.len() as u32;
         let packet = Packet::new(header, ack_bytes);
 
-        // Отправляем и ждем ответ
-        for attempt in 0..5 {
+        // Отправляем и ждем ответ. При неудаче делаем до 7 попыток с экспоненциальной
+        // задержкой: старт 500 мс, удвоение после каждой попытки и максимум 3200 мс.
+        // К каждой задержке добавляется случайный джиттер ±50 мс. Суммарное время
+        // ожидания составляет около 39.5 секунд.
+        for attempt in 0..7 {
             tracing::info!("Sending initial ACK (attempt {})", attempt + 1);
             let peer = *self.effective_peer_addr.read();
             self.socket.send_to(&packet.to_bytes(), peer).await?;
@@ -336,7 +354,8 @@ impl Sender {
                     let mut buf = BytesMut::from(&buffer[..size]);
                     if let Ok(response_packet) = Packet::from_bytes(&mut buf) {
                         if response_packet.header.packet_type == PacketType::Ack {
-                            let response: InitialAckResponse = bincode::deserialize(&response_packet.payload)?;
+                            let response: InitialAckResponse =
+                                bincode::deserialize(&response_packet.payload)?;
                             if response.accept_transfer {
                                 tracing::info!("Transfer accepted by receiver");
                                 *self.last_activity.write() = Instant::now();
@@ -358,10 +377,22 @@ impl Sender {
                 _ => {}
             }
 
-            sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
+            // Рассчитываем базовую задержку с экспоненциальным ростом
+            let mut delay = 500u64.saturating_mul(1u64 << attempt);
+            delay = delay.min(3200);
+
+            // Применяем случайный джиттер ±50 мс
+            let jitter: i64 = rand::thread_rng().gen_range(-50..=50);
+            let jittered = if jitter.is_negative() {
+                delay.saturating_sub(jitter.unsigned_abs())
+            } else {
+                delay.saturating_add(jitter as u64)
+            };
+
+            sleep(Duration::from_millis(jittered)).await;
         }
 
-        anyhow::bail!("Failed to establish connection with receiver after 5 attempts")
+        anyhow::bail!("Failed to establish connection with receiver after 7 attempts")
     }
 
     /// Возобновление передачи
@@ -416,8 +447,7 @@ impl Sender {
 
         // Запускаем поток обработки ACK
         let ack_self = self.clone();
-        let ack_handle = tokio::spawn(async move {
-            ack_self.ack_handler_task().await
+        let ack_handle = tokio::spawn(async move { ack_self.ack_handler_task().await });
         });
 
         // Основной цикл чтения и фрагментации файла
@@ -472,7 +502,8 @@ impl Sender {
             batch_hashes.reverse();
 
             // Сохраняем хеши в буфер
-            self.packet_buffer.add_batch_hashes(current_batch, batch_hashes.clone());
+            self.packet_buffer
+                .add_batch_hashes(current_batch, batch_hashes.clone());
 
             // Отправляем хеши
             let hashes_to_send = batch_hashes.clone();
@@ -614,16 +645,21 @@ impl Sender {
                     if let Ok(packet) = Packet::from_bytes(&mut buf) {
                         match packet.header.packet_type {
                             PacketType::Control => {
-                                let control_ack: ControlAck = bincode::deserialize(&packet.payload)?;
+                                let control_ack: ControlAck =
+                                    bincode::deserialize(&packet.payload)?;
 
                                 // Обновляем SAO с данными от получателя
                                 self.sao_system.update_from_ack(&control_ack);
 
                                 if control_ack.is_all_received() {
                                     // Все пакеты получены, очищаем буфер
-                                    self.packet_buffer.clear_before_batch(control_ack.batch_range_end);
-                                    tracing::info!("Batches {}-{} confirmed",
-                                        control_ack.batch_range_start, control_ack.batch_range_end);
+                                    self.packet_buffer
+                                        .clear_before_batch(control_ack.batch_range_end);
+                                    tracing::info!(
+                                        "Batches {}-{} confirmed",
+                                        control_ack.batch_range_start,
+                                        control_ack.batch_range_end
+                                    );
                                 } else {
                                     // Есть потерянные пакеты, перезапрашиваем
                                     self.handle_retransmit_request(&control_ack).await?;

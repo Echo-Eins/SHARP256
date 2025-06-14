@@ -1,4 +1,3 @@
-use anyhow::Result;
 use tokio::net::UdpSocket;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -8,6 +7,9 @@ pub mod stun;
 pub mod upnp;
 pub mod hole_punch;
 pub mod coordinator;
+pub mod error;
+pub use error::{NatError, NatResult};
+type Result<T> = NatResult<T>;
 
 use self::stun::StunClient;
 use self::upnp::UpnpClient;
@@ -239,7 +241,7 @@ impl NatManager {
         let mut client = UpnpClient::new().await?;
         
         if !client.is_available() {
-            return Err(anyhow::anyhow!("UPnP gateway not found"));
+            return Err(NatError::permanent("UPnP gateway not found"));
         }
         
         // Получаем внешний IP через UPnP для сравнения
@@ -261,7 +263,7 @@ impl NatManager {
     pub fn get_connectable_address(&self) -> Result<SocketAddr> {
         let info = self.network_info.read()
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Network info not initialized"))?
+            .ok_or_else(|| NatError::permanent("Network info not initialized"))?
             .clone();
 
         // Приоритеты:
@@ -291,7 +293,7 @@ impl NatManager {
     ) -> Result<()> {
         let info = self.network_info.read()
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Network info not initialized"))?
+            .ok_or_else(|| NatError::permanent("Network info not initialized"))?
             .clone();
 
         // Проверяем, нужны ли продвинутые методы

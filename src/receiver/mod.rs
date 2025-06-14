@@ -65,8 +65,22 @@ impl Receiver {
                     Some(Arc::new(RwLock::new(manager)))
                 }
                 Err(e) => {
-                    tracing::warn!("NAT traversal initialization failed: {}. Continuing without it.", e);
-                    None
+                    if e.is_transient() {
+                        tracing::warn!("Transient NAT init error: {}. Retrying once...", e);
+                        match manager.initialize(&socket).await {
+                            Ok(_) => {
+                                tracing::info!("Retry succeeded");
+                                Some(Arc::new(RwLock::new(manager)))
+                            }
+                            Err(e2) => {
+                                tracing::warn!("NAT init retry failed: {}. Continuing without it.", e2);
+                                None
+                            }
+                        }
+                    } else {
+                        tracing::error!("Permanent NAT init error: {}. Disabling NAT features.", e);
+                        None
+                    }
                 }
             }
         };
@@ -260,7 +274,11 @@ impl Receiver {
             if let Some(nat_manager) = &self.nat_manager {
                 tracing::info!("Preparing NAT connection to {}", response_addr);
                 if let Err(e) = nat_manager.read().prepare_connection(&self.socket, response_addr, false).await {
-                    tracing::warn!("Failed to prepare NAT connection: {}", e);
+                    if e.is_transient() {
+                        tracing::warn!("Transient NAT preparation error: {}", e);
+                    } else {
+                        tracing::error!("Permanent NAT preparation error: {}", e);
+                    }
                 }
             }
         }
