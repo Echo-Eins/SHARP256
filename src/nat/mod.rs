@@ -314,11 +314,16 @@ impl NatManager {
         }
 
         // Hole punching для остальных типов NAT
-        if self.config.enable_hole_punching && 
-           (info.nat_type == NatType::RestrictedCone || 
+        // RFC 5128 recommends attempting hole punching even when the NAT type is
+        // unknown to improve success rates.
+        if self.config.enable_hole_punching &&
+            (info.nat_type == NatType::RestrictedCone ||
             info.nat_type == NatType::PortRestricted ||
-            info.nat_type == NatType::Symmetric) {
-            
+                info.nat_type == NatType::Symmetric ||
+                info.nat_type == NatType::Unknown) {
+            if info.nat_type == NatType::Unknown {
+                tracing::info!("NAT type unknown; attempting hole punching by default");
+            }
             tracing::info!("Starting hole punching with {}", peer_addr);
             let puncher = HolePuncher::new(self.config.hole_punch_attempts);
             
