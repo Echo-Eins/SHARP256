@@ -34,12 +34,24 @@ pub struct StunClient {
 
 impl StunClient {
     pub fn new(servers: Vec<String>) -> Self {
-        Self { servers, password: None }
+        Self {
+            servers,
+            credentials: None,
+        }
     }
+}
 
-    /// Создание клиента с паролем для проверки целостности
-    pub fn with_password(servers: Vec<String>, password: String) -> Self {
-        Self { servers, password: Some(password) }
+/// Создание клиента с парой логин/пароль для проверки целостности
+pub fn with_credentials(
+    servers: Vec<String>,
+    username: String,
+    password: String,
+) -> Self {
+    let creds = Some((username, password));
+    Self {
+        servers,
+        credentials: creds,
+    }
     }
 
     /// Получение mapped address через STUN
@@ -77,6 +89,8 @@ impl StunClient {
             }
             tracing::debug!("STUN attempt {} failed", attempt + 1);
         }
+        Err(super::NatError::transient("All STUN attempts failed"))
+    }
 
         /// Определение типа NAT через несколько STUN серверов
         pub async fn detect_nat_type(&self, socket: &UdpSocket) -> Result<Vec<(SocketAddr, bool)>> {
@@ -123,7 +137,7 @@ impl StunClient {
 
                 if let Ok(Ok((size, addr))) = timeout(wait, socket.recv_from(&mut buf)).await {
                     if addr == server_addr {
-                        return self.parse_binding_response(&buf[..size], &transaction_id);
+                        return self.parse_binding_response(&buf[..size], &transaction_id, 0);
                     }
                 }
 
@@ -149,7 +163,7 @@ impl StunClient {
 
         /// Создание STUN Binding Request
         fn create_binding_request(&self, transaction_id: &[u8; 12]) -> Vec<u8> {
-            let use_integrity = self.password.is_some();
+            let use_integrity = self.credentials.is_some();
             let len_without_fp = if use_integrity { 36 } else { 0 };
             let total_len = len_without_fp + 8;
 
@@ -161,7 +175,7 @@ impl StunClient {
             buf.put_u32(STUN_MAGIC_COOKIE);
             buf.put_slice(transaction_id);
 
-            if let Some(pwd) = &self.password {
+            if let Some((_, pwd)) = &self.credentials {
                 buf.put_u16(MESSAGE_INTEGRITY_SHA256);
                 buf.put_u16(32);
                 let pos = buf.len();
@@ -218,18 +232,17 @@ impl StunClient {
 
             let _msg_length = buf.get_u16() as usize;
             let magic = buf.get_u32();
-        }
 
-        if magic != STUN_MAGIC_COOKIE {
-            return Err(super::NatError::transient("Invalid magic cookie"));
-        }
+            if magic != STUN_MAGIC_COOKIE {
+                return Err(super::NatError::transient("Invalid magic cookie"));
+            }
 
-        // Проверяем Transaction ID
-        let mut tid = [0u8; 12];
-        buf.copy_to_slice(&mut tid);
-        if tid != *expected_tid {
-            return Err(super::NatError::transient("Transaction ID mismatch"));
-        }
+            // Проверяем Transaction ID
+            let mut tid = [0u8; 12];
+            buf.copy_to_slice(&mut tid);
+            if tid != *expected_tid {
+                return Err(super::NatError::transient("Transaction ID mismatch"));
+            }
 
         let mut offset = 20usize;
         let mut mapped: Option<SocketAddr> = None;
@@ -287,7 +300,7 @@ impl StunClient {
             }
         }
         if let Some((mi_pos, mi_len)) = mi_offset {
-            if let Some(ref pwd) = self.password {
+            if let Some((_, ref pwd)) = self.credentials {
                 if mi_pos + 4 + mi_len > total_len {
                     anyhow::bail!("MESSAGE-INTEGRITY attribute truncated");
                 }

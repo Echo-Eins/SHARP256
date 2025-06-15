@@ -59,7 +59,7 @@ hmac = "0.12"
 sha2 = "0.10"
 
 # NAT traversal
-rand = { version = "0.8"}
+rand = { version = "0.8", optional = true }
 igd = { version = "0.12", features = ["aio"], optional = true }
 uuid = { version = "1.6", features = ["v4"] }
 if-addrs = { version = "0.6", optional = true }
