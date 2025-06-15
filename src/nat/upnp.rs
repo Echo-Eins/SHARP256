@@ -1,220 +1,19 @@
-use anyhow::Context;
-use super::NatResult as Result;
-use std::net::IpAddr;
-
+use anyhow::{Context, Result};
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
+use igd::{PortMappingProtocol, SearchOptions};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use igd::aio::{search_gateway, Gateway};
-
-use igd::{AddAnyPortError, PortMappingProtocol, RequestError, SearchError, SearchOptions};
-
-use if_addrs::get_if_addrs;
-
-use std::time::Duration;
-use url::Url;
-use xmltree::Element;
-
 use std::time::Instant;
+use rand::Rng;
 
-const SEARCH_REQUEST_V2: &str = "M-SEARCH * HTTP/1.1\r\nHost:239.255.255.250:1900\r\nST:urn:schemas-upnp-org:service:WANIPConnection:2\r\nMan:\"ssdp:discover\"\r\nMX:3\r\n\r\n";
-
-async fn search_gateway_v2(options: SearchOptions) -> Result<Gateway, SearchError> {
-    use hyper::Client;
-    use std::collections::HashMap;
-    use std::net::SocketAddr;
-    use tokio::net::UdpSocket;
-    use tokio::time::timeout;
-
-    const MAX_RESPONSE_SIZE: usize = 1500;
-
-    let mut socket = UdpSocket::bind(&options.bind_addr).await?;
-    // send search request with IGD v2 service type
-    socket
-        .send_to(SEARCH_REQUEST_V2.as_bytes(), &options.broadcast_address)
-        .await
-        .map(|_| ())
-        .map_err(SearchError::from)?;
-
-    async fn receive_search_response(
-        socket: &mut UdpSocket,
-    ) -> Result<(Vec<u8>, SocketAddr), SearchError> {
-        let mut buff = [0u8; MAX_RESPONSE_SIZE];
-        let (n, from) = socket
-            .recv_from(&mut buff)
-            .await
-            .map_err(SearchError::from)?;
-        Ok((buff[..n].to_vec(), from))
-    }
-
-    let search_response = receive_search_response(&mut socket);
-    let (response_body, from) = match options.timeout {
-        Some(t) => timeout(t, search_response).await?,
-        None => search_response.await,
-    }?;
-
-    let text = std::str::from_utf8(&response_body).map_err(SearchError::from)?;
-    let (addr, root_url) = parse_search_result(text)?;
-
-    async fn get_control_urls(
-        addr: &std::net::SocketAddrV4,
-        path: &str,
-    ) -> Result<(String, String), SearchError> {
-        let uri = format!("http://{}{}", addr, path)
-            .parse()
-            .map_err(SearchError::from)?;
-        let client = Client::new();
-        let resp = hyper::body::to_bytes(client.get(uri).await?.into_body())
-            .await
-            .map_err(SearchError::from)?;
-        parse_control_urls(std::io::Cursor::new(&resp))
-    }
-
-    async fn get_control_schemas(
-        addr: &std::net::SocketAddrV4,
-        url: &str,
-    ) -> Result<HashMap<String, Vec<String>>, SearchError> {
-        let uri = format!("http://{}{}", addr, url)
-            .parse()
-            .map_err(SearchError::from)?;
-        let client = Client::new();
-        let resp = hyper::body::to_bytes(client.get(uri).await?.into_body())
-            .await
-            .map_err(SearchError::from)?;
-        parse_schemas(std::io::Cursor::new(&resp))
-    }
-
-    let (control_schema_url, control_url) = get_control_urls(&addr, &root_url).await?;
-    let control_schema = get_control_schemas(&addr, &control_schema_url).await?;
-
-    let addr = addr;
-
-    Ok(Gateway {
-        addr,
-        root_url,
-        control_url,
-        control_schema_url,
-        control_schema,
-    })
-}
-
-fn parse_search_result(text: &str) -> Result<(std::net::SocketAddrV4, String), SearchError> {
-    for line in text.lines() {
-        let l = line.trim();
-        if l.to_ascii_lowercase().starts_with("location:") {
-            if let Some(colon) = l.find(':') {
-                let url_text = l[colon + 1..].trim();
-                let url = Url::parse(url_text).map_err(|_| SearchError::InvalidResponse)?;
-                let addr = url
-                    .host_str()
-                    .ok_or(SearchError::InvalidResponse)?
-                    .parse()
-                    .map_err(|_| SearchError::InvalidResponse)?;
-                let port = url
-                    .port_or_known_default()
-                    .ok_or(SearchError::InvalidResponse)?;
-                return Ok((
-                    std::net::SocketAddrV4::new(addr, port),
-                    url.path().to_string(),
-                ));
-            }
-        }
-    }
-    Err(SearchError::InvalidResponse)
-}
-
-fn parse_control_urls<R: std::io::Read>(reader: R) -> Result<(String, String), SearchError> {
-    let root = Element::parse(reader)?;
-    fn find_service(el: &Element) -> Option<(String, String)> {
-        if el.name == "service" {
-            let st = el.get_child("serviceType")?.get_text()?;
-            if st == "urn:schemas-upnp-org:service:WANIPConnection:2"
-                || st == "urn:schemas-upnp-org:service:WANIPConnection:1"
-                || st == "urn:schemas-upnp-org:service:WANPPPConnection:1"
-            {
-                let scpd = el.get_child("SCPDURL")?.get_text()?.into_owned();
-                let ctrl = el.get_child("controlURL")?.get_text()?.into_owned();
-                return Some((scpd, ctrl));
-            }
-        }
-        for child in &el.children {
-            if let Some(elem) = child.as_element() {
-                if let Some(res) = find_service(elem) {
-                    return Some(res);
-                }
-            }
-        }
-        None
-    }
-    for child in &root.children {
-        if let Some(elem) = child.as_element() {
-            if elem.name == "device" {
-                if let Some(res) = find_service(elem) {
-                    return Ok(res);
-                }
-            }
-        }
-    }
-    Err(SearchError::InvalidResponse)
-}
-
-fn parse_schemas<R: std::io::Read>(
-    reader: R,
-) -> Result<std::collections::HashMap<String, Vec<String>>, SearchError> {
-    let root = Element::parse(reader)?;
-    fn parse_action_list(el: &Element) -> Option<std::collections::HashMap<String, Vec<String>>> {
-        let mut map = std::collections::HashMap::new();
-        for child in &el.children {
-            let action = child.as_element()?;
-            if action.name == "action" {
-                if let Some((name, args)) = parse_action(action) {
-                    map.insert(name, args);
-                }
-            }
-        }
-        Some(map)
-    }
-    fn parse_action(el: &Element) -> Option<(String, Vec<String>)> {
-        let name = el.get_child("name")?.get_text()?.into_owned();
-        let mut args = Vec::new();
-        if let Some(arg_list) = el.get_child("argumentList") {
-            for arg in &arg_list.children {
-                let arg = arg.as_element()?;
-                if arg.name == "argument" {
-                    if arg.get_child("direction")?.get_text()? == "in" {
-                        args.push(arg.get_child("name")?.get_text()?.into_owned());
-                    }
-                }
-            }
-        }
-        Some((name, args))
-    }
-
-    for child in &root.children {
-        if let Some(al) = child.as_element() {
-            if al.name == "actionList" {
-                if let Some(map) = parse_action_list(al) {
-                    return Ok(map);
-                }
-            }
-        }
-    }
-    Err(SearchError::InvalidResponse)
-}
-
-/// UPnP клиент для управления port forwarding на роутере
+/// UPnP client for managing port forwarding on routers with robust error handling
 pub struct UpnpClient {
     gateway: Option<Gateway>,
     local_ip: IpAddr,
     active_mappings: Arc<RwLock<Vec<PortMapping>>>,
-    consecutive_failures: u8,
-    state: CircuitState,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CircuitState {
-    Closed,
-    Open { until: Instant },
-    HalfOpen,
+    discovery_attempts: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -228,167 +27,291 @@ struct PortMapping {
 }
 
 impl UpnpClient {
-    /// Создание нового UPnP клиента с автоматическим обнаружением gateway
+    /// Create new UPnP client with multiple discovery attempts
     pub async fn new() -> Result<Self> {
-        // Определяем локальный IP
-        let local_ip = Self::get_local_ip().await?;
-        
-        tracing::info!("Searching for UPnP gateway...");
-        
-        // Настройки поиска с таймаутом
-        let search_options = SearchOptions {
-            timeout: Some(Duration::from_secs(5)),
-            ..Default::default()
-        };
-        
-        // Ищем gateway
-        // Сначала пробуем найти gateway по service type v2
-        let gateway_res = match search_gateway_v2(SearchOptions {
-            timeout: search_options.timeout,
-            bind_addr: search_options.bind_addr,
-            broadcast_address: search_options.broadcast_address,
-        })
-            .await
-        {
-            Ok(gw) => Ok(gw),
-            Err(e) => {
-                tracing::debug!("IGD v2 search failed: {}", e);
-                search_gateway(search_options).await
+        // First, reliably determine local IP
+        let local_ip = Self::get_local_ip().await
+            .context("Failed to determine local IP address")?;
+
+        tracing::info!("Local IP detected: {}", local_ip);
+
+        // Try multiple discovery methods
+        let mut discovery_attempts = 0;
+        let mut last_error = None;
+
+        // Try different timeout values
+        let timeouts = [
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        ];
+
+        for timeout_duration in &timeouts {
+            discovery_attempts += 1;
+            tracing::info!("UPnP discovery attempt {} with timeout {:?}", discovery_attempts, timeout_duration);
+
+            let search_options = SearchOptions {
+                timeout: Some(*timeout_duration),
+                // Bind to specific interface if local IP is IPv4
+                bind_addr: match local_ip {
+                    IpAddr::V4(ipv4) => Some(std::net::SocketAddr::new(ipv4.into(), 0)),
+                    _ => None,
+                },
+                // Try both broadcast and multicast
+                broadcast_address: match local_ip {
+                    IpAddr::V4(_) => Some("255.255.255.255:1900".parse().unwrap()),
+                    _ => None,
+                },
+            };
+
+            match search_gateway(search_options).await {
+                Ok(gateway) => {
+                    tracing::info!("UPnP gateway found: {}", gateway.addr);
+
+                    // Verify gateway is functional
+                    match gateway.get_external_ip().await {
+                        Ok(external_ip) => {
+                            tracing::info!("External IP via UPnP: {}", external_ip);
+
+                            // Test port mapping capability
+                            if Self::test_port_mapping(&gateway, &local_ip).await {
+                                return Ok(Self {
+                                    gateway: Some(gateway),
+                                    local_ip,
+                                    active_mappings: Arc::new(RwLock::new(Vec::new())),
+                                    discovery_attempts,
+                                });
+                            } else {
+                                tracing::warn!("Gateway found but port mapping test failed");
+                                last_error = Some("Port mapping not supported");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Gateway found but cannot get external IP: {}", e);
+                            last_error = Some("Cannot retrieve external IP");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Discovery attempt {} failed: {}", discovery_attempts, e);
+                    last_error = Some("No gateway found");
+                }
             }
+        }
+
+        // If we're here, all attempts failed
+        let error_msg = format!(
+            "UPnP discovery failed after {} attempts. Last error: {}. \
+             Possible causes: router doesn't support UPnP, UPnP is disabled, \
+             firewall blocking UDP port 1900, or no IGD-compatible device found.",
+            discovery_attempts,
+            last_error.unwrap_or("Unknown error")
+        );
+
+        tracing::error!("{}", error_msg);
+
+        // Return client without gateway (for graceful degradation)
+        Ok(Self {
+            gateway: None,
+            local_ip,
+            active_mappings: Arc::new(RwLock::new(Vec::new())),
+            discovery_attempts,
+        })
+    }
+
+    /// Test if port mapping actually works
+    async fn test_port_mapping(gateway: &Gateway, local_ip: &IpAddr) -> bool {
+        let test_port = 50000 + rand::thread_rng().gen_range(0..10000);
+
+        let local_addr = match local_ip {
+            IpAddr::V4(ip) => std::net::SocketAddrV4::new(*ip, test_port),
+            IpAddr::V6(_) => return false, // UPnP typically requires IPv4
         };
 
-        match gateway_res {
-            Ok(gateway) => {
-                tracing::info!("UPnP gateway found: {}", gateway.addr);
-                
-                // Получаем информацию о внешнем IP
-                if let Ok(external_ip) = gateway.get_external_ip().await {
-                    tracing::info!("External IP via UPnP: {}", external_ip);
-                }
-                
-                Ok(Self {
-                    gateway: Some(gateway),
-                    local_ip,
-                    active_mappings: Arc::new(RwLock::new(Vec::new())),
-                    consecutive_failures: 0,
-                    state: CircuitState::Closed,
-                })
+        // Try to add a test mapping
+        match gateway.add_port(
+            PortMappingProtocol::UDP,
+            test_port,
+            local_addr,
+            60, // 60 second lease for test
+            "SHARP-256 UPnP Test"
+        ).await {
+            Ok(()) => {
+                // Successfully added, now remove it
+                let _ = gateway.remove_port(PortMappingProtocol::UDP, test_port).await;
+                true
             }
             Err(e) => {
-                tracing::warn!("No UPnP gateway found: {}", e);
-                
-                // Возвращаем клиент без gateway (будет работать как no-op)
-                Ok(Self {
-                    gateway: None,
-                    local_ip,
-                    active_mappings: Arc::new(RwLock::new(Vec::new())),
-                    consecutive_failures: 0,
-                    state: CircuitState::Closed,
-                })
+                tracing::debug!("Port mapping test failed: {}", e);
+                false
             }
         }
     }
 
-    /// Добавление port mapping
+    /// Add port mapping with intelligent port selection
     pub async fn add_port_mapping(
         &mut self,
         local_port: u16,
         lease_duration: u32,
         description: &str,
     ) -> Result<u16> {
-        let gateway = self
-            .gateway
-            .as_ref()
-            .ok_or_else(|| super::NatError::permanent("No UPnP gateway available"))?;
-
-        // Circuit breaker: check current state
-        match self.state {
-            CircuitState::Open { until } => {
-                if Instant::now() < until {
-                    anyhow::bail!("UPnP mapping disabled due to previous failures")
-                } else {
-                    self.state = CircuitState::HalfOpen;
-                }
-            }
-            _ => {}
-        }
+        let gateway = self.gateway.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No UPnP gateway available"))?;
 
         let local_addr = match self.local_ip {
             IpAddr::V4(ip) => std::net::SocketAddrV4::new(ip, local_port),
             IpAddr::V6(_) => {
-                return Err(super::NatError::permanent("UPnP requires an IPv4 local address"));
+                return Err(anyhow::anyhow!("UPnP requires IPv4 local address"));
             }
         };
 
-        match gateway
-            .add_any_port(
-                PortMappingProtocol::UDP,
-                local_addr,
-                lease_duration,
-                description,
-            )
-            .await
-        {
-            Ok(port) => {
-                tracing::info!(
-                    "UPnP port mapping created: {} -> {}:{} ({}s lease)",
-                    port,
-                    self.local_ip,
-                    local_port,
-                    lease_duration
-                );
+        // Port selection strategy
+        let mut external_port = local_port;
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: u32 = 20;
 
-                let mapping = PortMapping {
-                    external_port: port,
-                    internal_port: local_port,
-                    protocol: PortMappingProtocol::UDP,
-                    description: description.to_string(),
-                    created_at: Instant::now(),
+        loop {
+            match gateway
+                .add_port(
+                    PortMappingProtocol::UDP,
+                    external_port,
+                    local_addr,
                     lease_duration,
-                };
-                self.active_mappings.write().push(mapping);
+                    description,
+                )
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "UPnP port mapping created: external:{} -> {}:{} (lease: {}s)",
+                        external_port, self.local_ip, local_port, lease_duration
+                    );
 
-                self.consecutive_failures = 0;
-                self.state = CircuitState::Closed;
+                    // Save mapping info
+                    let mapping = PortMapping {
+                        external_port,
+                        internal_port: local_port,
+                        protocol: PortMappingProtocol::UDP,
+                        description: description.to_string(),
+                        created_at: Instant::now(),
+                        lease_duration,
+                    };
+                    self.active_mappings.write().push(mapping.clone());
 
-                Ok(port)
+                    // Schedule lease renewal
+                    self.schedule_lease_renewal(mapping, gateway.clone());
+
+                    return Ok(external_port);
+                }
+                Err(e) => {
+                    attempts += 1;
+
+                    if attempts >= MAX_ATTEMPTS {
+                        return Err(anyhow::anyhow!(
+                            "Failed to create port mapping after {} attempts: {}",
+                            MAX_ATTEMPTS, e
+                        ));
+                    }
+
+                    // Smart port selection based on error
+                    let error_str = e.to_string();
+
+                    if error_str.contains("ConflictInMappingEntry") ||
+                        error_str.contains("718") { // Common error code for conflict
+                        // Port is in use, try different strategies
+                        if attempts < 5 {
+                            // Try sequential ports
+                            external_port = local_port + attempts;
+                        } else if attempts < 10 {
+                            // Try common port ranges
+                            external_port = 40000 + (attempts - 5) * 1000;
+                        } else {
+                            // Random high port
+                            external_port = 49152 + rand::thread_rng().gen_range(0..16383);
+                        }
+
+                        tracing::debug!("Port {} unavailable, trying {}", external_port - 1, external_port);
+                    } else if error_str.contains("NotAuthorized") ||
+                        error_str.contains("606") {
+                        return Err(anyhow::anyhow!("Not authorized to create port mappings"));
+                    } else if error_str.contains("ExternalPortOnlySupportsWildcard") {
+                        // Some routers only support wildcard external ports
+                        external_port = 0; // Let router choose
+                    } else {
+                        // Unknown error, try random port
+                        external_port = 30000 + rand::thread_rng().gen_range(0..30000);
+                    }
+
+                    // Small delay to avoid hammering the router
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
-            Err(e) => match e {
-                AddAnyPortError::ExternalPortInUse | AddAnyPortError::NoPortsAvailable => {
-                    anyhow::bail!("Port conflict (error 718)");
-                }
-                AddAnyPortError::OnlyPermanentLeasesSupported => {
-                    anyhow::bail!("Only permanent leases supported (error 725)");
-                }
-                AddAnyPortError::RequestError(RequestError::ErrorCode(726, ref msg)) => {
-                    anyhow::bail!("Only wildcard remote host supported (error 726): {}", msg)
-                }
-                AddAnyPortError::RequestError(RequestError::ErrorCode(727, ref msg)) => {
-                    anyhow::bail!("External port only supports wildcard (error 727): {}", msg)
-                }
-                other => {
-                    anyhow::bail!("Failed to create port mapping: {}", other)
-                }
-            },
         }
     }
 
-    /// Удаление port mapping
-    pub async fn remove_port_mapping(&mut self, external_port: u16) -> Result<()> {
-        let gateway = self
-            .gateway
-            .as_ref()
-            .ok_or_else(|| super::NatError::permanent("No UPnP gateway available"))?;
+    /// Schedule automatic lease renewal
+    fn schedule_lease_renewal(&self, mapping: PortMapping, gateway: Gateway) {
+        let mappings = self.active_mappings.clone();
 
-        // Ищем mapping в списке активных
+        tokio::spawn(async move {
+            // Renew at 80% of lease duration
+            let renewal_time = Duration::from_secs((mapping.lease_duration * 4 / 5) as u64);
+
+            loop {
+                tokio::time::sleep(renewal_time).await;
+
+                // Check if mapping still exists
+                let still_active = mappings.read()
+                    .iter()
+                    .any(|m| m.external_port == mapping.external_port);
+
+                if !still_active {
+                    break;
+                }
+
+                // Renew the mapping
+                let local_addr = match mappings.read()
+                    .iter()
+                    .find(|m| m.external_port == mapping.external_port)
+                    .map(|m| std::net::SocketAddrV4::new(
+                        match gateway.get_local_ip() {
+                            Ok(IpAddr::V4(ip)) => ip,
+                            _ => Ipv4Addr::new(192, 168, 1, 100), // Fallback
+                        },
+                        m.internal_port
+                    )) {
+                    Some(addr) => addr,
+                    None => break,
+                };
+
+                match gateway.add_port(
+                    mapping.protocol,
+                    mapping.external_port,
+                    local_addr,
+                    mapping.lease_duration,
+                    &mapping.description,
+                ).await {
+                    Ok(()) => {
+                        tracing::debug!("Renewed UPnP mapping for port {}", mapping.external_port);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to renew UPnP mapping: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Remove port mapping
+    pub async fn remove_port_mapping(&mut self, external_port: u16) -> Result<()> {
+        let gateway = self.gateway.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No UPnP gateway available"))?;
+
         let mut mappings = self.active_mappings.write();
-        if let Some(pos) = mappings
-            .iter()
-            .position(|m| m.external_port == external_port)
-        {
+        if let Some(pos) = mappings.iter().position(|m| m.external_port == external_port) {
             let mapping = mappings.remove(pos);
-            
-            // Удаляем mapping на gateway
+
             match gateway.remove_port(mapping.protocol, external_port).await {
                 Ok(()) => {
                     tracing::info!("UPnP port mapping removed: {}", external_port);
@@ -396,133 +319,112 @@ impl UpnpClient {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to remove port mapping: {}", e);
-                    // Не считаем это критической ошибкой
+                    // Not critical - mapping will expire
                     Ok(())
                 }
             }
         } else {
-            tracing::warn!("Port mapping {} not found in active list", external_port);
             Ok(())
         }
     }
 
-    /// Обновление lease времени для всех активных mappings
-    pub async fn refresh_mappings(&self, lease_duration: u32) -> Result<()> {
-        let gateway = self
-            .gateway
-            .as_ref()
-            .ok_or_else(|| super::NatError::permanent("No UPnP gateway available"))?;
-
-        let mappings = self.active_mappings.read().clone();
-
-        if lease_duration == 0 {
-            tracing::debug!("Lease duration 0 - mappings valid until reboot, skipping refresh");
-            return Ok(());
-        }
-
-        for mapping in mappings {
-            let local_addr = match self.local_ip {
-                IpAddr::V4(ip) => std::net::SocketAddrV4::new(ip, mapping.internal_port),
-                IpAddr::V6(_) => {
-                    tracing::warn!("Cannot refresh mapping for IPv6 local address");
-                    continue;
-                }
-            };
-
-            match gateway
-                .add_port(
-                    mapping.protocol,
-                    mapping.external_port,
-                    local_addr,
-                    lease_duration,
-                    &mapping.description,
-                )
-                .await
-            {
-                Ok(()) => {
-                    tracing::debug!("Refreshed mapping for port {}", mapping.external_port);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to refresh mapping for port {}: {}",
-                        mapping.external_port,
-                        e
-                    );
-                }
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// Получение внешнего IP адреса через UPnP
+    /// Get external IP address via UPnP
     pub async fn get_external_ip(&self) -> Result<IpAddr> {
-        let gateway = self
-            .gateway
-            .as_ref()
-            .ok_or_else(|| super::NatError::permanent("No UPnP gateway available"))?;
+        let gateway = self.gateway.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No UPnP gateway available"))?;
 
-        let external_ip = gateway
-            .get_external_ip()
-            .await
+        let external_ip = gateway.get_external_ip().await
             .context("Failed to get external IP from UPnP gateway")?;
-        
+
         Ok(IpAddr::V4(external_ip))
     }
 
-    /// Очистка всех активных mappings
+    /// Clean up all active mappings
     pub async fn cleanup_all(&mut self) -> Result<()> {
         if let Some(gateway) = &self.gateway {
             let mappings = self.active_mappings.write().drain(..).collect::<Vec<_>>();
-            
+
             for mapping in mappings {
-                if let Err(e) = gateway
-                    .remove_port(mapping.protocol, mapping.external_port)
-                    .await
-                {
+                if let Err(e) = gateway.remove_port(mapping.protocol, mapping.external_port).await {
                     tracing::warn!("Failed to remove mapping {}: {}", mapping.external_port, e);
                 }
             }
-            
+
             tracing::info!("All UPnP port mappings cleaned up");
         }
-        
+
         Ok(())
     }
 
-    /// Проверка доступности UPnP
+    /// Check if UPnP is available and functional
     pub fn is_available(&self) -> bool {
-        if self.gateway.is_none() {
-            return false;
-        }
-
-        if let CircuitState::Open { until } = self.state {
-            if Instant::now() < until {
-                return false;
-            }
-        }
-
-        true
+        self.gateway.is_some()
     }
 
-    /// Получение локального IP адреса
+    /// Get gateway information
+    pub fn gateway_info(&self) -> Option<String> {
+        self.gateway.as_ref().map(|g| format!("Gateway: {}", g.addr))
+    }
+
+    /// Get local IP address with multiple detection methods
     async fn get_local_ip() -> Result<IpAddr> {
-        // Пробуем определить IP через список интерфейсов
-        if let Ok(addrs) = get_if_addrs() {
-            for iface in addrs {
-                if !iface.is_loopback() {
-                    return Ok(iface.ip());
+        // Method 1: Try to get from network interfaces
+        #[cfg(feature = "nat-traversal")]
+        {
+            use if_addrs::get_if_addrs;
+
+            if let Ok(addrs) = get_if_addrs() {
+                // Prefer non-loopback IPv4 addresses
+                for iface in &addrs {
+                    if !iface.is_loopback() {
+                        match iface.ip() {
+                            IpAddr::V4(ipv4) if !ipv4.is_link_local() => {
+                                return Ok(IpAddr::V4(ipv4));
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+
+                // Fallback to any non-loopback address
+                for iface in addrs {
+                    if !iface.is_loopback() {
+                        return Ok(iface.ip());
+                    }
                 }
             }
         }
 
-        // Фолбек через подключение к публичному адресу
+        // Method 2: Connect to public DNS and check local address
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        if socket.connect("8.8.8.8:80").await.is_ok() {
-            return Ok(socket.local_addr()?.ip());
+
+        // Try multiple public addresses
+        let test_addrs = [
+            "8.8.8.8:53",      // Google DNS
+            "1.1.1.1:53",      // Cloudflare DNS
+            "208.67.222.222:53", // OpenDNS
+        ];
+
+        for addr in &test_addrs {
+            if socket.connect(addr).await.is_ok() {
+                if let Ok(local) = socket.local_addr() {
+                    return Ok(local.ip());
+                }
+            }
         }
 
-        return Err(super::NatError::permanent("Failed to determine local IP"));
+        // Method 3: Last resort - try to determine from hostname
+        if let Ok(hostname) = hostname::get() {
+            if let Ok(addrs) = tokio::net::lookup_host(format!("{}:0", hostname.to_string_lossy())).await {
+                for addr in addrs {
+                    if !addr.ip().is_loopback() {
+                        return Ok(addr.ip());
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to determine local IP address"))
     }
 }
 
@@ -534,23 +436,12 @@ impl Drop for UpnpClient {
 
         let mappings = self.active_mappings.read().clone();
         if let Some(gateway) = self.gateway.clone() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.block_on(async {
-                    for mapping in &mappings {
-                        let _ = gateway
-                            .remove_port(mapping.protocol, mapping.external_port)
-                            .await;
-                    }
-                });
-            } else if let Ok(rt) = tokio::runtime::Runtime::new() {
-                rt.block_on(async {
-                    for mapping in &mappings {
-                        let _ = gateway
-                            .remove_port(mapping.protocol, mapping.external_port)
-                            .await;
-                    }
-                });
-            }
+            // Best effort cleanup
+            let _ = tokio::task::spawn(async move {
+                for mapping in mappings {
+                    let _ = gateway.remove_port(mapping.protocol, mapping.external_port).await;
+                }
+            });
         }
     }
 }
