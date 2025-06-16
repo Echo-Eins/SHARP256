@@ -87,27 +87,26 @@ impl Sender {
                     tracing::info!("Local address: {}", network_info.local_addr);
                     tracing::info!("Public address: {:?}", network_info.public_addr);
                     tracing::info!("NAT type: {:?}", network_info.nat_type);
-                    tracing::info!("UPnP available: {}", network_info.upnp_available);
+                    if !network_info.port_mappings.is_empty() {
+                        if let Some(mapping) = network_info.port_mappings.first() {
+                            tracing::info!("Port mapping active: {} -> {}", mapping.external_addr, mapping.internal_addr);
+                        }
+                    }
                     tracing::info!("============================");
 
                     Some(Arc::new(RwLock::new(manager)))
                 }
                 Err(e) => {
-                    if e.is_transient() {
-                        tracing::warn!("Transient NAT init error: {}. Retrying once...", e);
-                        match manager.initialize(&socket).await {
-                            Ok(_) => {
-                                tracing::info!("Retry succeeded");
-                                Some(Arc::new(RwLock::new(manager)))
-                            }
-                            Err(e2) => {
-                                tracing::warn!("NAT initialization retry failed: {}. Continuing without it.", e2);
-                                None
-                            }
+                    tracing::warn!("NAT init error: {}. Retrying once...", e);
+                    match manager.initialize(&socket).await {
+                        Ok(_) => {
+                            tracing::info!("Retry succeeded");
+                            Some(Arc::new(RwLock::new(manager)))
                         }
-                    } else {
-                        tracing::error!("Permanent NAT init error: {}. Disabling NAT features.", e);
-                        None
+                        Err(e2) => {
+                            tracing::warn!("NAT initialization retry failed: {}. Continuing without it.", e2);
+                            None
+                        }
                     }
                 }
             }
@@ -287,11 +286,7 @@ impl Sender {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                     Err(e) => {
-                        if e.is_transient() {
-                            tracing::warn!("Transient NAT preparation error: {}", e);
-                        } else {
-                            tracing::error!("Permanent NAT preparation error: {}", e);
-                        }
+                        tracing::warn!("NAT preparation error: {}", e);
                     }
                 }
             }
@@ -448,7 +443,6 @@ impl Sender {
         // Запускаем поток обработки ACK
         let ack_self = self.clone();
         let ack_handle = tokio::spawn(async move { ack_self.ack_handler_task().await });
-        });
 
         // Основной цикл чтения и фрагментации файла
         self.file_reader_task(tx_packets, hash_complete).await?;

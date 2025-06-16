@@ -56,17 +56,15 @@ impl Receiver {
                 Ok(network_info) => {
                     tracing::info!("Receiver network info: {:?}", network_info);
 
-                    // Для получателя особенно важен UPnP для входящих соединений
-                    if network_info.upnp_available && network_info.mapped_port.is_some() {
-                        tracing::info!("UPnP port mapping active on port {}", 
-                            network_info.mapped_port.unwrap());
-                    }
+                    // Для получателя особенно важен проброс порта
+                    if let Some(mapping) = network_info.port_mappings.first() {
+                        tracing::info!("Port mapping active: {} -> {}",
+                            mapping.external_addr, mapping.internal_addr);
 
                     Some(Arc::new(RwLock::new(manager)))
                 }
                 Err(e) => {
-                    if e.is_transient() {
-                        tracing::warn!("Transient NAT init error: {}. Retrying once...", e);
+                        tracing::warn!("NAT init error: {}. Retrying once...", e);
                         match manager.initialize(&socket).await {
                             Ok(_) => {
                                 tracing::info!("Retry succeeded");
@@ -75,11 +73,7 @@ impl Receiver {
                             Err(e2) => {
                                 tracing::warn!("NAT init retry failed: {}. Continuing without it.", e2);
                                 None
-                            }
                         }
-                    } else {
-                        tracing::error!("Permanent NAT init error: {}. Disabling NAT features.", e);
-                        None
                     }
                 }
             }
@@ -274,10 +268,7 @@ impl Receiver {
             if let Some(nat_manager) = &self.nat_manager {
                 tracing::info!("Preparing NAT connection to {}", response_addr);
                 if let Err(e) = nat_manager.read().prepare_connection(&self.socket, response_addr, false).await {
-                    if e.is_transient() {
-                        tracing::warn!("Transient NAT preparation error: {}", e);
-                    } else {
-                        tracing::error!("Permanent NAT preparation error: {}", e);
+                    tracing::warn!("NAT preparation error: {}", e);
                     }
                 }
             }

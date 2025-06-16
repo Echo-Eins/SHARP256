@@ -16,7 +16,7 @@ use tokio::time::{timeout, interval, sleep};
 use tokio::sync::{RwLock, Mutex};
 
 use bytes::{Bytes, BytesMut, Buf, BufMut};
-use http::{Request, Response, StatusCode};
+use hyper::http::{Request, Response, StatusCode};
 use xmltree::{Element, XMLNode};
 use rand::RngCore;
 

@@ -13,7 +13,7 @@
 - 🖥️ GUI и headless режимы работы
 - 🔐 Опциональное шифрование TLS 1.3
 - 📈 Адаптивная настройка под условия сети
-- 🌐 **NAT traversal** (STUN, UPnP, UDP hole punching)
+- 🌐 **NAT traversal** (STUN RFC8489/5780, UPnP/NAT-PMP/PCP, UDP hole punching)
 - 🔄 **Relay сервер** для сложных сетевых конфигураций
 
 ## Архитектура

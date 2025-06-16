@@ -4,7 +4,6 @@
 //! This module provides comprehensive NAT traversal functionality following
 //! the latest RFC standards and best practices.
 
-pub mod stun;
 pub mod upnp;
 pub mod hole_punch;
 pub mod coordinator;

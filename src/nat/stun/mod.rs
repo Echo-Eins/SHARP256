@@ -13,7 +13,7 @@ pub use protocol::{
     Message, MessageType, MessageClass, TransactionId,
     Attribute, AttributeType, AttributeValue,
     MAGIC_COOKIE, HEADER_SIZE, MAX_MESSAGE_SIZE,
-    PasswordAlgorithm, PasswordAlgorithmParams,
+    PasswordAlgorithm, PasswordAlgorithm, PasswordAlgorithmParams,
 };
 
 pub use client::{
