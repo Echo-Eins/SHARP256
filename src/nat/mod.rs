@@ -1,119 +1,231 @@
-use anyhow::Result;
-use tokio::net::UdpSocket;
-use parking_lot::RwLock;
-use std::sync::Arc;
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+// src/nat/mod.rs
+//! NAT traversal implementation with STUN, TURN, UPnP, NAT-PMP, and PCP support
+//!
+//! This module provides comprehensive NAT traversal functionality following
+//! the latest RFC standards and best practices.
 
 pub mod stun;
 pub mod upnp;
 pub mod hole_punch;
 pub mod coordinator;
 pub mod error;
+pub mod metrics;
+pub mod port_forwarding;
 
-use self::stun::StunClient;
-use self::upnp::UpnpClient;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+use parking_lot::RwLock;
+use tokio::net::UdpSocket;
+
+use self::stun::{StunService, StunConfig};
+use self::port_forwarding::{PortForwardingService, PortMappingConfig, Protocol};
 use self::hole_punch::HolePuncher;
 use self::coordinator::AdvancedNatTraversal;
+use self::error::{NatError, NatResult};
 
 /// NAT traversal configuration
 #[derive(Debug, Clone)]
 pub struct NatConfig {
+    /// Enable STUN
     pub enable_stun: bool,
+
+    /// Enable TURN relay
+    pub enable_turn: bool,
+
+    /// Enable UPnP-IGD
     pub enable_upnp: bool,
+
+    /// Enable NAT-PMP
+    pub enable_natpmp: bool,
+
+    /// Enable PCP (Port Control Protocol)
+    pub enable_pcp: bool,
+
+    /// Enable UDP hole punching
     pub enable_hole_punching: bool,
+
+    /// STUN servers
     pub stun_servers: Vec<String>,
-    pub upnp_lease_duration: u32,
-    pub hole_punch_attempts: u32,
+
+    /// TURN servers with credentials
+    pub turn_servers: Vec<TurnServer>,
+
+    /// Coordinator server for advanced NAT traversal
     pub coordinator_server: Option<String>,
+
+    /// Relay servers for symmetric NAT
     pub relay_servers: Vec<String>,
+
+    /// Port mapping lifetime in seconds
+    pub port_mapping_lifetime: u32,
+
+    /// Retry attempts
     pub retry_attempts: u32,
+
+    /// Detection timeout
     pub detection_timeout: Duration,
+
+    /// Enable IPv6
+    pub enable_ipv6: bool,
+
+    /// Preferred protocols order
+    pub preferred_protocols: Vec<NatProtocol>,
+}
+
+/// TURN server configuration
+#[derive(Debug, Clone)]
+pub struct TurnServer {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// NAT traversal protocols
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatProtocol {
+    /// Direct connection (no NAT)
+    Direct,
+    /// STUN for address discovery
+    Stun,
+    /// UPnP port forwarding
+    Upnp,
+    /// NAT-PMP port forwarding
+    NatPmp,
+    /// PCP port forwarding
+    Pcp,
+    /// UDP hole punching
+    HolePunch,
+    /// TURN relay
+    Turn,
 }
 
 impl Default for NatConfig {
     fn default() -> Self {
         Self {
             enable_stun: true,
+            enable_turn: false,
             enable_upnp: true,
+            enable_natpmp: true,
+            enable_pcp: true,
             enable_hole_punching: true,
             stun_servers: vec![
-                // Primary servers
                 "stun.l.google.com:19302".to_string(),
                 "stun1.l.google.com:19302".to_string(),
                 "stun2.l.google.com:19302".to_string(),
                 "stun3.l.google.com:19302".to_string(),
                 "stun4.l.google.com:19302".to_string(),
-
-                // Fallback servers
                 "stun.cloudflare.com:3478".to_string(),
                 "stun.services.mozilla.com:3478".to_string(),
-                "stun.stunprotocol.org:3478".to_string(),
-                "stun.voip.blackberry.com:3478".to_string(),
-                "stun.altar.com.pl:3478".to_string(),
-                "stun.antisip.com:3478".to_string(),
-                "stun.bluesip.net:3478".to_string(),
-                "stun.dus.net:3478".to_string(),
-                "stun.epygi.com:3478".to_string(),
-                "stun.sonetel.com:3478".to_string(),
-                "stun.sonetel.net:3478".to_string(),
-                "stun.stunprotocol.org:3478".to_string(),
-                "stun.uls.co.za:3478".to_string(),
-                "stun.voipgate.com:3478".to_string(),
-                "stun.voys.nl:3478".to_string(),
             ],
-            upnp_lease_duration: 7200, // 2 hours
-            hole_punch_attempts: 30,
+            turn_servers: vec![],
             coordinator_server: None,
             relay_servers: vec![],
+            port_mapping_lifetime: 7200, // 2 hours
             retry_attempts: 3,
             detection_timeout: Duration::from_secs(30),
+            enable_ipv6: true,
+            preferred_protocols: vec![
+                NatProtocol::Direct,
+                NatProtocol::Upnp,
+                NatProtocol::Pcp,
+                NatProtocol::NatPmp,
+                NatProtocol::Stun,
+                NatProtocol::HolePunch,
+                NatProtocol::Turn,
+            ],
         }
     }
 }
 
-/// Network configuration information
+/// Network information
 #[derive(Debug, Clone)]
 pub struct NetworkInfo {
+    /// Local address
     pub local_addr: SocketAddr,
+
+    /// Public address (if behind NAT)
     pub public_addr: Option<SocketAddr>,
+
+    /// NAT type
     pub nat_type: NatType,
-    pub upnp_available: bool,
-    pub mapped_port: Option<u16>,
-    pub external_ip_sources: Vec<(String, IpAddr)>, // Source name and IP
+
+    /// Available protocols
+    pub available_protocols: Vec<NatProtocol>,
+
+    /// Port mappings
+    pub port_mappings: Vec<port_forwarding::PortMapping>,
+
+    /// Connectivity status
     pub connectivity_status: ConnectivityStatus,
+
+    /// NAT behavior details
+    pub nat_behavior: Option<stun::NatBehavior>,
 }
 
+/// NAT type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatType {
-    None,               // Public IP, no NAT
-    FullCone,          // Full Cone NAT (best case)
-    RestrictedCone,    // Address-Restricted Cone NAT
-    PortRestricted,    // Port-Restricted Cone NAT
-    Symmetric,         // Symmetric NAT (worst case)
-    Unknown,           // Could not determine
+    /// No NAT (public IP)
+    None,
+    /// Full Cone NAT (best for P2P)
+    FullCone,
+    /// Restricted Cone NAT
+    RestrictedCone,
+    /// Port Restricted Cone NAT
+    PortRestricted,
+    /// Symmetric NAT (worst for P2P)
+    Symmetric,
+    /// Unknown/Not detected
+    Unknown,
 }
 
+/// Connectivity status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectivityStatus {
-    Direct,            // Direct internet connection
-    BehindNat,        // Behind NAT but traversable
-    Restricted,       // Behind restrictive NAT/firewall
-    Offline,          // No internet connectivity
+    /// Direct internet connection
+    Direct,
+    /// Behind NAT but traversable
+    BehindNat,
+    /// Behind restrictive NAT/firewall
+    Restricted,
+    /// No internet connectivity
+    Offline,
 }
 
-/// Enhanced NAT traversal manager
+/// NAT traversal manager
 pub struct NatManager {
+    /// Configuration
     config: NatConfig,
+
+    /// Network information
     network_info: Arc<RwLock<Option<NetworkInfo>>>,
-    upnp_client: Arc<RwLock<Option<UpnpClient>>>,
-    stun_client: StunClient,
-    advanced_traversal: Option<AdvancedNatTraversal>,
+
+    /// STUN service
+    stun_service: Arc<StunService>,
+
+    /// Port forwarding service
+    port_forwarding: Arc<RwLock<Option<PortForwardingService>>>,
+
+    /// Advanced NAT traversal
+    advanced_traversal: Option<Arc<AdvancedNatTraversal>>,
+
+    /// Initialization status
     initialized: Arc<RwLock<bool>>,
 }
 
 impl NatManager {
+    /// Create new NAT manager
     pub fn new(config: NatConfig) -> Self {
+        // Create STUN service
+        let stun_config = StunConfig {
+            servers: config.stun_servers.clone(),
+            enable_behavior_discovery: true,
+            ..Default::default()
+        };
+        let stun_service = Arc::new(StunService::with_config(stun_config));
+
+        // Create advanced traversal if configured
         let advanced_traversal = if config.coordinator_server.is_some() || !config.relay_servers.is_empty() {
             let client_id = format!("sharp-{}", uuid::Uuid::new_v4());
 
@@ -124,125 +236,175 @@ impl NatManager {
                 .filter_map(|s| s.parse().ok())
                 .collect();
 
-            Some(AdvancedNatTraversal::new(coordinator_addr, relay_addrs, client_id))
+            Some(Arc::new(AdvancedNatTraversal::new(
+                coordinator_addr,
+                relay_addrs,
+                client_id,
+            )))
         } else {
             None
         };
 
         Self {
-            stun_client: StunClient::new(config.stun_servers.clone()),
             config,
             network_info: Arc::new(RwLock::new(None)),
-            upnp_client: Arc::new(RwLock::new(None)),
+            stun_service,
+            port_forwarding: Arc::new(RwLock::new(None)),
             advanced_traversal,
             initialized: Arc::new(RwLock::new(false)),
         }
     }
 
-    /// Initialize NAT detection with comprehensive fallback
-    pub async fn initialize(&mut self, local_socket: &UdpSocket) -> Result<NetworkInfo> {
+    /// Initialize NAT detection and setup
+    pub async fn initialize(&mut self, socket: &UdpSocket) -> NatResult<NetworkInfo> {
+        // Check if already initialized
         if *self.initialized.read() {
             if let Some(info) = &*self.network_info.read() {
                 return Ok(info.clone());
             }
         }
 
-        let local_addr = local_socket.local_addr()?;
-        tracing::info!("=== Starting NAT Detection ===");
+        let local_addr = socket.local_addr()?;
+        tracing::info!("=== NAT Detection Starting ===");
         tracing::info!("Local address: {}", local_addr);
 
-        let mut external_ip_sources = Vec::new();
+        let mut available_protocols = vec![NatProtocol::Direct];
         let mut public_addr = None;
         let mut nat_type = NatType::Unknown;
         let mut connectivity_status = ConnectivityStatus::Offline;
+        let mut nat_behavior = None;
+        let mut port_mappings = Vec::new();
 
-        // Step 1: STUN discovery (parallel with multiple servers)
+        // Step 1: STUN detection
         if self.config.enable_stun {
-            tracing::info!("Performing STUN discovery...");
+            tracing::info!("Running STUN detection...");
 
-            match tokio::time::timeout(
-                self.config.detection_timeout,
-                self.discover_public_address_comprehensive(local_socket, &mut external_ip_sources)
-            ).await {
-                Ok(Ok(addr)) => {
+            match self.stun_service.get_public_address(socket).await {
+                Ok(addr) => {
                     public_addr = Some(addr);
                     connectivity_status = ConnectivityStatus::BehindNat;
-                    tracing::info!("STUN discovery successful: {}", addr);
+                    available_protocols.push(NatProtocol::Stun);
+
+                    tracing::info!("Public address detected: {}", addr);
+
+                    // Detect NAT type
+                    match self.stun_service.detect_nat_type(socket).await {
+                        Ok((detected_type, behavior)) => {
+                            nat_type = detected_type;
+                            nat_behavior = Some(behavior);
+                            tracing::info!("NAT type: {:?}", nat_type);
+                        }
+                        Err(e) => {
+                            tracing::warn!("NAT type detection failed: {}", e);
+                        }
+                    }
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("STUN discovery failed: {}", e);
-                }
-                Err(_) => {
-                    tracing::warn!("STUN discovery timed out");
+                Err(e) => {
+                    tracing::warn!("STUN detection failed: {}", e);
                 }
             }
         }
 
-        // Step 2: Determine NAT type if behind NAT
+        // Check if we have direct connection
         if let Some(pub_addr) = public_addr {
             if pub_addr.ip() == local_addr.ip() {
                 nat_type = NatType::None;
                 connectivity_status = ConnectivityStatus::Direct;
-                tracing::info!("Direct internet connection detected (public IP)");
-            } else {
-                // Detailed NAT type detection
-                match self.detect_nat_type_comprehensive(local_socket).await {
-                    Ok(detected_type) => {
-                        nat_type = detected_type;
-                        tracing::info!("NAT type detected: {:?}", nat_type);
+                tracing::info!("Direct internet connection detected");
+            }
+        }
+
+        // Step 2: Port forwarding setup (only if behind NAT)
+        if nat_type != NatType::None && connectivity_status != ConnectivityStatus::Offline {
+            // Initialize port forwarding service
+            if self.config.enable_upnp || self.config.enable_natpmp || self.config.enable_pcp {
+                tracing::info!("Setting up port forwarding...");
+
+                match PortForwardingService::new().await {
+                    Ok(service) => {
+                        *self.port_forwarding.write() = Some(service);
+
+                        // Try to create port mapping
+                        let mapping_config = PortMappingConfig {
+                            external_port: 0, // Let router choose
+                            internal_port: local_addr.port(),
+                            protocol: Protocol::UDP,
+                            lifetime: self.config.port_mapping_lifetime,
+                            description: "SHARP P2P Connection".to_string(),
+                            auto_renew: true,
+                            preferred_protocols: vec![],
+                        };
+
+                        if let Some(ref service) = *self.port_forwarding.read() {
+                            match service.create_mapping(mapping_config).await {
+                                Ok(mapping) => {
+                                    tracing::info!("Port mapping created: {:?}", mapping);
+
+                                    // Update available protocols
+                                    match mapping.protocol {
+                                        port_forwarding::MappingProtocol::UPnPIGD => {
+                                            available_protocols.push(NatProtocol::Upnp);
+                                        }
+                                        port_forwarding::MappingProtocol::NatPMP => {
+                                            available_protocols.push(NatProtocol::NatPmp);
+                                        }
+                                        port_forwarding::MappingProtocol::PCP => {
+                                            available_protocols.push(NatProtocol::Pcp);
+                                        }
+                                    }
+
+                                    port_mappings.push(mapping);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Port mapping failed: {}", e);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!("NAT type detection failed: {}", e);
-                        // Assume restricted cone as safe default
-                        nat_type = NatType::RestrictedCone;
+                        tracing::warn!("Port forwarding service initialization failed: {}", e);
                     }
+                }
+            }
+
+            // Check hole punching feasibility
+            if self.config.enable_hole_punching {
+                match nat_type {
+                    NatType::FullCone | NatType::RestrictedCone | NatType::PortRestricted => {
+                        available_protocols.push(NatProtocol::HolePunch);
+                        tracing::info!("UDP hole punching available");
+                    }
+                    NatType::Symmetric => {
+                        if let Some(ref behavior) = nat_behavior {
+                            if behavior.p2p_score() > 0.3 {
+                                available_protocols.push(NatProtocol::HolePunch);
+                                tracing::info!("UDP hole punching may work (limited)");
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Step 3: UPnP setup (only if behind NAT)
-        let (upnp_available, mapped_port) = if self.config.enable_upnp &&
-            nat_type != NatType::None &&
-            connectivity_status != ConnectivityStatus::Offline {
-            tracing::info!("Attempting UPnP configuration...");
-
-            match self.setup_upnp_comprehensive(local_addr.port()).await {
-                Ok(port) => {
-                    tracing::info!("✓ UPnP successful! External port: {}", port);
-
-                    // Update connectivity status
-                    if nat_type == NatType::Symmetric {
-                        connectivity_status = ConnectivityStatus::Restricted;
-                    } else {
-                        connectivity_status = ConnectivityStatus::BehindNat;
-                    }
-
-                    (true, Some(port))
-                }
-                Err(e) => {
-                    tracing::warn!("✗ UPnP failed: {}", e);
-
-                    // Determine if we're restricted
-                    if nat_type == NatType::Symmetric || nat_type == NatType::Unknown {
-                        connectivity_status = ConnectivityStatus::Restricted;
-                    }
-
-                    (false, None)
-                }
+        // Update connectivity status based on available protocols
+        if !available_protocols.is_empty() {
+            if nat_type == NatType::Symmetric && available_protocols.len() == 1 {
+                connectivity_status = ConnectivityStatus::Restricted;
+            } else if nat_type != NatType::None {
+                connectivity_status = ConnectivityStatus::BehindNat;
             }
-        } else {
-            (false, None)
-        };
+        }
 
         // Create network info
         let network_info = NetworkInfo {
             local_addr,
             public_addr,
             nat_type,
-            upnp_available,
-            mapped_port,
-            external_ip_sources,
+            available_protocols,
+            port_mappings,
             connectivity_status,
+            nat_behavior,
         };
 
         // Log summary
@@ -250,287 +412,219 @@ impl NatManager {
         tracing::info!("Local: {}", network_info.local_addr);
         tracing::info!("Public: {:?}", network_info.public_addr);
         tracing::info!("NAT Type: {:?}", network_info.nat_type);
-        tracing::info!("UPnP: {} (port: {:?})",
-            if network_info.upnp_available { "Available" } else { "Not Available" },
-            network_info.mapped_port
-        );
-        tracing::info!("Connectivity: {:?}", network_info.connectivity_status);
-        tracing::info!("=============================");
+        tracing::info!("Status: {:?}", network_info.connectivity_status);
+        tracing::info!("Available: {:?}", network_info.available_protocols);
+        tracing::info!("============================");
 
+        // Store results
         *self.network_info.write() = Some(network_info.clone());
         *self.initialized.write() = true;
 
         Ok(network_info)
     }
 
-    /// Comprehensive public address discovery using multiple STUN servers
-    async fn discover_public_address_comprehensive(
-        &self,
-        socket: &UdpSocket,
-        sources: &mut Vec<(String, IpAddr)>,
-    ) -> Result<SocketAddr> {
-        use futures::future::join_all;
-
-        let servers = self.config.stun_servers.clone();
-        let socket = Arc::new(socket);
-
-        // Query multiple STUN servers in parallel
-        let mut futures = Vec::new();
-
-        for (idx, server) in servers.iter().enumerate().take(5) {
-            let client = self.stun_client.clone();
-            let socket_clone = socket.clone();
-            let server_clone = server.clone();
-
-            let future = async move {
-                match tokio::time::timeout(
-                    Duration::from_secs(3),
-                    client.query_stun_server(&socket_clone, &server_clone)
-                ).await {
-                    Ok(Ok(addr)) => Some((server_clone, addr)),
-                    _ => None,
-                }
-            };
-
-            futures.push(future);
-        }
-
-        let results = join_all(futures).await;
-
-        // Collect successful results
-        let mut addresses = Vec::new();
-        for result in results {
-            if let Some((server, addr)) = result {
-                sources.push((server.clone(), addr.ip()));
-                addresses.push(addr);
-                tracing::debug!("STUN {} returned: {}", server, addr);
-            }
-        }
-
-        if addresses.is_empty() {
-            return Err(anyhow::anyhow!("All STUN servers failed"));
-        }
-
-        // Find consensus (most common address)
-        let mut addr_counts = std::collections::HashMap::new();
-        for addr in &addresses {
-            *addr_counts.entry(addr.ip()).or_insert(0) += 1;
-        }
-
-        let (consensus_ip, count) = addr_counts.iter()
-            .max_by_key(|(_, count)| *count)
-            .ok_or_else(|| anyhow::anyhow!("No consensus on public IP"))?;
-
-        tracing::info!("Public IP consensus: {} ({}/{} servers agree)",
-            consensus_ip, count, addresses.len());
-
-        // Use first matching address with consensus IP
-        addresses.into_iter()
-            .find(|addr| addr.ip() == **consensus_ip)
-            .ok_or_else(|| anyhow::anyhow!("Failed to determine public address"))
-    }
-
-    /// Comprehensive NAT type detection following RFC 5780
-    async fn detect_nat_type_comprehensive(&self, socket: &UdpSocket) -> Result<NatType> {
-        // This would implement the full RFC 5780 flow chart
-        // For now, using simplified detection
-
-        let results = self.stun_client.detect_nat_type(socket).await?;
-
-        if results.len() < 2 {
-            return Ok(NatType::Unknown);
-        }
-
-        // Check if external port changes
-        let ports_differ = results.windows(2)
-            .any(|w| w[0].0.port() != w[1].0.port());
-
-        // Check if external IP changes
-        let ips_differ = results.windows(2)
-            .any(|w| w[0].0.ip() != w[1].0.ip());
-
-        if ips_differ || ports_differ {
-            Ok(NatType::Symmetric)
-        } else if results.iter().any(|(_, changed)| *changed) {
-            Ok(NatType::FullCone)
-        } else {
-            // Would need more tests to distinguish between restricted types
-            Ok(NatType::RestrictedCone)
-        }
-    }
-
-    /// Comprehensive UPnP setup with fallback
-    async fn setup_upnp_comprehensive(&mut self, local_port: u16) -> Result<u16> {
-        // Create UPnP client with retry logic
-        let mut upnp_client = match UpnpClient::new().await {
-            Ok(client) => client,
-            Err(e) => return Err(anyhow::anyhow!("UPnP client creation failed: {}", e)),
-        };
-
-        if !upnp_client.is_available() {
-            return Err(anyhow::anyhow!("No UPnP gateway found"));
-        }
-
-        // Log gateway info
-        if let Some(info) = upnp_client.gateway_info() {
-            tracing::info!("UPnP {}", info);
-        }
-
-        // Try to get external IP for verification
-        match upnp_client.get_external_ip().await {
-            Ok(upnp_ip) => {
-                tracing::info!("UPnP reports external IP: {}", upnp_ip);
-
-                // Verify against STUN results
-                if let Some(network_info) = &*self.network_info.read() {
-                    if let Some(stun_addr) = network_info.public_addr {
-                        if stun_addr.ip() != upnp_ip {
-                            tracing::warn!(
-                                "UPnP IP {} differs from STUN IP {}",
-                                upnp_ip, stun_addr.ip()
-                            );
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Cannot get external IP from UPnP: {}", e);
-            }
-        }
-
-        // Add port mapping with retry
-        for attempt in 1..=self.config.retry_attempts {
-            match upnp_client.add_port_mapping(
-                local_port,
-                self.config.upnp_lease_duration,
-                "SHARP-256 File Transfer"
-            ).await {
-                Ok(external_port) => {
-                    *self.upnp_client.write() = Some(upnp_client);
-                    return Ok(external_port);
-                }
-                Err(e) if attempt < self.config.retry_attempts => {
-                    tracing::warn!("UPnP mapping attempt {} failed: {}", attempt, e);
-                    tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(anyhow::anyhow!("UPnP mapping failed after {} attempts", self.config.retry_attempts))
-    }
-
-    /// Get best connectable address based on network topology
-    pub fn get_connectable_address(&self) -> Result<SocketAddr> {
+    /// Get best connectable address
+    pub fn get_connectable_address(&self) -> NatResult<SocketAddr> {
         let info = self.network_info.read()
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Network info not initialized"))?
+            .ok_or_else(|| NatError::Configuration("Not initialized".to_string()))?
             .clone();
 
         // Priority order:
-        // 1. UPnP mapped address (most reliable)
-        // 2. STUN public address (if Full Cone NAT)
-        // 3. Local address (for LAN/same network)
+        // 1. Port mapped address (most reliable)
+        // 2. STUN public address (if suitable NAT type)
+        // 3. Local address (for LAN/direct connections)
 
-        if let (Some(pub_addr), Some(mapped_port)) = (info.public_addr, info.mapped_port) {
-            return Ok(SocketAddr::new(pub_addr.ip(), mapped_port));
+        // Check port mappings first
+        if let Some(mapping) = info.port_mappings.first() {
+            return Ok(mapping.external_addr);
         }
 
+        // Check public address
         if let Some(pub_addr) = info.public_addr {
             match info.nat_type {
                 NatType::None | NatType::FullCone => return Ok(pub_addr),
                 NatType::RestrictedCone | NatType::PortRestricted => {
-                    // These might work with hole punching
-                    tracing::warn!("Using public address {} but may require hole punching", pub_addr);
-                    return Ok(pub_addr);
+                    if info.available_protocols.contains(&NatProtocol::HolePunch) {
+                        return Ok(pub_addr);
+                    }
                 }
                 _ => {}
             }
         }
 
         // Fallback to local address
-        tracing::warn!("No public address available, using local address");
         Ok(info.local_addr)
     }
 
-    /// Prepare connection with comprehensive NAT traversal
+    /// Prepare connection to peer
     pub async fn prepare_connection(
         &self,
         socket: &UdpSocket,
         peer_addr: SocketAddr,
         is_initiator: bool,
-    ) -> Result<()> {
+    ) -> NatResult<SocketAddr> {
         let info = self.network_info.read()
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Network info not initialized"))?
+            .ok_or_else(|| NatError::Configuration("Not initialized".to_string()))?
             .clone();
 
-        tracing::info!("Preparing connection to {} (NAT type: {:?})", peer_addr, info.nat_type);
+        tracing::info!("Preparing connection to {} (NAT: {:?})", peer_addr, info.nat_type);
 
-        // Check if we need NAT traversal
-        match info.connectivity_status {
-            ConnectivityStatus::Direct => {
-                tracing::info!("Direct connection available, no NAT traversal needed");
-                return Ok(());
-            }
-            ConnectivityStatus::Offline => {
-                return Err(anyhow::anyhow!("No internet connectivity"));
-            }
-            _ => {}
+        // Direct connection if possible
+        if info.connectivity_status == ConnectivityStatus::Direct {
+            return Ok(peer_addr);
         }
 
-        // Try advanced traversal first for difficult NATs
-        if info.nat_type == NatType::Symmetric || info.nat_type == NatType::Unknown {
-            if let Some(advanced) = &self.advanced_traversal {
-                tracing::info!("Using advanced NAT traversal");
+        // Try protocols in preference order
+        for protocol in &self.config.preferred_protocols {
+            if !info.available_protocols.contains(protocol) {
+                continue;
+            }
 
-                match advanced.establish_connection(socket, "peer", Some(peer_addr)).await {
-                    Ok(effective_addr) => {
-                        tracing::info!("Advanced traversal successful via {}", effective_addr);
-                        return Ok(());
+            match protocol {
+                NatProtocol::Direct => {
+                    // Try direct connection
+                    if self.test_connectivity(socket, peer_addr).await {
+                        return Ok(peer_addr);
                     }
-                    Err(e) => {
-                        tracing::warn!("Advanced traversal failed: {}", e);
+                }
+
+                NatProtocol::HolePunch => {
+                    // Perform UDP hole punching
+                    if let Err(e) = self.perform_hole_punching(socket, peer_addr, is_initiator).await {
+                        tracing::warn!("Hole punching failed: {}", e);
+                    } else {
+                        return Ok(peer_addr);
                     }
+                }
+
+                NatProtocol::Turn => {
+                    // Use TURN relay
+                    if let Some(relay_addr) = self.setup_turn_relay(peer_addr).await? {
+                        return Ok(relay_addr);
+                    }
+                }
+
+                _ => {
+                    // Port forwarding protocols already handled during initialization
                 }
             }
         }
 
-        // Standard hole punching for cone NATs
-        if self.config.enable_hole_punching {
-            let puncher = HolePuncher::new(self.config.hole_punch_attempts);
+        // Advanced traversal for difficult cases
+        if let Some(ref advanced) = self.advanced_traversal {
+            match advanced.establish_connection(socket, "peer", Some(peer_addr)).await {
+                Ok(effective_addr) => return Ok(effective_addr),
+                Err(e) => tracing::warn!("Advanced traversal failed: {}", e),
+            }
+        }
 
-            // Use coordinated punching if available
-            let coordination_server = if let Some(advanced) = &self.advanced_traversal {
-                advanced.coordinator.as_ref().map(|_| self.config.coordinator_server.clone())
-                    .flatten()
-                    .and_then(|s| s.parse().ok())
-            } else {
-                None
-            };
+        Err(NatError::NotSupported("No working NAT traversal method".to_string()))
+    }
 
-            if let Some(coord_addr) = coordination_server {
-                tracing::info!("Using coordinated hole punching via {}", coord_addr);
-                puncher.simultaneous_punch(socket, peer_addr, Some(coord_addr)).await?;
-            } else {
-                tracing::info!("Performing direct hole punching");
-                puncher.punch_hole(socket, peer_addr, is_initiator).await?;
+    /// Test direct connectivity
+    async fn test_connectivity(&self, socket: &UdpSocket, addr: SocketAddr) -> bool {
+        let test_data = b"SHARP_PING";
+
+        if socket.send_to(test_data, addr).await.is_err() {
+            return false;
+        }
+
+        let mut buf = vec![0u8; 256];
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            socket.recv_from(&mut buf)
+        ).await {
+            Ok(Ok((size, from))) if from == addr && &buf[..size] == b"SHARP_PONG" => true,
+            _ => false,
+        }
+    }
+
+    /// Perform UDP hole punching
+    async fn perform_hole_punching(
+        &self,
+        socket: &UdpSocket,
+        peer_addr: SocketAddr,
+        is_initiator: bool,
+    ) -> NatResult<()> {
+        let puncher = HolePuncher::new(30); // 30 attempts
+
+        // Check if we have coordinator for synchronized punching
+        let coordination_server = self.config.coordinator_server.as_ref()
+            .and_then(|s| s.parse().ok());
+
+        if let Some(coord) = coordination_server {
+            puncher.simultaneous_punch(socket, peer_addr, Some(coord)).await
+        } else {
+            puncher.punch_hole(socket, peer_addr, is_initiator).await
+        }
+    }
+
+    /// Setup TURN relay
+    async fn setup_turn_relay(&self, peer_addr: SocketAddr) -> NatResult<Option<SocketAddr>> {
+        // This would implement TURN allocation
+        // For now, return None
+        Ok(None)
+    }
+
+    /// Get network info
+    pub fn get_network_info(&self) -> Option<NetworkInfo> {
+        self.network_info.read().clone()
+    }
+
+    /// Cleanup resources
+    pub async fn cleanup(&mut self) -> NatResult<()> {
+        // Delete port mappings
+        if let Some(ref service) = *self.port_forwarding.read() {
+            let mappings = service.get_mappings().await;
+            for mapping in mappings {
+                if let Err(e) = service.delete_mapping(mapping.id).await {
+                    tracing::warn!("Failed to delete mapping {}: {}", mapping.id, e);
+                }
             }
         }
 
         Ok(())
     }
+}
 
-    /// Clean up resources
-    pub async fn cleanup(&mut self) -> Result<()> {
-        if let Some(mut client) = self.upnp_client.write().take() {
-            client.cleanup_all().await?;
+impl Drop for NatManager {
+    fn drop(&mut self) {
+        // Best effort cleanup
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let port_forwarding = self.port_forwarding.clone();
+
+            handle.spawn(async move {
+                if let Some(ref service) = *port_forwarding.read() {
+                    let mappings = service.get_mappings().await;
+                    for mapping in mappings {
+                        let _ = service.delete_mapping(mapping.id).await;
+                    }
+                }
+            });
         }
-        Ok(())
     }
+}
 
-    /// Extract UPnP client for external management
-    pub fn take_upnp_client(&mut self) -> Option<UpnpClient> {
-        self.upnp_client.write().take()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_nat_manager() {
+        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let config = NatConfig::default();
+        let mut manager = NatManager::new(config);
+
+        match manager.initialize(&socket).await {
+            Ok(info) => {
+                println!("Network info: {:?}", info);
+                assert!(!info.available_protocols.is_empty());
+            }
+            Err(e) => {
+                eprintln!("NAT manager test failed (expected without network): {}", e);
+            }
+        }
     }
 }

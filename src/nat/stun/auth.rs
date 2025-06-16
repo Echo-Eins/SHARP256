@@ -1,9 +1,11 @@
 use sha2::{Sha256, Digest};
+use sha1::Sha1;
 use hmac::{Hmac, Mac};
 use md5::Md5;
+use rand::RngCore;
 use crate::nat::error::{StunError, NatResult};
 
-/// STUN credential types
+/// STUN credential types as per RFC 8489
 #[derive(Debug, Clone)]
 pub enum CredentialType {
     /// Short-term credentials (for ICE)
@@ -11,14 +13,14 @@ pub enum CredentialType {
         username: String,
         password: String,
     },
-    
+
     /// Long-term credentials (for TURN)
     LongTerm {
         username: String,
         realm: String,
         password: String,
     },
-    
+
     /// Anonymous with USERHASH
     Anonymous {
         username: String,
@@ -34,6 +36,7 @@ pub struct Credentials {
     pub credential_type: CredentialType,
     pub nonce: Option<Vec<u8>>,
     pub password_algorithm: PasswordAlgorithm,
+    pub password_algorithms: Option<Vec<u16>>, // Server-supported algorithms
 }
 
 /// Password algorithms (RFC 8489 Section 14.4)
@@ -41,7 +44,7 @@ pub struct Credentials {
 pub enum PasswordAlgorithm {
     /// MD5 (legacy, for compatibility)
     MD5,
-    
+
     /// SHA-256 (RFC 8489 default)
     SHA256,
 }
@@ -59,44 +62,53 @@ impl Credentials {
             credential_type: CredentialType::ShortTerm { username, password },
             nonce: None,
             password_algorithm: PasswordAlgorithm::default(),
+            password_algorithms: None,
         }
     }
-    
+
     /// Create long-term credentials
     pub fn long_term(username: String, realm: String, password: String) -> Self {
         Self {
             credential_type: CredentialType::LongTerm { username, realm, password },
             nonce: None,
             password_algorithm: PasswordAlgorithm::default(),
+            password_algorithms: None,
         }
     }
-    
+
     /// Create anonymous credentials with USERHASH
     pub fn anonymous(username: String, realm: String, password: String) -> Self {
         Self {
-            credential_type: CredentialType::Anonymous { 
-                username, 
-                realm, 
-                password, 
-                use_userhash: true 
+            credential_type: CredentialType::Anonymous {
+                username,
+                realm,
+                password,
+                use_userhash: true
             },
             nonce: None,
             password_algorithm: PasswordAlgorithm::default(),
+            password_algorithms: None,
         }
     }
-    
+
     /// Set nonce for long-term credentials
     pub fn with_nonce(mut self, nonce: Vec<u8>) -> Self {
         self.nonce = Some(nonce);
         self
     }
-    
+
     /// Set password algorithm
     pub fn with_algorithm(mut self, algorithm: PasswordAlgorithm) -> Self {
         self.password_algorithm = algorithm;
         self
     }
-    
+
+    /// Set server-supported algorithms
+    pub fn with_supported_algorithms(mut self, algorithms: Vec<u16>) -> Self {
+        self.password_algorithms = Some(algorithms);
+        self
+    }
+
     /// Compute HMAC key for MESSAGE-INTEGRITY
     pub fn compute_key(&self) -> NatResult<Vec<u8>> {
         match &self.credential_type {
@@ -104,7 +116,7 @@ impl Credentials {
                 // Short-term: key = password (UTF-8 encoded)
                 Ok(password.as_bytes().to_vec())
             }
-            
+
             CredentialType::LongTerm { username, realm, password } |
             CredentialType::Anonymous { username, realm, password, .. } => {
                 // Long-term: key = hash(username:realm:password)
@@ -123,7 +135,7 @@ impl Credentials {
             }
         }
     }
-    
+
     /// Get username for request
     pub fn get_username(&self) -> &str {
         match &self.credential_type {
@@ -132,7 +144,7 @@ impl Credentials {
             CredentialType::Anonymous { username, .. } => username,
         }
     }
-    
+
     /// Get realm if applicable
     pub fn get_realm(&self) -> Option<&str> {
         match &self.credential_type {
@@ -141,7 +153,7 @@ impl Credentials {
             CredentialType::Anonymous { realm, .. } => Some(realm),
         }
     }
-    
+
     /// Check if USERHASH should be used
     pub fn use_userhash(&self) -> bool {
         match &self.credential_type {
@@ -149,13 +161,13 @@ impl Credentials {
             _ => false,
         }
     }
-    
+
     /// Compute USERHASH value (RFC 8489 Section 14.8)
     pub fn compute_userhash(&self) -> NatResult<Vec<u8>> {
         if let Some(realm) = self.get_realm() {
             let username = self.get_username();
             let input = format!("{}:{}", username, realm);
-            
+
             match self.password_algorithm {
                 PasswordAlgorithm::MD5 => {
                     // USERHASH with MD5 not recommended
@@ -174,6 +186,21 @@ impl Credentials {
             ).into())
         }
     }
+
+    /// Select best password algorithm from server list
+    pub fn select_algorithm(&mut self, server_algorithms: &[u16]) -> NatResult<()> {
+        // Prefer SHA-256 if available
+        if server_algorithms.contains(&0x0002) {
+            self.password_algorithm = PasswordAlgorithm::SHA256;
+        } else if server_algorithms.contains(&0x0001) {
+            self.password_algorithm = PasswordAlgorithm::MD5;
+        } else {
+            return Err(StunError::Authentication(
+                "No compatible password algorithm".to_string()
+            ).into());
+        }
+        Ok(())
+    }
 }
 
 /// Compute MESSAGE-INTEGRITY-SHA256
@@ -182,10 +209,10 @@ pub fn compute_message_integrity_sha256(
     key: &[u8],
 ) -> NatResult<[u8; 32]> {
     type HmacSha256 = Hmac<Sha256>;
-    
+
     let mut mac = HmacSha256::new_from_slice(key)
         .map_err(|e| StunError::Authentication(format!("Invalid key: {}", e)))?;
-    
+
     mac.update(message);
     Ok(mac.finalize().into_bytes().into())
 }
@@ -199,16 +226,12 @@ pub fn verify_message_integrity_sha256(
     if expected_hash.len() != 32 {
         return Ok(false);
     }
-    
+
     let computed = compute_message_integrity_sha256(message, key)?;
-    
+
     // Constant-time comparison to prevent timing attacks
-    let mut equal = true;
-    for i in 0..32 {
-        equal &= computed[i] == expected_hash[i];
-    }
-    
-    Ok(equal)
+    use subtle::ConstantTimeEq;
+    Ok(computed.ct_eq(expected_hash).into())
 }
 
 /// Compute MESSAGE-INTEGRITY (legacy SHA1)
@@ -216,13 +239,30 @@ pub fn compute_message_integrity_sha1(
     message: &[u8],
     key: &[u8],
 ) -> NatResult<[u8; 20]> {
-    type HmacSha1 = Hmac<sha1::Sha1>;
-    
+    type HmacSha1 = Hmac<Sha1>;
+
     let mut mac = HmacSha1::new_from_slice(key)
         .map_err(|e| StunError::Authentication(format!("Invalid key: {}", e)))?;
-    
+
     mac.update(message);
     Ok(mac.finalize().into_bytes().into())
+}
+
+/// Verify MESSAGE-INTEGRITY (legacy SHA1)
+pub fn verify_message_integrity_sha1(
+    message: &[u8],
+    key: &[u8],
+    expected_hash: &[u8],
+) -> NatResult<bool> {
+    if expected_hash.len() != 20 {
+        return Ok(false);
+    }
+
+    let computed = compute_message_integrity_sha1(message, key)?;
+
+    // Constant-time comparison
+    use subtle::ConstantTimeEq;
+    Ok(computed.ct_eq(expected_hash).into())
 }
 
 /// Password algorithms parameters (RFC 8489 Section 14.4)
@@ -240,7 +280,7 @@ impl PasswordAlgorithmParams {
             parameters: Vec::new(),
         }
     }
-    
+
     /// Create SHA256 algorithm parameters
     pub fn sha256() -> Self {
         Self {
@@ -248,7 +288,7 @@ impl PasswordAlgorithmParams {
             parameters: Vec::new(),
         }
     }
-    
+
     /// Parse algorithm from ID
     pub fn to_algorithm(&self) -> Option<PasswordAlgorithm> {
         match self.algorithm_id {
@@ -264,12 +304,15 @@ impl PasswordAlgorithmParams {
 pub struct SecurityFeatures {
     /// Support for MESSAGE-INTEGRITY-SHA256
     pub message_integrity_sha256: bool,
-    
+
     /// Support for USERHASH
     pub userhash: bool,
-    
+
     /// Support for PASSWORD-ALGORITHM
     pub password_algorithm: bool,
+
+    /// Support for PASSWORD-ALGORITHMS
+    pub password_algorithms: bool,
 }
 
 impl SecurityFeatures {
@@ -279,9 +322,10 @@ impl SecurityFeatures {
             message_integrity_sha256: bits & 0x01 != 0,
             userhash: bits & 0x02 != 0,
             password_algorithm: bits & 0x04 != 0,
+            password_algorithms: bits & 0x08 != 0,
         }
     }
-    
+
     /// Convert to nonce cookie bits
     pub fn to_nonce_bits(&self) -> u8 {
         let mut bits = 0u8;
@@ -293,6 +337,9 @@ impl SecurityFeatures {
         }
         if self.password_algorithm {
             bits |= 0x04;
+        }
+        if self.password_algorithms {
+            bits |= 0x08;
         }
         bits
     }
@@ -311,12 +358,12 @@ impl NonceCookie {
         if nonce.len() < 8 {
             return None;
         }
-        
+
         // Check for "obMatJos" prefix (RFC 8489)
         if &nonce[..8] != b"obMatJos" {
             return None;
         }
-        
+
         // Extract security features from 9th byte if present
         let features = if nonce.len() > 8 {
             SecurityFeatures::from_nonce_bits(nonce[8])
@@ -325,45 +372,59 @@ impl NonceCookie {
                 message_integrity_sha256: false,
                 userhash: false,
                 password_algorithm: false,
+                password_algorithms: false,
             }
         };
-        
+
         Some(Self {
             nonce: nonce.to_vec(),
             features,
         })
     }
-    
+
     /// Create nonce cookie with security features
     pub fn create(features: SecurityFeatures) -> Self {
         let mut nonce = b"obMatJos".to_vec();
         nonce.push(features.to_nonce_bits());
-        
+
         // Add random bytes for uniqueness
         let mut random_bytes = vec![0u8; 16];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut random_bytes);
+        use rand::rngs::OsRng;
+        OsRng.fill_bytes(&mut random_bytes);
         nonce.extend(random_bytes);
-        
+
         Self { nonce, features }
     }
+
+    /// Check if this is a valid nonce cookie
+    pub fn is_valid_cookie(nonce: &[u8]) -> bool {
+        nonce.len() >= 8 && &nonce[..8] == b"obMatJos"
+    }
+}
+
+/// Generate a secure nonce
+pub fn generate_nonce() -> Vec<u8> {
+    let mut nonce = vec![0u8; 32];
+    use rand::rngs::OsRng;
+    OsRng.fill_bytes(&mut nonce);
+    nonce
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_short_term_credentials() {
         let creds = Credentials::short_term(
             "user".to_string(),
             "pass".to_string()
         );
-        
+
         let key = creds.compute_key().unwrap();
         assert_eq!(key, b"pass");
     }
-    
+
     #[test]
     fn test_long_term_credentials_sha256() {
         let creds = Credentials::long_term(
@@ -371,14 +432,14 @@ mod tests {
             "realm".to_string(),
             "pass".to_string()
         );
-        
+
         let key = creds.compute_key().unwrap();
-        
+
         // Verify against known value
         let expected = Sha256::digest(b"user:realm:pass");
         assert_eq!(key, expected.as_slice());
     }
-    
+
     #[test]
     fn test_userhash_computation() {
         let creds = Credentials::anonymous(
@@ -386,47 +447,65 @@ mod tests {
             "realm".to_string(),
             "pass".to_string()
         );
-        
+
         let userhash = creds.compute_userhash().unwrap();
-        
+
         // Verify against known value
         let expected = Sha256::digest(b"user:realm");
         assert_eq!(userhash, expected.as_slice());
     }
-    
+
     #[test]
     fn test_nonce_cookie() {
         let features = SecurityFeatures {
             message_integrity_sha256: true,
             userhash: true,
             password_algorithm: false,
+            password_algorithms: true,
         };
-        
+
         let cookie = NonceCookie::create(features);
         assert!(cookie.nonce.starts_with(b"obMatJos"));
-        assert_eq!(cookie.nonce[8], 0x03); // bits 0 and 1 set
-        
+        assert_eq!(cookie.nonce[8], 0x0B); // bits 0, 1, and 3 set
+
         // Test parsing
         let parsed = NonceCookie::parse(&cookie.nonce).unwrap();
         assert_eq!(parsed.features.message_integrity_sha256, true);
         assert_eq!(parsed.features.userhash, true);
         assert_eq!(parsed.features.password_algorithm, false);
+        assert_eq!(parsed.features.password_algorithms, true);
     }
-    
+
     #[test]
     fn test_message_integrity_sha256() {
         let message = b"test message";
         let key = b"secret key";
-        
+
         let hash = compute_message_integrity_sha256(message, key).unwrap();
         assert_eq!(hash.len(), 32);
-        
+
         // Verify
         let valid = verify_message_integrity_sha256(message, key, &hash).unwrap();
         assert!(valid);
-        
+
         // Verify with wrong key
         let invalid = verify_message_integrity_sha256(message, b"wrong key", &hash).unwrap();
         assert!(!invalid);
+    }
+
+    #[test]
+    fn test_constant_time_comparison() {
+        let hash1 = [0u8; 32];
+        let hash2 = [0u8; 32];
+        let hash3 = [1u8; 32];
+
+        // Same arrays should be equal
+        assert!(verify_message_integrity_sha256(b"", b"", &hash1).unwrap());
+
+        // Different arrays should not be equal
+        let key = b"key";
+        let computed = compute_message_integrity_sha256(b"msg1", key).unwrap();
+        let different = compute_message_integrity_sha256(b"msg2", key).unwrap();
+        assert_ne!(computed, different);
     }
 }

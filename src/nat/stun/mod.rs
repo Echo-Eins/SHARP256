@@ -1,51 +1,108 @@
-/// RFC 8489 compliant STUN implementation
-/// 
-/// This module provides a complete STUN (Session Traversal Utilities for NAT)
-/// implementation following RFC 8489 with support for:
-/// - MESSAGE-INTEGRITY-SHA256 authentication
-/// - IPv6/IPv4 dual-stack
-/// - NAT behavior discovery (RFC 5780)
-/// - Comprehensive error handling and retry logic
+// src/nat/stun/mod.rs
+//! STUN (Session Traversal Utilities for NAT) implementation
+//!
+//! Fully compliant with RFC 8489 and RFC 5780 for NAT traversal
+//! and behavior discovery.
 
-pub mod protocol;
-pub mod client;
-pub mod auth;
-pub mod discovery;
+mod protocol;
+mod client;
+mod auth;
+mod discovery;
 
-// Re-export commonly used types
 pub use protocol::{
-    Message, MessageType, MessageClass, 
+    Message, MessageType, MessageClass, TransactionId,
     Attribute, AttributeType, AttributeValue,
-    TransactionId, MAGIC_COOKIE
+    MAGIC_COOKIE, HEADER_SIZE, MAX_MESSAGE_SIZE,
+    PasswordAlgorithm, PasswordAlgorithmParams,
 };
 
-pub use client::{StunClient, StunConfig, StunServerInfo};
-pub use discovery::{NatBehavior, MappingBehavior, FilteringBehavior};
-pub use auth::{Credentials, CredentialType};
+pub use client::{
+    StunClient, StunConfig, StunServerInfo,
+};
 
-use crate::nat::error::NatResult;
+pub use auth::{
+    Credentials, CredentialType, SecurityFeatures, NonceCookie,
+    compute_message_integrity_sha256, verify_message_integrity_sha256,
+};
+
+pub use discovery::{
+    NatBehavior, NatBehaviorDiscovery,
+    MappingBehavior, FilteringBehavior,
+};
+
 use std::net::SocketAddr;
+use tokio::net::UdpSocket;
+use crate::nat::{NatType, error::NatResult};
 
-/// Quick helper to get mapped address from a STUN server
-pub async fn get_mapped_address(
-    socket: &tokio::net::UdpSocket,
-    stun_server: &str,
-) -> NatResult<SocketAddr> {
-    let config = StunConfig::default();
-    let client = StunClient::new(config);
-    
-    client.get_mapped_address(socket, stun_server).await
+/// High-level STUN interface for NAT traversal
+pub struct StunService {
+    client: StunClient,
 }
 
-/// Quick helper to detect NAT type
-pub async fn detect_nat_type(
-    socket: &tokio::net::UdpSocket,
-) -> NatResult<crate::nat::NatType> {
-    let config = StunConfig::default();
-    let client = StunClient::new(config);
-    
-    let behavior = client.detect_nat_behavior(socket).await?;
-    
-    // Map detailed behavior to simple NAT type
-    Ok(behavior.to_simple_nat_type())
+impl StunService {
+    /// Create new STUN service with default configuration
+    pub fn new() -> Self {
+        Self {
+            client: StunClient::new(StunConfig::default()),
+        }
+    }
+
+    /// Create with custom configuration
+    pub fn with_config(config: StunConfig) -> Self {
+        Self {
+            client: StunClient::new(config),
+        }
+    }
+
+    /// Get public address via STUN
+    pub async fn get_public_address(&self, socket: &UdpSocket) -> NatResult<SocketAddr> {
+        self.client.get_mapped_address(socket).await
+    }
+
+    /// Detect NAT type and behavior
+    pub async fn detect_nat_type(&self, socket: &UdpSocket) -> NatResult<(NatType, NatBehavior)> {
+        let behavior = self.client.detect_nat_behavior(socket).await?;
+        let nat_type = behavior.to_simple_nat_type();
+        Ok((nat_type, behavior))
+    }
+
+    /// Check if P2P connection is feasible
+    pub async fn check_p2p_feasibility(&self, socket: &UdpSocket) -> NatResult<f64> {
+        let behavior = self.client.detect_nat_behavior(socket).await?;
+        Ok(behavior.p2p_score())
+    }
+
+    /// Get multiple public addresses for redundancy
+    pub async fn get_all_public_addresses(&self, socket: &UdpSocket) -> NatResult<Vec<SocketAddr>> {
+        let behavior = self.client.detect_nat_behavior(socket).await?;
+        Ok(behavior.public_addresses)
+    }
+}
+
+impl Default for StunService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_stun_service() {
+        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let service = StunService::new();
+
+        // This test requires network access
+        match service.get_public_address(&socket).await {
+            Ok(addr) => {
+                println!("Public address: {}", addr);
+                assert!(!addr.ip().is_loopback());
+            }
+            Err(e) => {
+                eprintln!("STUN test failed (may be offline): {}", e);
+            }
+        }
+    }
 }

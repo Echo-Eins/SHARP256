@@ -24,6 +24,7 @@ dependencies = [
  "igd",
  "libc",
  "memmap2 0.9.5",
+ "once_cell",
  "parking_lot",
  "rand",
  "rfd",
