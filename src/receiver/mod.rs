@@ -58,8 +58,12 @@ impl Receiver {
 
                     // Для получателя особенно важен проброс порта
                     if let Some(mapping) = network_info.port_mappings.first() {
-                        tracing::info!("Port mapping active: {} -> {}",
-                            mapping.external_addr, mapping.internal_addr);
+                        tracing::info!(
+                            "Port mapping active: {} -> {}",
+                            mapping.external_addr,
+                            mapping.internal_addr
+                        );
+                    }
 
                     Some(Arc::new(RwLock::new(manager)))
                 }
@@ -71,7 +75,10 @@ impl Receiver {
                                 Some(Arc::new(RwLock::new(manager)))
                             }
                             Err(e2) => {
-                                tracing::warn!("NAT init retry failed: {}. Continuing without it.", e2);
+                                tracing::warn!(
+                                "NAT init retry failed: {}. Continuing without it.",
+                                e2
+                            );
                                 None
                         }
                     }
@@ -267,9 +274,12 @@ impl Receiver {
         {
             if let Some(nat_manager) = &self.nat_manager {
                 tracing::info!("Preparing NAT connection to {}", response_addr);
-                if let Err(e) = nat_manager.read().prepare_connection(&self.socket, response_addr, false).await {
+                if let Err(e) = nat_manager
+                    .read()
+                    .prepare_connection(&self.socket, response_addr, false)
+                    .await
+                {
                     tracing::warn!("NAT preparation error: {}", e);
-                    }
                 }
             }
         }

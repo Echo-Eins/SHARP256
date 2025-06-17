@@ -17,7 +17,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 
-use self::stun::{StunService, StunConfig};
+
 use self::port_forwarding::{PortForwardingService, PortMappingConfig, Protocol};
 use self::hole_punch::HolePuncher;
 use self::coordinator::AdvancedNatTraversal;

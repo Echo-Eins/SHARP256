@@ -48,7 +48,25 @@ pub enum NatError {
     /// Feature not supported
     #[error("Feature not supported: {0}")]
     NotSupported(String),
+
+
+    /// Transient errors that may succeed on retry
+    #[error("Transient error: {0}")]
+    Transient(String),
+
+    /// Permanent errors that should not be retried
+    #[error("Permanent error: {0}")]
+    Permanent(String),
+
+    /// Circuit breaker opened for specific resource
+    #[error("Circuit breaker open for {0}")]
+    CircuitBreakerOpen(String),
+
+    /// All available methods failed
+    #[error("All NAT traversal methods failed")]
+    AllMethodsFailed,
 }
+
 
 /// STUN-specific error types
 #[derive(Error, Debug)]
@@ -161,6 +179,25 @@ impl From<StunError> for NatError {
 impl From<TurnError> for NatError {
     fn from(err: TurnError) -> Self {
         NatError::Turn(err)
+    }
+}
+
+impl NatError {
+    /// Check if the error is transient and a retry may succeed
+    pub fn is_transient(&self) -> bool {
+        matches!(self,
+            NatError::Transient(_) | NatError::Timeout(_) | NatError::Network(_)
+        )
+    }
+
+    /// Helper to create a transient error
+    pub fn transient(msg: impl Into<String>) -> Self {
+        NatError::Transient(msg.into())
+    }
+
+    /// Helper to create a permanent error
+    pub fn permanent(msg: impl Into<String>) -> Self {
+        NatError::Permanent(msg.into())
     }
 }
 
