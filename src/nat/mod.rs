@@ -315,7 +315,7 @@ impl NatManager {
         }
 
         // Step 2: Port forwarding setup (only if behind NAT)
-        if nat_type != NatType::None && connectivity_status != ConnectivityStatus::Offline {
+        if nat_type != NatType::None {
             // Initialize port forwarding service
             if self.config.enable_upnp || self.config.enable_natpmp || self.config.enable_pcp {
                 tracing::info!("Setting up port forwarding...");
