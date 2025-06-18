@@ -215,10 +215,10 @@ pub async fn handle_fragmentation_packet(
                 let test_id = u32::from_be_bytes(data[8..12].try_into()?);
 
                 // Determine our maximum receive size
-                let our_max = if cfg!(target_os = "linux") {
-                    65507 // Linux typically supports full UDP
+                let our_max: u32 = if cfg!(target_os = "linux") {
+                    65_507 // Linux typically supports full UDP
                 } else {
-                    8192 // Conservative for other platforms
+                    8_192 // Conservative for other platforms
                 };
 
                 let mut response = vec![0u8; 16];

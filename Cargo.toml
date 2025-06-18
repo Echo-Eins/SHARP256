@@ -59,7 +59,7 @@ hmac = "0.12"
 sha2 = "0.10"
 
 # NAT traversal
-rand = { version = "0.8", optional = true }
+rand = "0.8"
 igd = { version = "0.12", features = ["aio"], optional = true }
 uuid = { version = "1.6", features = ["v4"] }
 if-addrs = { version = "0.6", optional = true }
@@ -86,7 +86,6 @@ default = ["gui", "nat-traversal"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 nat-traversal = [
-    "dep:rand",
     "dep:igd",
     "dep:if-addrs",
     "dep:xmltree",

@@ -8,7 +8,6 @@
 
 // Core protocol modules
 pub mod protocol;
-
 pub mod buffer;
 pub mod file;
 pub mod sao;
@@ -52,6 +51,7 @@ pub use nat::{
 };
 
 // Re-export error types
+#[cfg(feature = "nat-traversal")]
 pub use nat::error::{NatError, NatResult};
 
 /// Protocol version
