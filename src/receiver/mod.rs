@@ -833,7 +833,7 @@ impl Drop for Receiver {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let manager = nat_manager.clone();
                     handle.block_on(async move {
-                        let _ = manager.write().cleanup().await;
+                        let _ = crate::nat::NatManager::cleanup_shared(manager).await;
                     })
                 }
             }

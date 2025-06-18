@@ -588,6 +588,26 @@ impl NatManager {
 
         Ok(())
     }
+
+    /// Cleanup resources using shared manager without requiring `Send` lock guards
+    pub async fn cleanup_shared(manager: Arc<RwLock<Self>>) -> NatResult<()> {
+        let service_opt = {
+            let mut mgr = manager.write();
+            let opt = mgr.port_forwarding.write().take();
+            opt
+        };
+
+        if let Some(service) = service_opt {
+            let mappings = service.get_mappings().await;
+            for mapping in mappings {
+                if let Err(e) = service.delete_mapping(mapping.id).await {
+                    tracing::warn!("Failed to delete mapping {}: {}", mapping.id, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for NatManager {

@@ -837,7 +837,7 @@ impl Drop for Sender {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let manager = nat_manager.clone();
                     handle.spawn(async move {
-                        if let Err(e) = manager.write().cleanup().await {
+                        if let Err(e) = crate::nat::NatManager::cleanup_shared(manager).await {
                             tracing::warn!("Failed to cleanup NAT mappings: {}", e);
                         }
                     });
