@@ -49,28 +49,21 @@ impl HolePuncher {
 
         let stats = Arc::new(RwLock::new(PunchStatistics::default()));
 
-        // Try multiple strategies in parallel
-        let strategies = vec![
-            self.classic_punch(socket, peer_addr, is_initiator, stats.clone()),
-            self.birthday_paradox_punch(socket, peer_addr, is_initiator, stats.clone()),
-            self.rapid_fire_punch(socket, peer_addr, is_initiator, stats.clone()),
-        ];
-
-        // Use tokio::select! to run strategies concurrently
-        tokio::select! {
-            result = strategies[0] => {
+        // Try strategies sequentially with proper async handling
+        let result = tokio::select! {
+            res = self.classic_punch(socket, peer_addr, is_initiator, stats.clone()) => {
                 stats.write().strategy_used = "Classic".to_string();
-                result
+                res
             }
-            result = strategies[1] => {
+            res = self.birthday_paradox_punch(socket, peer_addr, is_initiator, stats.clone()) => {
                 stats.write().strategy_used = "Birthday Paradox".to_string();
-                result
+                res
             }
-            result = strategies[2] => {
+            res = self.rapid_fire_punch(socket, peer_addr, is_initiator, stats.clone()) => {
                 stats.write().strategy_used = "Rapid Fire".to_string();
-                result
+                res
             }
-        }?;
+        };
 
         let final_stats = stats.read().clone();
         tracing::info!("Hole punch completed - Strategy: {}, Packets sent: {}, Received: {}",
@@ -79,7 +72,7 @@ impl HolePuncher {
             final_stats.packets_received
         );
 
-        Ok(())
+        result
     }
 
     /// Classic hole punching with improved timing
@@ -103,37 +96,46 @@ impl HolePuncher {
 
         let mut punch_interval = interval(self.packet_interval);
         let mut attempt = 0;
-        let mut received_response = false;
 
-        // Start receiver task
-        let socket_clone = Arc::new(socket);
-        let stats_clone = stats.clone();
+        // Create a channel for receiving responses
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
         let expected_response = if is_initiator { 2u8 } else { 1u8 };
 
-        let receiver = tokio::spawn(async move {
+        // Start receiver task
+        let receiver_socket = socket.try_clone()?;
+        let receiver_stats = stats.clone();
+        let receiver_start_time = start_time;
+
+        let receiver_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 1024];
             loop {
-                match timeout(Duration::from_millis(100), socket_clone.recv_from(&mut buf)).await {
+                match timeout(Duration::from_millis(100), receiver_socket.recv_from(&mut buf)).await {
                     Ok(Ok((size, addr))) if addr == peer_addr => {
                         if size >= 12 && &buf[..11] == b"SHARP_PUNCH" {
                             let role = buf[11];
                             if role == expected_response {
-                                let mut s = stats_clone.write();
+                                let mut s = receiver_stats.write();
                                 s.packets_received += 1;
                                 if s.first_response_time.is_none() {
-                                    s.first_response_time = Some(start_time.elapsed());
+                                    s.first_response_time = Some(receiver_start_time.elapsed());
                                 }
-                                return true;
+                                let _ = response_tx.send(true);
+                                return;
                             }
                         }
                     }
-                    _ => continue,
+                    Ok(Err(e)) => {
+                        tracing::debug!("Receiver error: {}", e);
+                    }
+                    Err(_) => {
+                        // Timeout, continue
+                    }
                 }
             }
         });
 
         // Send packets with adaptive timing
-        while attempt < self.max_attempts && !received_response {
+        while attempt < self.max_attempts {
             punch_interval.tick().await;
 
             // Send punch packet
@@ -144,17 +146,22 @@ impl HolePuncher {
             }
 
             // Check if we received a response
-            if receiver.is_finished() {
-                received_response = true;
-                stats.write().success = true;
+            match response_rx.try_recv() {
+                Ok(true) => {
+                    stats.write().success = true;
 
-                // Send confirmation packets
-                for _ in 0..5 {
-                    let _ = socket.send_to(b"SHARP_PUNCH_CONFIRM", peer_addr).await;
-                    sleep(Duration::from_millis(10)).await;
+                    // Send confirmation packets
+                    for _ in 0..5 {
+                        let _ = socket.send_to(b"SHARP_PUNCH_CONFIRM", peer_addr).await;
+                        sleep(Duration::from_millis(10)).await;
+                    }
+
+                    receiver_task.abort();
+                    return Ok(());
                 }
-
-                return Ok(());
+                Err(_) => {
+                    // No response yet, continue
+                }
             }
 
             // Adaptive timing - increase interval after initial burst
@@ -167,7 +174,7 @@ impl HolePuncher {
             attempt += 1;
         }
 
-        // Even if no response, NAT should be punched
+        receiver_task.abort();
         Ok(())
     }
 
@@ -230,7 +237,9 @@ impl HolePuncher {
 
         // Listen on all sockets for response
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
+        let timeout_duration = Duration::from_secs(5);
+
+        while start.elapsed() < timeout_duration {
             for sock in &sockets {
                 let mut buf = vec![0u8; 1024];
                 match timeout(Duration::from_millis(10), sock.recv_from(&mut buf)).await {
@@ -250,12 +259,13 @@ impl HolePuncher {
                     _ => continue,
                 }
             }
+
+            // Small delay before next check
+            sleep(Duration::from_millis(10)).await;
         }
 
-        // Keep trying with original socket
-        loop {
-            sleep(Duration::from_secs(3600)).await;
-        }
+        // Timeout reached
+        Ok(())
     }
 
     /// Rapid fire approach for aggressive NATs
@@ -307,10 +317,7 @@ impl HolePuncher {
             sleep(Duration::from_millis(delay)).await;
         }
 
-        // Keep strategy running
-        loop {
-            sleep(Duration::from_secs(3600)).await;
-        }
+        Ok(())
     }
 
     /// Coordinated simultaneous hole punching

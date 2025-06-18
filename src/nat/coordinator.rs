@@ -1,11 +1,10 @@
-use super::NatResult as Result;
+use super::error::{NatError, NatResult};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use serde::{Deserialize, Serialize};
 
-use super::NatError;
 /// Клиент для координации P2P соединений через сервер
 pub struct CoordinatorClient {
     server_addr: SocketAddr,
@@ -46,22 +45,27 @@ impl CoordinatorClient {
         &self,
         socket: &UdpSocket,
         public_addr: Option<SocketAddr>,
-    ) -> Result<()> {
+    ) -> NatResult<()> {
         let msg = CoordinatorMessage::Register {
             client_id: self.client_id.clone(),
             public_addr,
         };
-        
-        let data = serde_json::to_vec(&msg)?;
-        socket.send_to(&data, self.server_addr).await?;
-        
+
+        let data = serde_json::to_vec(&msg)
+            .map_err(|e| NatError::Platform(format!("Failed to serialize message: {}", e)))?;
+
+        socket.send_to(&data, self.server_addr).await
+            .map_err(|e| NatError::Network(e))?;
+
         // Ждем подтверждение
         let mut buffer = vec![0u8; 1024];
         let (_size, _) = timeout(
             Duration::from_secs(5),
             socket.recv_from(&mut buffer)
-        ).await??;
-        
+        ).await
+            .map_err(|_| NatError::Timeout(Duration::from_secs(5)))?
+            .map_err(|e| NatError::Network(e))?;
+
         tracing::info!("Registered with coordinator as {}", self.client_id);
         Ok(())
     }
@@ -71,29 +75,35 @@ impl CoordinatorClient {
         &self,
         socket: &UdpSocket,
         peer_id: &str,
-    ) -> Result<(Vec<SocketAddr>, String)> {
+    ) -> NatResult<(Vec<SocketAddr>, String)> {
         let msg = CoordinatorMessage::RequestPeer {
             client_id: self.client_id.clone(),
             peer_id: peer_id.to_string(),
         };
-        
-        let data = serde_json::to_vec(&msg)?;
-        socket.send_to(&data, self.server_addr).await?;
-        
+
+        let data = serde_json::to_vec(&msg)
+            .map_err(|e| NatError::Platform(format!("Failed to serialize message: {}", e)))?;
+
+        socket.send_to(&data, self.server_addr).await
+            .map_err(|e| NatError::Network(e))?;
+
         // Получаем ответ
         let mut buffer = vec![0u8; 4096];
         let (size, _) = timeout(
             Duration::from_secs(10),
             socket.recv_from(&mut buffer)
-        ).await??;
-        
-        let response: CoordinatorMessage = serde_json::from_slice(&buffer[..size])?;
-        
+        ).await
+            .map_err(|_| NatError::Timeout(Duration::from_secs(10)))?
+            .map_err(|e| NatError::Network(e))?;
+
+        let response: CoordinatorMessage = serde_json::from_slice(&buffer[..size])
+            .map_err(|e| NatError::Platform(format!("Failed to deserialize response: {}", e)))?;
+
         match response {
             CoordinatorMessage::PeerInfo { addresses, nat_type, .. } => {
                 Ok((addresses, nat_type))
             }
-            _ => Err(super::NatError::transient("Unexpected response from coordinator")),
+            _ => Err(NatError::transient("Unexpected response from coordinator")),
         }
     }
 
@@ -102,18 +112,21 @@ impl CoordinatorClient {
         &self,
         socket: &UdpSocket,
         peer_addr: SocketAddr,
-    ) -> Result<()> {
+    ) -> NatResult<()> {
         // Генерируем токен для синхронизации
-        let token: String = rand::random::<u64>().to_string();
-        
+        let token: String = format!("{}", rand::random::<u64>());
+
         let msg = CoordinatorMessage::StartPunch {
             peer_addr,
             token: token.clone(),
         };
-        
-        let data = serde_json::to_vec(&msg)?;
-        socket.send_to(&data, self.server_addr).await?;
-        
+
+        let data = serde_json::to_vec(&msg)
+            .map_err(|e| NatError::Platform(format!("Failed to serialize message: {}", e)))?;
+
+        socket.send_to(&data, self.server_addr).await
+            .map_err(|e| NatError::Network(e))?;
+
         // Ждем сигнал начать punching
         let mut buffer = vec![0u8; 256];
         match timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await {
@@ -124,11 +137,13 @@ impl CoordinatorClient {
                     return Ok(());
                 }
             }
+            Ok(Err(e)) => return Err(NatError::Network(e)),
+            Err(_) => return Err(NatError::Timeout(Duration::from_secs(5))),
             _ => {}
         }
-        Err(super::NatError::transient("Failed to coordinate hole punch"))
-    }
 
+        Err(NatError::transient("Failed to coordinate hole punch"))
+    }
 }
 
 /// Стратегия для обхода сложных NAT
@@ -144,7 +159,7 @@ impl AdvancedNatTraversal {
         client_id: String,
     ) -> Self {
         let coordinator = coordinator_addr.map(|addr| CoordinatorClient::new(addr, client_id));
-        
+
         Self {
             coordinator,
             relay_servers,
@@ -157,32 +172,35 @@ impl AdvancedNatTraversal {
         socket: &UdpSocket,
         peer_id: &str,
         peer_hint_addr: Option<SocketAddr>,
-    ) -> Result<SocketAddr> {
+    ) -> NatResult<SocketAddr> {
         // 1. Если есть прямой адрес, пробуем его
         if let Some(addr) = peer_hint_addr {
             if self.try_direct_connection(socket, addr).await.is_ok() {
                 return Ok(addr);
             }
         }
-        
+
         // 2. Запрашиваем информацию через координатор
         if let Some(coordinator) = &self.coordinator {
             match coordinator.request_peer_info(socket, peer_id).await {
                 Ok((addresses, nat_type)) => {
                     tracing::info!("Peer {} has NAT type: {}", peer_id, nat_type);
-                    
+
                     // Пробуем все известные адреса
                     for addr in &addresses {
                         if self.try_direct_connection(socket, *addr).await.is_ok() {
                             return Ok(*addr);
                         }
                     }
-                    
+
                     // Если прямое соединение не удалось, пробуем hole punching
                     if nat_type != "Symmetric" {
                         for addr in &addresses {
-                            if coordinator.coordinate_hole_punch(socket, *addr).await.is_ok() {
-                                return Ok(*addr);
+                            match coordinator.coordinate_hole_punch(socket, *addr).await {
+                                Ok(()) => return Ok(*addr),
+                                Err(e) => {
+                                    tracing::debug!("Hole punch to {} failed: {}", addr, e);
+                                }
                             }
                         }
                     }
@@ -192,14 +210,14 @@ impl AdvancedNatTraversal {
                 }
             }
         }
-        
+
         // 3. Последний вариант - relay сервер
         if !self.relay_servers.is_empty() {
             tracing::info!("Falling back to relay server");
             return Ok(self.relay_servers[0]); // Используем первый доступный relay
         }
 
-        Err(super::NatError::transient("Failed to establish connection with peer"))
+        Err(NatError::transient("Failed to establish connection with peer"))
     }
 
     /// Попытка прямого соединения
@@ -207,10 +225,11 @@ impl AdvancedNatTraversal {
         &self,
         socket: &UdpSocket,
         addr: SocketAddr,
-    ) -> Result<()> {
+    ) -> NatResult<()> {
         // Отправляем тестовый пакет
-        socket.send_to(b"SHARP_PING", addr).await?;
-        
+        socket.send_to(b"SHARP_PING", addr).await
+            .map_err(|e| NatError::Network(e))?;
+
         // Ждем ответ
         let mut buffer = vec![0u8; 256];
         match timeout(Duration::from_secs(2), socket.recv_from(&mut buffer)).await {
@@ -221,8 +240,11 @@ impl AdvancedNatTraversal {
                     return Ok(());
                 }
             }
+            Ok(Err(e)) => return Err(NatError::Network(e)),
+            Err(_) => return Err(NatError::Timeout(Duration::from_secs(2))),
             _ => {}
         }
-        Err(super::NatError::transient(format!("Direct connection to {} failed", addr)))
+
+        Err(NatError::transient(format!("Direct connection to {} failed", addr)))
     }
 }

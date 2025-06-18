@@ -4,10 +4,11 @@
 //! This module provides comprehensive NAT traversal functionality following
 //! the latest RFC standards and best practices.
 
+pub mod error;
+pub mod stun;
 pub mod upnp;
 pub mod hole_punch;
 pub mod coordinator;
-pub mod error;
 pub mod metrics;
 pub mod port_forwarding;
 
@@ -17,7 +18,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 
-
+use self::stun::{StunService, StunConfig, NatBehavior};
 use self::port_forwarding::{PortForwardingService, PortMappingConfig, Protocol};
 use self::hole_punch::HolePuncher;
 use self::coordinator::AdvancedNatTraversal;
@@ -159,7 +160,7 @@ pub struct NetworkInfo {
     pub connectivity_status: ConnectivityStatus,
 
     /// NAT behavior details
-    pub nat_behavior: Option<stun::NatBehavior>,
+    pub nat_behavior: Option<NatBehavior>,
 }
 
 /// NAT type classification
@@ -561,7 +562,7 @@ impl NatManager {
     }
 
     /// Setup TURN relay
-    async fn setup_turn_relay(&self, peer_addr: SocketAddr) -> NatResult<Option<SocketAddr>> {
+    async fn setup_turn_relay(&self, _peer_addr: SocketAddr) -> NatResult<Option<SocketAddr>> {
         // This would implement TURN allocation
         // For now, return None
         Ok(None)
@@ -592,17 +593,15 @@ impl Drop for NatManager {
     fn drop(&mut self) {
         // Best effort cleanup
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let port_forwarding = self.port_forwarding.clone();
-
-            handle.spawn(async move {
-                if let Some(ref service) = *port_forwarding.read() {
+            let service_opt = self.port_forwarding.write().take();
+            if let Some(service) = service_opt {
+                handle.spawn(async move {
                     let mappings = service.get_mappings().await;
                     for mapping in mappings {
                         let _ = service.delete_mapping(mapping.id).await;
                     }
-                }
-            });
-        }
+                });
+            }
     }
 }
 

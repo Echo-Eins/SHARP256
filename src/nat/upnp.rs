@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
+use igd::aio::{search_gateway, Gateway};
 use igd::{PortMappingProtocol, SearchOptions};
 use parking_lot::RwLock;
 use std::sync::Arc;
-use igd::aio::{search_gateway, Gateway};
 use std::time::Instant;
 use rand::Rng;
 
@@ -54,14 +54,10 @@ impl UpnpClient {
                 timeout: Some(*timeout_duration),
                 // Bind to specific interface if local IP is IPv4
                 bind_addr: match local_ip {
-                    IpAddr::V4(ipv4) => Some(std::net::SocketAddr::new(ipv4.into(), 0)),
+                    IpAddr::V4(ipv4) => Some(std::net::SocketAddr::new(IpAddr::V4(ipv4), 0)),
                     _ => None,
                 },
-                // Try both broadcast and multicast
-                broadcast_address: match local_ip {
-                    IpAddr::V4(_) => Some("255.255.255.255:1900".parse().unwrap()),
-                    _ => None,
-                },
+                ..Default::default()
             };
 
             match search_gateway(search_options).await {
@@ -269,35 +265,43 @@ impl UpnpClient {
                     break;
                 }
 
-                // Renew the mapping
-                let local_addr = match mappings.read()
-                    .iter()
-                    .find(|m| m.external_port == mapping.external_port)
-                    .map(|m| std::net::SocketAddrV4::new(
-                        match gateway.get_local_ip() {
-                            Ok(IpAddr::V4(ip)) => ip,
-                            _ => Ipv4Addr::new(192, 168, 1, 100), // Fallback
-                        },
-                        m.internal_port
-                    )) {
-                    Some(addr) => addr,
-                    None => break,
-                };
-
-                match gateway.add_port(
-                    mapping.protocol,
-                    mapping.external_port,
-                    local_addr,
-                    mapping.lease_duration,
-                    &mapping.description,
-                ).await {
-                    Ok(()) => {
-                        tracing::debug!("Renewed UPnP mapping for port {}", mapping.external_port);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to renew UPnP mapping: {}", e);
+                // Get local IP for renewal
+                let local_ip = match Self::get_local_ip().await {
+                    Ok(IpAddr::V4(ip)) => ip,
+                    _ => {
+                        tracing::warn!("Failed to get local IP for renewal");
                         break;
                     }
+                };
+
+                // Find local port from stored mapping
+                let local_port = {
+                    let mappings_guard = mappings.read();
+                    mappings_guard.iter()
+                        .find(|m| m.external_port == mapping.external_port)
+                        .map(|m| m.internal_port)
+                };
+
+                if let Some(port) = local_port {
+                    let local_addr = std::net::SocketAddrV4::new(local_ip, port);
+
+                    match gateway.add_port(
+                        mapping.protocol,
+                        mapping.external_port,
+                        local_addr,
+                        mapping.lease_duration,
+                        &mapping.description,
+                    ).await {
+                        Ok(()) => {
+                            tracing::debug!("Renewed UPnP mapping for port {}", mapping.external_port);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to renew UPnP mapping: {}", e);
+                            break;
+                        }
+                    }
+                } else {
+                    break;
                 }
             }
         });

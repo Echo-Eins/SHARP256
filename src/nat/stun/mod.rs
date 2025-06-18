@@ -4,16 +4,16 @@
 //! Fully compliant with RFC 8489 and RFC 5780 for NAT traversal
 //! and behavior discovery.
 
-mod protocol;
-mod client;
-mod auth;
-mod discovery;
+pub mod protocol;
+pub mod client;
+pub mod auth;
+pub mod discovery;
 
 pub use protocol::{
     Message, MessageType, MessageClass, TransactionId,
     Attribute, AttributeType, AttributeValue,
     MAGIC_COOKIE, HEADER_SIZE, MAX_MESSAGE_SIZE,
-    PasswordAlgorithm, PasswordAlgorithm, PasswordAlgorithmParams,
+    PasswordAlgorithm
 };
 
 pub use client::{
@@ -22,7 +22,7 @@ pub use client::{
 
 pub use auth::{
     Credentials, CredentialType, SecurityFeatures, NonceCookie,
-    compute_message_integrity_sha256, verify_message_integrity_sha256,
+    compute_message_integrity_sha256, verify_message_integrity_sha256, PasswordAlgorithmParams,
 };
 
 pub use discovery::{
@@ -32,7 +32,8 @@ pub use discovery::{
 
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
-use crate::nat::{NatType, error::NatResult};
+use crate::nat::error::NatResult;
+use crate::nat::NatType;
 
 /// High-level STUN interface for NAT traversal
 pub struct StunService {

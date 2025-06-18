@@ -132,10 +132,15 @@ pub fn system_info() -> String {
 
             for iface in interfaces {
                 if !iface.is_loopback() {
+                    let ip_version = match iface.ip() {
+                        std::net::IpAddr::V4(_) => "IPv4",
+                        std::net::IpAddr::V6(_) => "IPv6",
+                    };
+
                     info.push_str(&format!(
                         "\n  {} ({}): {}",
                         iface.name,
-                        if iface.addr.is_ipv4() { "IPv4" } else { "IPv6" },
+                        ip_version,
                         iface.ip()
                     ));
                     displayed = true;

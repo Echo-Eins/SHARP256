@@ -281,7 +281,8 @@ impl Sender {
                     .prepare_connection(&self.socket, self.peer_addr, true)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(addr) => {
+                        *self.effective_peer_addr.write() = addr;
                         tracing::info!("Waiting for hole punch confirmation...");
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
@@ -833,15 +834,13 @@ impl Drop for Sender {
         {
             // Очищаем NAT маппинги
             if let Some(nat_manager) = &self.nat_manager {
-                let client = nat_manager.write().take_upnp_client();
-                if let Some(mut c) = client {
-                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        handle.spawn(async move {
-                            if let Err(e) = c.cleanup_all().await {
-                                tracing::warn!("Failed to cleanup NAT mappings: {}", e);
-                            }
-                        });
-                    }
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let manager = nat_manager.clone();
+                    handle.spawn(async move {
+                        if let Err(e) = manager.write().cleanup().await {
+                            tracing::warn!("Failed to cleanup NAT mappings: {}", e);
+                        }
+                    });
                 }
             }
         }

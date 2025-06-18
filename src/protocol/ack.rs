@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::protocol::constants::PROTOCOL_VERSION;
 use std::net::SocketAddr;
-use std::net::IpAddr;
+
 /// Первичный ACK от отправителя к получателю
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitialAck {

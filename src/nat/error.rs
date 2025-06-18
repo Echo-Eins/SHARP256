@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::io;
 use thiserror::Error;
+use serde_json;
 
 /// Result type for NAT operations
 pub type NatResult<T> = Result<T, NatError>;
@@ -67,6 +68,17 @@ pub enum NatError {
     AllMethodsFailed,
 }
 
+impl From<tokio::time::error::Elapsed> for NatError {
+    fn from(_: tokio::time::error::Elapsed) -> Self {
+        NatError::Timeout(Duration::from_secs(0))
+    }
+}
+
+impl From<serde_json::Error> for NatError {
+    fn from(err: serde_json::Error) -> Self {
+        NatError::Platform(err.to_string())
+    }
+}
 
 /// STUN-specific error types
 #[derive(Error, Debug)]
@@ -168,18 +180,6 @@ pub enum TurnError {
     /// Lifetime expired
     #[error("Allocation lifetime expired")]
     LifetimeExpired,
-}
-
-impl From<StunError> for NatError {
-    fn from(err: StunError) -> Self {
-        NatError::Stun(err)
-    }
-}
-
-impl From<TurnError> for NatError {
-    fn from(err: TurnError) -> Self {
-        NatError::Turn(err)
-    }
 }
 
 impl NatError {
