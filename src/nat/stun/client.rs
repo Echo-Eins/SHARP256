@@ -109,6 +109,11 @@ impl StunClient {
         }
     }
 
+    /// Get a reference to the client configuration
+    pub fn config(&self) -> &StunConfig {
+        &self.config
+    }
+
     /// Get mapped address from any available STUN server
     pub async fn get_mapped_address(
         &self,

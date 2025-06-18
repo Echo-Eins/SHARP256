@@ -428,7 +428,7 @@ impl<'a> NatBehaviorDiscovery<'a> {
     /// Find a server that supports RFC 5780
     async fn find_rfc5780_server(&self, socket: &UdpSocket) -> NatResult<super::StunServerInfo> {
         // Try servers from configuration
-        for server in &self.client.config.servers {
+        for server in &self.client.config().servers {
             match self.client.query_server(socket, server).await {
                 Ok(info) if info.other_address.is_some() => {
                     tracing::info!("Found RFC 5780 compliant server: {}", server);
@@ -475,7 +475,7 @@ impl<'a> NatBehaviorDiscovery<'a> {
     }
 
     /// Test mapping lifetime
-    async fn test_mapping_lifetime(&self, socket: &UdpSocket) -> NatResult<u64> {
+    async fn test_mapping_lifetime(&mut self, socket: &UdpSocket) -> NatResult<u64> {
         let initial_result = self.perform_test(socket, "lifetime_initial", None).await?;
         let initial_mapping = initial_result.mapped_addr;
 

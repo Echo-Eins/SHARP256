@@ -54,8 +54,8 @@ impl UpnpClient {
                 timeout: Some(*timeout_duration),
                 // Bind to specific interface if local IP is IPv4
                 bind_addr: match local_ip {
-                    IpAddr::V4(ipv4) => Some(std::net::SocketAddr::new(IpAddr::V4(ipv4), 0)),
-                    _ => None,
+                    IpAddr::V4(ipv4) => std::net::SocketAddr::new(IpAddr::V4(ipv4), 0),
+                    _ => std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
                 },
                 ..Default::default()
             };
@@ -163,7 +163,7 @@ impl UpnpClient {
 
         // Port selection strategy
         let mut external_port = local_port;
-        let mut attempts = 0;
+        let mut attempts: u32 = 0;
         const MAX_ATTEMPTS: u32 = 20;
 
         loop {
@@ -215,18 +215,19 @@ impl UpnpClient {
                     if error_str.contains("ConflictInMappingEntry") ||
                         error_str.contains("718") { // Common error code for conflict
                         // Port is in use, try different strategies
-                        if attempts < 5 {
+                        let next_port = if attempts < 5 {
                             // Try sequential ports
-                            external_port = local_port + attempts;
+                            local_port.saturating_add(attempts as u16)
                         } else if attempts < 10 {
                             // Try common port ranges
-                            external_port = 40000 + (attempts - 5) * 1000;
+                            40000 + ((attempts - 5) * 1000) as u16
                         } else {
                             // Random high port
-                            external_port = 49152 + rand::thread_rng().gen_range(0..16383);
-                        }
+                            49152 + rand::thread_rng().gen_range(0..16383)
+                        };
 
-                        tracing::debug!("Port {} unavailable, trying {}", external_port - 1, external_port);
+                        tracing::debug!("Port {} unavailable, trying {}", external_port, next_port);
+                        external_port = next_port;
                     } else if error_str.contains("NotAuthorized") ||
                         error_str.contains("606") {
                         return Err(anyhow::anyhow!("Not authorized to create port mappings"));
@@ -235,7 +236,7 @@ impl UpnpClient {
                         external_port = 0; // Let router choose
                     } else {
                         // Unknown error, try random port
-                        external_port = 30000 + rand::thread_rng().gen_range(0..30000);
+                        external_port = 30000u16 + rand::thread_rng().gen_range(0..30000u16);
                     }
 
                     // Small delay to avoid hammering the router

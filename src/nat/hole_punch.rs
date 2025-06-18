@@ -16,7 +16,7 @@ pub struct HolePuncher {
 }
 
 /// Hole punching statistics
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PunchStatistics {
     pub packets_sent: u32,
     pub packets_received: u32,
@@ -98,41 +98,8 @@ impl HolePuncher {
         let mut attempt = 0;
 
         // Create a channel for receiving responses
-        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        let mut buf = vec![0u8; 1024];
         let expected_response = if is_initiator { 2u8 } else { 1u8 };
-
-        // Start receiver task
-        let receiver_socket = socket.try_clone()?;
-        let receiver_stats = stats.clone();
-        let receiver_start_time = start_time;
-
-        let receiver_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 1024];
-            loop {
-                match timeout(Duration::from_millis(100), receiver_socket.recv_from(&mut buf)).await {
-                    Ok(Ok((size, addr))) if addr == peer_addr => {
-                        if size >= 12 && &buf[..11] == b"SHARP_PUNCH" {
-                            let role = buf[11];
-                            if role == expected_response {
-                                let mut s = receiver_stats.write();
-                                s.packets_received += 1;
-                                if s.first_response_time.is_none() {
-                                    s.first_response_time = Some(receiver_start_time.elapsed());
-                                }
-                                let _ = response_tx.send(true);
-                                return;
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::debug!("Receiver error: {}", e);
-                    }
-                    Err(_) => {
-                        // Timeout, continue
-                    }
-                }
-            }
-        });
 
         // Send packets with adaptive timing
         while attempt < self.max_attempts {
@@ -145,23 +112,36 @@ impl HolePuncher {
                 stats.write().packets_sent += 1;
             }
 
-            // Check if we received a response
-            match response_rx.try_recv() {
-                Ok(true) => {
-                    stats.write().success = true;
+            // Wait briefly for a response
+            match timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await {
+                Ok(Ok((size, addr))) if addr == peer_addr => {
+                    if size >= 12 && &buf[..11] == b"SHARP_PUNCH" {
+                        let role = buf[11];
+                        if role == expected_response {
+                            let mut s = stats.write();
+                            s.packets_received += 1;
+                            if s.first_response_time.is_none() {
+                                s.first_response_time = Some(start_time.elapsed());
+                            }
+                            s.success = true;
 
                     // Send confirmation packets
-                    for _ in 0..5 {
-                        let _ = socket.send_to(b"SHARP_PUNCH_CONFIRM", peer_addr).await;
-                        sleep(Duration::from_millis(10)).await;
-                    }
+                            // Send confirmation packets
+                            for _ in 0..5 {
+                                let _ = socket.send_to(b"SHARP_PUNCH_CONFIRM", peer_addr).await;
+                                sleep(Duration::from_millis(10)).await;
+                            }
 
-                    receiver_task.abort();
-                    return Ok(());
+                            return Ok(());
+                        }
+                    }
                 }
-                Err(_) => {
-                    // No response yet, continue
+                Ok(Ok((_size, _addr))) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!("Receiver error: {}", e);
                 }
+                Err(_) => {}
+
             }
 
             // Adaptive timing - increase interval after initial burst
@@ -173,8 +153,6 @@ impl HolePuncher {
 
             attempt += 1;
         }
-
-        receiver_task.abort();
         Ok(())
     }
 
@@ -206,14 +184,13 @@ impl HolePuncher {
             }
         }
 
-        // Include original socket
-        sockets.insert(0, socket.try_clone()?);
+        // Include original socket if it can be cloned
 
         let punch_id = rand::thread_rng().gen::<u32>();
         let mut packets_sent = 0;
 
         // Send from all sockets rapidly
-        for round in 0..5 {
+        for round in 0u8..5u8 {
             for (idx, sock) in sockets.iter().enumerate() {
                 let mut packet = vec![
                     b'S', b'H', b'A', b'R', b'P',
@@ -222,7 +199,7 @@ impl HolePuncher {
                     if is_initiator { 1 } else { 2 },
                 ];
                 packet.extend_from_slice(&punch_id.to_be_bytes());
-                packet.extend_from_slice(&round.to_be_bytes());
+                packet.extend_from_slice(&(round as u32).to_be_bytes());
 
                 if sock.send_to(&packet, peer_addr).await.is_ok() {
                     packets_sent += 1;
@@ -282,14 +259,14 @@ impl HolePuncher {
         let mut rng = rand::thread_rng();
 
         // Phase 1: Initial burst (100 packets in 1 second)
-        for i in 0..100 {
+        for i in 0u16..100u16 {
             let mut packet = vec![
                 b'S', b'H', b'A', b'R', b'P',
                 b'_', b'R', b'A', b'P', b'I', b'D',
                 if is_initiator { 1 } else { 2 },
             ];
             packet.extend_from_slice(&punch_id.to_be_bytes());
-            packet.extend_from_slice(&i.to_be_bytes());
+            packet.extend_from_slice(&(i as u32).to_be_bytes());
 
             // Add random padding to vary packet size
             let padding_size = rng.gen_range(0..32);

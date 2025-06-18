@@ -554,11 +554,12 @@ impl NatManager {
         let coordination_server = self.config.coordinator_server.as_ref()
             .and_then(|s| s.parse().ok());
 
-        if let Some(coord) = coordination_server {
+        let result = if let Some(coord) = coordination_server {
             puncher.simultaneous_punch(socket, peer_addr, Some(coord)).await
         } else {
             puncher.punch_hole(socket, peer_addr, is_initiator).await
-        }
+        };
+        result.map_err(|e| NatError::transient(format!("Hole punching failed: {}", e)))
     }
 
     /// Setup TURN relay
@@ -602,13 +603,13 @@ impl Drop for NatManager {
                     }
                 });
             }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[tokio::test]
     async fn test_nat_manager() {
         let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();

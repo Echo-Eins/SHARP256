@@ -158,7 +158,6 @@ pub enum AttributeType {
     // Comprehension-optional (0x8000-0xFFFF)
     Software = 0x8022,
     AlternateServer = 0x8023,
-    Cache = 0x8027,             // Deprecated
     Fingerprint = 0x8028,
     IceControlled = 0x8029,
     IceControlling = 0x802A,
