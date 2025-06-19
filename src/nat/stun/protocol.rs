@@ -70,7 +70,7 @@ impl MessageType {
     /// Get message method
     pub fn method(&self) -> u16 {
         let value = *self as u16;
-        ((value & 0x000F) | ((value & 0x00E0) >> 1) | ((value & 0x3E00) >> 2))
+        (value & 0x000F) | ((value & 0x00E0) >> 1) | ((value & 0x3E00) >> 2)
     }
 
     /// Create from method and class

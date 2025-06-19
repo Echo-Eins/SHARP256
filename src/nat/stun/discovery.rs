@@ -1,10 +1,20 @@
 use std::net::SocketAddr;
 use std::collections::HashMap;
 use tokio::net::UdpSocket;
-use crate::nat::{NatType, error::NatResult};
+use crate::nat::NatType;
 use crate::nat::metrics::record_nat_type_detection;
 use super::client::StunClient;
 use super::protocol::*;
+
+use crate::nat::error::{NatError, NatResult, StunError};
+use crate::nat::metrics::{record_ip_version_usage, StunMetrics};
+use parking_lot::RwLock;
+use rand::Rng;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::lookup_host;
+use tokio::time::{sleep, timeout};
 
 /// NAT mapping behavior (RFC 5780)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,9 +404,9 @@ impl<'a> NatBehaviorDiscovery<'a> {
                 AttributeValue::MappedAddress(addr) => Some(*addr),
                 _ => None,
             })
-            .ok_or_else(|| crate::nat::error::StunError::MissingAttribute(
-                "MAPPED-ADDRESS".to_string()
-            ))?;
+            .ok_or_else(|| {
+                crate::nat::error::StunError::MissingAttribute("MAPPED-ADDRESS".to_string())
+            })?;
 
         // Extract other address (for change requests)
         let other_addr = response.attributes.iter()
@@ -444,8 +454,41 @@ impl<'a> NatBehaviorDiscovery<'a> {
         }
 
         Err(crate::nat::error::NatError::Configuration(
-            "No RFC 5780 compliant STUN servers found".to_string()
+            "No RFC 5780 compliant STUN servers found".to_string(),
         ))
+    }
+    /// Fallback behavior detection using only RFC 8489 features
+    pub async fn detect_basic_behavior(&mut self, socket: &UdpSocket) -> NatResult<NatBehavior> {
+        let local_addr = socket.local_addr()?;
+        tracing::info!("Starting basic NAT behavior detection from {}", local_addr);
+
+        // Determine public addresses by querying configured servers
+        let mut public_addresses = Vec::new();
+        for server in &self.client.config().servers {
+            if let Ok(info) = self.client.query_server(socket, server).await {
+                if let Some(addr) = info.response_origin {
+                    if !public_addresses.contains(&addr) {
+                        public_addresses.push(addr);
+                    }
+                }
+            }
+        }
+
+        if public_addresses.is_empty() {
+            return Err(NatError::from(StunError::AllServersFailed));
+        }
+
+        // Basic mapping behavior detection
+        let mapping = self.test_mapping_basic(socket).await?;
+
+        Ok(NatBehavior {
+            mapping,
+            filtering: FilteringBehavior::AddressPortDependent,
+            hairpinning: false,
+            mapping_lifetime: None,
+            public_addresses,
+            confidence: 0.3,
+        })
     }
 
     /// Test hairpinning support

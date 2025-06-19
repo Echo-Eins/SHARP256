@@ -14,6 +14,8 @@ use super::protocol::*;
 use super::auth::Credentials;
 use super::discovery::{NatBehavior, NatBehaviorDiscovery};
 
+
+use super::protocol::*;
 /// STUN client configuration
 #[derive(Debug, Clone)]
 pub struct StunConfig {
@@ -115,20 +117,13 @@ impl StunClient {
     }
 
     /// Get mapped address from any available STUN server
-    pub async fn get_mapped_address(
-        &self,
-        socket: &UdpSocket,
-    ) -> NatResult<SocketAddr> {
+    pub async fn get_mapped_address(&self, socket: &UdpSocket) -> NatResult<SocketAddr> {
         let local_addr = socket.local_addr()?;
         let ip_version = if local_addr.is_ipv4() { "ipv4" } else { "ipv6" };
         record_ip_version_usage(ip_version, "stun_request");
 
         // Try primary servers first with parallel requests
-        let primary_servers: Vec<_> = self.config.servers
-            .iter()
-            .take(3)
-            .cloned()
-            .collect();
+        let primary_servers: Vec<_> = self.config.servers.iter().take(3).cloned().collect();
 
         let results = self.query_multiple_servers(socket, &primary_servers).await;
 
@@ -207,12 +202,9 @@ impl StunClient {
         };
 
         // Send request with retries
-        let response = self.send_with_retries(
-            socket,
-            server_addr,
-            request,
-            integrity_key.as_deref(),
-        ).await?;
+        let response = self
+            .send_with_retries(socket, server_addr, request, integrity_key.as_deref())
+            .await?;
 
         let response_time = start_time.elapsed().as_millis() as u64;
         metrics.record_response(true);
@@ -227,18 +219,22 @@ impl StunClient {
     }
 
     /// Detect NAT behavior using RFC 5780 tests
-    pub async fn detect_nat_behavior(
-        &self,
-        socket: &UdpSocket,
-    ) -> NatResult<NatBehavior> {
+    pub async fn detect_nat_behavior(&self, socket: &UdpSocket) -> NatResult<NatBehavior> {
         if !self.config.enable_behavior_discovery {
             return Err(NatError::Configuration(
-                "NAT behavior discovery is disabled".to_string()
+                "NAT behavior discovery is disabled".to_string(),
             ));
         }
 
         let mut discovery = NatBehaviorDiscovery::new(self);
-        discovery.detect_behavior(socket).await
+        match discovery.detect_behavior(socket).await {
+            Ok(behavior) => Ok(behavior),
+            Err(NatError::Configuration(msg)) if msg.contains("No RFC 5780") => {
+                tracing::warn!("RFC 5780 unsupported, falling back to RFC 8489 detection");
+                discovery.detect_basic_behavior(socket).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Query multiple servers in parallel
@@ -273,7 +269,7 @@ impl StunClient {
 
     /// Find consensus address from multiple results
     fn find_consensus_address(
-        results: &[(String, Result<StunServerInfo, NatError>)]
+        results: &[(String, Result<StunServerInfo, NatError>)],
     ) -> Option<SocketAddr> {
         let mut addr_counts = std::collections::HashMap::new();
 
@@ -373,11 +369,12 @@ impl StunClient {
 
                     // Verify MESSAGE-INTEGRITY-SHA256 if we sent credentials
                     if integrity_key.is_some() {
-                        if let Some(_) = response.get_attribute(AttributeType::MessageIntegritySha256) {
-                            if !response.verify_integrity_sha256(
-                                integrity_key.unwrap(),
-                                &buffer[..size]
-                            )? {
+                        if let Some(_) =
+                            response.get_attribute(AttributeType::MessageIntegritySha256)
+                        {
+                            if !response
+                                .verify_integrity_sha256(integrity_key.unwrap(), &buffer[..size])?
+                            {
                                 return Err(StunError::IntegrityCheckFailed.into());
                             }
                         }
