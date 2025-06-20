@@ -6,7 +6,7 @@ use sha2::Sha256;
 use sha1::Sha1;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use rand::{Rng, RngCore};
-use crate::nat::error::{StunError, NatResult};
+use crate::nat::error::{StunError, NatError, NatResult};
 
 /// STUN magic cookie as defined in RFC 8489
 pub const MAGIC_COOKIE: u32 = 0x2112A442;
@@ -378,7 +378,9 @@ impl Message {
             match Attribute::decode(attr_type_raw, attr_len, &mut buf, &transaction_id) {
                 Ok(attr) => attributes.push(attr),
                 Err(e) => {
-                    // Gracefully skip unknown or malformed attribute
+                    if let NatError::Stun(StunError::UnknownComprehensionRequired(_)) = e {
+                        return Err(e);
+                    }
                     tracing::debug!(
                         "Skipping undecodable attribute 0x{:04X}: {}",
                         attr_type_raw,
@@ -712,13 +714,18 @@ impl Attribute {
             0x8028 => AttributeType::Fingerprint,
             0x8002 => AttributeType::PasswordAlgorithms,
             0x8003 => AttributeType::AlternateDomain,
-            _ => return Ok(Self {
-                attr_type: AttributeType::Padding, // Use as placeholder for unknown
-                value: AttributeValue::Raw(match value {
-                    AttributeValue::Raw(data) => data,
-                    _ => Vec::new(),
-                }),
-            }),
+            _ => {
+                if attr_type_raw < 0x8000 {
+                    return Err(StunError::UnknownComprehensionRequired(vec![attr_type_raw]).into());
+                }
+                return Ok(Self {
+                    attr_type: AttributeType::Padding,
+                    value: AttributeValue::Raw(match value {
+                        AttributeValue::Raw(data) => data,
+                        _ => Vec::new(),
+                    }),
+                });
+            }
         };
 
         Ok(Self { attr_type, value })
@@ -950,5 +957,31 @@ mod tests {
 
         // At least half the bytes should be different
         assert!(diff_count >= 6);
+    }
+
+
+    #[test]
+    fn test_unknown_comprehension_required_attribute_error() {
+        let tid = TransactionId::new();
+        let mut buf = BytesMut::new();
+        buf.put_u16(MessageType::BindingRequest as u16);
+        buf.put_u16(0);
+        buf.put_u32(MAGIC_COOKIE);
+        buf.put_slice(tid.as_bytes());
+
+        let unknown: u16 = 0x1234;
+        buf.put_u16(unknown);
+        buf.put_u16(0);
+
+        let len = buf.len() - HEADER_SIZE;
+        buf[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+
+        let res = Message::decode(buf);
+        match res {
+            Err(NatError::Stun(StunError::UnknownComprehensionRequired(attrs))) => {
+                assert_eq!(attrs, vec![unknown]);
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 }
