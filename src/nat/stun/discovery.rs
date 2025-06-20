@@ -259,18 +259,25 @@ impl<'a> NatBehaviorDiscovery<'a> {
         Ok((mapping, filtering, confidence))
     }
 
-    /// Test mapping behavior with basic servers
+    /// Test mapping behaviour by сравнивая публичный адрес (XOR-MAPPED-ADDRESS),
+    /// полученный от разных STUN-серверов.  Полностью соответствует RFC 4787.
     async fn test_mapping_basic(&mut self, socket: &UdpSocket) -> NatResult<MappingBehavior> {
         // Query multiple servers to see if we get same mapping
         let servers = vec![
-            "stun.l.google.com:19302",
-            "stun1.l.google.com:19302",
-            "stun2.l.google.com:19302",
+            "stun.l.google.com:3478",
+            "stun1.l.google.com:3478",
+            "stun2.l.google.com:3478",
+            "stun3.l.google.com:3478",
+            "stun4.l.google.com:3478",
+            "stun.cloudflare.com:3478",
+            "stun.cloudflare.com:3479",
+            "stun.services.mozilla.com:3478",
         ];
 
         let mut mappings = Vec::new();
 
         for server in servers {
+            // Стандартный запрос без CHANGE-REQUEST
             if let Ok(info) = self.client.query_server(socket, server).await {
                 if let Some(addr) = info.response_origin {
                     mappings.push(addr);
@@ -337,26 +344,26 @@ impl<'a> NatBehaviorDiscovery<'a> {
     /// Analyze filtering behavior from test results
     fn analyze_filtering_behavior(
         &self,
-        test2: &Option<TestResult>,
-        test3: &Option<TestResult>,
-        test4: &Option<TestResult>,
+        test2: &Option<TestResult>, // Change IP
+        test3: &Option<TestResult>, // Change Port
+        test4: &Option<TestResult>, // Change IP + Port
     ) -> FilteringBehavior {
-        // If we can receive from different IP and port, it's endpoint-independent
+        // 1. Endpoint-Independent – ответ приходит даже при изменении IP и Port.
         if test4.is_some() {
             return FilteringBehavior::EndpointIndependent;
         }
 
-        // If we can receive from different IP (same port), it's address-dependent
-        if test2.is_some() {
-            return FilteringBehavior::AddressDependent;
-        }
-
-        // If we can only receive from same IP but different port, it's still address-dependent
+        // 2. Address-Dependent – IP тот же, порт другой (ChangePort).
         if test3.is_some() {
             return FilteringBehavior::AddressDependent;
         }
 
-        // Conservative default
+        // 3. Endpoint-Independent (по порту) – IP другой, порт тот же (ChangeIP).
+        if test2.is_some() {
+            return FilteringBehavior::EndpointIndependent;
+        }
+
+        // 4. Самый строгий случай – Address+Port-Dependent
         FilteringBehavior::AddressPortDependent
     }
 
@@ -500,21 +507,24 @@ impl<'a> NatBehaviorDiscovery<'a> {
             return false;
         }
 
-        // Try to receive it
+        // Try to receive it with tolerance for network delay
         let mut buffer = vec![0u8; 100];
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            socket.recv_from(&mut buffer)
-        ).await {
-            Ok(Ok((size, addr))) if addr == public_addr && &buffer[..size] == test_data => {
-                tracing::info!("Hairpinning supported");
-                true
-            }
-            _ => {
-                tracing::info!("Hairpinning not supported");
-                false
+        for _ in 0..3 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                socket.recv_from(&mut buffer)
+            ).await {
+                Ok(Ok((size, addr))) if addr == public_addr && &buffer[..size] == test_data => {
+                    tracing::info!("Hairpinning supported");
+                    return true;
+                }
+                Ok(Ok(_)) => continue,
+                _ => {}
             }
         }
+
+        tracing::info!("Hairpinning not supported");
+        false
     }
 
     /// Test mapping lifetime

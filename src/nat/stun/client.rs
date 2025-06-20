@@ -355,6 +355,11 @@ impl StunClient {
                     // Parse response
                     let response = Message::decode(BytesMut::from(&buffer[..size]))?;
 
+                    // Ensure method matches
+                    if response.message_type.method() != request.message_type.method() {
+                        return Err(StunError::InvalidMessageType.into());
+                    }
+
                     // Verify transaction ID
                     if response.transaction_id != request.transaction_id {
                         return Err(StunError::TransactionIdMismatch.into());
@@ -399,6 +404,18 @@ impl StunClient {
                                     438 => {
                                         // Stale nonce
                                         return Err(StunError::NonceExpired.into());
+                                    }
+
+                                    300 => {
+                                        if let Some(alt_attr) = response.get_attribute(AttributeType::AlternateServer) {
+                                            if let AttributeValue::AlternateServer(addr) = alt_attr.value {
+                                                tracing::info!("STUN redirect to alternate server {}", addr);
+                                                return Box::pin (self
+                                                    .send_with_retries(socket, addr, request.clone(), integrity_key))
+                                                    .await;
+                                            }
+                                        }
+                                        return Err(StunError::ErrorResponse { code: *code, reason: reason.clone() }.into());
                                     }
                                     _ => {}
                                 }

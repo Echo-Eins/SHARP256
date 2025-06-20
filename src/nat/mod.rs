@@ -408,28 +408,14 @@ impl NatManager {
                 }
             }
 
-            // Check hole punching feasibility
-            if self.config.enable_hole_punching {
-                match nat_type {
-                    NatType::FullCone | NatType::RestrictedCone | NatType::PortRestricted => {
-                        available_protocols.push(NatProtocol::HolePunch);
-                        tracing::info!("UDP hole punching available (NAT type: {:?})", nat_type);
-                    }
-                    NatType::Symmetric => {
-                        if let Some(ref behavior) = nat_behavior {
-                            if behavior.p2p_score() > 0.3 {
-                                available_protocols.push(NatProtocol::HolePunch);
-                                tracing::info!("UDP hole punching may work (limited) - P2P score: {:.2}",
-                                    behavior.p2p_score());
-                            } else {
-                                tracing::info!("UDP hole punching unlikely - P2P score too low: {:.2}",
-                                    behavior.p2p_score());
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::info!("UDP hole punching not feasible for NAT type: {:?}", nat_type);
-                    }
+            // Enable hole punching if configured and not a direct connection
+            if self.config.enable_hole_punching && nat_type != NatType::None {
+                available_protocols.push(NatProtocol::HolePunch);
+                if let Some(ref behavior) = nat_behavior {
+                    tracing::info!("UDP hole punching considered - P2P score: {:.2}",
+                        behavior.p2p_score());
+                } else {
+                    tracing::info!("UDP hole punching enabled");
                 }
             }
         }

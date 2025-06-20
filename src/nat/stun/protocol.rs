@@ -361,7 +361,6 @@ impl Message {
 
         // Parse attributes
         let mut attributes = Vec::new();
-        let mut unknown_required = Vec::new();
 
         while buf.has_remaining() {
             if buf.remaining() < 4 {
@@ -378,13 +377,13 @@ impl Message {
             // Try to parse known attribute types
             match Attribute::decode(attr_type_raw, attr_len, &mut buf, &transaction_id) {
                 Ok(attr) => attributes.push(attr),
-                Err(_) if attr_type_raw < 0x8000 => {
-                    // Unknown comprehension-required attribute
-                    unknown_required.push(attr_type_raw);
-                    buf.advance(attr_len);
-                }
-                Err(_) => {
-                    // Unknown comprehension-optional attribute, skip
+                Err(e) => {
+                    // Gracefully skip unknown or malformed attribute
+                    tracing::debug!(
+                        "Skipping undecodable attribute 0x{:04X}: {}",
+                        attr_type_raw,
+                        e
+                    );
                     buf.advance(attr_len);
                 }
             }
@@ -394,11 +393,6 @@ impl Message {
             if buf.remaining() >= padding {
                 buf.advance(padding);
             }
-        }
-
-        // Check for unknown comprehension-required attributes
-        if !unknown_required.is_empty() {
-            return Err(StunError::UnknownComprehensionRequired(unknown_required).into());
         }
 
         Ok(Self {
