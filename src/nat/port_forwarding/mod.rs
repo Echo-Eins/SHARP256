@@ -3,7 +3,9 @@
 //!
 //! Implements:
 //! - UPnP-IGD v1/v2 (RFC 6970)
-//! - NAT-PMP (RFC 6886) - Full implementation
+//! - NAT-PMP (RFC 6886) - Full implementation.
+//!   The client tracks the gateway's `server epoch` on every request and
+//!   automatically recreates mappings if the epoch changes.
 //! - PCP (Port Control Protocol) (RFC 6887) - Full implementation
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -896,6 +898,14 @@ impl UPnPClient {
 }
 
 /// NAT-PMP client implementation (RFC 6886)
+///
+// /// The NAT gateway returns a `server epoch` value with every response.
+// /// We store this epoch after each external address or port mapping
+// /// request. When renewing an existing mapping we obtain a fresh epoch
+// /// via `get_external_address()` and compare it to the epoch saved for
+// /// the mapping. If the values differ the gateway has likely rebooted,
+// /// so the client reinitializes itself and recreates the mapping.
+
 struct NatPMPClient {
     /// Gateway address
     gateway: Arc<AsyncRwLock<Option<Ipv4Addr>>>,
@@ -1229,6 +1239,41 @@ impl NatPMPClient {
     /// Renew port mapping
     async fn renew_mapping(&self, mapping: &PortMapping) -> NatResult<()> {
         if let IpAddr::V4(gateway) = mapping.gateway {
+            // Check if the gateway has restarted by comparing epochs
+            if let Some(saved_epoch) = mapping.epoch {
+                let _ = self.get_external_address().await?;
+                let current_epoch = *self.server_epoch.read().await;
+
+                if current_epoch != saved_epoch {
+                    tracing::debug!(
+                        "NAT-PMP server epoch changed from {} to {}, reinitializing",
+                        saved_epoch,
+                        current_epoch
+                    );
+
+                    // Reinitialize and recreate the mapping
+                    self.initialize().await?;
+
+                    let protocols = match mapping.transport {
+                        Protocol::TCP => vec![1u8],
+                        Protocol::UDP => vec![2u8],
+                        Protocol::Both => vec![1u8, 2u8],
+                    };
+
+                    for opcode in protocols {
+                        self.map_port(
+                            gateway,
+                            opcode,
+                            mapping.internal_addr.port(),
+                            mapping.external_addr.port(),
+                            mapping.lifetime.as_secs() as u32,
+                        ).await?;
+                    }
+
+                    return Ok(());
+                }
+            }
+
             let protocols = match mapping.transport {
                 Protocol::TCP => vec![1u8],
                 Protocol::UDP => vec![2u8],
