@@ -1,10 +1,24 @@
-use anyhow::Result;
-use tokio::net::UdpSocket;
+use crate::protocol::constants::{MAX_PAYLOAD_SIZE_GSO, MAX_PAYLOAD_SIZE_MTU};
+use anyhow::{Context, Result};
 use std::net::SocketAddr;
-use std::time::Duration;
-use tokio::time::timeout;
 use rand::Rng;
 use crate::protocol::constants::*;
+
+use tokio::net::UdpSocket;
+use tokio::time::{timeout, Duration};
+use tokio::time::{sleep};
+
+#[cfg(unix)]
+use libc::{IPPROTO_IP, IPPROTO_IPV6, IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_PMTUDISC_DONT, IP_MTU, IPV6_MTU_DISCOVER, IPV6_PMTUDISC_DO, IPV6_PMTUDISC_DONT, IPV6_MTU};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+const EMSGSIZE: i32 = libc::EMSGSIZE;
+#[cfg(windows)]
+const EMSGSIZE: i32 = 10040; // WSAEMSGSIZE
+const FRAG_REQ_PREFIX: &[u8] = b"SHARP_FRAG_REQ";
+const FRAG_ACK_PREFIX: &[u8] = b"SHARP_FRAG_ACK";
+const FRAG_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Information about detected fragmentation limits
 #[derive(Debug, Clone)]
@@ -15,27 +29,94 @@ pub struct FragmentationInfo {
     pub tested_successfully: Vec<usize>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_df(socket: &UdpSocket, v6: bool, enable: bool) -> std::io::Result<()> {
+    let fd = socket.as_raw_fd();
+    unsafe {
+        let (level, optname, val) = if v6 {
+            let val = if enable { IPV6_PMTUDISC_DO } else { IPV6_PMTUDISC_DONT };
+            (IPPROTO_IPV6, IPV6_MTU_DISCOVER, val)
+        } else {
+            let val = if enable { IP_PMTUDISC_DO } else { IP_PMTUDISC_DONT };
+            (IPPROTO_IP, IP_MTU_DISCOVER, val)
+        };
+        let val: libc::c_int = val;
+        if libc::setsockopt(
+            fd,
+            level,
+            optname,
+            &val as *const _ as *const _,
+            std::mem::size_of::<libc::c_int>() as _,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_df(_socket: &UdpSocket, _v6: bool, _enable: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn get_pmtu(socket: &UdpSocket, v6: bool) -> Option<usize> {
+    let fd = socket.as_raw_fd();
+    unsafe {
+        let (level, opt) = if v6 {
+            (IPPROTO_IPV6, IPV6_MTU)
+        } else {
+            (IPPROTO_IP, IP_MTU)
+        };
+        let mut mtu: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            level,
+            opt,
+            &mut mtu as *mut _ as *mut _,
+            &mut len,
+        ) == -1
+        {
+            None
+        } else {
+            Some(mtu as usize)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn get_pmtu(_socket: &UdpSocket, _v6: bool) -> Option<usize> {
+    None
+}
+
 /// Test for UDP fragmentation between peers
 pub async fn check_fragmentation(socket: &UdpSocket, peer: SocketAddr) -> Result<usize> {
     tracing::info!("Checking fragmentation limits with {}", peer);
 
-    // Send a fragmentation test request
-    let test_id = rand::thread_rng().gen::<u32>();
-    let request = create_frag_test_request(test_id);
+    for attempt in 0..3 {
+        let test_id = rand::thread_rng().gen::<u32>();
+        let request = create_frag_test_request(test_id);
 
-    socket.send_to(&request, peer).await?;
+        socket
+            .send_to(&request, peer)
+            .await
+            .with_context(|| "failed to send fragmentation request")?;
 
     // Wait for response
-    let mut buffer = vec![0u8; 1024];
-    match timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await {
-        Ok(Ok((size, addr))) if addr == peer => {
-            if size >= 12 && &buffer[..8] == b"SHARP_FR" {
-                let max_size = u32::from_be_bytes(buffer[8..12].try_into()?) as usize;
+        let mut buffer = vec![0u8; 1024];
+        match timeout(Duration::from_secs(2), socket.recv_from(&mut buffer)).await {
+            Ok(Ok((size, addr))) if addr == peer && size >= 12 && &buffer[..8] == b"SHARP_FR" => {
+                let max_size = u32::from_be_bytes(buffer[8..12].try_into().unwrap()) as usize;
                 tracing::info!("Peer reports max payload size: {} bytes", max_size);
                 return Ok(max_size);
             }
+            _ => {
+                tracing::debug!("No response to fragmentation request attempt {}", attempt + 1);
+                sleep(Duration::from_millis(200)).await;
+            }
         }
-        _ => {}
     }
 
     // If no response, perform active probing
@@ -84,12 +165,20 @@ pub async fn detect_max_payload(socket: &UdpSocket, peer: SocketAddr) -> Result<
         max_working = binary_search_mtu(socket, peer, 576, 1500).await?;
     }
 
-    // Determine path MTU
-    let path_mtu = if max_working <= 1472 {
-        max_working + 28 // Add IP + UDP headers
-    } else {
-        1500 // Assume standard if using larger packets
-    };
+    // Determine path MTU using socket info or fallback calculation
+    let path_mtu = get_pmtu(socket, peer.is_ipv6()).unwrap_or_else(|| {
+        if peer.is_ipv6() {
+            if max_working <= (MTU_SIZE - IPV6_HEADER_SIZE - UDP_HEADER_SIZE) {
+                max_working + IPV6_HEADER_SIZE + UDP_HEADER_SIZE
+            } else {
+                MTU_SIZE
+            }
+        } else if max_working <= (MTU_SIZE - IPV4_HEADER_SIZE - UDP_HEADER_SIZE) {
+            max_working + IPV4_HEADER_SIZE + UDP_HEADER_SIZE
+        } else {
+            MTU_SIZE
+        }
+    });
 
     let info = FragmentationInfo {
         max_payload_size: max_working,
@@ -109,6 +198,9 @@ pub async fn detect_max_payload(socket: &UdpSocket, peer: SocketAddr) -> Result<
 
 /// Test if a specific payload size works
 async fn test_payload_size(socket: &UdpSocket, peer: SocketAddr, size: usize) -> bool {
+    let v6 = peer.is_ipv6();
+    let _ = set_df(socket, v6, true);
+
     let test_id = rand::thread_rng().gen::<u32>();
 
     // Create test packet with specific size
@@ -123,25 +215,37 @@ async fn test_payload_size(socket: &UdpSocket, peer: SocketAddr, size: usize) ->
     }
 
     // Try sending the packet
-    if socket.send_to(&packet, peer).await.is_err() {
-        return false;
+    match socket.send_to(&packet, peer).await {
+        Ok(_) => {}
+        Err(e) => {
+            if let Some(code) = e.raw_os_error() {
+                if code == EMSGSIZE {
+                    let _ = set_df(socket, v6, false);
+                    return false;
+                }
+            }
+            let _ = set_df(socket, v6, false);
+            return false;
+        }
     }
 
     // Wait for acknowledgment
     let mut buffer = vec![0u8; 256];
-    match timeout(Duration::from_millis(500), socket.recv_from(&mut buffer)).await {
+    let result = match timeout(Duration::from_millis(500), socket.recv_from(&mut buffer)).await {
         Ok(Ok((recv_size, addr))) if addr == peer => {
             if recv_size >= 16 && &buffer[..8] == b"SHARP_TA" {
                 let recv_id = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
                 let recv_size = u32::from_be_bytes(buffer[12..16].try_into().unwrap()) as usize;
 
-                return recv_id == test_id && recv_size == size;
+                recv_id == test_id && recv_size == size
+            } else {
+                false
             }
         }
-        _ => {}
-    }
-
-    false
+        _ => false,
+    };
+    let _ = set_df(socket, v6, false);
+    result
 }
 
 /// Binary search for precise MTU

@@ -395,9 +395,9 @@ impl NatManager {
                                     tracing::warn!("Port mapping failed after {:?}: {}", pf_start.elapsed(), e);
 
                                     // Log statistics if available
-                                    if let Ok(stats) = service.get_statistics().await.lines().take(10).collect::<Vec<_>>().join("\n") {
-                                        tracing::debug!("Port forwarding stats:\n{}", stats);
-                                    }
+                                    let stats = service.get_statistics().await;
+                                    let short = stats.lines().take(10).collect::<Vec<_>>().join("\n");
+                                    tracing::debug!("Port forwarding stats:\n{}", short);
                                 }
                             }
                         }

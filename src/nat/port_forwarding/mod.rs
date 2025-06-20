@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use tokio::net::{UdpSocket, TcpStream};
 use tokio::time::{timeout, interval, sleep};
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::{RwLock as AsyncRwLock, Mutex};
+use parking_lot::RwLock;
 
 use bytes::{Bytes, BytesMut, Buf, BufMut};
 use hyper::http::{Request, Response, StatusCode};
@@ -24,7 +25,7 @@ use crate::nat::error::{NatError, NatResult};
 use crate::nat::metrics::NatMetricsCollector;
 
 /// Port mapping protocol
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MappingProtocol {
     /// Universal Plug and Play Internet Gateway Device
     UPnPIGD,
@@ -123,7 +124,7 @@ pub struct PortMapping {
 /// Port forwarding service
 pub struct PortForwardingService {
     /// Active mappings
-    mappings: Arc<RwLock<HashMap<uuid::Uuid, PortMapping>>>,
+    mappings: Arc<AsyncRwLock<HashMap<uuid::Uuid, PortMapping>>>,
 
     /// UPnP-IGD client
     upnp_client: Arc<UPnPClient>,
@@ -161,7 +162,7 @@ impl PortForwardingService {
     /// Create new port forwarding service
     pub async fn new() -> NatResult<Self> {
         let service = Self {
-            mappings: Arc::new(RwLock::new(HashMap::new())),
+            mappings: Arc::new(AsyncRwLock::new(HashMap::new())),
             upnp_client: Arc::new(UPnPClient::new()),
             natpmp_client: Arc::new(NatPMPClient::new()),
             pcp_client: Arc::new(PCPClient::new()),
@@ -381,10 +382,10 @@ impl PortForwardingService {
 /// UPnP-IGD client implementation
 struct UPnPClient {
     /// Discovered devices
-    devices: Arc<RwLock<Vec<UPnPDevice>>>,
+    devices: Arc<AsyncRwLock<Vec<UPnPDevice>>>,
 
     /// Discovery state
-    discovery_done: Arc<RwLock<bool>>,
+    discovery_done: Arc<AsyncRwLock<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -405,8 +406,8 @@ struct UPnPDevice {
 impl UPnPClient {
     fn new() -> Self {
         Self {
-            devices: Arc::new(RwLock::new(Vec::new())),
-            discovery_done: Arc::new(RwLock::new(false)),
+            devices: Arc::new(AsyncRwLock::new(Vec::new())),
+            discovery_done: Arc::new(AsyncRwLock::new(false)),
         }
     }
 
@@ -769,6 +770,7 @@ impl UPnPClient {
             .map_err(|e| NatError::Platform(format!("Failed to add port mapping: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
 
             // Parse SOAP error
@@ -780,13 +782,15 @@ impl UPnPClient {
                         .and_then(|d| d.get_child("UPnPError"))
                         .and_then(|e| e.get_child("errorCode"))
                         .and_then(|c| c.get_text())
-                        .unwrap_or("Unknown");
+                        .map(|c| c.into_owned())
+                        .unwrap_or_else(|| "Unknown".to_string());
 
                     let error_desc = fault.get_child("detail")
                         .and_then(|d| d.get_child("UPnPError"))
                         .and_then(|e| e.get_child("errorDescription"))
                         .and_then(|d| d.get_text())
-                        .unwrap_or("Unknown error");
+                        .map(|c| c.into_owned())
+                        .unwrap_or_else(|| "Unknow error".to_string())    ;
 
                     return Err(NatError::Platform(
                         format!("UPnP error {}: {}", error_code, error_desc)
@@ -795,7 +799,7 @@ impl UPnPClient {
             }
 
             return Err(NatError::Platform(
-                format!("UPnP AddPortMapping failed with status {}", response.status())
+                format!("UPnP AddPortMapping failed with status {}", status)
             ));
         }
 
@@ -894,21 +898,21 @@ impl UPnPClient {
 /// NAT-PMP client implementation (RFC 6886)
 struct NatPMPClient {
     /// Gateway address
-    gateway: Arc<RwLock<Option<Ipv4Addr>>>,
+    gateway: Arc<AsyncRwLock<Option<Ipv4Addr>>>,
 
     /// Server epoch
-    server_epoch: Arc<RwLock<u32>>,
+    server_epoch: Arc<AsyncRwLock<u32>>,
 
     /// Socket for NAT-PMP communication
-    socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
+    socket: Arc<AsyncRwLock<Option<Arc<UdpSocket>>>>,
 }
 
 impl NatPMPClient {
     fn new() -> Self {
         Self {
-            gateway: Arc::new(RwLock::new(None)),
-            server_epoch: Arc::new(RwLock::new(0)),
-            socket: Arc::new(RwLock::new(None)),
+            gateway: Arc::new(AsyncRwLock::new(None)),
+            server_epoch: Arc::new(AsyncRwLock::new(0)),
+            socket: Arc::new(AsyncRwLock::new(None)),
         }
     }
 
@@ -963,8 +967,8 @@ impl NatPMPClient {
         request.put_u8(0); // Opcode (external address)
 
         // NAT-PMP uses exponential backoff for retries
-        let mut retry_delay = Duration::from_millis(250);
-        let max_retries = 3;
+        let mut retry_delay = Duration::from_millis(2000);
+        let max_retries = 5;
 
         for attempt in 0..max_retries {
             socket.send_to(&request, (gateway, 5351)).await?;
@@ -1272,21 +1276,21 @@ impl NatPMPClient {
 /// PCP client implementation (RFC 6887)
 struct PCPClient {
     /// PCP server address
-    server: Arc<RwLock<Option<SocketAddr>>>,
+    server: Arc<AsyncRwLock<Option<SocketAddr>>>,
 
     /// Client epoch
-    client_epoch: Arc<RwLock<u32>>,
+    client_epoch: Arc<AsyncRwLock<u32>>,
 
     /// Socket for PCP communication
-    socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
+    socket: Arc<AsyncRwLock<Option<Arc<UdpSocket>>>>,
 }
 
 impl PCPClient {
     fn new() -> Self {
         Self {
-            server: Arc::new(RwLock::new(None)),
-            client_epoch: Arc::new(RwLock::new(0)),
-            socket: Arc::new(RwLock::new(None)),
+            server: Arc::new(AsyncRwLock::new(None)),
+            client_epoch: Arc::new(AsyncRwLock::new(0)),
+            socket: Arc::new(AsyncRwLock::new(None)),
         }
     }
 
@@ -1384,7 +1388,7 @@ impl PCPClient {
 
         // Wait for responses
         let mut buf = vec![0u8; 1100];
-        match timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+        match timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await {
             Ok(Ok((size, addr))) => {
                 if size >= 24 && buf[0] == 2 && buf[1] == 129 {
                     return Ok(SocketAddr::new(addr.ip(), 5351));
@@ -1533,8 +1537,8 @@ impl PCPClient {
         request.put_slice(&[0u8; 16]);
 
         // PCP uses initial RTO of 3 seconds with binary exponential backoff
-        let mut retry_delay = Duration::from_secs(3);
-        let max_retries = 4;
+        let mut retry_delay = Duration::from_secs(5);
+        let max_retries = 6;
 
         for attempt in 0..max_retries {
             socket.send_to(&request, server).await?;
@@ -1582,7 +1586,7 @@ impl PCPClient {
 
                     // Parse MAP response
                     let resp_nonce = response.copy_to_bytes(12);
-                    if resp_nonce != nonce {
+                    if resp_nonce.as_ref() != nonce {
                         return Err(NatError::Platform("PCP nonce mismatch".to_string()));
                     }
 
@@ -1733,7 +1737,8 @@ fn get_default_gateway() -> NatResult<Option<IpAddr>> {
     // Platform-specific implementation
     #[cfg(target_os = "windows")]
     {
-        use winapi::um::iphlpapi::{GetAdaptersInfo, IP_ADAPTER_INFO};
+        use winapi::um::iphlpapi::GetAdaptersInfo;
+        use winapi::um::iptypes::IP_ADAPTER_INFO;
         use std::mem;
         use std::ptr;
 
@@ -1832,9 +1837,10 @@ fn get_default_gateway() -> NatResult<Option<IpAddr>> {
     for gateway in &common_gateways {
         if let Ok(ip) = gateway.parse::<IpAddr>() {
             // Try to ping the gateway
-            let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-            if socket.connect((ip, 80)).is_ok() {
-                return Ok(Some(ip));
+            if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if socket.connect((ip, 80)).is_ok() {
+                    return Ok(Some(ip));
+                }
             }
         }
     }
@@ -1870,8 +1876,10 @@ impl PortForwardingStats {
         {
             let mut times = self.avg_mapping_time.write();
             let entry = times.entry(protocol).or_insert(Duration::ZERO);
-            let count = self.success_count.read().get(&protocol).copied().unwrap_or(1);
-            *entry = (*entry * (count - 1) + duration) / count as u32;
+            let count = self.success_count.read().get(&protocol).copied().unwrap_or(1) as u32;
+            if count > 0 {
+                *entry = (*entry * (count - 1) + duration) / count;
+            }
         }
     }
 
