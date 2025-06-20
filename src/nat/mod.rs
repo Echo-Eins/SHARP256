@@ -267,6 +267,12 @@ impl NatManager {
         let local_addr = socket.local_addr()?;
         tracing::info!("=== NAT Detection Starting ===");
         tracing::info!("Local address: {}", local_addr);
+        tracing::info!("Protocol support: UPnP={}, NAT-PMP={}, PCP={}, Hole-punching={}",
+            self.config.enable_upnp,
+            self.config.enable_natpmp,
+            self.config.enable_pcp,
+            self.config.enable_hole_punching
+        );
 
         let mut available_protocols = vec![NatProtocol::Direct];
         let mut public_addr = None;
@@ -278,6 +284,7 @@ impl NatManager {
         // Step 1: STUN detection
         if self.config.enable_stun {
             tracing::info!("Running STUN detection...");
+            let stun_start = std::time::Instant::now();
 
             match self.stun_service.get_public_address(socket).await {
                 Ok(addr) => {
@@ -285,14 +292,19 @@ impl NatManager {
                     connectivity_status = ConnectivityStatus::BehindNat;
                     available_protocols.push(NatProtocol::Stun);
 
-                    tracing::info!("Public address detected: {}", addr);
+                    tracing::info!("Public address detected: {} (took {:?})", addr, stun_start.elapsed());
 
                     // Detect NAT type
                     match self.stun_service.detect_nat_type(socket).await {
                         Ok((detected_type, behavior)) => {
                             nat_type = detected_type;
-                            nat_behavior = Some(behavior);
-                            tracing::info!("NAT type: {:?}", nat_type);
+                            nat_behavior = Some(behavior.clone());
+                            tracing::info!("NAT type: {:?}, P2P score: {:.2}", nat_type, behavior.p2p_score());
+
+                            // Log detailed NAT behavior
+                            tracing::info!("  Mapping: {:?}", behavior.mapping);
+                            tracing::info!("  Filtering: {:?}", behavior.filtering);
+                            tracing::info!("  Hairpinning: {}", behavior.hairpinning);
                         }
                         Err(e) => {
                             tracing::warn!("NAT type detection failed: {}", e);
@@ -319,10 +331,25 @@ impl NatManager {
             // Initialize port forwarding service
             if self.config.enable_upnp || self.config.enable_natpmp || self.config.enable_pcp {
                 tracing::info!("Setting up port forwarding...");
+                let pf_start = std::time::Instant::now();
 
                 match PortForwardingService::new().await {
                     Ok(service) => {
                         *self.port_forwarding.write() = Some(service);
+
+                        // Build preferred protocols list based on configuration
+                        let mut preferred_protocols = Vec::new();
+
+                        // Order based on recommendations from RFC and real-world success rates
+                        if self.config.enable_pcp {
+                            preferred_protocols.push(port_forwarding::MappingProtocol::PCP);
+                        }
+                        if self.config.enable_upnp {
+                            preferred_protocols.push(port_forwarding::MappingProtocol::UPnPIGD);
+                        }
+                        if self.config.enable_natpmp {
+                            preferred_protocols.push(port_forwarding::MappingProtocol::NatPMP);
+                        }
 
                         // Try to create port mapping
                         let mapping_config = PortMappingConfig {
@@ -332,13 +359,22 @@ impl NatManager {
                             lifetime: self.config.port_mapping_lifetime,
                             description: "SHARP P2P Connection".to_string(),
                             auto_renew: true,
-                            preferred_protocols: vec![],
+                            preferred_protocols,
                         };
 
                         if let Some(ref service) = *self.port_forwarding.read() {
                             match service.create_mapping(mapping_config).await {
                                 Ok(mapping) => {
-                                    tracing::info!("Port mapping created: {:?}", mapping);
+                                    tracing::info!("Port mapping created in {:?}: {} -> {} via {}",
+                                        pf_start.elapsed(),
+                                        mapping.internal_addr,
+                                        mapping.external_addr,
+                                        match mapping.protocol {
+                                            port_forwarding::MappingProtocol::UPnPIGD => "UPnP-IGD",
+                                            port_forwarding::MappingProtocol::NatPMP => "NAT-PMP",
+                                            port_forwarding::MappingProtocol::PCP => "PCP",
+                                        }
+                                    );
 
                                     // Update available protocols
                                     match mapping.protocol {
@@ -356,7 +392,12 @@ impl NatManager {
                                     port_mappings.push(mapping);
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Port mapping failed: {}", e);
+                                    tracing::warn!("Port mapping failed after {:?}: {}", pf_start.elapsed(), e);
+
+                                    // Log statistics if available
+                                    if let Ok(stats) = service.get_statistics().await.lines().take(10).collect::<Vec<_>>().join("\n") {
+                                        tracing::debug!("Port forwarding stats:\n{}", stats);
+                                    }
                                 }
                             }
                         }
@@ -372,24 +413,30 @@ impl NatManager {
                 match nat_type {
                     NatType::FullCone | NatType::RestrictedCone | NatType::PortRestricted => {
                         available_protocols.push(NatProtocol::HolePunch);
-                        tracing::info!("UDP hole punching available");
+                        tracing::info!("UDP hole punching available (NAT type: {:?})", nat_type);
                     }
                     NatType::Symmetric => {
                         if let Some(ref behavior) = nat_behavior {
                             if behavior.p2p_score() > 0.3 {
                                 available_protocols.push(NatProtocol::HolePunch);
-                                tracing::info!("UDP hole punching may work (limited)");
+                                tracing::info!("UDP hole punching may work (limited) - P2P score: {:.2}",
+                                    behavior.p2p_score());
+                            } else {
+                                tracing::info!("UDP hole punching unlikely - P2P score too low: {:.2}",
+                                    behavior.p2p_score());
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        tracing::info!("UDP hole punching not feasible for NAT type: {:?}", nat_type);
+                    }
                 }
             }
         }
 
         // Update connectivity status based on available protocols
         if !available_protocols.is_empty() {
-            if nat_type == NatType::Symmetric && available_protocols.len() == 1 {
+            if nat_type == NatType::Symmetric && available_protocols.len() <= 2 {
                 connectivity_status = ConnectivityStatus::Restricted;
             } else if nat_type != NatType::None {
                 connectivity_status = ConnectivityStatus::BehindNat;
@@ -401,7 +448,7 @@ impl NatManager {
             local_addr,
             public_addr,
             nat_type,
-            available_protocols,
+            available_protocols: available_protocols.clone(),
             port_mappings,
             connectivity_status,
             nat_behavior,
@@ -413,8 +460,27 @@ impl NatManager {
         tracing::info!("Public: {:?}", network_info.public_addr);
         tracing::info!("NAT Type: {:?}", network_info.nat_type);
         tracing::info!("Status: {:?}", network_info.connectivity_status);
-        tracing::info!("Available: {:?}", network_info.available_protocols);
-        tracing::info!("============================");
+        tracing::info!("Available protocols: {}",
+            available_protocols.iter()
+                .map(|p| format!("{:?}", p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if !network_info.port_mappings.is_empty() {
+            tracing::info!("Port mappings:");
+            for mapping in &network_info.port_mappings {
+                tracing::info!("  {} -> {} ({})",
+                    mapping.internal_addr,
+                    mapping.external_addr,
+                    match mapping.protocol {
+                        port_forwarding::MappingProtocol::UPnPIGD => "UPnP",
+                        port_forwarding::MappingProtocol::NatPMP => "NAT-PMP",
+                        port_forwarding::MappingProtocol::PCP => "PCP",
+                    }
+                );
+            }
+        }
+        tracing::info!("==============================");
 
         // Store results
         *self.network_info.write() = Some(network_info.clone());
