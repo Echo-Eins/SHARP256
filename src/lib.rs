@@ -15,10 +15,8 @@ pub mod state;
 pub mod progress;
 pub mod sender;
 pub mod receiver;
-
 // Fragmentation module with stub implementation
 pub mod fragmentation;
-
 // NAT traversal module (always compiled, feature controls functionality)
 pub mod nat;
 
@@ -31,6 +29,7 @@ pub use sender::Sender;
 pub use receiver::Receiver;
 pub use protocol::constants::*;
 pub use progress::{ProgressInfo, TransferEvent, ProgressCallback, EventCallback};
+// pub use nat::ice::*;
 
 // Re-export fragmentation types
 pub use fragmentation::{

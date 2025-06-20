@@ -500,31 +500,30 @@ impl<'a> NatBehaviorDiscovery<'a> {
 
     /// Test hairpinning support
     async fn test_hairpinning(&self, socket: &UdpSocket, public_addr: SocketAddr) -> bool {
-        // Try to send packet to our own public address
+        // Создаём временный приёмник на том же порту, но с отдельным дескриптором
+        let bind_addr = match socket.local_addr() {
+            Ok(mut a) => {
+                a.set_ip("0.0.0.0".parse().unwrap());
+                a
+            }
+            Err(_) => return false,
+        };
+        let listener = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
         let test_data = b"SHARP_HAIRPIN_TEST";
 
         if socket.send_to(test_data, public_addr).await.is_err() {
             return false;
         }
 
-        // Try to receive it with tolerance for network delay
-        let mut buffer = vec![0u8; 100];
-        for _ in 0..3 {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                socket.recv_from(&mut buffer)
-            ).await {
-                Ok(Ok((size, addr))) if addr == public_addr && &buffer[..size] == test_data => {
-                    tracing::info!("Hairpinning supported");
-                    return true;
-                }
-                Ok(Ok(_)) => continue,
-                _ => {}
-            }
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_millis(750), listener.recv_from(&mut buf)).await {
+            Ok(Ok((size, addr))) if addr == public_addr && &buf[..size] == test_data => true,
+            _ => false,
         }
-
-        tracing::info!("Hairpinning not supported");
-        false
     }
 
     /// Test mapping lifetime
