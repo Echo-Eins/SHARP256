@@ -846,3 +846,130 @@ impl Drop for Sender {
         }
     }
 }
+
+// ICE support section
+impl Sender {
+    /// Create sender with ICE support
+    pub async fn new_with_ice(
+        peer_signaling_addr: SocketAddr,
+        file_path: &Path,
+        use_encryption: bool,
+        stun_servers: Vec<String>,
+    ) -> Result<Self> {
+        // Create temporary socket for ICE
+        let temp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let local_addr = temp_socket.local_addr()?;
+
+        let connection_id = Uuid::new_v4().to_string();
+        tracing::info!("Connection {}: initiating ICE", connection_id);
+
+        // Create ICE integration
+        let ice = Arc::new(
+            crate::nat::ice_integration::Sharp3IceIntegration::new(
+                crate::nat::ice::IceRole::Controlling,
+                stun_servers,
+            ).await?
+        );
+
+        // Gather local candidates
+        tracing::info!("Gathering ICE candidates...");
+        let local_candidates = ice.gather_candidates().await?;
+        tracing::info!("Gathered {} local candidates", local_candidates.len());
+
+        // Create ICE parameters for signaling
+        let ice_params = crate::nat::ice_integration::IceParameters::new(
+            ice.get_local_credentials(),
+            local_candidates,
+        );
+
+        // Exchange ICE parameters via signaling
+        let remote_ice_params = Self::exchange_ice_parameters(
+            &temp_socket,
+            peer_signaling_addr,
+            ice_params,
+        ).await?;
+
+        // Set remote credentials and candidates
+        ice.set_remote_credentials(remote_ice_params.to_credentials()).await?;
+        ice.add_remote_candidates(remote_ice_params.parse_candidates()).await?;
+
+        // Establish ICE connection
+        tracing::info!("Starting ICE connectivity checks...");
+        let peer_addr = ice.establish_connection().await?;
+        tracing::info!("ICE connection established with {}", peer_addr);
+
+        // Create sender with established peer address
+        let file_manager = FileManager::open_for_send(file_path)?;
+        file_manager.init_mmap()?;
+
+        let file_name = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let transfer_state = TransferState::new(
+            file_name,
+            file_manager.size(),
+            true,
+            peer_addr.to_string(),
+        );
+
+        Ok(Self {
+            socket: Arc::new(temp_socket),
+            peer_addr,
+            effective_peer_addr: Arc::new(RwLock::new(peer_addr)),
+            connection_id,
+            file_manager: Arc::new(file_manager),
+            packet_buffer: Arc::new(PacketBuffer::new()),
+            sao_system: Arc::new(SaoSystem::new()),
+            state_manager: Arc::new(StateManager::new()?),
+            transfer_state: Arc::new(RwLock::new(transfer_state)),
+            use_encryption,
+            use_gso: Arc::new(RwLock::new(false)),
+            max_payload_size: Arc::new(RwLock::new(MAX_PAYLOAD_SIZE_MTU)),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            fragmentation_checked: Arc::new(RwLock::new(false)),
+            #[cfg(feature = "nat-traversal")]
+            nat_manager: None, // ICE handles NAT traversal
+        })
+    }
+
+    /// Exchange ICE parameters via signaling
+    async fn exchange_ice_parameters(
+        socket: &UdpSocket,
+        peer_addr: SocketAddr,
+        local_params: crate::nat::ice_integration::IceParameters,
+    ) -> Result<crate::nat::ice_integration::IceParameters> {
+        // Serialize local parameters
+        let local_data = serde_json::to_vec(&local_params)?;
+
+        // Create signaling packet
+        let mut packet = vec![0u8; 8 + local_data.len()];
+        packet[0..8].copy_from_slice(b"ICE_INIT");
+        packet[8..].copy_from_slice(&local_data);
+
+        // Send and wait for response
+        for attempt in 0..5 {
+            socket.send_to(&packet, peer_addr).await?;
+
+            let mut buffer = vec![0u8; 65536];
+            match timeout(Duration::from_secs(3), socket.recv_from(&mut buffer)).await {
+                Ok(Ok((size, addr))) if addr == peer_addr => {
+                    if size > 8 && &buffer[0..8] == b"ICE_RESP" {
+                        let remote_params: crate::nat::ice_integration::IceParameters =
+                            serde_json::from_slice(&buffer[8..size])?;
+                        return Ok(remote_params);
+                    }
+                }
+                _ => {
+                    tracing::debug!("ICE parameter exchange attempt {} failed", attempt + 1);
+                }
+            }
+
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        anyhow::bail!("Failed to exchange ICE parameters")
+    }
+}

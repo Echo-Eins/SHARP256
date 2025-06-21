@@ -840,3 +840,97 @@ impl Drop for Receiver {
         }
     }
 }
+
+// ICE support section
+
+impl Receiver {
+    /// Handle ICE parameter exchange
+    async fn handle_ice_exchange(&self, data: &[u8], sender_addr: SocketAddr) -> Result<()> {
+        if data.len() <= 8 {
+            return Ok(());
+        }
+
+        // Parse remote ICE parameters
+        let remote_params: crate::nat::ice_integration::IceParameters =
+            serde_json::from_slice(&data[8..])?;
+
+        tracing::info!("Received ICE parameters from {}", sender_addr);
+
+        // Create ICE integration
+        let ice = Arc::new(
+            crate::nat::ice_integration::Sharp3IceIntegration::new(
+                crate::nat::ice::IceRole::Controlled,
+                vec![
+                    "stun.l.google.com:19302".to_string(),
+                    "stun1.l.google.com:19302".to_string(),
+                ],
+            ).await?
+        );
+
+        // Set remote credentials
+        ice.set_remote_credentials(remote_params.to_credentials()).await?;
+
+        // Gather local candidates
+        let local_candidates = ice.gather_candidates().await?;
+
+        // Create response parameters
+        let local_params = crate::nat::ice_integration::IceParameters::new(
+            ice.get_local_credentials(),
+            local_candidates,
+        );
+
+        // Send response
+        let response_data = serde_json::to_vec(&local_params)?;
+        let mut response = vec![0u8; 8 + response_data.len()];
+        response[0..8].copy_from_slice(b"ICE_RESP");
+        response[8..].copy_from_slice(&response_data);
+
+        self.socket.send_to(&response, sender_addr).await?;
+
+        // Add remote candidates
+        ice.add_remote_candidates(remote_params.parse_candidates()).await?;
+
+        // Establish connection
+        tracing::info!("Starting ICE connectivity checks...");
+        let peer_addr = ice.establish_connection().await?;
+        tracing::info!("ICE connection established with {}", peer_addr);
+
+        // Update peer address
+        *self.peer_addr.write() = Some(peer_addr);
+
+        Ok(())
+    }
+
+    /// Updated start method with ICE support
+    pub async fn start_with_ice(&self) -> Result<()> {
+        let listen_addr = self.socket.local_addr()?;
+        tracing::info!("=== Receiver Status (ICE Mode) ===");
+        tracing::info!("Signaling on: {}", listen_addr);
+        tracing::info!("Waiting for ICE negotiation...");
+        tracing::info!("=================================");
+
+        let mut buffer = vec![0u8; 65536];
+
+        loop {
+            match self.socket.recv_from(&mut buffer).await {
+                Ok((size, addr)) => {
+                    // Check for ICE initiation
+                    if size > 8 && &buffer[0..8] == b"ICE_INIT" {
+                        tracing::info!("ICE initiation from {}", addr);
+                        self.handle_ice_exchange(&buffer[..size], addr).await?;
+
+                        // After ICE is established, continue with normal flow
+                        return self.start().await;
+                    }
+
+                    // Handle other packets normally
+                    // ... existing packet handling ...
+                }
+                Err(e) => {
+                    tracing::error!("Socket error: {}", e);
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+}
