@@ -31,6 +31,14 @@ pub fn is_private(ip: &IpAddr) -> bool {
     }
 }
 
+/// Check if an IPv6 address is globally routable
+fn is_global_ipv6(addr: &Ipv6Addr) -> bool {
+    !(addr.is_unspecified()
+        || addr.is_loopback()
+        || addr.is_unique_local()
+        || addr.is_unicast_link_local()
+        || addr.is_multicast())
+}
 /// Get IP address preference score (higher is better)
 pub fn ip_preference_score(ip: &IpAddr) -> u32 {
     if is_loopback(ip) {
@@ -52,7 +60,7 @@ pub fn ip_preference_score(ip: &IpAddr) -> u32 {
         IpAddr::V6(v6) => {
             if is_private(ip) {
                 40 // ULA IPv6
-            } else if v6.is_global() {
+            } else if is_global_ipv6(v6) {
                 90 // Global IPv6
             } else {
                 30 // Other IPv6

@@ -10,12 +10,11 @@ use tokio::sync::{mpsc, RwLock, Mutex};
 use tokio::time::{interval, timeout};
 use rand::Rng;
 use bytes::{Bytes, BytesMut, BufMut};
-
 use crate::nat::stun::{
     Message, MessageType, TransactionId, Attribute, AttributeType, AttributeValue,
 };
 use crate::nat::error::{NatError, NatResult};
-use super::{Candidate, CandidatePair, IceCredentials};
+use super::{Candidate, CandidatePair, IceCredentials, TransportProtocol};
 use super::candidate::CandidatePairState;
 
 /// Connectivity check manager
