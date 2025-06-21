@@ -23,8 +23,6 @@
 // Proper priority and foundation calculations
 // Aggressive and regular nomination modes
 
-
-
 pub mod error;
 pub mod stun;
 pub mod upnp;
