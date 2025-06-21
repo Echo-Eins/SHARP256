@@ -57,6 +57,7 @@ memmap2 = "0.9"
 crc32fast = "1.3"
 hmac = "0.12"
 sha2 = "0.10"
+hex = "0.4.0"
 
 # NAT traversal
 rand = "0.8"

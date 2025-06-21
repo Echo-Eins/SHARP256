@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use super::{CandidatePair, CandidatePairState};
+use super::CandidatePair;
+use super::candidate::CandidatePairState;
 
 /// Nomination strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

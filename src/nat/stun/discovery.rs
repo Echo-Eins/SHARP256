@@ -7,14 +7,7 @@ use super::client::StunClient;
 use super::protocol::*;
 
 use crate::nat::error::{NatError, NatResult, StunError};
-use crate::nat::metrics::{record_ip_version_usage, StunMetrics};
-use parking_lot::RwLock;
-use rand::Rng;
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::net::lookup_host;
-use tokio::time::{sleep, timeout};
+use std::time::Duration;
 
 /// NAT mapping behavior (RFC 5780)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

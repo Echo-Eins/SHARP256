@@ -1,11 +1,9 @@
-use std::convert::TryFrom;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use sha1::Sha1;
 use crc::{Crc, CRC_32_ISO_HDLC};
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use crate::nat::error::{StunError, NatError, NatResult};
 
 /// STUN magic cookie as defined in RFC 8489
@@ -191,7 +189,7 @@ impl AttributeType {
 }
 
 /// STUN transaction ID (96 bits)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionId([u8; 12]);
 
 impl TransactionId {

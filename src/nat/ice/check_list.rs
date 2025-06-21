@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use super::{CandidatePair, CandidatePairState};
+use super::{CandidatePair};
+use super::candidate::CandidatePairState;
 
 /// Check list for managing candidate pairs
 pub struct CheckList {

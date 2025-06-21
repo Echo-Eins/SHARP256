@@ -8,7 +8,7 @@
 //! - Port forwarding (UPnP/NAT-PMP/PCP)
 //! - Overall NAT traversal performance
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;

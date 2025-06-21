@@ -2,7 +2,6 @@
 //! Enhanced UDP hole punching implementation with RFC 4787 compliance
 //! and integration with ICE, STUN, and advanced NAT traversal techniques
 
-use anyhow::Result;
 use std::net::{SocketAddr, IpAddr};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -10,11 +9,10 @@ use tokio::time::{interval, timeout, sleep, Instant as TokioInstant};
 use rand::{Rng, RngCore};
 use std::sync::Arc;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use bytes::{Bytes, BytesMut, BufMut};
 
 use crate::nat::error::{NatError, NatResult};
-use crate::nat::metrics::{HolePunchMetrics, NatMetricsCollector};
+use crate::nat::metrics::HolePunchMetrics;
 use crate::nat::stun::{NatBehavior, MappingBehavior, FilteringBehavior};
 use crate::nat::ice::{Candidate, CandidateType};
 
@@ -918,10 +916,10 @@ impl HolePuncher {
 
         if stats.first_response_time.is_none() {
             stats.first_response_time = Some(
-                (std::time::SystemTime::now()
+                ((std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_micros() as u64
+                    .as_micros() as u64)
                     .saturating_sub(packet.timestamp)
                     .max(1) as u64)
                     .into()
@@ -930,10 +928,10 @@ impl HolePuncher {
 
         // Calculate RTT
         let rtt = Duration::from_micros(
-            std::time::SystemTime::now()
+            (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_micros() as u64
+                .as_micros() as u64)
                 .saturating_sub(packet.timestamp)
         );
         stats.rtt_samples.push(rtt);

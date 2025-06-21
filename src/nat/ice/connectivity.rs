@@ -15,7 +15,8 @@ use crate::nat::stun::{
     Message, MessageType, TransactionId, Attribute, AttributeType, AttributeValue,
 };
 use crate::nat::error::{NatError, NatResult};
-use super::{Candidate, CandidatePair, CandidatePairState, IceCredentials};
+use super::{Candidate, CandidatePair, IceCredentials};
+use super::candidate::CandidatePairState;
 
 /// Connectivity check manager
 pub struct ConnectivityChecker {

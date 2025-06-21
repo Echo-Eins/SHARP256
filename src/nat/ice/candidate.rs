@@ -48,7 +48,7 @@ pub enum TransportProtocol {
 }
 
 /// TCP candidate type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TcpType {
     Active,
     Passive,

@@ -1,7 +1,6 @@
 // src/nat/error.rs
 //! Error types for NAT traversal operations
 
-use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::io;
@@ -203,7 +202,7 @@ pub enum NatPmpError {
     #[error("Unknown Error ({0})")]
     Unknown(u16) = 0xFFFF,
     #[error("Invalid response: {0}")]
-    InvalidResponse(&'static str),
+    InvalidResponse(&'static str) = 0,
 }
 
 impl NatPmpError {
@@ -253,7 +252,7 @@ pub enum PcpError {
     #[error("Unknown Error ({0})")]
     Unknown(u8) = 0xFF,
     #[error("Invalid response: {0}")]
-    InvalidResponse(&'static str),
+    InvalidResponse(&'static str) = 0,
 }
 
 impl PcpError {
@@ -277,6 +276,7 @@ impl PcpError {
         }
     }
 }
+
 
 impl NatError {
     /// Check if the error is transient and a retry may succeed

@@ -13,18 +13,16 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::net::{UdpSocket, TcpStream};
+use tokio::net::UdpSocket;
 use tokio::time::{timeout, interval, sleep};
 use tokio::sync::{RwLock as AsyncRwLock, Mutex};
 use parking_lot::RwLock;
 
 use bytes::{Bytes, BytesMut, Buf, BufMut};
-use hyper::http::{Request, Response, StatusCode};
 use xmltree::{Element, XMLNode};
 use rand::RngCore;
 
 use crate::nat::error::{NatError, NatPmpError, PcpError, NatResult};
-use crate::nat::metrics::NatMetricsCollector;
 
 /// Port mapping protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1094,7 +1092,7 @@ impl NatPMPClient {
         }
 
         let final_port = successful_port
-            .ok_or_else(|| NatPmpError::InvalidResponse("Failed to create mapping").into())?;
+            .ok_or_else(|| NatError::from(NatPmpError::InvalidResponse("Failed to create mapping")))?;
 
         Ok(PortMapping {
             id: uuid::Uuid::new_v4(),
@@ -1507,9 +1505,9 @@ impl PCPClient {
         }
 
         let external_ip = external_ip
-            .ok_or_else(|| PcpError::InvalidResponse("Missing external ip").into())?;
+            .ok_or_else(|| NatError::from(PcpError::InvalidResponse("Missing external ip")))?;
         let final_port = successful_port
-            .ok_or_else(|| PcpError::InvalidResponse("Failed to create mapping").into())?;
+            .ok_or_else(|| NatError::from(PcpError::InvalidResponse("Failed to create mapping")))?;
 
         Ok(PortMapping {
             id: uuid::Uuid::new_v4(),
@@ -1766,7 +1764,6 @@ fn get_default_gateway() -> NatResult<Option<IpAddr>> {
     {
         use winapi::um::iphlpapi::GetAdaptersInfo;
         use winapi::um::iptypes::IP_ADAPTER_INFO;
-        use std::mem;
         use std::ptr;
 
         unsafe {
