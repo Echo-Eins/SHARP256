@@ -40,7 +40,7 @@ use tokio::net::UdpSocket;
 
 use self::stun::{StunService, StunConfig, NatBehavior};
 use self::port_forwarding::{PortForwardingService, PortMappingConfig, Protocol};
-use self::hole_punch::HolePuncher;
+use self::hole_punch::{HolePuncher, HolePunchConfig, CoordinatedHolePunch};
 use self::coordinator::AdvancedNatTraversal;
 use self::error::{NatError, NatResult};
 
@@ -579,7 +579,16 @@ impl NatManager {
 
                 NatProtocol::HolePunch => {
                     // Perform UDP hole punching
-                    if let Err(e) = self.perform_hole_punching(socket, peer_addr, is_initiator).await {
+                    if let Err(e) = self
+                        .perform_hole_punching(
+                            socket,
+                            peer_addr,
+                            is_initiator,
+                            info.nat_behavior.as_ref(),
+                        )
+                        .await
+                    {
+
                         tracing::warn!("Hole punching failed: {}", e);
                     } else {
                         return Ok(peer_addr);
@@ -634,19 +643,31 @@ impl NatManager {
         socket: &UdpSocket,
         peer_addr: SocketAddr,
         is_initiator: bool,
+        nat_behavior: Option<&NatBehavior>,
     ) -> NatResult<()> {
-        let puncher = HolePuncher::new(30); // 30 attempts
+        let config = HolePunchConfig::default();
 
         // Check if we have coordinator for synchronized punching
-        let coordination_server = self.config.coordinator_server.as_ref()
-            .and_then(|s| s.parse().ok());
-
-        let result = if let Some(coord) = coordination_server {
-            puncher.simultaneous_punch(socket, peer_addr, Some(coord)).await
+        if let Some(coord) = self
+            .config
+            .coordinator_server
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+        {
+            let coordinated = CoordinatedHolePunch::new(config, Some(coord));
+            coordinated
+                .simultaneous_punch(socket, "peer", nat_behavior)
+                .await
+                .map(|_| ())
+                .map_err(|e| NatError::transient(format!("Hole punching failed: {}", e)))
         } else {
-            puncher.punch_hole(socket, peer_addr, is_initiator).await
-        };
-        result.map_err(|e| NatError::transient(format!("Hole punching failed: {}", e)))
+            let puncher = HolePuncher::new(config);
+            puncher
+                .punch_hole(socket, peer_addr, is_initiator, nat_behavior)
+                .await
+                .map(|_| ())
+                .map_err(|e| NatError::transient(format!("Hole punching failed: {}", e)))
+        }
     }
 
     /// Setup TURN relay
