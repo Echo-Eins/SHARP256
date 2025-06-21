@@ -23,7 +23,7 @@ use hyper::http::{Request, Response, StatusCode};
 use xmltree::{Element, XMLNode};
 use rand::RngCore;
 
-use crate::nat::error::{NatError, NatResult};
+use crate::nat::error::{NatError, NatPmpError, PcpError, NatResult};
 use crate::nat::metrics::NatMetricsCollector;
 
 /// Port mapping protocol
@@ -992,7 +992,7 @@ impl NatPMPClient {
                     }
 
                     if size < 12 {
-                        return Err(NatError::Platform("Invalid NAT-PMP response size".to_string()));
+                        return Err(NatPmpError::InvalidResponse("Response too short").into());
                     }
 
                     let mut response = &buf[..];
@@ -1002,21 +1002,15 @@ impl NatPMPClient {
                     let epoch = response.get_u32();
 
                     if version != 0 {
-                        return Err(NatError::Platform(
-                            format!("Unsupported NAT-PMP version: {}", version)
-                        ));
+                        return Err(NatPmpError::InvalidResponse("Unsupported version").into());
                     }
 
                     if opcode != 128 { // 128 = response to opcode 0
-                        return Err(NatError::Platform(
-                            format!("Invalid NAT-PMP opcode: {}", opcode)
-                        ));
+                        return Err(NatPmpError::InvalidResponse("Invalid opcode").into());
                     }
 
                     if result_code != 0 {
-                        return Err(NatError::Platform(
-                            format!("NAT-PMP error code: {}", Self::error_code_to_string(result_code))
-                        ));
+                        return Err(NatPmpError::from_code(result_code).into());
                     }
 
                     *self.server_epoch.write().await = epoch;
@@ -1047,7 +1041,7 @@ impl NatPMPClient {
             retry_delay *= 2;
         }
 
-        Err(NatError::Platform("NAT-PMP request failed after all retries".to_string()))
+        Err(NatPmpError::InvalidResponse("Request failed after retries").into())
     }
 
     /// Create port mapping
@@ -1100,7 +1094,7 @@ impl NatPMPClient {
         }
 
         let final_port = successful_port
-            .ok_or_else(|| NatError::Platform("Failed to create NAT-PMP mapping".to_string()))?;
+            .ok_or_else(|| NatPmpError::InvalidResponse("Failed to create mapping").into())?;
 
         Ok(PortMapping {
             id: uuid::Uuid::new_v4(),
@@ -1152,7 +1146,7 @@ impl NatPMPClient {
                     }
 
                     if size < 16 {
-                        return Err(NatError::Platform("Invalid NAT-PMP response size".to_string()));
+                        return Err(NatPmpError::InvalidResponse("response too short").into());
                     }
 
                     let mut response = &buf[..];
@@ -1165,21 +1159,16 @@ impl NatPMPClient {
                     let mapped_lifetime = response.get_u32();
 
                     if version != 0 || resp_opcode != (opcode + 128) {
-                        return Err(NatError::Platform("Invalid NAT-PMP response".to_string()));
+                        return Err(NatPmpError::InvalidResponse("invalid response").into());
                     }
 
                     if result_code != 0 {
-                        return Err(NatError::Platform(
-                            format!("NAT-PMP mapping error: {}", Self::error_code_to_string(result_code))
-                        ));
+                        return Err(NatPmpError::from_code(result_code).into());
                     }
 
                     // Verify internal port matches
                     if resp_internal != internal_port {
-                        return Err(NatError::Platform(
-                            format!("NAT-PMP internal port mismatch: expected {}, got {}",
-                                    internal_port, resp_internal)
-                        ));
+                        return Err(NatPmpError::InvalidResponse("internal port mismatch").into());
                     }
 
                     *self.server_epoch.write().await = epoch;
@@ -1209,7 +1198,7 @@ impl NatPMPClient {
             retry_delay *= 2;
         }
 
-        Err(NatError::Platform("NAT-PMP mapping request failed after all retries".to_string()))
+        Err(NatPmpError::InvalidResponse("Mapping request failed after retries").into())
     }
 
     /// Delete port mapping
@@ -1518,9 +1507,9 @@ impl PCPClient {
         }
 
         let external_ip = external_ip
-            .ok_or_else(|| NatError::Platform("Failed to get external IP from PCP".to_string()))?;
+            .ok_or_else(|| PcpError::InvalidResponse("Missing external ip").into())?;
         let final_port = successful_port
-            .ok_or_else(|| NatError::Platform("Failed to create PCP mapping".to_string()))?;
+            .ok_or_else(|| PcpError::InvalidResponse("Failed to create mapping").into())?;
 
         Ok(PortMapping {
             id: uuid::Uuid::new_v4(),
@@ -1612,27 +1601,21 @@ impl PCPClient {
                     response.advance(12); // Reserved
 
                     if version != 2 {
-                        return Err(NatError::Platform(
-                            format!("Unsupported PCP version: {}", version)
-                        ));
+                        return Err(PcpError::InvalidResponse("Unsupported version").into());
                     }
 
                     if opcode != 129 {  // 129 = MAP response
-                        return Err(NatError::Platform(
-                            format!("Invalid PCP opcode: {}", opcode)
-                        ));
+                        return Err(PcpError::InvalidResponse("Invalid opcode").into());
                     }
 
                     if result_code != 0 {
-                        return Err(NatError::Platform(
-                            format!("PCP error: {}", Self::result_code_to_string(result_code))
-                        ));
+                        return Err(PcpError::from_code(result_code).into())
                     }
 
                     // Parse MAP response
                     let resp_nonce = response.copy_to_bytes(12);
                     if resp_nonce.as_ref() != nonce {
-                        return Err(NatError::Platform("PCP nonce mismatch".to_string()));
+                        return Err(PcpError::InvalidResponse("Nonce mismatch").into());
                     }
 
                     let _protocol = response.get_u8();
@@ -1677,8 +1660,7 @@ impl PCPClient {
             // Double the retry delay, capped at 1024 seconds
             retry_delay = (retry_delay * 2).min(Duration::from_secs(1024));
         }
-
-        Err(NatError::Platform("PCP mapping request failed after all retries".to_string()))
+        Err(PcpError::InvalidResponse("mapping request failed after retries").into())
     }
 
     /// Delete port mapping
