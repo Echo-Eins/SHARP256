@@ -308,9 +308,11 @@ impl ConnectivityChecker {
                     let pair = pair_ref.read().await;
                     if pair.state == CandidatePairState::Waiting {
                         drop(pair);
+                        let sid = *stream_id;
+                        let pair_cloned = pair_ref.clone();
                         drop(check_lists);
-                        
-                        self.send_check(*stream_id, pair_ref.clone(), false).await;
+
+                        self.send_check(sid, pair_cloned, false).await;
                         return;
                     }
                 }
@@ -702,12 +704,14 @@ impl ConnectivityChecker {
                     if pair.state == CandidatePairState::Waiting ||
                        pair.state == CandidatePairState::Frozen {
                         drop(pair);
+                        let sid = *stream_id;
+                        let pair_cloned = pair_ref.clone();
                         drop(check_lists);
                         
                         // Add to triggered queue
                         self.triggered_queue.lock().await.push_back(TriggeredCheck {
-                            pair: pair_ref.clone(),
-                            stream_id: *stream_id,
+                            pair: pair_cloned,
+                            stream_id: sid,
                             use_candidate,
                         });
                         

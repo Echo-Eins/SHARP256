@@ -80,7 +80,7 @@ impl Nominator {
         });
 
         // Select best pair
-        sorted_pairs.first().map(|&&p| p.clone())
+        sorted_pairs.first().map(|&p| p.clone())
     }
 
     /// Nominate pair
