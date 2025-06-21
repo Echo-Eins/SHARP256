@@ -247,6 +247,55 @@ async fn send_file(file_path: &Path, receiver: SocketAddr) -> Result<()> {
     Ok(())
 }
 ```
+```
+// Example usage of SHARP3 with ICE
+
+use SHARP3::{Sender, Receiver};
+use std::path::Path;
+
+// Sender side
+async fn send_with_ice() -> anyhow::Result<()> {
+    let file_path = Path::new("large_file.bin");
+    
+    // STUN servers for ICE
+    let stun_servers = vec![
+        "stun.l.google.com:19302".to_string(),
+        "stun1.l.google.com:19302".to_string(),
+        "stun.cloudflare.com:3478".to_string(),
+    ];
+    
+    // Create sender with ICE
+    // The peer_signaling_addr is used only for initial ICE parameter exchange
+    let sender = Sender::new_with_ice(
+        "receiver.example.com:5555".parse()?,
+        file_path,
+        true, // encryption
+        stun_servers,
+    ).await?;
+    
+    // ICE has already established the optimal path
+    // Now just start the transfer
+    sender.start_transfer().await?;
+    
+    Ok(())
+}
+
+// Receiver side
+async fn receive_with_ice() -> anyhow::Result<()> {
+    let output_dir = Path::new("./downloads");
+    
+    // Bind to signaling address
+    let receiver = Receiver::new(
+        "0.0.0.0:5555".parse()?,
+        output_dir.to_path_buf(),
+    ).await?;
+    
+    // Start with ICE support
+    receiver.start_with_ice().await?;
+    
+    Ok(())
+}
+```
 
 ## Troubleshooting
 
