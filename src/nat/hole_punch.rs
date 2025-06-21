@@ -767,7 +767,8 @@ impl HolePuncher {
         predicted_ports.sort_unstable();
         predicted_ports.dedup();
 
-        tracing::debug!("Testing {} predicted ports", predicted_ports.len());
+        let total_ports = predicted_ports.len();
+        tracing::debug!("Testing {} predicted ports", total_ports);
 
         // Test predicted ports
         let mut sequence = 0u32;
@@ -790,7 +791,7 @@ impl HolePuncher {
                             tracing::info!("Port prediction succeeded: {} -> {}", peer_addr, addr);
 
                             self.stats.write().port_prediction_accuracy = Some(
-                                sequence as f64 / predicted_ports.len() as f64
+                                sequence as f64 / total_ports as f64
                             );
 
                             // Continue with this address
