@@ -918,12 +918,12 @@ impl HolePuncher {
 
         if stats.first_response_time.is_none() {
             stats.first_response_time = Some(
-                std::time::SystemTime::now()
+                (std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_micros() as u64
                     .saturating_sub(packet.timestamp)
-                    .max(1) as u64
+                    .max(1) as u64)
                     .into()
             );
         }

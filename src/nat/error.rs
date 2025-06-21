@@ -28,7 +28,11 @@ pub enum NatError {
 
     /// NAT-PMP errors
     #[error("NAT-PMP error: {0}")]
-    NatPmp(String),
+    NatPmp(#[from] NatPmpError),
+
+    /// PCP errors
+    #[error("PCP error: {0}")]
+    Pcp(#[from] PcpError),
 
     /// Network I/O errors
     #[error("Network error: {0}")]
@@ -180,6 +184,98 @@ pub enum TurnError {
     /// Lifetime expired
     #[error("Allocation lifetime expired")]
     LifetimeExpired,
+}
+
+/// NAT-PMP specific errors (RFC 6886)
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum NatPmpError {
+    #[error("Unsupported Version (1)")]
+    UnsupportedVersion = 1,
+    #[error("Not Authorized/Refused (2)")]
+    NotAuthorized = 2,
+    #[error("Network Failure (3)")]
+    NetworkFailure = 3,
+    #[error("Out of Resources (4)")]
+    OutOfResources = 4,
+    #[error("Unsupported Opcode (5)")]
+    UnsupportedOpcode = 5,
+    #[error("Unknown Error ({0})")]
+    Unknown(u16) = 0xFFFF,
+    #[error("Invalid response: {0}")]
+    InvalidResponse(&'static str),
+}
+
+impl NatPmpError {
+    /// Convert NAT-PMP result code to error
+    pub fn from_code(code: u16) -> Self {
+        match code {
+            1 => NatPmpError::UnsupportedVersion,
+            2 => NatPmpError::NotAuthorized,
+            3 => NatPmpError::NetworkFailure,
+            4 => NatPmpError::OutOfResources,
+            5 => NatPmpError::UnsupportedOpcode,
+            c => NatPmpError::Unknown(c),
+        }
+    }
+}
+
+/// PCP specific errors (RFC 6887)
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PcpError {
+    #[error("UNSUPP_VERSION (1)")]
+    UnsupportedVersion = 1,
+    #[error("NOT_AUTHORIZED (2)")]
+    NotAuthorized = 2,
+    #[error("MALFORMED_REQUEST (3)")]
+    MalformedRequest = 3,
+    #[error("UNSUPP_OPCODE (4)")]
+    UnsupportedOpcode = 4,
+    #[error("UNSUPP_OPTION (5)")]
+    UnsupportedOption = 5,
+    #[error("MALFORMED_OPTION (6)")]
+    MalformedOption = 6,
+    #[error("NETWORK_FAILURE (7)")]
+    NetworkFailure = 7,
+    #[error("NO_RESOURCES (8)")]
+    NoResources = 8,
+    #[error("UNSUPP_PROTOCOL (9)")]
+    UnsupportedProtocol = 9,
+    #[error("USER_EX_QUOTA (10)")]
+    UserExQuota = 10,
+    #[error("CANNOT_PROVIDE_EXTERNAL (11)")]
+    CannotProvideExternal = 11,
+    #[error("ADDRESS_MISMATCH (12)")]
+    AddressMismatch = 12,
+    #[error("EXCESSIVE_REMOTE_PEERS (13)")]
+    ExcessiveRemotePeers = 13,
+    #[error("Unknown Error ({0})")]
+    Unknown(u8) = 0xFF,
+    #[error("Invalid response: {0}")]
+    InvalidResponse(&'static str),
+}
+
+impl PcpError {
+    /// Convert PCP result code to error
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            1 => PcpError::UnsupportedVersion,
+            2 => PcpError::NotAuthorized,
+            3 => PcpError::MalformedRequest,
+            4 => PcpError::UnsupportedOpcode,
+            5 => PcpError::UnsupportedOption,
+            6 => PcpError::MalformedOption,
+            7 => PcpError::NetworkFailure,
+            8 => PcpError::NoResources,
+            9 => PcpError::UnsupportedProtocol,
+            10 => PcpError::UserExQuota,
+            11 => PcpError::CannotProvideExternal,
+            12 => PcpError::AddressMismatch,
+            13 => PcpError::ExcessiveRemotePeers,
+            c => PcpError::Unknown(c),
+        }
+    }
 }
 
 impl NatError {
