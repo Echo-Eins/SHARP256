@@ -9,7 +9,7 @@ use futures::future::join_all;
 use parking_lot::RwLock;
 
 use crate::nat::error::{NatError, StunError, NatResult};
-use crate::nat::metrics::{StunMetrics, record_ip_version_usage};
+use crate::nat::metrics::{StunMetricsHelper, record_ip_version_usage};
 use super::protocol::*;
 use super::auth::Credentials;
 use super::discovery::{NatBehavior, NatBehaviorDiscovery};
@@ -156,7 +156,7 @@ impl StunClient {
         server: &str,
     ) -> NatResult<StunServerInfo> {
         let server_addr = self.resolve_server(server).await?;
-        let metrics = StunMetrics::new(server.to_string());
+        let metrics = StunMetricsHelper::new(server.to_string());
 
         let start_time = Instant::now();
         let transaction_id = TransactionId::new();

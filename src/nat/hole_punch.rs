@@ -246,7 +246,10 @@ impl HolePunchPacket {
         // Version
         let version = data[cursor];
         if version != 2 {
-            return Err(NatError::Platform(format!("Unsupported version: {}", version)));
+            return Err(NatError::Platform(format!(
+                "Unsupported version: {}",
+                version
+            )));
         }
         cursor += 1;
 
@@ -270,14 +273,23 @@ impl HolePunchPacket {
 
         // Sequence
         let sequence = u32::from_be_bytes([
-            data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]
+            data[cursor],
+            data[cursor + 1],
+            data[cursor + 2],
+            data[cursor + 3],
         ]);
         cursor += 4;
 
         // Timestamp
         let timestamp = u64::from_be_bytes([
-            data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3],
-            data[cursor + 4], data[cursor + 5], data[cursor + 6], data[cursor + 7]
+            data[cursor],
+            data[cursor + 1],
+            data[cursor + 2],
+            data[cursor + 3],
+            data[cursor + 4],
+            data[cursor + 5],
+            data[cursor + 6],
+            data[cursor + 7],
         ]);
         cursor += 8;
 
@@ -365,7 +377,11 @@ impl HolePuncher {
         tracing::info!(
             "Starting hole punch to {} (role: {}, NAT: {:?})",
             peer_addr,
-            if is_initiator { "initiator" } else { "responder" },
+            if is_initiator {
+                "initiator"
+            } else {
+                "responder"
+            },
             nat_behavior.map(|n| n.to_simple_nat_type())
         );
 
@@ -376,13 +392,34 @@ impl HolePuncher {
 
         // Execute selected strategy
         let result = match strategy.as_str() {
-            "direct" => self.direct_punch(socket, peer_addr, is_initiator, session_id).await,
-            "birthday" => self.birthday_paradox_punch(socket, peer_addr, is_initiator, session_id).await,
-            "rapid_fire" => self.rapid_fire_punch(socket, peer_addr, is_initiator, session_id).await,
-            "port_prediction" => self.port_prediction_punch(socket, peer_addr, is_initiator, session_id).await,
-            "ttl_discovery" => self.ttl_discovery_punch(socket, peer_addr, is_initiator, session_id).await,
-            "sequential" => self.sequential_strategy(socket, peer_addr, is_initiator, session_id, nat_behavior).await,
-            _ => self.classic_punch(socket, peer_addr, is_initiator, session_id).await,
+            "direct" => {
+                self.direct_punch(socket, peer_addr, is_initiator, session_id)
+                    .await
+            }
+            "birthday" => {
+                self.birthday_paradox_punch(socket, peer_addr, is_initiator, session_id)
+                    .await
+            }
+            "rapid_fire" => {
+                self.rapid_fire_punch(socket, peer_addr, is_initiator, session_id)
+                    .await
+            }
+            "port_prediction" => {
+                self.port_prediction_punch(socket, peer_addr, is_initiator, session_id)
+                    .await
+            }
+            "ttl_discovery" => {
+                self.ttl_discovery_punch(socket, peer_addr, is_initiator, session_id)
+                    .await
+            }
+            "sequential" => {
+                self.sequential_strategy(socket, peer_addr, is_initiator, session_id, nat_behavior)
+                    .await
+            }
+            _ => {
+                self.classic_punch(socket, peer_addr, is_initiator, session_id)
+                    .await
+            }
         };
 
         // Update stats
@@ -390,7 +427,8 @@ impl HolePuncher {
         if result.is_ok() {
             stats.successful_strategy = Some(strategy.clone());
             stats.connection_time = Some(start_time.elapsed());
-            self.metrics.record_success(peer_addr, start_time.elapsed(), strategy);
+            self.metrics
+                .record_success(peer_addr, start_time.elapsed(), strategy);
         } else {
             self.metrics.record_failure(peer_addr, strategy);
         }
@@ -404,15 +442,19 @@ impl HolePuncher {
             Some(behavior) => {
                 match (behavior.mapping, behavior.filtering) {
                     // Best case: Full Cone NAT
-                    (MappingBehavior::EndpointIndependent, FilteringBehavior::EndpointIndependent) => {
-                        "direct".to_string()
-                    }
+                    (
+                        MappingBehavior::EndpointIndependent,
+                        FilteringBehavior::EndpointIndependent,
+                    ) => "direct".to_string(),
                     // Good case: Restricted Cone NAT
                     (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressDependent) => {
                         "classic".to_string()
                     }
                     // Moderate case: Port Restricted Cone NAT
-                    (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressPortDependent) => {
+                    (
+                        MappingBehavior::EndpointIndependent,
+                        FilteringBehavior::AddressPortDependent,
+                    ) => {
                         if self.config.enable_birthday_paradox {
                             "birthday".to_string()
                         } else {
@@ -420,8 +462,8 @@ impl HolePuncher {
                         }
                     }
                     // Hard case: Symmetric NAT
-                    (MappingBehavior::AddressDependent, _) |
-                    (MappingBehavior::AddressPortDependent, _) => {
+                    (MappingBehavior::AddressDependent, _)
+                    | (MappingBehavior::AddressPortDependent, _) => {
                         if self.config.enable_port_prediction {
                             "port_prediction".to_string()
                         } else if self.config.enable_birthday_paradox {
@@ -460,12 +502,14 @@ impl HolePuncher {
             match timeout(Duration::from_secs(1), socket.recv_from(&mut buf)).await {
                 Ok(Ok((size, addr))) if addr == peer_addr => {
                     if let Ok(response) = HolePunchPacket::decode(&buf[..size]) {
-                        if response.packet_type == PacketType::Response &&
-                            response.session_id == session_id {
+                        if response.packet_type == PacketType::Response
+                            && response.session_id == session_id
+                        {
                             self.stats.write().packets_received += 1;
 
                             // Send confirmation
-                            let confirm = HolePunchPacket::new(PacketType::Connected, session_id, i + 1);
+                            let confirm =
+                                HolePunchPacket::new(PacketType::Connected, session_id, i + 1);
                             socket.send_to(&confirm.encode(), peer_addr).await?;
 
                             return Ok(());
@@ -498,9 +542,13 @@ impl HolePuncher {
         // Phase 1: Initial burst (RFC 4787 recommends initial rapid packets)
         for i in 0..10 {
             let packet = HolePunchPacket::new(
-                if is_initiator { PacketType::Probe } else { PacketType::Response },
+                if is_initiator {
+                    PacketType::Probe
+                } else {
+                    PacketType::Response
+                },
                 session_id,
-                sequence
+                sequence,
             );
             sequence += 1;
 
@@ -511,7 +559,10 @@ impl HolePuncher {
             let mut buf = vec![0u8; 2048];
             match timeout(Duration::from_millis(10), socket.recv_from(&mut buf)).await {
                 Ok(Ok((size, addr))) if addr == peer_addr => {
-                    if self.handle_packet(&buf[..size], session_id, socket, peer_addr).await? {
+                    if self
+                        .handle_packet(&buf[..size], session_id, socket, peer_addr)
+                        .await?
+                    {
                         return Ok(());
                     }
                 }
@@ -526,9 +577,13 @@ impl HolePuncher {
             interval.tick().await;
 
             let packet = HolePunchPacket::new(
-                if is_initiator { PacketType::Probe } else { PacketType::Response },
+                if is_initiator {
+                    PacketType::Probe
+                } else {
+                    PacketType::Response
+                },
                 session_id,
-                sequence
+                sequence,
             );
             sequence += 1;
 
@@ -541,7 +596,10 @@ impl HolePuncher {
 
             match timeout(listen_duration, socket.recv_from(&mut buf)).await {
                 Ok(Ok((size, addr))) if addr == peer_addr => {
-                    if self.handle_packet(&buf[..size], session_id, socket, peer_addr).await? {
+                    if self
+                        .handle_packet(&buf[..size], session_id, socket, peer_addr)
+                        .await?
+                    {
                         return Ok(());
                     }
                 }
@@ -565,7 +623,10 @@ impl HolePuncher {
         is_initiator: bool,
         session_id: [u8; 16],
     ) -> NatResult<()> {
-        tracing::debug!("Using birthday paradox strategy with {} sockets", self.config.birthday_sockets);
+        tracing::debug!(
+            "Using birthday paradox strategy with {} sockets",
+            self.config.birthday_sockets
+        );
 
         // Create multiple sockets
         let mut sockets = Vec::new();
@@ -577,7 +638,9 @@ impl HolePuncher {
         }
 
         if sockets.len() < 3 {
-            return Err(NatError::Platform("Failed to create enough sockets".to_string()));
+            return Err(NatError::Platform(
+                "Failed to create enough sockets".to_string(),
+            ));
         }
 
         tracing::debug!("Created {} sockets for birthday paradox", sockets.len());
@@ -636,18 +699,23 @@ impl HolePuncher {
                 }
             }
             Err(())
-        }).await {
+        })
+            .await
+        {
             Ok(Ok((winning_socket, response))) => {
-                tracing::info!("Birthday paradox succeeded with socket on port {}",
-                    winning_socket.local_addr()?.port());
+                tracing::info!(
+                    "Birthday paradox succeeded with socket on port {}",
+                    winning_socket.local_addr()?.port()
+                );
 
                 // Confirm connection
-                let confirm = HolePunchPacket::new(PacketType::Connected, session_id, response.sequence + 1);
+                let confirm =
+                    HolePunchPacket::new(PacketType::Connected, session_id, response.sequence + 1);
                 winning_socket.send_to(&confirm.encode(), peer_addr).await?;
 
                 Ok(())
             }
-            _ => Err(NatError::Transient("Birthday paradox failed".to_string()))
+            _ => Err(NatError::Transient("Birthday paradox failed".to_string())),
         }
     }
 
@@ -684,8 +752,8 @@ impl HolePuncher {
         // Phase 2: Pattern variation
         let patterns = vec![
             vec![100, 200, 100, 300], // Variable delays
-            vec![50; 10],              // Consistent rapid
-            vec![500, 50, 50, 500],    // Burst pattern
+            vec![50; 10],             // Consistent rapid
+            vec![500, 50, 50, 500],   // Burst pattern
         ];
 
         for pattern in patterns {
@@ -700,7 +768,10 @@ impl HolePuncher {
                 let mut buf = vec![0u8; 2048];
                 match timeout(Duration::from_millis(delay), socket.recv_from(&mut buf)).await {
                     Ok(Ok((size, addr))) if addr == peer_addr => {
-                        if self.handle_packet(&buf[..size], session_id, socket, peer_addr).await? {
+                        if self
+                            .handle_packet(&buf[..size], session_id, socket, peer_addr)
+                            .await?
+                        {
                             return Ok(());
                         }
                     }
@@ -756,7 +827,7 @@ impl HolePuncher {
         let common_ports = vec![
             base_port.wrapping_sub(1),
             base_port.wrapping_add(1),
-            base_port ^ 0xFF,  // Simple bit manipulation
+            base_port ^ 0xFF,   // Simple bit manipulation
             base_port ^ 0xFFFF, // Invert all bits
         ];
         predicted_ports.extend(common_ports);
@@ -788,12 +859,13 @@ impl HolePuncher {
                         if response.session_id == session_id {
                             tracing::info!("Port prediction succeeded: {} -> {}", peer_addr, addr);
 
-                            self.stats.write().port_prediction_accuracy = Some(
-                                sequence as f64 / total_ports as f64
-                            );
+                            self.stats.write().port_prediction_accuracy =
+                                Some(sequence as f64 / total_ports as f64);
 
                             // Continue with this address
-                            return self.classic_punch(socket, addr, is_initiator, session_id).await;
+                            return self
+                                .classic_punch(socket, addr, is_initiator, session_id)
+                                .await;
                         }
                     }
                 }
@@ -863,21 +935,61 @@ impl HolePuncher {
     ) -> NatResult<()> {
         tracing::debug!("Using sequential strategy (unknown NAT behavior)");
 
+        // Try each strategy in a predefined order. We avoid casting async
+        // functions to function pointers by matching on the strategy name
+        // inside the loop.
+
         let strategies = vec![
-            ("direct", Self::direct_punch as fn(&Self, &UdpSocket, SocketAddr, bool, [u8; 16]) -> _),
-            ("classic", Self::classic_punch as fn(&Self, &UdpSocket, SocketAddr, bool, [u8; 16]) -> _),
-            ("rapid_fire", Self::rapid_fire_punch as fn(&Self, &UdpSocket, SocketAddr, bool, [u8; 16]) -> _),
-            ("birthday", Self::birthday_paradox_punch as fn(&Self, &UdpSocket, SocketAddr, bool, [u8; 16]) -> _),
-            ("port_prediction", Self::port_prediction_punch as fn(&Self, &UdpSocket, SocketAddr, bool, [u8; 16]) -> _),
+            "direct",
+            "classic",
+            "rapid_fire",
+            "birthday",
+            "port_prediction",
         ];
 
-        for (name, strategy_fn) in strategies {
+        for name in strategies {
             tracing::info!("Trying {} strategy", name);
 
-            match timeout(
-                Duration::from_secs(5),
-                strategy_fn(self, socket, peer_addr, is_initiator, session_id)
-            ).await {
+            let res = match name {
+                "direct" => {
+                    timeout(
+                        Duration::from_secs(5),
+                        self.direct_punch(socket, peer_addr, is_initiator, session_id),
+                    )
+                        .await
+                }
+                "classic" => {
+                    timeout(
+                        Duration::from_secs(5),
+                        self.classic_punch(socket, peer_addr, is_initiator, session_id),
+                    )
+                        .await
+                }
+                "rapid_fire" => {
+                    timeout(
+                        Duration::from_secs(5),
+                        self.rapid_fire_punch(socket, peer_addr, is_initiator, session_id),
+                    )
+                        .await
+                }
+                "birthday" => {
+                    timeout(
+                        Duration::from_secs(5),
+                        self.birthday_paradox_punch(socket, peer_addr, is_initiator, session_id),
+                    )
+                        .await
+                }
+                "port_prediction" => {
+                    timeout(
+                        Duration::from_secs(5),
+                        self.port_prediction_punch(socket, peer_addr, is_initiator, session_id),
+                    )
+                        .await
+                }
+                _ => unreachable!(),
+            };
+
+            match res {
                 Ok(Ok(())) => {
                     self.stats.write().successful_strategy = Some(name.to_string());
                     return Ok(());
@@ -915,15 +1027,13 @@ impl HolePuncher {
         stats.packets_received += 1;
 
         if stats.first_response_time.is_none() {
-            stats.first_response_time = Some(
-                ((std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64)
-                    .saturating_sub(packet.timestamp)
-                    .max(1) as u64)
-                    .into()
-            );
+            let micros = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64)
+                .saturating_sub(packet.timestamp)
+                .max(1);
+            stats.first_response_time = Some(Duration::from_micros(micros));
         }
 
         // Calculate RTT
@@ -932,7 +1042,7 @@ impl HolePuncher {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_micros() as u64)
-                .saturating_sub(packet.timestamp)
+                .saturating_sub(packet.timestamp),
         );
         stats.rtt_samples.push(rtt);
 
@@ -961,7 +1071,7 @@ impl HolePuncher {
                 self.stats.write().detected_mtu = Some(packet.payload.len());
                 Ok(false)
             }
-            _ => Ok(false)
+            _ => Ok(false),
         }
     }
 
@@ -1077,12 +1187,15 @@ impl CoordinatedHolePunch {
 
                 if &buf[..size] == b"START" {
                     // Perform synchronized hole punching
-                    let stats = self.puncher.punch_hole(
-                        socket,
-                        peer_addr,
-                        true, // Both act as initiators in simultaneous mode
-                        nat_behavior
-                    ).await?;
+                    let stats = self
+                        .puncher
+                        .punch_hole(
+                            socket,
+                            peer_addr,
+                            true, // Both act as initiators in simultaneous mode
+                            nat_behavior,
+                        )
+                        .await?;
 
                     return Ok((peer_addr, stats));
                 }
@@ -1117,12 +1230,14 @@ impl IceCompatibleHolePunch {
         let nat_behavior = self.infer_nat_behavior(local_candidate, remote_candidate);
 
         // Perform hole punching
-        self.puncher.punch_hole(
-            socket,
-            remote_candidate.addr,
-            is_controlling,
-            nat_behavior.as_ref()
-        ).await
+        self.puncher
+            .punch_hole(
+                socket,
+                remote_candidate.addr,
+                is_controlling,
+                nat_behavior.as_ref(),
+            )
+            .await
     }
 
     /// Infer NAT behavior from ICE candidates

@@ -23,6 +23,8 @@ use xmltree::{Element, XMLNode};
 use rand::RngCore;
 
 use crate::nat::error::{NatError, NatPmpError, PcpError, NatResult};
+use crate::nat::metrics::HolePunchMetrics;
+use crate::nat::stun::{FilteringBehavior, MappingBehavior, NatBehavior};
 
 /// Port mapping protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
