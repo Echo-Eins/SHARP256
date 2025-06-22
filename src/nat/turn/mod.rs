@@ -3,17 +3,18 @@
 //! NOTE: This is a simplified server for demonstration and testing.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{SocketAddr, IpAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use rand::RngCore;
 
 use crate::nat::error::{NatResult, NatError, TurnError};
 use crate::nat::stun::{Message, MessageType, Attribute, AttributeType, AttributeValue, MessageClass};
-use utils::{check_message_integrity, build_error_response};
+use utils::build_error_response;
 
 /// TURN relay configuration
 #[derive(Debug, Clone)]
@@ -26,6 +27,9 @@ pub struct TurnRelayConfig {
     pub users: HashMap<String, String>,
     /// Maximum allocation lifetime
     pub max_lifetime: Duration,
+
+    /// Lifetime of issued NONCE values
+    pub nonce_lifetime: Duration,
     /// Optional software string
     pub software: Option<String>,
 }
@@ -37,6 +41,7 @@ impl Default for TurnRelayConfig {
             realm: "sharp-turn".into(),
             users: HashMap::new(),
             max_lifetime: Duration::from_secs(600),
+            nonce_lifetime: Duration::from_secs(600),
             software: Some("SHARP TURN".into()),
         }
     }
@@ -50,11 +55,23 @@ struct Allocation {
     expire: Instant,
 }
 
+struct NonceEntry {
+    value: Vec<u8>,
+    expire: Instant,
+}
+
+enum AuthStatus {
+    Ok(Vec<u8>),
+    Unauthorized(Vec<u8>),
+    StaleNonce(Vec<u8>),
+}
+
 /// TURN relay server
 pub struct TurnRelay {
     config: TurnRelayConfig,
     socket: Arc<UdpSocket>,
     allocations: Arc<Mutex<HashMap<SocketAddr, Allocation>>>,
+    nonces: Arc<Mutex<HashMap<SocketAddr, NonceEntry>>>,
 }
 
 impl TurnRelay {
@@ -66,6 +83,7 @@ impl TurnRelay {
             config,
             socket,
             allocations: Arc::new(Mutex::new(HashMap::new())),
+            nonces: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -75,8 +93,9 @@ impl TurnRelay {
         loop {
             let (len, src) = self.socket.recv_from(&mut buf).await?;
             let data = &buf[..len];
-            if let Ok(msg) = Message::decode(bytes::BytesMut::from(data)) {
-                if let Err(e) = self.handle_stun(msg, src).await {
+            let raw = bytes::BytesMut::from(data);
+            if let Ok(msg) = Message::decode(raw.clone()) {
+                if let Err(e) = self.handle_stun(msg, src, &raw).await {
                     warn!("STUN handling failed from {}: {}", src, e);
                 }
             } else {
@@ -87,16 +106,16 @@ impl TurnRelay {
     }
 
     /// Handle incoming STUN messages
-    async fn handle_stun(&self, msg: Message, src: SocketAddr) -> NatResult<()> {
+    async fn handle_stun(&self, msg: Message, src: SocketAddr, raw: &[u8]) -> NatResult<()> {
         match msg.message_type {
             MessageType::AllocateRequest => {
-                self.handle_allocate(msg, src).await
+                self.handle_allocate(msg, src, raw).await
             }
             MessageType::RefreshRequest => {
-                self.handle_refresh(msg, src).await
+                self.handle_refresh(msg, src, raw).await
             }
             MessageType::CreatePermissionRequest => {
-                self.handle_create_permission(msg, src).await
+                self.handle_create_permission(msg, src, raw).await
             }
             MessageType::SendIndication => {
                 if let Some(attr) = msg.get_attribute(AttributeType::Data) {
@@ -120,8 +139,24 @@ impl TurnRelay {
         }
     }
 
-    async fn handle_allocate(&self, msg: Message, src: SocketAddr) -> NatResult<()> {
-        check_message_integrity(&msg, &self.config, &self.socket, src)?;
+    async fn handle_allocate(&self, msg: Message, src: SocketAddr, raw: &[u8]) -> NatResult<()> {
+        let key = match self.authenticate(&msg, src, raw).await? {
+            AuthStatus::Ok(key) => key,
+            AuthStatus::Unauthorized(nonce) => {
+                let mut err = build_error_response(&msg, 401, "Unauthorized", Some(nonce));
+                err.add_attribute(Attribute::new(AttributeType::Realm, AttributeValue::Realm(self.config.realm.clone())));
+                let bytes = err.encode(None, true)?;
+                self.socket.send_to(&bytes, src).await?;
+                return Ok(());
+            }
+            AuthStatus::StaleNonce(nonce) => {
+                let mut err = build_error_response(&msg, 438, "Stale Nonce", Some(nonce));
+                err.add_attribute(Attribute::new(AttributeType::Realm, AttributeValue::Realm(self.config.realm.clone())));
+                let bytes = err.encode(None, true)?;
+                self.socket.send_to(&bytes, src).await?;
+                return Ok(());
+            }
+        };
 
         // Allocate relay socket
         let relay_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -153,14 +188,29 @@ impl TurnRelay {
             ));
         }
 
-        let key = self.long_term_key(&msg)?;
         let bytes = resp.encode(Some(&key), true)?;
         self.socket.send_to(&bytes, src).await?;
         Ok(())
     }
 
-    async fn handle_refresh(&self, msg: Message, src: SocketAddr) -> NatResult<()> {
-        check_message_integrity(&msg, &self.config, &self.socket, src)?;
+    async fn handle_refresh(&self, msg: Message, src: SocketAddr, raw: &[u8]) -> NatResult<()> {
+        let key = match self.authenticate(&msg, src, raw).await? {
+            AuthStatus::Ok(key) => key,
+            AuthStatus::Unauthorized(nonce) => {
+                let mut err = build_error_response(&msg, 401, "Unauthorized", Some(nonce));
+                err.add_attribute(Attribute::new(AttributeType::Realm, AttributeValue::Realm(self.config.realm.clone())));
+                let bytes = err.encode(None, true)?;
+                self.socket.send_to(&bytes, src).await?;
+                return Ok(());
+            }
+            AuthStatus::StaleNonce(nonce) => {
+                let mut err = build_error_response(&msg, 438, "Stale Nonce", Some(nonce));
+                err.add_attribute(Attribute::new(AttributeType::Realm, AttributeValue::Realm(self.config.realm.clone())));
+                let bytes = err.encode(None, true)?;
+                self.socket.send_to(&bytes, src).await?;
+                return Ok(());
+            }
+        };
         let mut allocations = self.allocations.lock().await;
         if let Some(allocation) = allocations.get_mut(&src) {
             allocation.expire = Instant::now() + self.config.max_lifetime;
@@ -169,7 +219,6 @@ impl TurnRelay {
                 AttributeType::Lifetime,
                 AttributeValue::Raw((self.config.max_lifetime.as_secs() as u32).to_be_bytes().to_vec()),
             ));
-            let key = self.long_term_key(&msg)?;
             let bytes = resp.encode(Some(&key), true)?;
             self.socket.send_to(&bytes, src).await?;
         } else {
@@ -180,8 +229,24 @@ impl TurnRelay {
         Ok(())
     }
 
-    async fn handle_create_permission(&self, msg: Message, src: SocketAddr) -> NatResult<()> {
-        check_message_integrity(&msg, &self.config, &self.socket, src)?;
+    async fn handle_create_permission(&self, msg: Message, src: SocketAddr, raw: &[u8]) -> NatResult<()> {
+        let key = match self.authenticate(&msg, src, raw).await? {
+            AuthStatus::Ok(key) => key,
+            AuthStatus::Unauthorized(nonce) => {
+                let mut err = build_error_response(&msg, 401, "Unauthorized", Some(nonce));
+                err.add_attribute(Attribute::new(AttributeType::Realm, AttributeValue::Realm(self.config.realm.clone())));
+                let bytes = err.encode(None, true)?;
+                self.socket.send_to(&bytes, src).await?;
+                return Ok(());
+            }
+            AuthStatus::StaleNonce(nonce) => {
+                let mut err = build_error_response(&msg, 438, "Stale Nonce", Some(nonce));
+                err.add_attribute(Attribute::new(AttributeType::Realm, AttributeValue::Realm(self.config.realm.clone())));
+                let bytes = err.encode(None, true)?;
+                self.socket.send_to(&bytes, src).await?;
+                return Ok(());
+            }
+        };
         let mut allocations = self.allocations.lock().await;
         if let Some(allocation) = allocations.get_mut(&src) {
             for attr in msg.get_attributes(AttributeType::XorPeerAddress) {
@@ -190,7 +255,6 @@ impl TurnRelay {
                 }
             }
             let mut resp = Message::new(MessageType::CreatePermissionResponse, msg.transaction_id);
-            let key = self.long_term_key(&msg)?;
             let bytes = resp.encode(Some(&key), true)?;
             self.socket.send_to(&bytes, src).await?;
         } else {
@@ -224,13 +288,59 @@ impl TurnRelay {
         Ok(())
     }
 
-    fn long_term_key(&self, msg: &Message) -> NatResult<Vec<u8>> {
-        let username = msg
-            .get_attribute(AttributeType::Username)
-            .and_then(|a| match &a.value { AttributeValue::Username(u) => Some(u.clone()), _ => None })
-            .ok_or_else(|| NatError::Turn(TurnError::AllocationFailed("missing username".into())))?;
+    async fn authenticate(&self, msg: &Message, src: SocketAddr, raw: &[u8]) -> NatResult<AuthStatus> {
+        let username = match msg.get_attribute(AttributeType::Username) {
+            Some(a) => match &a.value { AttributeValue::Username(u) => u.clone(), _ => return Ok(AuthStatus::Unauthorized(self.refresh_nonce(src).await)) },
+            None => return Ok(AuthStatus::Unauthorized(self.refresh_nonce(src).await)),
+        };
+
+        let nonce = match msg.get_attribute(AttributeType::Nonce) {
+            Some(a) => match &a.value { AttributeValue::Nonce(n) => n.clone(), _ => return Ok(AuthStatus::Unauthorized(self.refresh_nonce(src).await)) },
+            None => return Ok(AuthStatus::Unauthorized(self.refresh_nonce(src).await)),
+        };
+
+        let mut nonce_store = self.nonces.lock().await;
+        match nonce_store.get_mut(&src) {
+            Some(entry) => {
+                if entry.value != nonce || Instant::now() >= entry.expire {
+                    let new = self.generate_nonce();
+                    *entry = NonceEntry { value: new.clone(), expire: Instant::now() + self.config.nonce_lifetime };
+                    return Ok(AuthStatus::StaleNonce(entry.value.clone()));
+                }
+            }
+            None => {
+                let new = self.generate_nonce();
+                nonce_store.insert(src, NonceEntry { value: new.clone(), expire: Instant::now() + self.config.nonce_lifetime });
+                return Ok(AuthStatus::Unauthorized(new));
+            }
+        }
+        drop(nonce_store);
+
+        let key = self.long_term_key_user(&username)?;
+        if !msg.verify_integrity_sha256(&key, raw)? {
+            let new = self.refresh_nonce(src).await;
+            return Ok(AuthStatus::Unauthorized(new));
+        }
+        Ok(AuthStatus::Ok(key))
+    }
+
+    async fn refresh_nonce(&self, src: SocketAddr) -> Vec<u8> {
+        let mut store = self.nonces.lock().await;
+        let nonce = self.generate_nonce();
+        store.insert(src, NonceEntry { value: nonce.clone(), expire: Instant::now() + self.config.nonce_lifetime });
+        nonce
+    }
+
+    fn generate_nonce(&self) -> Vec<u8> {
+        use rand::RngCore;
+        let mut buf = vec![0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        buf
+    }
+
+    fn long_term_key_user(&self, username: &str) -> NatResult<Vec<u8>> {
         let realm = self.config.realm.clone();
-        let password = self.config.users.get(&username)
+        let password = self.config.users.get(username)
             .ok_or_else(|| NatError::Turn(TurnError::AllocationFailed("unknown user".into())))?;
         use md5::{Md5, Digest};
         let input = format!("{}:{}:{}", username, realm, password);
@@ -243,14 +353,6 @@ impl TurnRelay {
 mod utils {
     use super::*;
     use crate::nat::stun::{Message, Attribute, AttributeType, AttributeValue, MessageClass};
-
-    pub fn check_message_integrity(msg: &Message, _config: &TurnRelayConfig, _socket: &UdpSocket, _src: SocketAddr) -> NatResult<()> {
-        if msg.get_attribute(AttributeType::MessageIntegrity).is_none() {
-            return Err(NatError::Turn(TurnError::AllocationFailed("no integrity".into())));
-        }
-        // TODO: verify NONCE (not implemented)
-        Ok(())
-    }
 
     pub fn build_error_response(req: &Message, code: u16, reason: &str, nonce: Option<Vec<u8>>) -> Message {
         let mut resp = Message::new(MessageType::from_method_class(req.message_type.method(), MessageClass::ErrorResponse).unwrap(), req.transaction_id);
