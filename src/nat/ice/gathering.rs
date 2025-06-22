@@ -15,7 +15,6 @@ use crate::nat::error::{NatError, NatResult};
 use super::{Candidate, CandidateType, TransportProtocol};
 
 // TURN client implementation
-mod turn_client;
 use turn_client::{TurnClient, TurnAllocation, TurnConfig};
 
 /// Candidate gatherer with full RFC 8445 and TURN support

@@ -31,6 +31,7 @@ pub mod coordinator;
 pub mod metrics;
 pub mod port_forwarding;
 //pub mod ice;
+pub mod turn;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -44,6 +45,7 @@ use self::hole_punch::{HolePuncher, HolePunchConfig, CoordinatedHolePunch};
 use self::coordinator::AdvancedNatTraversal;
 use self::error::{NatError, NatResult};
 
+pub use turn::TurnRelay;
 pub mod ice;
 pub mod ice_integration;
 

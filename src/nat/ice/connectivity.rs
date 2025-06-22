@@ -13,7 +13,7 @@ use bytes::{Bytes, BytesMut, BufMut};
 use tracing::{info, warn, error, debug, trace};
 
 use crate::nat::stun::{
-    Message, MessageType, TransactionId, Attribute, AttributeType, AttributeValue,
+    Message, MessageType, TransactionId, Attribute, AttributeType as StunAttrType, AttributeValue,
     compute_message_integrity_sha256, MAGIC_COOKIE,
 };
 use crate::nat::error::{NatError, StunError, NatResult};
@@ -178,22 +178,20 @@ pub enum ConnectivityEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttributeType(u16);
+
 // ICE-specific STUN attribute types
 impl AttributeType {
     pub const Priority: AttributeType = AttributeType(0x0024);
     pub const UseCandidate: AttributeType = AttributeType(0x0025);
     pub const IceControlled: AttributeType = AttributeType(0x8029);
     pub const IceControlling: AttributeType = AttributeType(0x802A);
-}
 
-impl AttributeType {
     const fn new(value: u16) -> Self {
         AttributeType(value)
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AttributeType(u16);
 
 impl ConnectivityChecker {
     /// Create new connectivity checker
@@ -628,7 +626,7 @@ impl ConnectivityChecker {
         if let Some(remote_creds) = &*self.remote_creds.read().await {
             let username = format!("{}:{}", remote_creds.ufrag, self.local_creds.ufrag);
             request.add_attribute(Attribute::new(
-                AttributeType::Username,
+                StunAttrType::Username,
                 AttributeValue::Username(username),
             ));
         } else {
@@ -657,7 +655,7 @@ impl ConnectivityChecker {
         priority_bytes[3] = priority as u8;
 
         request.add_attribute(Attribute::new(
-            AttributeType::Priority,
+            StunAttrType::Priority,
             AttributeValue::Raw(priority_bytes),
         ));
 
@@ -668,14 +666,14 @@ impl ConnectivityChecker {
                 controlling_bytes[i] = *byte;
             }
             request.add_attribute(Attribute::new(
-                AttributeType::IceControlling,
+                StunAttrType::IceControlling,
                 AttributeValue::Raw(controlling_bytes),
             ));
 
             if use_candidate {
                 debug!("Adding USE-CANDIDATE to check");
                 request.add_attribute(Attribute::new(
-                    AttributeType::UseCandidate,
+                    AttributeType::UseCandidate.into(),
                     AttributeValue::Raw(vec![]),
                 ));
             }
@@ -685,7 +683,7 @@ impl ConnectivityChecker {
                 controlled_bytes[i] = *byte;
             }
             request.add_attribute(Attribute::new(
-                AttributeType::IceControlled,
+                StunAttrType::IceControlled,
                 AttributeValue::Raw(controlled_bytes),
             ));
         }
@@ -896,11 +894,11 @@ impl ConnectivityChecker {
         drop(pair);
 
         // Verify MESSAGE-INTEGRITY if present
-        if response.get_attribute(AttributeType::MessageIntegrity).is_some() ||
-            response.get_attribute(AttributeType::MessageIntegritySha256).is_some() {
+        if response.get_attribute(StunAttrType::MessageIntegrity).is_some() ||
+            response.get_attribute(StunAttrType::MessageIntegritySha256).is_some() {
             let key = self.local_creds.pwd.as_bytes();
 
-            if response.get_attribute(AttributeType::MessageIntegritySha256).is_some() {
+            if response.get_attribute(StunAttrType::MessageIntegritySha256).is_some() {
                 if !response.verify_integrity_sha256(key, raw_data).unwrap_or(false) {
                     error!("MESSAGE-INTEGRITY-SHA256 verification failed");
                     self.handle_check_failure(transaction.stream_id, transaction.pair).await;
@@ -914,7 +912,7 @@ impl ConnectivityChecker {
         }
 
         // Verify FINGERPRINT if present
-        if response.get_attribute(AttributeType::Fingerprint).is_some() {
+        if response.get_attribute(StunAttrType::Fingerprint).is_some() {
             if !response.verify_fingerprint(raw_data).unwrap_or(false) {
                 error!("FINGERPRINT verification failed");
                 self.handle_check_failure(transaction.stream_id, transaction.pair).await;
@@ -1004,7 +1002,7 @@ impl ConnectivityChecker {
         debug!("Handling binding request from {} to {}", remote_addr, local_addr);
 
         // Verify USERNAME attribute
-        let username_attr = match request.get_attribute(AttributeType::Username) {
+        let username_attr = match request.get_attribute(StunAttrType::Username) {
             Some(attr) => attr,
             None => {
                 warn!("No USERNAME in binding request");
@@ -1031,8 +1029,8 @@ impl ConnectivityChecker {
         }
 
         // Verify MESSAGE-INTEGRITY
-        let has_integrity = request.get_attribute(AttributeType::MessageIntegrity).is_some() ||
-            request.get_attribute(AttributeType::MessageIntegritySha256).is_some();
+        let has_integrity = request.get_attribute(StunAttrType::MessageIntegrity).is_some() ||
+            request.get_attribute(StunAttrType::MessageIntegritySha256).is_some();
 
         if !has_integrity {
             warn!("No MESSAGE-INTEGRITY in request");
@@ -1048,15 +1046,15 @@ impl ConnectivityChecker {
 
         // Add XOR-MAPPED-ADDRESS
         response.add_attribute(Attribute::new(
-            AttributeType::XorMappedAddress,
+            StunAttrType::XorMappedAddress,
             AttributeValue::XorMappedAddress(remote_addr),
         ));
 
         // Check for role conflict (RFC 8445 Section 7.3.1.1)
         let has_controlling = request.attributes.iter()
-            .any(|a| matches!(a.attr_type, AttributeType::IceControlling));
+            .any(|a| matches!(a.attr_type, StunAttrType::IceControlling));
         let has_controlled = request.attributes.iter()
-            .any(|a| matches!(a.attr_type, AttributeType::IceControlled));
+            .any(|a| matches!(a.attr_type, StunAttrType::IceControlled));
 
         let controlling = *self.controlling.read().await;
 
@@ -1093,7 +1091,7 @@ impl ConnectivityChecker {
 
         // Check USE-CANDIDATE
         let use_candidate = request.attributes.iter()
-            .any(|a| matches!(a.attr_type, AttributeType::UseCandidate));
+            .any(|a| matches!(a.attr_type, StunAttrType::UseCandidate));
 
         // Send response with MESSAGE-INTEGRITY and FINGERPRINT
         let integrity_key = self.local_creds.pwd.as_bytes();
@@ -1125,7 +1123,7 @@ impl ConnectivityChecker {
         let mut response = Message::new(MessageType::BindingError, transaction_id);
 
         response.add_attribute(Attribute::new(
-            AttributeType::ErrorCode,
+            StunAttrType::ErrorCode,
             AttributeValue::ErrorCode {
                 code: error_code,
                 reason: reason.to_string(),
@@ -1216,7 +1214,7 @@ impl ConnectivityChecker {
     /// Handle STUN binding error
     async fn handle_binding_error(&self, error: Message) {
         if let Some(transaction) = self.transactions.lock().await.remove(&error.transaction_id) {
-            if let Some(error_attr) = error.get_attribute(AttributeType::ErrorCode) {
+            if let Some(error_attr) = error.get_attribute(StunAttrType::ErrorCode) {
                 if let AttributeValue::ErrorCode { code, reason } = &error_attr.value {
                     error!("Binding error {}: {}", code, reason);
 
@@ -1423,7 +1421,7 @@ impl Message {
         use hmac::{Hmac, Mac};
         use sha1::Sha1;
 
-        let attr = self.get_attribute(AttributeType::MessageIntegrity)
+        let attr = self.get_attribute(StunAttrType::MessageIntegrity)
             .ok_or_else(|| StunError::MissingAttribute("MESSAGE-INTEGRITY".to_string()))?;
 
         if let AttributeValue::Raw(hash) = &attr.value {
@@ -1432,7 +1430,7 @@ impl Message {
             }
 
             // Find position of MESSAGE-INTEGRITY attribute
-            let integrity_pos = self.find_attribute_position(raw_msg, AttributeType::MessageIntegrity)?;
+            let integrity_pos = self.find_attribute_position(raw_msg, StunAttrType::MessageIntegrity)?;
 
             // Create message for verification (up to but not including the attribute)
             let verify_len = integrity_pos + 4 + 20; // Include the attribute itself
