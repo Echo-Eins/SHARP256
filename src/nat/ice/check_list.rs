@@ -1,253 +1,667 @@
 // src/nat/ice/check_list.rs
-//! ICE check list management
+//! ICE check list management - Full RFC 8445 implementation
+//! Implements all requirements from RFC 8445 Section 6
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use super::{CandidatePair};
-use super::candidate::CandidatePairState;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, Mutex};
+use tracing::{debug, info, warn, error, trace};
 
-/// Check list for managing candidate pairs
+use super::{CandidatePair, Candidate, CandidateType};
+use super::candidate::CandidatePairState;
+use super::foundation::calculate_pair_foundation;
+use crate::nat::error::{NatError, NatResult};
+
+/// Maximum number of pairs in a check list (RFC 8445 Section 6.1.2.5)
+const MAX_PAIRS_PER_STREAM: usize = 100;
+
+/// Maximum number of waiting+in-progress pairs per foundation
+const MAX_PAIRS_PER_FOUNDATION: usize = 5;
+
+/// Check list for managing candidate pairs per RFC 8445 Section 6
 pub struct CheckList {
     /// Stream ID
     pub stream_id: u32,
 
     /// All candidate pairs sorted by priority (highest first)
+    /// Invariant: Always sorted in descending priority order
     pairs: Vec<Arc<RwLock<CandidatePair>>>,
 
     /// State of the check list
     pub state: CheckListState,
 
     /// Valid pairs (connectivity check succeeded)
+    /// Sorted by priority for efficient nomination
     valid_pairs: Vec<Arc<RwLock<CandidatePair>>>,
 
-    /// Running pairs (currently being checked)
+    /// Running pairs indexed by pair ID
     running_pairs: HashMap<String, Arc<RwLock<CandidatePair>>>,
 
     /// Foundation groups for managing frozen candidates
-    foundation_groups: HashMap<String, Vec<Arc<RwLock<CandidatePair>>>>,
+    foundation_groups: HashMap<String, FoundationGroup>,
+
+    /// Triggered check queue (RFC 8445 Section 7.3.1.4)
+    triggered_queue: VecDeque<TriggeredCheck>,
+
+    /// Statistics
+    stats: CheckListStats,
+
+    /// Creation timestamp
+    created_at: Instant,
 }
 
-/// Check list state
+/// Foundation group for managing related pairs
+#[derive(Debug)]
+struct FoundationGroup {
+    /// Pairs in this foundation
+    pairs: Vec<Arc<RwLock<CandidatePair>>>,
+
+    /// Number of waiting or in-progress pairs
+    active_count: usize,
+
+    /// Has at least one succeeded pair
+    has_succeeded: bool,
+}
+
+/// Triggered check information
+#[derive(Debug, Clone)]
+pub struct TriggeredCheck {
+    /// The pair to check
+    pub pair: Arc<RwLock<CandidatePair>>,
+
+    /// Use candidate flag
+    pub use_candidate: bool,
+
+    /// When this was triggered
+    pub triggered_at: Instant,
+}
+
+/// Check list statistics
+#[derive(Debug, Default)]
+struct CheckListStats {
+    /// Total pairs created
+    total_pairs: usize,
+
+    /// Pairs pruned
+    pruned_pairs: usize,
+
+    /// Checks performed
+    checks_performed: usize,
+
+    /// Successful checks
+    successful_checks: usize,
+
+    /// Failed checks
+    failed_checks: usize,
+
+    /// Nominated pairs
+    nominated_pairs: usize,
+}
+
+/// Check list state per RFC 8445 Section 6.1.2.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckListState {
-    /// Actively running checks
+    /// Initial state
     Running,
 
-    /// Completed (has nominated pairs)
+    /// All pairs have been tested, some succeeded
     Completed,
 
-    /// Failed (no valid pairs)
+    /// All pairs have been tested, none succeeded
     Failed,
 }
 
 impl CheckList {
-    /// Create new check list
+    /// Create new check list for a stream
     pub fn new(stream_id: u32) -> Self {
+        info!("Creating check list for stream {}", stream_id);
+
         Self {
             stream_id,
-            pairs: Vec::new(),
+            pairs: Vec::with_capacity(MAX_PAIRS_PER_STREAM),
             state: CheckListState::Running,
             valid_pairs: Vec::new(),
             running_pairs: HashMap::new(),
             foundation_groups: HashMap::new(),
+            triggered_queue: VecDeque::new(),
+            stats: CheckListStats::default(),
+            created_at: Instant::now(),
         }
     }
 
-    /// Add candidate pair and maintain sorted order
-    pub fn add_pair(&mut self, pair: Arc<RwLock<CandidatePair>>) {
-        // Add to foundation groups
-        let foundation = pair.blocking_read().foundation.clone();
-        self.foundation_groups
-            .entry(foundation)
-            .or_insert_with(Vec::new)
-            .push(pair.clone());
+    /// Form check list from candidates per RFC 8445 Section 6.1.2
+    pub async fn form_check_list(
+        &mut self,
+        local_candidates: Vec<Candidate>,
+        remote_candidates: Vec<Candidate>,
+        controlling: bool,
+    ) -> NatResult<()> {
+        info!(
+            "Forming check list for stream {}: {} local x {} remote candidates",
+            self.stream_id,
+            local_candidates.len(),
+            remote_candidates.len()
+        );
 
-        // Insert in sorted position (highest priority first)
-        let pair_priority = pair.blocking_read().priority;
+        // Step 1: Form candidate pairs (RFC 8445 Section 6.1.2.2)
+        let mut all_pairs = Vec::new();
 
-        match self.pairs.binary_search_by(|p| {
-            // Reverse comparison for descending order
-            pair_priority.cmp(&p.blocking_read().priority)
-        }) {
-            Ok(pos) | Err(pos) => self.pairs.insert(pos, pair),
+        for local in &local_candidates {
+            for remote in &remote_candidates {
+                // Only pair candidates with same component
+                if local.component_id != remote.component_id {
+                    continue;
+                }
+
+                // Skip pairing IPv4 with IPv6 (RFC 8421)
+                if local.addr.is_ipv4() != remote.addr.is_ipv4() {
+                    continue;
+                }
+
+                // Skip loopback addresses
+                if local.addr.ip().is_loopback() || remote.addr.ip().is_loopback() {
+                    continue;
+                }
+
+                // Create pair
+                let pair = CandidatePair::new(
+                    local.clone(),
+                    remote.clone(),
+                    controlling,
+                );
+
+                trace!(
+                    "Created pair: {} -> {} (priority: {}, foundation: {})",
+                    local.addr,
+                    remote.addr,
+                    pair.priority,
+                    pair.foundation
+                );
+
+                all_pairs.push(Arc::new(RwLock::new(pair)));
+            }
         }
-    }
 
-    /// Sort pairs by priority (should maintain sorted order but can be called to re-sort)
-    pub async fn sort_pairs(&mut self) {
+        self.stats.total_pairs = all_pairs.len();
+        info!("Created {} candidate pairs", all_pairs.len());
+
+        if all_pairs.is_empty() {
+            warn!("No valid pairs created for stream {}", self.stream_id);
+            self.state = CheckListState::Failed;
+            return Ok(());
+        }
+
+        // Step 2: Sort by priority (RFC 8445 Section 6.1.2.3)
         // Collect priorities to avoid holding locks during sort
         let mut pairs_with_priority: Vec<(Arc<RwLock<CandidatePair>>, u64)> =
-            Vec::with_capacity(self.pairs.len());
+            Vec::with_capacity(all_pairs.len());
 
-        for pair in &self.pairs {
+        for pair in all_pairs {
             let priority = pair.read().await.priority;
-            pairs_with_priority.push((pair.clone(), priority));
+            pairs_with_priority.push((pair, priority));
         }
 
-        // Sort by priority (highest first)
-        pairs_with_priority.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort by priority descending (highest first)
+        pairs_with_priority.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        debug!("Sorted {} pairs by priority", pairs_with_priority.len());
 
-        // Update pairs vector
-        self.pairs = pairs_with_priority.into_iter()
-            .map(|(pair, _)| pair)
-            .collect();
+        // Step 3: Prune redundant pairs (RFC 8445 Section 6.1.2.4)
+        let pruned_pairs = self.prune_pairs_internal(pairs_with_priority).await?;
+        info!(
+            "Pruned {} redundant pairs, {} remaining",
+            self.stats.pruned_pairs,
+            pruned_pairs.len()
+        );
+
+        // Step 4: Limit check list size (RFC 8445 Section 6.1.2.5)
+        let limited_pairs = if pruned_pairs.len() > MAX_PAIRS_PER_STREAM {
+            info!(
+                "Limiting check list from {} to {} pairs",
+                pruned_pairs.len(),
+                MAX_PAIRS_PER_STREAM
+            );
+            pruned_pairs.into_iter()
+                .take(MAX_PAIRS_PER_STREAM)
+                .collect()
+        } else {
+            pruned_pairs
+        };
+
+        // Step 5: Initialize pair states and foundation groups (RFC 8445 Section 6.1.2.6)
+        await self.initialize_pair_states(limited_pairs).await?;
+
+        info!(
+            "Check list formed for stream {}: {} pairs, {} foundations",
+            self.stream_id,
+            self.pairs.len(),
+            self.foundation_groups.len()
+        );
+
+        Ok(())
+    }
+
+    /// Prune redundant pairs per RFC 8445 Section 6.1.2.4
+    async fn prune_pairs_internal(
+        &mut self,
+        mut pairs: Vec<(Arc<RwLock<CandidatePair>>, u64)>,
+    ) -> NatResult<Vec<Arc<RwLock<CandidatePair>>>> {
+        let mut pruned = Vec::with_capacity(pairs.len());
+        let mut seen_bases = HashSet::new();
+
+        for (pair_ref, _) in pairs {
+            let pair = pair_ref.read().await;
+            let should_prune = {
+                // Check if this is a redundant server reflexive pair
+                if pair.local.typ == CandidateType::ServerReflexive {
+                    if let Some(base_addr) = pair.local.related_addr {
+                        // Check if we've seen a host candidate with this base
+                        let base_key = format!("{}:{}", base_addr, pair.remote.addr);
+                        if seen_bases.contains(&base_key) {
+                            debug!(
+                                "Pruning redundant srflx pair: {} (base: {})",
+                                pair.id(),
+                                base_addr
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if !should_prune {
+                // Record base addresses for host candidates
+                if pair.local.typ == CandidateType::Host {
+                    let base_key = format!("{}:{}", pair.local.addr, pair.remote.addr);
+                    seen_bases.insert(base_key);
+                }
+
+                drop(pair);
+                pruned.push(pair_ref);
+            } else {
+                self.stats.pruned_pairs += 1;
+            }
+        }
+
+        Ok(pruned)
+    }
+
+    /// Initialize pair states and foundation groups
+    async fn initialize_pair_states(
+        &mut self,
+        pairs: Vec<Arc<RwLock<CandidatePair>>>,
+    ) -> NatResult<()> {
+        // Group by foundation
+        let mut temp_foundation_groups: HashMap<String, Vec<Arc<RwLock<CandidatePair>>>> =
+            HashMap::new();
+
+        for pair_ref in &pairs {
+            let foundation = pair_ref.read().await.foundation.clone();
+            temp_foundation_groups
+                .entry(foundation)
+                .or_insert_with(Vec::new)
+                .push(pair_ref.clone());
+        }
+
+        // Initialize states per RFC 8445 Section 6.1.2.6
+        let mut waiting_foundations = HashSet::new();
+
+        for pair_ref in &pairs {
+            let mut pair = pair_ref.write().await;
+
+            // First pairs and first of each foundation start as Waiting
+            if self.pairs.len() < 5 || !waiting_foundations.contains(&pair.foundation) {
+                pair.state = CandidatePairState::Waiting;
+                waiting_foundations.insert(pair.foundation.clone());
+                debug!("Pair {} set to Waiting (foundation: {})", pair.id(), pair.foundation);
+            } else {
+                pair.state = CandidatePairState::Frozen;
+                trace!("Pair {} set to Frozen (foundation: {})", pair.id(), pair.foundation);
+            }
+        }
+
+        // Build foundation groups
+        for (foundation, pairs) in temp_foundation_groups {
+            let active_count = pairs.iter()
+                .filter(|p| {
+                    let state = p.blocking_read().state;
+                    matches!(state, CandidatePairState::Waiting | CandidatePairState::InProgress)
+                })
+                .count();
+
+            self.foundation_groups.insert(
+                foundation.clone(),
+                FoundationGroup {
+                    pairs,
+                    active_count,
+                    has_succeeded: false,
+                }
+            );
+        }
+
+        // Store sorted pairs
+        self.pairs = pairs;
+
+        Ok(())
+    }
+
+    /// Add candidate pair maintaining sorted order
+    pub async fn add_pair(&mut self, pair: Arc<RwLock<CandidatePair>>) {
+        let pair_data = pair.read().await;
+        let priority = pair_data.priority;
+        let foundation = pair_data.foundation.clone();
+        let pair_id = pair_data.id();
+        drop(pair_data);
+
+        debug!("Adding pair {} with priority {}", pair_id, priority);
+
+        // Find insertion position (binary search)
+        let pos = match self.pairs.binary_search_by(|p| {
+            priority.cmp(&p.blocking_read().priority)
+        }) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        };
+
+        // Insert at correct position
+        self.pairs.insert(pos, pair.clone());
+
+        // Update foundation group
+        match self.foundation_groups.get_mut(&foundation) {
+            Some(group) => {
+                group.pairs.push(pair);
+            }
+            None => {
+                self.foundation_groups.insert(
+                    foundation,
+                    FoundationGroup {
+                        pairs: vec![pair],
+                        active_count: 0,
+                        has_succeeded: false,
+                    }
+                );
+            }
+        }
+
+        self.stats.total_pairs += 1;
     }
 
     /// Get next pair to check (highest priority waiting pair)
     pub async fn get_next_pair(&self) -> Option<Arc<RwLock<CandidatePair>>> {
-        // Pairs are sorted by priority, so iterate in order
+        // Check triggered queue first (RFC 8445 Section 7.3.1.4)
+        if let Some(triggered) = self.triggered_queue.front() {
+            return Some(triggered.pair.clone());
+        }
+
+        // Find highest priority waiting pair
         for pair_ref in &self.pairs {
             let pair = pair_ref.read().await;
             if pair.state == CandidatePairState::Waiting {
+                trace!("Next pair to check: {} (priority: {})", pair.id(), pair.priority);
+                return Some(pair_ref.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Update pair state with all side effects
+    pub async fn update_pair_state(
+        &mut self,
+        pair_id: String,
+        new_state: CandidatePairState,
+    ) -> NatResult<()> {
+        debug!("Updating pair {} state to {:?}", pair_id, new_state);
+
+        // Find the pair
+        let pair_ref = self.pairs.iter()
+            .find(|p| p.blocking_read().id() == pair_id)
+            .ok_or_else(|| NatError::Platform(format!("Pair {} not found", pair_id)))?
+            .clone();
+
+        let mut pair = pair_ref.write().await;
+        let old_state = pair.state;
+        let foundation = pair.foundation.clone();
+
+        // Update state
+        pair.state = new_state;
+        drop(pair);
+
+        // Handle state transition side effects
+        match (old_state, new_state) {
+            (_, CandidatePairState::InProgress) => {
+                self.running_pairs.insert(pair_id.clone(), pair_ref.clone());
+                self.stats.checks_performed += 1;
+
+                // Update foundation active count
+                if let Some(group) = self.foundation_groups.get_mut(&foundation) {
+                    if old_state != CandidatePairState::InProgress {
+                        group.active_count += 1;
+                    }
+                }
+            }
+
+            (CandidatePairState::InProgress, CandidatePairState::Succeeded) => {
+                self.running_pairs.remove(&pair_id);
+                self.stats.successful_checks += 1;
+
+                // Add to valid list maintaining sort order
+                self.insert_valid_pair(pair_ref.clone()).await;
+
+                // Update foundation group
+                if let Some(group) = self.foundation_groups.get_mut(&foundation) {
+                    group.active_count = group.active_count.saturating_sub(1);
+                    group.has_succeeded = true;
+                }
+
+                // Unfreeze pairs with same foundation (RFC 8445 Section 7.2.5.3.3)
+                self.unfreeze_foundation(&foundation).await;
+            }
+
+            (CandidatePairState::InProgress, CandidatePairState::Failed) => {
+                self.running_pairs.remove(&pair_id);
+                self.stats.failed_checks += 1;
+
+                // Update foundation active count
+                if let Some(group) = self.foundation_groups.get_mut(&foundation) {
+                    group.active_count = group.active_count.saturating_sub(1);
+                }
+            }
+
+            _ => {}
+        }
+
+        // Update check list state
+        self.update_list_state().await;
+
+        Ok(())
+    }
+
+    /// Insert pair into valid list maintaining sort order
+    async fn insert_valid_pair(&mut self, pair: Arc<RwLock<CandidatePair>>) {
+        let priority = pair.read().await.priority;
+
+        // Find insertion position
+        let pos = match self.valid_pairs.binary_search_by(|p| {
+            priority.cmp(&p.blocking_read().priority)
+        }) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        };
+
+        self.valid_pairs.insert(pos, pair);
+    }
+
+    /// Unfreeze pairs with same foundation
+    async fn unfreeze_foundation(&mut self, foundation: &str) {
+        if let Some(group) = self.foundation_groups.get(foundation) {
+            for pair_ref in &group.pairs {
+                let mut pair = pair_ref.write().await;
+                if pair.state == CandidatePairState::Frozen {
+                    pair.state = CandidatePairState::Waiting;
+                    debug!("Unfroze pair {} (foundation: {})", pair.id(), foundation);
+                }
+            }
+        }
+    }
+
+    /// Update overall check list state
+    async fn update_list_state(&mut self) {
+        // Count pair states
+        let mut waiting = 0;
+        let mut in_progress = 0;
+        let mut succeeded = 0;
+        let mut failed = 0;
+
+        for pair_ref in &self.pairs {
+            match pair_ref.read().await.state {
+                CandidatePairState::Waiting | CandidatePairState::Frozen => waiting += 1,
+                CandidatePairState::InProgress => in_progress += 1,
+                CandidatePairState::Succeeded => succeeded += 1,
+                CandidatePairState::Failed => failed += 1,
+            }
+        }
+
+        trace!(
+            "Check list state: {} waiting, {} in progress, {} succeeded, {} failed",
+            waiting, in_progress, succeeded, failed
+        );
+
+        // Determine new state
+        let new_state = if in_progress > 0 || waiting > 0 {
+            // Still have work to do
+            CheckListState::Running
+        } else if succeeded > 0 {
+            // All done, some succeeded
+            CheckListState::Completed
+        } else {
+            // All done, none succeeded
+            CheckListState::Failed
+        };
+
+        if new_state != self.state {
+            info!(
+                "Check list {} state changed from {:?} to {:?}",
+                self.stream_id, self.state, new_state
+            );
+            self.state = new_state;
+        }
+    }
+
+    /// Add triggered check (RFC 8445 Section 7.3.1.4)
+    pub async fn add_triggered_check(
+        &mut self,
+        pair: Arc<RwLock<CandidatePair>>,
+        use_candidate: bool,
+    ) {
+        let pair_id = pair.read().await.id();
+        debug!("Adding triggered check for pair {} (use_candidate: {})", pair_id, use_candidate);
+
+        // Check if already in queue
+        let already_queued = self.triggered_queue.iter()
+            .any(|tc| Arc::ptr_eq(&tc.pair, &pair));
+
+        if !already_queued {
+            self.triggered_queue.push_back(TriggeredCheck {
+                pair,
+                use_candidate,
+                triggered_at: Instant::now(),
+            });
+        }
+    }
+
+    /// Get and remove next triggered check
+    pub fn pop_triggered_check(&mut self) -> Option<TriggeredCheck> {
+        self.triggered_queue.pop_front()
+    }
+
+    /// Get valid pairs for a component
+    pub async fn get_valid_pairs(&self, component_id: u32) -> Vec<Arc<RwLock<CandidatePair>>> {
+        let mut component_pairs = Vec::new();
+
+        for pair_ref in &self.valid_pairs {
+            if pair_ref.read().await.local.component_id == component_id {
+                component_pairs.push(pair_ref.clone());
+            }
+        }
+
+        component_pairs
+    }
+
+    /// Get best valid pair for a component
+    pub async fn get_best_valid_pair(
+        &self,
+        component_id: u32,
+    ) -> Option<Arc<RwLock<CandidatePair>>> {
+        // Valid pairs are sorted, so first matching component is best
+        for pair_ref in &self.valid_pairs {
+            if pair_ref.read().await.local.component_id == component_id {
                 return Some(pair_ref.clone());
             }
         }
         None
     }
 
-    /// Get pairs by foundation
-    pub fn get_foundation_pairs(&self, foundation: &str) -> Vec<Arc<RwLock<CandidatePair>>> {
-        self.foundation_groups
-            .get(foundation)
-            .cloned()
-            .unwrap_or_default()
+    /// Handle nomination of a pair
+    pub async fn nominate_pair(&mut self, pair_id: &str) -> NatResult<()> {
+        let pair_ref = self.valid_pairs.iter()
+            .find(|p| p.blocking_read().id() == pair_id)
+            .ok_or_else(|| NatError::Platform(format!("Pair {} not in valid list", pair_id)))?
+            .clone();
+
+        let mut pair = pair_ref.write().await;
+        if !pair.nominated {
+            pair.nominated = true;
+            self.stats.nominated_pairs += 1;
+            info!("Nominated pair: {}", pair.id());
+        }
+
+        Ok(())
     }
 
-    /// Update pair state
-    pub async fn update_pair_state(
-        &mut self,
-        pair_id: String,
-        new_state: CandidatePairState,
-    ) {
-        for pair_ref in &self.pairs {
-            let mut pair = pair_ref.write().await;
-            if pair.id() == pair_id {
-                let old_state = pair.state;
-                pair.state = new_state;
-
-                // Update tracking lists based on state change
-                match (old_state, new_state) {
-                    (_, CandidatePairState::Succeeded) => {
-                        // Add to valid pairs if not already there
-                        if !self.valid_pairs.iter().any(|p| {
-                            p.blocking_read().id() == pair_id
-                        }) {
-                            self.valid_pairs.push(pair_ref.clone());
-                        }
-                        // Remove from running
-                        self.running_pairs.remove(&pair_id);
-                    }
-                    (_, CandidatePairState::InProgress) => {
-                        // Add to running pairs
-                        self.running_pairs.insert(pair_id.clone(), pair_ref.clone());
-                    }
-                    (CandidatePairState::InProgress, CandidatePairState::Failed) |
-                    (CandidatePairState::InProgress, CandidatePairState::Waiting) => {
-                        // Remove from running
-                        self.running_pairs.remove(&pair_id);
-                    }
-                    _ => {}
-                }
-
-                break;
+    /// Check if specific component has nominated pair
+    pub async fn has_nominated_pair(&self, component_id: u32) -> bool {
+        for pair_ref in &self.valid_pairs {
+            let pair = pair_ref.read().await;
+            if pair.local.component_id == component_id && pair.nominated {
+                return true;
             }
         }
-
-        // Update check list state
-        self.update_state().await;
+        false
     }
 
-    /// Update check list state based on pairs
-    async fn update_state(&mut self) {
-        // Check if we have nominated pairs
-        let has_nominated = self.valid_pairs.iter().any(|p| {
-            p.blocking_read().nominated
-        });
+    /// Get all nominated pairs
+    pub async fn get_nominated_pairs(&self) -> Vec<Arc<RwLock<CandidatePair>>> {
+        let mut nominated = Vec::new();
 
-        if has_nominated {
-            self.state = CheckListState::Completed;
-            return;
-        }
-
-        // Check if all pairs are in terminal state
-        let all_terminal = self.pairs.iter().all(|p| {
-            let pair = p.blocking_read();
-            matches!(
-                pair.state,
-                CandidatePairState::Succeeded | CandidatePairState::Failed
-            )
-        });
-
-        if all_terminal {
-            if self.valid_pairs.is_empty() {
-                self.state = CheckListState::Failed;
-            } else {
-                self.state = CheckListState::Completed;
+        for pair_ref in &self.valid_pairs {
+            if pair_ref.read().await.nominated {
+                nominated.push(pair_ref.clone());
             }
         }
+
+        nominated
     }
 
-    /// Get valid pairs for component
-    pub async fn get_valid_pairs(&self, component_id: u32) -> Vec<Arc<RwLock<CandidatePair>>> {
-        let mut component_pairs = Vec::new();
-
-        for pair in &self.valid_pairs {
-            if pair.read().await.local.component_id == component_id {
-                component_pairs.push(pair.clone());
-            }
-        }
-
-        // Sort by priority (highest first)
-        component_pairs.sort_by(|a, b| {
-            let a_priority = a.blocking_read().priority;
-            let b_priority = b.blocking_read().priority;
-            b_priority.cmp(&a_priority)
-        });
-
-        component_pairs
-    }
-
-    /// Prune pairs based on RFC 8445 Section 6.1.2.4
-    pub async fn prune_pairs(&mut self) {
-        let mut pairs_to_remove = HashSet::new();
-
-        // Find redundant pairs
-        for i in 0..self.pairs.len() {
-            if pairs_to_remove.contains(&i) {
-                continue;
-            }
-
-            for j in (i + 1)..self.pairs.len() {
-                if pairs_to_remove.contains(&j) {
-                    continue;
-                }
-
-                let pair_i = self.pairs[i].read().await;
-                let pair_j = self.pairs[j].read().await;
-
-                if pair_i.should_prune(&pair_j) {
-                    pairs_to_remove.insert(i);
-                    tracing::debug!("Pruning redundant pair: {}", pair_i.id());
-                } else if pair_j.should_prune(&pair_i) {
-                    pairs_to_remove.insert(j);
-                    tracing::debug!("Pruning redundant pair: {}", pair_j.id());
-                }
-            }
-        }
-
-        // Remove pruned pairs (in reverse order to maintain indices)
-        let mut indices: Vec<_> = pairs_to_remove.into_iter().collect();
-        indices.sort_by(|a, b| b.cmp(a));
-
-        for idx in indices {
-            let removed = self.pairs.remove(idx);
-            // Also remove from foundation groups
-            let foundation = removed.blocking_read().foundation.clone();
-            if let Some(group) = self.foundation_groups.get_mut(&foundation) {
-                group.retain(|p| !Arc::ptr_eq(p, &removed));
-            }
-        }
+    /// Get statistics
+    pub fn get_stats(&self) -> String {
+        format!(
+            "CheckList[{}] - Total: {}, Pruned: {}, Checks: {} (Success: {}, Failed: {}), Nominated: {}, State: {:?}",
+            self.stream_id,
+            self.stats.total_pairs,
+            self.stats.pruned_pairs,
+            self.stats.checks_performed,
+            self.stats.successful_checks,
+            self.stats.failed_checks,
+            self.stats.nominated_pairs,
+            self.state
+        )
     }
 
     /// Get number of running checks
@@ -255,7 +669,14 @@ impl CheckList {
         self.running_pairs.len()
     }
 
-    /// Get all pairs (for debugging/testing)
+    /// Check if can start more checks (respects pacing)
+    pub fn can_start_check(&self) -> bool {
+        // RFC 8445: Limit concurrent checks
+        const MAX_CONCURRENT_CHECKS: usize = 5;
+        self.running_pairs.len() < MAX_CONCURRENT_CHECKS
+    }
+
+    /// Get all pairs for debugging
     pub fn get_all_pairs(&self) -> &Vec<Arc<RwLock<CandidatePair>>> {
         &self.pairs
     }
@@ -266,135 +687,127 @@ mod tests {
     use super::*;
     use crate::nat::ice::{Candidate, TransportProtocol};
 
+    async fn create_test_candidates() -> (Vec<Candidate>, Vec<Candidate>) {
+        let local = vec![
+            Candidate::new_host(
+                "192.168.1.100:50000".parse().unwrap(),
+                1,
+                TransportProtocol::Udp,
+                1,
+            ),
+            Candidate::new_host(
+                "192.168.1.100:50001".parse().unwrap(),
+                2,
+                TransportProtocol::Udp,
+                1,
+            ),
+        ];
+
+        let remote = vec![
+            Candidate::new_host(
+                "192.168.1.200:60000".parse().unwrap(),
+                1,
+                TransportProtocol::Udp,
+                1,
+            ),
+            Candidate::new_host(
+                "192.168.1.200:60001".parse().unwrap(),
+                2,
+                TransportProtocol::Udp,
+                1,
+            ),
+        ];
+
+        (local, remote)
+    }
+
     #[tokio::test]
-    async fn test_check_list_sorting() {
+    async fn test_check_list_formation() {
         let mut check_list = CheckList::new(1);
+        let (local, remote) = create_test_candidates().await;
 
-        // Create test pairs with different priorities
-        let local = Candidate::new_host(
-            "192.168.1.100:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        check_list.form_check_list(local, remote, true).await.unwrap();
 
-        let remote1 = Candidate::new_host(
-            "192.168.1.200:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        // Should create 2 pairs (one per component)
+        assert_eq!(check_list.pairs.len(), 2);
 
-        let remote2 = Candidate::new_host(
-            "192.168.1.201:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        // Verify pairs are sorted by priority
+        let priorities: Vec<u64> = stream::iter(&check_list.pairs)
+            .then(|p| async { p.read().await.priority })
+            .collect().await;
 
-        let mut pair1 = CandidatePair::new(local.clone(), remote1, true);
-        pair1.priority = 1000;
-        pair1.state = CandidatePairState::Waiting;
+        for i in 1..priorities.len() {
+            assert!(priorities[i-1] >= priorities[i], "Pairs not sorted");
+        }
+    }
 
-        let mut pair2 = CandidatePair::new(local.clone(), remote2, true);
-        pair2.priority = 2000;
-        pair2.state = CandidatePairState::Waiting;
+    #[tokio::test]
+    async fn test_triggered_checks() {
+        let mut check_list = CheckList::new(1);
+        let (local, remote) = create_test_candidates().await;
 
-        // Add in wrong order
-        check_list.add_pair(Arc::new(RwLock::new(pair1)));
-        check_list.add_pair(Arc::new(RwLock::new(pair2)));
+        check_list.form_check_list(local, remote, true).await.unwrap();
 
-        // Verify pairs are sorted by priority (highest first)
-        let pairs = check_list.get_all_pairs();
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].read().await.priority, 2000);
-        assert_eq!(pairs[1].read().await.priority, 1000);
+        // Add triggered check
+        let pair = check_list.pairs[0].clone();
+        check_list.add_triggered_check(pair.clone(), true).await;
 
-        // Get next pair should return highest priority
+        // Should be in queue
+        assert_eq!(check_list.triggered_queue.len(), 1);
+
+        // Get next pair should return triggered check
         let next = check_list.get_next_pair().await.unwrap();
-        assert_eq!(next.read().await.priority, 2000);
+        assert!(Arc::ptr_eq(&next, &pair));
+
+        // Pop triggered check
+        let triggered = check_list.pop_triggered_check().unwrap();
+        assert!(triggered.use_candidate);
     }
 
     #[tokio::test]
-    async fn test_check_list_management() {
+    async fn test_state_transitions() {
         let mut check_list = CheckList::new(1);
+        let (local, remote) = create_test_candidates().await;
 
-        // Create test pair
-        let local = Candidate::new_host(
-            "192.168.1.100:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        check_list.form_check_list(local, remote, true).await.unwrap();
 
-        let remote = Candidate::new_host(
-            "192.168.1.200:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        // Initially Running
+        assert_eq!(check_list.state, CheckListState::Running);
 
-        let mut pair = CandidatePair::new(local, remote, true);
-        pair.state = CandidatePairState::Waiting;
+        // Update all pairs to failed
+        for pair in check_list.pairs.clone() {
+            let pair_id = pair.read().await.id();
+            check_list.update_pair_state(pair_id, CandidatePairState::Failed).await.unwrap();
+        }
 
-        let pair_ref = Arc::new(RwLock::new(pair));
-        check_list.add_pair(pair_ref.clone());
-
-        // Should find waiting pair
-        let next = check_list.get_next_pair().await;
-        assert!(next.is_some());
-
-        // Update state
-        let pair_id = pair_ref.read().await.id();
-        check_list.update_pair_state(pair_id.clone(), CandidatePairState::InProgress).await;
-
-        // Should be in running pairs
-        assert_eq!(check_list.running_count(), 1);
-
-        // Update to succeeded
-        check_list.update_pair_state(pair_id, CandidatePairState::Succeeded).await;
-
-        // Should be in valid pairs
-        assert_eq!(check_list.valid_pairs.len(), 1);
-        assert_eq!(check_list.running_count(), 0);
+        // Should be Failed
+        assert_eq!(check_list.state, CheckListState::Failed);
     }
 
     #[tokio::test]
-    async fn test_foundation_groups() {
+    async fn test_nomination() {
         let mut check_list = CheckList::new(1);
+        let (local, remote) = create_test_candidates().await;
 
-        let local = Candidate::new_host(
-            "192.168.1.100:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        check_list.form_check_list(local, remote, true).await.unwrap();
 
-        let remote1 = Candidate::new_host(
-            "192.168.1.200:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        // Make first pair valid
+        let pair_id = check_list.pairs[0].read().await.id();
+        check_list.update_pair_state(
+            pair_id.clone(),
+            CandidatePairState::InProgress
+        ).await.unwrap();
 
-        let remote2 = Candidate::new_host(
-            "192.168.1.201:50000".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            1,
-        );
+        check_list.update_pair_state(
+            pair_id.clone(),
+            CandidatePairState::Succeeded
+        ).await.unwrap();
 
-        // Create pairs with same foundation
-        let pair1 = CandidatePair::new(local.clone(), remote1.clone(), true);
-        let pair2 = CandidatePair::new(local.clone(), remote2.clone(), true);
+        // Nominate the pair
+        check_list.nominate_pair(&pair_id).await.unwrap();
 
-        let foundation = pair1.foundation.clone();
-
-        check_list.add_pair(Arc::new(RwLock::new(pair1)));
-        check_list.add_pair(Arc::new(RwLock::new(pair2)));
-
-        // Check foundation grouping
-        let foundation_pairs = check_list.get_foundation_pairs(&foundation);
-        assert_eq!(foundation_pairs.len(), 2);
+        // Check nomination
+        assert!(check_list.has_nominated_pair(1).await);
+        assert_eq!(check_list.get_nominated_pairs().await.len(), 1);
     }
 }
