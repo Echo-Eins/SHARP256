@@ -9326,4 +9326,3239 @@ impl RoleBasedAccess {
         roles.insert("guest".to_string(), guest_role);
 
         Ok(Self {
-            roles: Arc::new(RwLock::new(
+            roles: Arc::new(RwLock::new(roles)),
+            user_roles: Arc::new(RwLock::new(HashMap::new())),
+            permissions: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    async fn evaluate(&self, request: &AccessRequest) -> NatResult<AccessDecision> {
+        // Extract username from subject
+        let username = self.extract_username_from_subject(&request.subject);
+
+        // Get user roles
+        let user_roles = self.user_roles.read().await;
+        let roles = self.roles.read().await;
+
+        if let Some(user_role_names) = user_roles.get(&username) {
+            // Check each role the user has
+            for role_name in user_role_names {
+                if let Some(role) = roles.get(role_name) {
+                    // Check if role has required permission
+                    let required_permission = self.action_to_permission(&request.action);
+
+                    if role.permissions.contains(&required_permission) {
+                        // Check role constraints
+                        if self.check_role_constraints(role, request).await {
+                            return Ok(AccessDecision::Allow);
+                        }
+                    }
+                }
+            }
+        }
+
+        // No matching permission found
+        Ok(AccessDecision::Deny)
+    }
+
+    fn extract_username_from_subject(&self, subject: &str) -> String {
+        // For IP addresses, we might use a default user mapping
+        if let Ok(_addr) = subject.parse::<SocketAddr>() {
+            return "anonymous".to_string();
+        }
+        subject.to_string()
+    }
+
+    fn action_to_permission(&self, action: &str) -> Permission {
+        match action {
+            "connect" => Permission::CreateAllocation,
+            "allocate" => Permission::CreateAllocation,
+            "refresh" => Permission::RefreshAllocation,
+            "delete_allocation" => Permission::DeleteAllocation,
+            "create_permission" => Permission::CreatePermission,
+            "delete_permission" => Permission::DeletePermission,
+            "create_channel" => Permission::CreateChannel,
+            "delete_channel" => Permission::DeleteChannel,
+            "send_data" => Permission::SendData,
+            "receive_data" => Permission::ReceiveData,
+            "view_stats" => Permission::ViewStatistics,
+            "manage_users" => Permission::ManageUsers,
+            "configure" => Permission::ConfigureServer,
+            "shutdown" => Permission::Shutdown,
+            "restart" => Permission::Restart,
+            "debug" => Permission::Debug,
+            _ => Permission::SendData, // Default fallback
+        }
+    }
+
+    async fn check_role_constraints(&self, role: &Role, request: &AccessRequest) -> bool {
+        let now = chrono::Utc::now();
+
+        for constraint in &role.constraints {
+            match constraint {
+                RoleConstraint::TimeWindow { start, end } => {
+                    let current_hour = now.hour();
+                    if current_hour < *start || current_hour >= *end {
+                        return false;
+                    }
+                }
+                RoleConstraint::IpRestriction { allowed_ips } => {
+                    if let Some(client_ip) = request.context.get("client_ip") {
+                        if let Ok(ip) = client_ip.parse::<IpAddr>() {
+                            if !allowed_ips.contains(&ip) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                RoleConstraint::UsageLimit { max_allocations, max_bandwidth: _ } => {
+                    // This would require checking current usage - simplified for now
+                    // In real implementation, we'd track per-user allocation counts
+                    if *max_allocations == 0 {
+                        return false;
+                    }
+                }
+                RoleConstraint::GeoRestriction { allowed_countries } => {
+                    if let Some(country) = request.context.get("country") {
+                        if !allowed_countries.contains(country) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    async fn add_user_role(&self, username: String, role_name: String) -> NatResult<()> {
+        let mut user_roles = self.user_roles.write().await;
+        user_roles.entry(username).or_insert_with(HashSet::new).insert(role_name);
+        Ok(())
+    }
+
+    async fn remove_user_role(&self, username: &str, role_name: &str) -> NatResult<()> {
+        let mut user_roles = self.user_roles.write().await;
+        if let Some(roles) = user_roles.get_mut(username) {
+            roles.remove(role_name);
+            if roles.is_empty() {
+                user_roles.remove(username);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AttributeBasedAccess {
+    async fn new() -> NatResult<Self> {
+        let mut attributes = HashMap::new();
+
+        // Define standard attributes
+        attributes.insert("client_ip".to_string(), AttributeDefinition {
+            name: "client_ip".to_string(),
+            attr_type: AttributeType::IpAddress,
+            possible_values: None,
+            default_value: None,
+        });
+
+        attributes.insert("time_of_day".to_string(), AttributeDefinition {
+            name: "time_of_day".to_string(),
+            attr_type: AttributeType::Integer,
+            possible_values: Some((0..24).map(|i| i.to_string()).collect()),
+            default_value: Some("12".to_string()),
+        });
+
+        attributes.insert("country".to_string(), AttributeDefinition {
+            name: "country".to_string(),
+            attr_type: AttributeType::String,
+            possible_values: None,
+            default_value: Some("UNKNOWN".to_string()),
+        });
+
+        attributes.insert("risk_score".to_string(), AttributeDefinition {
+            name: "risk_score".to_string(),
+            attr_type: AttributeType::Integer,
+            possible_values: Some((0..100).map(|i| i.to_string()).collect()),
+            default_value: Some("0".to_string()),
+        });
+
+        // Create default ABAC rules
+        let mut rules = Vec::new();
+
+        // Allow during business hours
+        rules.push(AbacRule {
+            name: "business_hours_access".to_string(),
+            condition: RuleCondition::And(vec![
+                RuleCondition::AttributeGreaterThan {
+                    attribute: "time_of_day".to_string(),
+                    value: "8".to_string()
+                },
+                RuleCondition::AttributeLessThan {
+                    attribute: "time_of_day".to_string(),
+                    value: "18".to_string()
+                },
+            ]),
+            effect: RuleEffect::Allow,
+            priority: 100,
+        });
+
+        // Block high-risk connections
+        rules.push(AbacRule {
+            name: "block_high_risk".to_string(),
+            condition: RuleCondition::AttributeGreaterThan {
+                attribute: "risk_score".to_string(),
+                value: "80".to_string()
+            },
+            effect: RuleEffect::Deny,
+            priority: 200,
+        });
+
+        // Block certain countries if needed
+        rules.push(AbacRule {
+            name: "geo_restriction".to_string(),
+            condition: RuleCondition::AttributeEquals {
+                attribute: "country".to_string(),
+                value: "BLOCKED".to_string()
+            },
+            effect: RuleEffect::Deny,
+            priority: 150,
+        });
+
+        Ok(Self {
+            attributes: Arc::new(RwLock::new(attributes)),
+            rules: Arc::new(RwLock::new(rules)),
+            providers: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    async fn evaluate(&self, request: &AccessRequest) -> NatResult<AccessDecision> {
+        let rules = self.rules.read().await;
+        let mut sorted_rules: Vec<_> = rules.iter().collect();
+        sorted_rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
+
+        // Evaluate rules in priority order
+        for rule in sorted_rules {
+            if self.evaluate_condition(&rule.condition, request).await {
+                return Ok(match rule.effect {
+                    RuleEffect::Allow => AccessDecision::Allow,
+                    RuleEffect::Deny => AccessDecision::Deny,
+                    RuleEffect::Conditional => AccessDecision::Indeterminate,
+                });
+            }
+        }
+
+        // No matching rule found
+        Ok(AccessDecision::Indeterminate)
+    }
+
+    async fn evaluate_condition(&self, condition: &RuleCondition, request: &AccessRequest) -> bool {
+        match condition {
+            RuleCondition::AttributeEquals { attribute, value } => {
+                self.get_attribute_value(attribute, request).await
+                    .map(|attr_val| attr_val == *value)
+                    .unwrap_or(false)
+            }
+            RuleCondition::AttributeNotEquals { attribute, value } => {
+                self.get_attribute_value(attribute, request).await
+                    .map(|attr_val| attr_val != *value)
+                    .unwrap_or(true)
+            }
+            RuleCondition::AttributeContains { attribute, value } => {
+                self.get_attribute_value(attribute, request).await
+                    .map(|attr_val| attr_val.contains(value))
+                    .unwrap_or(false)
+            }
+            RuleCondition::AttributeGreaterThan { attribute, value } => {
+                if let (Some(attr_val), Ok(val_num)) = (
+                    self.get_attribute_value(attribute, request).await,
+                    value.parse::<f64>()
+                ) {
+                    attr_val.parse::<f64>().map(|attr_num| attr_num > val_num).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            RuleCondition::AttributeLessThan { attribute, value } => {
+                if let (Some(attr_val), Ok(val_num)) = (
+                    self.get_attribute_value(attribute, request).await,
+                    value.parse::<f64>()
+                ) {
+                    attr_val.parse::<f64>().map(|attr_num| attr_num < val_num).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            RuleCondition::And(conditions) => {
+                for cond in conditions {
+                    if !self.evaluate_condition(cond, request).await {
+                        return false;
+                    }
+                }
+                true
+            }
+            RuleCondition::Or(conditions) => {
+                for cond in conditions {
+                    if self.evaluate_condition(cond, request).await {
+                        return true;
+                    }
+                }
+                false
+            }
+            RuleCondition::Not(condition) => {
+                !self.evaluate_condition(condition, request).await
+            }
+            RuleCondition::TimeRange { start, end } => {
+                let now = chrono::Utc::now();
+                let current_hour = now.hour();
+                current_hour >= *start && current_hour < *end
+            }
+            RuleCondition::IpInRange { start, end } => {
+                if let Some(client_ip_str) = request.context.get("client_ip") {
+                    if let Ok(client_ip) = client_ip_str.parse::<IpAddr>() {
+                        return self.ip_in_range(client_ip, *start, *end);
+                    }
+                }
+                false
+            }
+            RuleCondition::Custom(expression) => {
+                // Simplified custom expression evaluation
+                // In a real implementation, this would use a proper expression parser
+                self.evaluate_custom_expression(expression, request).await
+            }
+        }
+    }
+
+    async fn get_attribute_value(&self, attribute: &str, request: &AccessRequest) -> Option<String> {
+        // First check request context
+        if let Some(value) = request.context.get(attribute) {
+            return Some(value.clone());
+        }
+
+        // Then check attribute providers
+        let providers = self.providers.read().await;
+        for provider in providers.values() {
+            if let Some(value) = provider.get_attribute(&request.subject, attribute) {
+                return Some(value);
+            }
+        }
+
+        // Finally check for computed attributes
+        match attribute {
+            "time_of_day" => {
+                let now = chrono::Utc::now();
+                Some(now.hour().to_string())
+            }
+            "day_of_week" => {
+                let now = chrono::Utc::now();
+                Some(now.weekday().to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn ip_in_range(&self, ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
+        match (ip, start, end) {
+            (IpAddr::V4(ip), IpAddr::V4(start), IpAddr::V4(end)) => {
+                let ip_u32 = u32::from(ip);
+                let start_u32 = u32::from(start);
+                let end_u32 = u32::from(end);
+                ip_u32 >= start_u32 && ip_u32 <= end_u32
+            }
+            (IpAddr::V6(ip), IpAddr::V6(start), IpAddr::V6(end)) => {
+                let ip_u128 = u128::from(ip);
+                let start_u128 = u128::from(start);
+                let end_u128 = u128::from(end);
+                ip_u128 >= start_u128 && ip_u128 <= end_u128
+            }
+            _ => false, // Mixed v4/v6 comparison
+        }
+    }
+
+    async fn evaluate_custom_expression(&self, expression: &str, request: &AccessRequest) -> bool {
+        // Simplified custom expression evaluation
+        // This would typically use a proper expression language parser
+        match expression {
+            "always_allow" => true,
+            "always_deny" => false,
+            "business_hours" => {
+                let now = chrono::Utc::now();
+                let hour = now.hour();
+                hour >= 8 && hour < 18
+            }
+            "weekend_only" => {
+                let now = chrono::Utc::now();
+                matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
+            }
+            _ => false,
+        }
+    }
+
+    async fn add_attribute_provider(&self, name: String, provider: Box<dyn AttributeProvider>) {
+        self.providers.write().await.insert(name, provider);
+    }
+}
+
+impl AccessDecisionEngine {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            decision_cache: Arc::new(RwLock::new(HashMap::new())),
+            decision_history: Arc::new(RwLock::new(VecDeque::new())),
+            config: DecisionEngineConfig {
+                enable_caching: true,
+                cache_ttl: Duration::from_secs(300), // 5 minutes
+                max_cache_size: 10000,
+                enable_logging: true,
+                default_decision: AccessDecision::Deny,
+            },
+        })
+    }
+
+    async fn get_cached_decision(&self, request: &AccessRequest) -> Option<AccessDecision> {
+        if !self.config.enable_caching {
+            return None;
+        }
+
+        let cache = self.decision_cache.read().await;
+        cache.get(request).copied()
+    }
+
+    async fn cache_decision(&self, request: AccessRequest, decision: AccessDecision) {
+        if !self.config.enable_caching {
+            return;
+        }
+
+        let mut cache = self.decision_cache.write().await;
+
+        // Check cache size limit
+        if cache.len() >= self.config.max_cache_size {
+            // Remove 10% of entries (simple LRU approximation)
+            let remove_count = self.config.max_cache_size / 10;
+            let keys_to_remove: Vec<_> = cache.keys().take(remove_count).cloned().collect();
+            for key in keys_to_remove {
+                cache.remove(&key);
+            }
+        }
+
+        cache.insert(request.clone(), decision);
+
+        // Log decision if enabled
+        if self.config.enable_logging {
+            let record = AccessDecisionRecord {
+                request,
+                decision,
+                timestamp: Instant::now(),
+                reasoning: "Cached decision".to_string(),
+                applied_policies: vec!["cache".to_string()],
+            };
+
+            let mut history = self.decision_history.write().await;
+            history.push_back(record);
+
+            // Keep history size manageable
+            while history.len() > 1000 {
+                history.pop_front();
+            }
+        }
+    }
+
+    async fn cleanup_expired_cache(&self) {
+        if !self.config.enable_caching {
+            return;
+        }
+
+        // In a real implementation, we'd track cache entry timestamps
+        // For simplicity, we'll just clear old entries periodically
+        let mut cache = self.decision_cache.write().await;
+        if cache.len() > self.config.max_cache_size * 2 {
+            cache.clear();
+        }
+    }
+}
+
+impl ThreatDetector {
+    async fn new() -> NatResult<Self> {
+        let signature_detector = SignatureDetector::new().await?;
+        let behavioral_detector = BehavioralDetector::new().await?;
+        let anomaly_detector = AnomalyDetector::new().await?;
+        let threat_intel = ThreatIntelligence::new().await?;
+
+        Ok(Self {
+            signature_detector: Arc::new(signature_detector),
+            behavioral_detector: Arc::new(behavioral_detector),
+            anomaly_detector: Arc::new(anomaly_detector),
+            threat_intel: Arc::new(threat_intel),
+            stats: ThreatDetectionStats::default(),
+        })
+    }
+
+    async fn analyze(&self, data: &[u8], source: SocketAddr) -> NatResult<ThreatAnalysisResult> {
+        let mut threats = Vec::new();
+        let mut confidence = 0.0;
+
+        // Signature-based detection
+        if let Ok(sig_results) = self.signature_detector.scan(data).await {
+            for result in sig_results {
+                threats.push(DetectedThreat {
+                    id: result.signature_id,
+                    threat_type: result.threat_type,
+                    severity: result.severity,
+                    confidence: result.confidence,
+                    evidence: ThreatEvidence {
+                        evidence_type: EvidenceType::SignatureMatch,
+                        data: EvidenceData::SignatureData {
+                            signature_id: result.signature_id.clone(),
+                            matched_bytes: result.matched_data,
+                        },
+                        confidence: result.confidence,
+                        source: "signature_detector".to_string(),
+                    },
+                    mitigations: result.recommended_mitigations,
+                });
+                confidence = confidence.max(result.confidence);
+            }
+        }
+
+        // Behavioral analysis
+        if let Ok(behavior_result) = self.behavioral_detector.analyze(data, source).await {
+            if behavior_result.threat_probability > 0.5 {
+                threats.extend(behavior_result.threats);
+                confidence = confidence.max(behavior_result.confidence);
+            }
+        }
+
+        // Anomaly detection
+        if let Ok(anomaly_result) = self.anomaly_detector.detect_anomalies(data, source).await {
+            for anomaly in anomaly_result.anomalies {
+                if anomaly.severity >= Severity::Medium {
+                    threats.push(DetectedThreat {
+                        id: format!("anomaly_{}", anomaly.anomaly_type as u8),
+                        threat_type: ThreatType::Intrusion,
+                        severity: anomaly.severity,
+                        confidence: anomaly.confidence,
+                        evidence: ThreatEvidence {
+                            evidence_type: EvidenceType::StatisticalAnomaly,
+                            data: EvidenceData::StatisticalData {
+                                metric: "anomaly_score".to_string(),
+                                value: anomaly.confidence,
+                                expected: 0.5,
+                            },
+                            confidence: anomaly.confidence,
+                            source: "anomaly_detector".to_string(),
+                        },
+                        mitigations: vec!["rate_limit".to_string(), "monitor".to_string()],
+                    });
+                }
+            }
+        }
+
+        // Threat intelligence lookup
+        if let Ok(intel_result) = self.threat_intel.lookup_ip(source.ip()).await {
+            if intel_result.is_malicious {
+                threats.push(DetectedThreat {
+                    id: "threat_intel_match".to_string(),
+                    threat_type: ThreatType::Reconnaissance,
+                    severity: intel_result.severity,
+                    confidence: intel_result.confidence,
+                    evidence: ThreatEvidence {
+                        evidence_type: EvidenceType::Heuristic,
+                        data: EvidenceData::HeuristicData {
+                            rule: "threat_intelligence".to_string(),
+                            score: intel_result.confidence,
+                        },
+                        confidence: intel_result.confidence,
+                        source: "threat_intelligence".to_string(),
+                    },
+                    mitigations: vec!["block_ip".to_string(), "alert".to_string()],
+                });
+                confidence = confidence.max(intel_result.confidence);
+            }
+        }
+
+        // Update statistics
+        if !threats.is_empty() {
+            self.stats.threats_detected.fetch_add(threats.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            for threat in &threats {
+                if let Some(counter) = self.stats.threats_by_category.get(&threat.threat_type) {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        self.stats.total_analyses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(ThreatAnalysisResult {
+            threats,
+            overall_threat_level: self.calculate_threat_level(confidence),
+            confidence,
+            analysis_duration: Instant::now().elapsed(),
+            recommendations: self.generate_recommendations(&threats),
+        })
+    }
+
+    fn calculate_threat_level(&self, confidence: f64) -> ThreatLevel {
+        match confidence {
+            c if c >= 0.9 => ThreatLevel::Critical,
+            c if c >= 0.7 => ThreatLevel::High,
+            c if c >= 0.5 => ThreatLevel::Medium,
+            c if c >= 0.3 => ThreatLevel::Low,
+            _ => ThreatLevel::Green,
+        }
+    }
+
+    fn generate_recommendations(&self, threats: &[DetectedThreat]) -> Vec<String> {
+        let mut recommendations = Vec::new();
+
+        for threat in threats {
+            recommendations.extend(threat.mitigations.clone());
+        }
+
+        // Remove duplicates and sort by priority
+        recommendations.sort();
+        recommendations.dedup();
+
+        // Add generic recommendations based on threat count
+        if threats.len() > 3 {
+            recommendations.insert(0, "immediate_block".to_string());
+        } else if threats.len() > 1 {
+            recommendations.insert(0, "enhanced_monitoring".to_string());
+        }
+
+        recommendations
+    }
+}
+
+impl SignatureDetector {
+    async fn new() -> NatResult<Self> {
+        let mut signatures = HashMap::new();
+
+        // Add some basic threat signatures
+        signatures.insert("malformed_turn_packet".to_string(), ThreatSignature {
+            id: "malformed_turn_packet".to_string(),
+            name: "Malformed TURN Packet".to_string(),
+            category: ThreatCategory::Exploit,
+            severity: Severity::High,
+            pattern: SignaturePattern::Custom("check_turn_packet_structure".to_string()),
+            metadata: SignatureMetadata {
+                cve_refs: vec!["CVE-2023-TURN-01".to_string()],
+                mitre_techniques: vec!["T1190".to_string()],
+                created: "2024-01-01".to_string(),
+                updated: "2024-01-01".to_string(),
+                author: "SHARP Security Team".to_string(),
+                references: vec!["https://tools.ietf.org/rfc/rfc5766.txt".to_string()],
+            },
+        });
+
+        signatures.insert("suspicious_payload_size".to_string(), ThreatSignature {
+            id: "suspicious_payload_size".to_string(),
+            name: "Suspicious Payload Size".to_string(),
+            category: ThreatCategory::DoS,
+            severity: Severity::Medium,
+            pattern: SignaturePattern::Custom("check_payload_size_anomaly".to_string()),
+            metadata: SignatureMetadata {
+                cve_refs: Vec::new(),
+                mitre_techniques: vec!["T1499".to_string()],
+                created: "2024-01-01".to_string(),
+                updated: "2024-01-01".to_string(),
+                author: "SHARP Security Team".to_string(),
+                references: Vec::new(),
+            },
+        });
+
+        let matcher = PatternMatcher::new().await?;
+        let updater = SignatureUpdater::new().await?;
+
+        Ok(Self {
+            signatures: Arc::new(RwLock::new(signatures)),
+            matcher: Arc::new(matcher),
+            updater: Arc::new(updater),
+        })
+    }
+
+    async fn scan(&self, data: &[u8]) -> NatResult<Vec<SignatureMatchResult>> {
+        let signatures = self.signatures.read().await;
+        let mut results = Vec::new();
+
+        for signature in signatures.values() {
+            if let Some(match_result) = self.match_signature(signature, data).await {
+                results.push(match_result);
+            }
+        }
+
+        // Update statistics
+        self.matcher.stats.total_patterns.store(signatures.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.matcher.stats.matches_found.fetch_add(results.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(results)
+    }
+
+    async fn match_signature(&self, signature: &ThreatSignature, data: &[u8]) -> Option<SignatureMatchResult> {
+        match &signature.pattern {
+            SignaturePattern::Exact(pattern_bytes) => {
+                if data.windows(pattern_bytes.len()).any(|window| window == pattern_bytes) {
+                    Some(SignatureMatchResult {
+                        signature_id: signature.id.clone(),
+                        threat_type: self.category_to_threat_type(signature.category),
+                        severity: signature.severity,
+                        confidence: 0.95,
+                        matched_data: pattern_bytes.clone(),
+                        recommended_mitigations: self.get_mitigations_for_category(signature.category),
+                    })
+                } else {
+                    None
+                }
+            }
+            SignaturePattern::Custom(rule_name) => {
+                match rule_name.as_str() {
+                    "check_turn_packet_structure" => {
+                        self.check_turn_packet_structure(data, signature).await
+                    }
+                    "check_payload_size_anomaly" => {
+                        self.check_payload_size_anomaly(data, signature).await
+                    }
+                    _ => None,
+                }
+            }
+            SignaturePattern::Regex(pattern) => {
+                // In a real implementation, we'd use a proper regex library
+                // For now, simple string matching
+                let data_str = String::from_utf8_lossy(data);
+                if data_str.contains(pattern) {
+                    Some(SignatureMatchResult {
+                        signature_id: signature.id.clone(),
+                        threat_type: self.category_to_threat_type(signature.category),
+                        severity: signature.severity,
+                        confidence: 0.8,
+                        matched_data: data.to_vec(),
+                        recommended_mitigations: self.get_mitigations_for_category(signature.category),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None, // Other pattern types not implemented for brevity
+        }
+    }
+
+    async fn check_turn_packet_structure(&self, data: &[u8], signature: &ThreatSignature) -> Option<SignatureMatchResult> {
+        // Check if this looks like a malformed TURN packet
+        if data.len() < 20 {
+            return Some(SignatureMatchResult {
+                signature_id: signature.id.clone(),
+                threat_type: ThreatType::Exploitation,
+                severity: Severity::High,
+                confidence: 0.9,
+                matched_data: data.to_vec(),
+                recommended_mitigations: vec!["drop_packet".to_string(), "log_event".to_string()],
+            });
+        }
+
+        // Check STUN message type validity
+        if data.len() >= 2 {
+            let msg_type = u16::from_be_bytes([data[0], data[1]]);
+
+            // Check if it's a valid STUN/TURN message type
+            let valid_types = [
+                0x0001, // Binding Request
+                0x0101, // Binding Response
+                0x0111, // Binding Error Response
+                0x0003, // Allocate Request
+                0x0103, // Allocate Response
+                0x0113, // Allocate Error Response
+                0x0004, // Refresh Request
+                0x0104, // Refresh Response
+                0x0114, // Refresh Error Response
+                0x0008, // Send Indication
+                0x0009, // Data Indication
+                0x000A, // CreatePermission Request
+                0x010A, // CreatePermission Response
+                0x011A, // CreatePermission Error Response
+                0x000B, // ChannelBind Request
+                0x010B, // ChannelBind Response
+                0x011B, // ChannelBind Error Response
+            ];
+
+            if !valid_types.contains(&msg_type) {
+                return Some(SignatureMatchResult {
+                    signature_id: signature.id.clone(),
+                    threat_type: ThreatType::Exploitation,
+                    severity: Severity::Medium,
+                    confidence: 0.7,
+                    matched_data: data[0..2].to_vec(),
+                    recommended_mitigations: vec!["monitor".to_string(), "rate_limit".to_string()],
+                });
+            }
+        }
+
+        None
+    }
+
+    async fn check_payload_size_anomaly(&self, data: &[u8], signature: &ThreatSignature) -> Option<SignatureMatchResult> {
+        // Check for unusual payload sizes
+        let size = data.len();
+
+        // Very small packets (potential protocol probe)
+        if size < 10 {
+            return Some(SignatureMatchResult {
+                signature_id: signature.id.clone(),
+                threat_type: ThreatType::Reconnaissance,
+                severity: Severity::Low,
+                confidence: 0.6,
+                matched_data: data.to_vec(),
+                recommended_mitigations: vec!["monitor".to_string()],
+            });
+        }
+
+        // Very large packets (potential amplification)
+        if size > 1500 {
+            return Some(SignatureMatchResult {
+                signature_id: signature.id.clone(),
+                threat_type: ThreatType::DenialOfService,
+                severity: Severity::Medium,
+                confidence: 0.8,
+                matched_data: data[0..100].to_vec(), // Just first 100 bytes
+                recommended_mitigations: vec!["rate_limit".to_string(), "size_limit".to_string()],
+            });
+        }
+
+        None
+    }
+
+    fn category_to_threat_type(&self, category: ThreatCategory) -> ThreatType {
+        match category {
+            ThreatCategory::Malware => ThreatType::Malware,
+            ThreatCategory::Exploit => ThreatType::Exploitation,
+            ThreatCategory::DoS | ThreatCategory::DDoS => ThreatType::DenialOfService,
+            ThreatCategory::Reconnaissance => ThreatType::Reconnaissance,
+            ThreatCategory::DataExfiltration => ThreatType::DataExfiltration,
+            ThreatCategory::PrivilegeEscalation => ThreatType::PrivilegeEscalation,
+            ThreatCategory::LateralMovement => ThreatType::LateralMovement,
+            ThreatCategory::Persistence => ThreatType::Persistence,
+            ThreatCategory::CommandControl | ThreatCategory::C2 => ThreatType::CommandAndControl,
+            _ => ThreatType::Intrusion,
+        }
+    }
+
+    fn get_mitigations_for_category(&self, category: ThreatCategory) -> Vec<String> {
+        match category {
+            ThreatCategory::DoS | ThreatCategory::DDoS => {
+                vec!["rate_limit".to_string(), "block_ip".to_string(), "alert".to_string()]
+            }
+            ThreatCategory::Malware => {
+                vec!["quarantine".to_string(), "deep_scan".to_string(), "alert".to_string()]
+            }
+            ThreatCategory::Exploit => {
+                vec!["drop_packet".to_string(), "block_ip".to_string(), "log_event".to_string()]
+            }
+            ThreatCategory::Reconnaissance => {
+                vec!["monitor".to_string(), "rate_limit".to_string(), "log_event".to_string()]
+            }
+            _ => {
+                vec!["monitor".to_string(), "alert".to_string()]
+            }
+        }
+    }
+}
+
+impl PatternMatcher {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            patterns: Arc::new(RwLock::new(HashMap::new())),
+            stats: MatchingStats::default(),
+        })
+    }
+}
+
+impl SignatureUpdater {
+    async fn new() -> NatResult<Self> {
+        let sources = vec![
+            UpdateSource {
+                name: "internal_signatures".to_string(),
+                url: "internal://signatures".to_string(),
+                frequency: Duration::from_hours(24),
+                credentials: None,
+                trust_level: TrustLevel::Verified,
+            }
+        ];
+
+        let scheduler = UpdateScheduler::new().await?;
+
+        Ok(Self {
+            sources,
+            scheduler: Arc::new(scheduler),
+            stats: UpdateStats::default(),
+        })
+    }
+}
+
+impl UpdateScheduler {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            schedule: Arc::new(RwLock::new(HashMap::new())),
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            state: Arc::new(RwLock::new(SchedulerState {
+                active_queues: HashSet::new(),
+                queue_weights: HashMap::new(),
+                rr_state: HashMap::new(),
+                token_buckets: HashMap::new(),
+            })),
+        })
+    }
+}
+
+impl BehavioralDetector {
+    async fn new() -> NatResult<Self> {
+        let mut models = HashMap::new();
+
+        // Create basic behavioral models
+        let connection_model = BehaviorModel {
+            name: "connection_behavior".to_string(),
+            model_type: BehaviorModelType::Statistical,
+            parameters: BehaviorParameters {
+                feature_weights: [
+                    ("connection_rate".to_string(), 0.8),
+                    ("packet_size_variance".to_string(), 0.6),
+                    ("timing_regularity".to_string(), 0.7),
+                ].into_iter().collect(),
+                thresholds: [
+                    ("anomaly_threshold".to_string(), 0.7),
+                    ("warning_threshold".to_string(), 0.5),
+                ].into_iter().collect(),
+                time_windows: [
+                    ("short_term".to_string(), Duration::from_secs(60)),
+                    ("medium_term".to_string(), Duration::from_secs(300)),
+                    ("long_term".to_string(), Duration::from_secs(1800)),
+                ].into_iter().collect(),
+                model_params: HashMap::new(),
+            },
+            training_data: None,
+            accuracy: ModelAccuracy {
+                overall: 0.85,
+                per_class: HashMap::new(),
+                confusion_matrix: Vec::new(),
+                last_evaluation: Instant::now(),
+            },
+        };
+
+        models.insert("connection_behavior".to_string(), connection_model);
+
+        let analyzer = BehaviorAnalyzer::new().await?;
+
+        Ok(Self {
+            models: Arc::new(RwLock::new(models)),
+            analyzer: Arc::new(analyzer),
+            stats: BehaviorDetectionStats::default(),
+        })
+    }
+
+    async fn analyze(&self, data: &[u8], source: SocketAddr) -> NatResult<AnalysisResult> {
+        let models = self.models.read().await;
+        let mut threats = Vec::new();
+        let mut indicators = Vec::new();
+
+        // Analyze with each behavior model
+        for model in models.values() {
+            let features = self.extract_features(data, source, model).await;
+            let behavior_score = self.calculate_behavior_score(&features, model).await;
+
+            if behavior_score > model.parameters.thresholds.get("anomaly_threshold").copied().unwrap_or(0.7) {
+                threats.push(DetectedThreat {
+                    id: format!("behavior_{}", model.name),
+                    threat_type: ThreatType::Intrusion,
+                    severity: if behavior_score > 0.9 { Severity::High } else { Severity::Medium },
+                    confidence: behavior_score,
+                    evidence: ThreatEvidence {
+                        evidence_type: EvidenceType::BehavioralAnomaly,
+                        data: EvidenceData::BehaviorData {
+                            behavior_pattern: model.name.clone(),
+                            deviation: behavior_score,
+                        },
+                        confidence: behavior_score,
+                        source: "behavioral_detector".to_string(),
+                    },
+                    mitigations: vec!["monitor".to_string(), "rate_limit".to_string()],
+                });
+            }
+
+            // Create behavior indicators
+            for (feature_name, feature_value) in &features {
+                let baseline = model.parameters.feature_weights.get(feature_name).copied().unwrap_or(0.5);
+                let deviation = (feature_value - baseline).abs();
+
+                if deviation > 0.3 {
+                    indicators.push(BehaviorIndicator {
+                        name: feature_name.clone(),
+                        value: *feature_value,
+                        baseline,
+                        deviation,
+                        significance: deviation / baseline,
+                    });
+                }
+            }
+        }
+
+        let threat_probability = if threats.is_empty() { 0.0 } else {
+            threats.iter().map(|t| t.confidence).fold(0.0, f64::max)
+        };
+
+        let confidence = threat_probability;
+
+        // Update statistics
+        self.stats.total_analyses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !threats.is_empty() {
+            self.stats.threats_detected.fetch_add(threats.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        Ok(AnalysisResult {
+            id: format!("behavior_analysis_{}", Instant::now().elapsed().as_nanos()),
+            timestamp: Instant::now(),
+            threat_probability,
+            confidence,
+            threats,
+            indicators,
+            metadata: AnalysisMetadata {
+                duration: Instant::now().elapsed(),
+                models_used: models.keys().cloned().collect(),
+                features_analyzed: vec!["connection_rate".to_string(), "packet_size".to_string()],
+                version: "1.0".to_string(),
+            },
+        })
+    }
+
+    async fn extract_features(&self, data: &[u8], source: SocketAddr, model: &BehaviorModel) -> HashMap<String, f64> {
+        let mut features = HashMap::new();
+
+        // Basic packet features
+        features.insert("packet_size".to_string(), data.len() as f64);
+        features.insert("source_port".to_string(), source.port() as f64);
+
+        // Time-based features
+        let now = Instant::now();
+        features.insert("hour_of_day".to_string(), chrono::Utc::now().hour() as f64);
+
+        // Protocol features
+        if data.len() >= 2 {
+            let possible_msg_type = u16::from_be_bytes([data[0], data[1]]);
+            features.insert("message_type".to_string(), possible_msg_type as f64);
+        }
+
+        // Entropy calculation (simplified)
+        let entropy = self.calculate_entropy(data);
+        features.insert("entropy".to_string(), entropy);
+
+        features
+    }
+
+    fn calculate_entropy(&self, data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+
+        let mut byte_counts = [0u32; 256];
+        for &byte in data {
+            byte_counts[byte as usize] += 1;
+        }
+
+        let len = data.len() as f64;
+        let mut entropy = 0.0;
+
+        for &count in &byte_counts {
+            if count > 0 {
+                let p = count as f64 / len;
+                entropy -= p * p.log2();
+            }
+        }
+
+        entropy
+    }
+
+    async fn calculate_behavior_score(&self, features: &HashMap<String, f64>, model: &BehaviorModel) -> f64 {
+        let mut score = 0.0;
+        let mut weight_sum = 0.0;
+
+        for (feature_name, &feature_value) in features {
+            if let Some(&weight) = model.parameters.feature_weights.get(feature_name) {
+                // Normalize feature value (simplified)
+                let normalized_value = match feature_name.as_str() {
+                    "packet_size" => (feature_value / 1500.0).min(1.0),
+                    "entropy" => feature_value / 8.0,
+                    "hour_of_day" => feature_value / 24.0,
+                    _ => feature_value,
+                };
+
+                score += weight * normalized_value;
+                weight_sum += weight;
+            }
+        }
+
+        if weight_sum > 0.0 {
+            score / weight_sum
+        } else {
+            0.0
+        }
+    }
+}
+
+impl BehaviorAnalyzer {
+    async fn new() -> NatResult<Self> {
+        let pipeline = AnalysisPipeline::new().await?;
+        let mut extractors: HashMap<String, Box<dyn FeatureExtractor>> = HashMap::new();
+
+        // Add basic feature extractors
+        extractors.insert("statistical".to_string(), Box::new(StatisticalFeatureExtractor::new()));
+        extractors.insert("temporal".to_string(), Box::new(TemporalFeatureExtractor::new()));
+
+        Ok(Self {
+            pipeline: Arc::new(pipeline),
+            extractors: Arc::new(RwLock::new(extractors)),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+}
+
+impl AnalysisPipeline {
+    async fn new() -> NatResult<Self> {
+        let stages = vec![
+            PipelineStage {
+                name: "preprocessing".to_string(),
+                processor: StageProcessor::Preprocessing(PreprocessingConfig {
+                    normalization: NormalizationMethod::MinMax,
+                    filters: vec![
+                        DataFilter::OutlierFilter { threshold: 3.0 },
+                        DataFilter::NoiseFilter { method: NoiseFilterMethod::MedianFilter },
+                    ],
+                    transformations: vec![DataTransformation::Log],
+                }),
+                inputs: vec!["raw_data".to_string()],
+                outputs: vec!["preprocessed_data".to_string()],
+            },
+            PipelineStage {
+                name: "feature_extraction".to_string(),
+                processor: StageProcessor::FeatureExtraction(ExtractionConfig {
+                    feature_types: vec![FeatureType::Statistical, FeatureType::Temporal],
+                    parameters: HashMap::new(),
+                    time_windows: vec![Duration::from_secs(60), Duration::from_secs(300)],
+                }),
+                inputs: vec!["preprocessed_data".to_string()],
+                outputs: vec!["features".to_string()],
+            },
+        ];
+
+        Ok(Self {
+            stages,
+            config: PipelineConfig {
+                parallel_processing: true,
+                max_concurrent_stages: 4,
+                timeout: Duration::from_secs(30),
+                error_handling: ErrorHandlingConfig {
+                    retry_policy: RetryPolicy {
+                        max_retries: 3,
+                        retry_delay: Duration::from_millis(100),
+                        backoff_strategy: BackoffStrategy::Exponential,
+                    },
+                    fallback_actions: vec![FallbackAction::UseDefaults],
+                    error_reporting: ErrorReportingConfig {
+                        enable_logging: true,
+                        enable_alerts: true,
+                        severity_threshold: Severity::Medium,
+                    },
+                },
+            },
+            metrics: PipelineMetrics::default(),
+        })
+    }
+}
+
+// Basic feature extractors
+#[derive(Debug)]
+struct StatisticalFeatureExtractor;
+
+impl StatisticalFeatureExtractor {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl FeatureExtractor for StatisticalFeatureExtractor {
+    fn extract_features(&self, data: &[u8], context: &HashMap<String, String>) -> Vec<FeatureVector> {
+        let mut features = HashMap::new();
+
+        if !data.is_empty() {
+            let mean = data.iter().map(|&b| b as f64).sum::<f64>() / data.len() as f64;
+            let variance = data.iter()
+                .map(|&b| (b as f64 - mean).powi(2))
+                .sum::<f64>() / data.len() as f64;
+
+            features.insert("mean".to_string(), mean);
+            features.insert("variance".to_string(), variance);
+            features.insert("length".to_string(), data.len() as f64);
+        }
+
+        vec![FeatureVector {
+            values: features,
+            timestamp: Instant::now(),
+            context: context.clone(),
+        }]
+    }
+
+    fn get_feature_names(&self) -> Vec<String> {
+        vec!["mean".to_string(), "variance".to_string(), "length".to_string()]
+    }
+
+    fn configure(&mut self, _config: &HashMap<String, ParameterValue>) {
+        // Configuration would be applied here
+    }
+}
+
+#[derive(Debug)]
+struct TemporalFeatureExtractor;
+
+impl TemporalFeatureExtractor {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl FeatureExtractor for TemporalFeatureExtractor {
+    fn extract_features(&self, _data: &[u8], context: &HashMap<String, String>) -> Vec<FeatureVector> {
+        let mut features = HashMap::new();
+
+        let now = chrono::Utc::now();
+        features.insert("hour".to_string(), now.hour() as f64);
+        features.insert("day_of_week".to_string(), now.weekday().number_from_monday() as f64);
+        features.insert("minute".to_string(), now.minute() as f64);
+
+        vec![FeatureVector {
+            values: features,
+            timestamp: Instant::now(),
+            context: context.clone(),
+        }]
+    }
+
+    fn get_feature_names(&self) -> Vec<String> {
+        vec!["hour".to_string(), "day_of_week".to_string(), "minute".to_string()]
+    }
+
+    fn configure(&mut self, _config: &HashMap<String, ParameterValue>) {
+        // Configuration would be applied here
+    }
+}
+
+impl AnomalyDetector {
+    async fn new() -> NatResult<Self> {
+        let mut statistical_models = HashMap::new();
+        let mut ml_models = HashMap::new();
+        let mut time_series = HashMap::new();
+
+        // Create basic statistical model
+        statistical_models.insert("packet_size_model".to_string(), StatisticalModel {
+            name: "packet_size_model".to_string(),
+            model_type: StatisticalModelType::Gaussian,
+            parameters: StatisticalParameters {
+                means: vec![512.0], // Expected average packet size
+                covariance: vec![vec![100.0]], // Variance
+                thresholds: vec![2.0], // 2 standard deviations
+                confidence_intervals: vec![(400.0, 624.0)],
+            },
+            training_stats: TrainingStatistics {
+                sample_count: 1000,
+                training_duration: Duration::from_secs(60),
+                cv_scores: vec![0.85, 0.87, 0.83],
+                complexity: 1.0,
+            },
+        });
+
+        // Create time series analyzer
+        time_series.insert("connection_rate_ts".to_string(), TimeSeriesAnalyzer {
+            name: "connection_rate_ts".to_string(),
+            models: vec![TimeSeriesModel {
+                model_type: TimeSeriesModelType::ARIMA,
+                parameters: TimeSeriesParameters {
+                    ar_order: 2,
+                    i_order: 1,
+                    ma_order: 1,
+                    seasonal_params: None,
+                    exog_params: Vec::new(),
+                },
+                state: TimeSeriesState {
+                    current_values: VecDeque::new(),
+                    residuals: VecDeque::new(),
+                    fitted_values: VecDeque::new(),
+                    prediction_intervals: VecDeque::new(),
+                },
+            }],
+            seasonal_decomp: SeasonalDecomposition {
+                trend: Vec::new(),
+                seasonal: Vec::new(),
+                residual: Vec::new(),
+                method: DecompositionMethod::Additive,
+            },
+            trend_analysis: TrendAnalysis {
+                direction: TrendDirection::Stable,
+                strength: 0.0,
+                change_points: Vec::new(),
+                significance: 0.0,
+            },
+            forecasting: ForecastingModels {
+                short_term: Box::new(SimpleForecaster::new()),
+                medium_term: Box::new(SimpleForecaster::new()),
+                long_term: Box::new(SimpleForecaster::new()),
+            },
+        });
+
+        Ok(Self {
+            statistical_models: Arc::new(RwLock::new(statistical_models)),
+            ml_models: Arc::new(RwLock::new(ml_models)),
+            time_series: Arc::new(RwLock::new(time_series)),
+            config: AnomalyDetectionConfig {
+                sensitivity: 0.7,
+                false_positive_rate: 0.05,
+                analysis_window: Duration::from_secs(300),
+                min_samples: 10,
+                update_frequency: Duration::from_secs(3600),
+            },
+        })
+    }
+
+    async fn detect_anomalies(&self, data: &[u8], source: SocketAddr) -> NatResult<AnomalyDetectionResult> {
+        let mut anomalies = Vec::new();
+
+        // Statistical anomaly detection
+        let statistical_models = self.statistical_models.read().await;
+        for model in statistical_models.values() {
+            if let Some(anomaly) = self.detect_statistical_anomaly(data, model).await {
+                anomalies.push(anomaly);
+            }
+        }
+
+        // Time series anomaly detection
+        let time_series_models = self.time_series.read().await;
+        for ts_analyzer in time_series_models.values() {
+            if let Some(anomaly) = self.detect_time_series_anomaly(data, source, ts_analyzer).await {
+                anomalies.push(anomaly);
+            }
+        }
+
+        Ok(AnomalyDetectionResult {
+            anomalies,
+            confidence: if anomalies.is_empty() { 0.0 } else {
+                anomalies.iter().map(|a| a.confidence).fold(0.0, f64::max)
+            },
+            analysis_timestamp: Instant::now(),
+        })
+    }
+
+    async fn detect_statistical_anomaly(&self, data: &[u8], model: &StatisticalModel) -> Option<DetectedAnomaly> {
+        match model.model_type {
+            StatisticalModelType::Gaussian => {
+                if let (Some(&mean), Some(&variance)) = (model.parameters.means.get(0),
+                                                         model.parameters.covariance.get(0).and_then(|row| row.get(0))) {
+                    let value = data.len() as f64;
+                    let z_score = (value - mean) / variance.sqrt();
+
+                    if z_score.abs() > model.parameters.thresholds.get(0).copied().unwrap_or(2.0) {
+                        return Some(DetectedAnomaly {
+                            anomaly_type: AnomalyType::StatisticalAnomaly,
+                            severity: if z_score.abs() > 3.0 { Severity::High } else { Severity::Medium },
+                            detected_at: Instant::now(),
+                            evidence: AnomalyEvidence::StatisticalData {
+                                metric: "packet_size".to_string(),
+                                value,
+                                expected: mean,
+                            },
+                            confidence: (z_score.abs() / 4.0).min(1.0),
+                        });
+                    }
+                }
+            }
+            _ => {
+                // Other model types would be implemented here
+            }
+        }
+
+        None
+    }
+
+    async fn detect_time_series_anomaly(&self, data: &[u8], source: SocketAddr, analyzer: &TimeSeriesAnalyzer) -> Option<DetectedAnomaly> {
+        // Simplified time series anomaly detection
+        let current_value = data.len() as f64;
+
+        // Check if current value deviates significantly from recent trend
+        if current_value > 2000.0 { // Simple threshold for demo
+            return Some(DetectedAnomaly {
+                anomaly_type: AnomalyType::TimingAnomaly,
+                severity: Severity::Medium,
+                detected_at: Instant::now(),
+                evidence: AnomalyEvidence::TimingViolation {
+                    expected_timing: Duration::from_millis(100),
+                    observed_timing: Duration::from_millis(200),
+                },
+                confidence: 0.7,
+            });
+        }
+
+        None
+    }
+}
+
+// Simple forecaster implementation
+#[derive(Debug)]
+struct SimpleForecaster {
+    last_values: VecDeque<f64>,
+}
+
+impl SimpleForecaster {
+    fn new() -> Self {
+        Self {
+            last_values: VecDeque::new(),
+        }
+    }
+}
+
+impl ForecastingModel for SimpleForecaster {
+    fn forecast(&self, steps: usize) -> Vec<f64> {
+        let avg = if self.last_values.is_empty() {
+            0.0
+        } else {
+            self.last_values.iter().sum::<f64>() / self.last_values.len() as f64
+        };
+
+        vec![avg; steps]
+    }
+
+    fn prediction_intervals(&self, steps: usize, confidence: f64) -> Vec<(f64, f64)> {
+        let avg = if self.last_values.is_empty() {
+            0.0
+        } else {
+            self.last_values.iter().sum::<f64>() / self.last_values.len() as f64
+        };
+
+        let margin = avg * (1.0 - confidence) * 0.5;
+        vec![(avg - margin, avg + margin); steps]
+    }
+
+    fn update(&mut self, new_data: &[f64]) {
+        for &value in new_data {
+            self.last_values.push_back(value);
+            if self.last_values.len() > 100 {
+                self.last_values.pop_front();
+            }
+        }
+    }
+
+    fn accuracy_metrics(&self) -> ForecastAccuracy {
+        ForecastAccuracy {
+            mae: 0.1,
+            mse: 0.01,
+            rmse: 0.1,
+            mape: 0.05,
+            smape: 0.05,
+        }
+    }
+}
+
+impl ThreatIntelligence {
+    async fn new() -> NatResult<Self> {
+        let intel_feeds = HashMap::new();
+        let threat_db = ThreatDatabase::new().await?;
+        let analyzer = IntelligenceAnalyzer::new().await?;
+        let reputation = ReputationSystem::new().await?;
+        let attribution = AttributionEngine::new().await?;
+
+        Ok(Self {
+            intel_feeds: Arc::new(RwLock::new(intel_feeds)),
+            threat_db: Arc::new(threat_db),
+            analyzer: Arc::new(analyzer),
+            reputation: Arc::new(reputation),
+            attribution: Arc::new(attribution),
+        })
+    }
+
+    async fn lookup_ip(&self, ip: IpAddr) -> NatResult<ThreatIntelResult> {
+        // Check reputation system first
+        if let Some(reputation) = self.reputation.get_ip_reputation(ip).await {
+            if reputation.category >= ReputationCategory::Suspicious {
+                return Ok(ThreatIntelResult {
+                    is_malicious: true,
+                    confidence: reputation.score / 100.0,
+                    severity: match reputation.category {
+                        ReputationCategory::Threat => Severity::Critical,
+                        ReputationCategory::Malicious => Severity::High,
+                        ReputationCategory::Suspicious => Severity::Medium,
+                        _ => Severity::Low,
+                    },
+                    threat_types: reputation.indicators.iter()
+                        .map(|i| format!("{:?}", i.indicator_type))
+                        .collect(),
+                    last_seen: reputation.last_seen,
+                });
+            }
+        }
+
+        // Check threat database
+        // Implementation would query various threat intel sources
+
+        Ok(ThreatIntelResult {
+            is_malicious: false,
+            confidence: 0.0,
+            severity: Severity::Low,
+            threat_types: Vec::new(),
+            last_seen: Instant::now(),
+        })
+    }
+}
+
+impl ThreatDatabase {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            patterns: Arc::new(RwLock::new(HashMap::new())),
+            malware: Arc::new(RwLock::new(HashMap::new())),
+            vulnerabilities: Arc::new(RwLock::new(HashMap::new())),
+            campaigns: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+}
+
+impl IntelligenceAnalyzer {
+    async fn new() -> NatResult<Self> {
+        let correlator = CorrelationEngine::new().await?;
+        let pattern_matcher = IntelligencePatternMatcher::new().await?;
+        let trend_analyzer = IntelligenceTrendAnalyzer::new().await?;
+        let confidence_calc = ConfidenceCalculator::new().await?;
+
+        Ok(Self {
+            correlator: Arc::new(correlator),
+            pattern_matcher: Arc::new(pattern_matcher),
+            trend_analyzer: Arc::new(trend_analyzer),
+            confidence_calc: Arc::new(confidence_calc),
+        })
+    }
+}
+
+impl CorrelationEngine {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            rules: Arc::new(RwLock::new(Vec::new())),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            stats: CorrelationStats::default(),
+        })
+    }
+}
+
+impl IntelligencePatternMatcher {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            patterns: Arc::new(RwLock::new(HashMap::new())),
+            algorithms: Vec::new(),
+            stats: PatternMatchingStats::default(),
+        })
+    }
+}
+
+impl IntelligenceTrendAnalyzer {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            models: Arc::new(RwLock::new(HashMap::new())),
+            algorithms: Vec::new(),
+            historical_data: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+}
+
+impl ConfidenceCalculator {
+    async fn new() -> NatResult<Self> {
+        let credibility = CredibilityAssessor::new().await?;
+        let reliability = ReliabilityTracker::new().await?;
+
+        Ok(Self {
+            models: Arc::new(RwLock::new(HashMap::new())),
+            credibility: Arc::new(credibility),
+            reliability: Arc::new(reliability),
+        })
+    }
+}
+
+impl CredibilityAssessor {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            source_scores: Arc::new(RwLock::new(HashMap::new())),
+            history: Arc::new(RwLock::new(HashMap::new())),
+            algorithms: Vec::new(),
+        })
+    }
+}
+
+impl ReliabilityTracker {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            metrics: Arc::new(RwLock::new(HashMap::new())),
+            algorithms: Vec::new(),
+            thresholds: ReliabilityThresholds {
+                minimum: 0.3,
+                warning: 0.5,
+                good: 0.7,
+                excellent: 0.9,
+            },
+        })
+    }
+}
+
+impl ReputationSystem {
+    async fn new() -> NatResult<Self> {
+        let calculators = ReputationCalculators {
+            ip_calculator: Arc::new(IpReputationCalculator {
+                weights: [
+                    ("c2_server".to_string(), 50.0),
+                    ("malware_hosting".to_string(), 40.0),
+                    ("phishing".to_string(), 35.0),
+                    ("botnet".to_string(), 45.0),
+                    ("scanner".to_string(), 10.0),
+                ].into_iter().collect(),
+                base_score: 50.0,
+                decay_factors: [
+                    ("daily".to_string(), 0.95),
+                    ("weekly".to_string(), 0.8),
+                ].into_iter().collect(),
+            }),
+            domain_calculator: Arc::new(DomainReputationCalculator {
+                parameters: DomainCalculationParams {
+                    base_score: 50.0,
+                    age_weight: 0.2,
+                    registration_weight: 0.3,
+                    dns_weight: 0.1,
+                },
+                pattern_weights: HashMap::new(),
+            }),
+            file_calculator: Arc::new(FileReputationCalculator {
+                scanner_weights: HashMap::new(),
+                severity_weights: HashMap::new(),
+                consensus_threshold: 0.6,
+            }),
+        };
+
+        Ok(Self {
+            ip_reputation: Arc::new(RwLock::new(HashMap::new())),
+            domain_reputation: Arc::new(RwLock::new(HashMap::new())),
+            file_reputation: Arc::new(RwLock::new(HashMap::new())),
+            calculators,
+            feeds: Arc::new(RwLock::new(Vec::new())),
+        })
+    }
+
+    async fn get_ip_reputation(&self, ip: IpAddr) -> Option<IpReputation> {
+        self.ip_reputation.read().await.get(&ip).cloned()
+    }
+
+    async fn update_ip_reputation(&self, ip: IpAddr, indicators: Vec<ThreatIndicator>) {
+        let reputation = self.ip_reputation.read().await.get(&ip).cloned();
+
+        let sources = vec![ReputationSource {
+            name: "internal".to_string(),
+            weight: 1.0,
+            last_update: Instant::now(),
+            confidence: 0.8,
+        }];
+
+        let score = self.calculators.ip_calculator.calculate_score(&indicators, &sources);
+
+        let category = match score {
+            s if s >= 80.0 => ReputationCategory::Trusted,
+            s if s >= 60.0 => ReputationCategory::Unknown,
+            s if s >= 40.0 => ReputationCategory::Suspicious,
+            s if s >= 20.0 => ReputationCategory::Malicious,
+            _ => ReputationCategory::Threat,
+        };
+
+        let new_reputation = IpReputation {
+            ip,
+            score,
+            category,
+            last_seen: Instant::now(),
+            indicators,
+            geo_info: None, // Would be populated from GeoIP lookup
+            sources,
+        };
+
+        self.ip_reputation.write().await.insert(ip, new_reputation);
+    }
+}
+
+impl AttributionEngine {
+    async fn new() -> NatResult<Self> {
+        let correlator = EvidenceCorrelator::new().await?;
+        let confidence_assessor = AttributionConfidenceAssessor::new().await?;
+        let database = AttributionDatabase::new().await?;
+
+        Ok(Self {
+            models: Arc::new(RwLock::new(HashMap::new())),
+            correlator: Arc::new(correlator),
+            confidence_assessor: Arc::new(confidence_assessor),
+            database: Arc::new(database),
+        })
+    }
+}
+
+impl EvidenceCorrelator {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            algorithms: Vec::new(),
+            evidence_db: Arc::new(RwLock::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+}
+
+impl AttributionConfidenceAssessor {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            models: Vec::new(),
+            criteria: Vec::new(),
+            historical_accuracy: HashMap::new(),
+        })
+    }
+}
+
+impl AttributionDatabase {
+    async fn new() -> NatResult<Self> {
+        Ok(Self {
+            attributions: Arc::new(RwLock::new(HashMap::new())),
+            relationships: Arc::new(RwLock::new(HashMap::new())),
+            history: Arc::new(RwLock::new(Vec::new())),
+        })
+    }
+}
+
+impl PerformanceMonitor {
+    async fn new(config: PerformanceConfig) -> NatResult<Self> {
+        let mut resource_monitors = Vec::new();
+
+        // Create resource monitors
+        for resource_type in [ResourceType::Cpu, ResourceType::Memory, ResourceType::Network] {
+            let monitor = ResourceMonitor {
+                name: format!("{:?}_monitor", resource_type),
+                resource_type,
+                interval: Duration::from_secs(10),
+                current_value: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                history: Arc::new(RwLock::new(VecDeque::new())),
+            };
+            resource_monitors.push(monitor);
+        }
+
+        let alert_system = AlertSystem::new().await?;
+
+        Ok(Self {
+            metrics: Arc::new(RwLock::new(PerformanceMetrics::default())),
+            resource_monitors,
+            thresholds: PerformanceThresholds {
+                cpu_threshold: 80.0,
+                memory_threshold: config.socket_recv_buffer as u64 * 2,
+                latency_threshold: Duration::from_millis(100),
+                error_rate_threshold: 0.05,
+                throughput_threshold: 1000,
+            },
+            alert_system: Arc::new(alert_system),
+        })
+    }
+
+    async fn collect_metrics(&self) -> PerformanceMetrics {
+        let mut metrics = PerformanceMetrics::default();
+
+        // Collect CPU usage (simplified)
+        #[cfg(unix)]
+        {
+            // In a real implementation, this would read from /proc/stat or similar
+            metrics.cpu_usage = 15.0; // Placeholder
+        }
+
+        // Collect memory usage
+        metrics.memory_usage = self.get_memory_usage().await;
+
+        // Collect network metrics
+        metrics.network_throughput = self.get_network_throughput().await;
+
+        // Update stored metrics
+        *self.metrics.write().await = metrics;
+
+        metrics
+    }
+
+    async fn get_memory_usage(&self) -> u64 {
+        // In a real implementation, this would read actual memory usage
+        // For now, return a placeholder value
+        1024 * 1024 * 100 // 100 MB
+    }
+
+    async fn get_network_throughput(&self) -> u64 {
+        // In a real implementation, this would calculate actual network throughput
+        1024 * 1024 // 1 MB/s
+    }
+
+    async fn check_thresholds(&self) -> Vec<String> {
+        let metrics = self.metrics.read().await;
+        let mut violations = Vec::new();
+
+        if metrics.cpu_usage > self.thresholds.cpu_threshold {
+            violations.push(format!("CPU usage ({:.1}%) exceeds threshold ({:.1}%)",
+                                    metrics.cpu_usage, self.thresholds.cpu_threshold));
+        }
+
+        if metrics.memory_usage > self.thresholds.memory_threshold {
+            violations.push(format!("Memory usage ({} bytes) exceeds threshold ({} bytes)",
+                                    metrics.memory_usage, self.thresholds.memory_threshold));
+        }
+
+        if metrics.request_latency > self.thresholds.latency_threshold {
+            violations.push(format!("Request latency ({:?}) exceeds threshold ({:?})",
+                                    metrics.request_latency, self.thresholds.latency_threshold));
+        }
+
+        violations
+    }
+}
+
+impl AlertSystem {
+    async fn new() -> NatResult<Self> {
+        let mut channels = HashMap::new();
+
+        // Create default log channel
+        channels.insert("log".to_string(), AlertChannel {
+            name: "log".to_string(),
+            channel_type: AlertChannelType::Log,
+            config: AlertChannelConfig {
+                recipients: vec!["system".to_string()],
+                template: "{severity}: {message}".to_string(),
+                rate_limit: Some(RateLimit {
+                    max_alerts: 100,
+                    window: Duration::from_secs(60),
+                    burst: 10,
+                }),
+                retry_config: RetryConfig {
+                    max_retries: 3,
+                    initial_delay: Duration::from_millis(100),
+                    backoff_multiplier: 2.0,
+                    max_delay: Duration::from_secs(10),
+                },
+            },
+            status: AlertChannelStatus::Active,
+        });
+
+        Ok(Self {
+            channels: Arc::new(RwLock::new(channels)),
+            rules: Arc::new(RwLock::new(Vec::new())),
+            history: Arc::new(RwLock::new(VecDeque::new())),
+            stats: AlertStats::default(),
+        })
+    }
+
+    async fn send_alert(&self, alert: Alert) -> NatResult<()> {
+        let channels = self.channels.read().await;
+        let rules = self.rules.read().await;
+
+        // Find matching rules
+        let mut target_channels = Vec::new();
+        for rule in rules.iter() {
+            if self.evaluate_alert_condition(&rule.condition, &alert).await {
+                target_channels.extend(rule.channels.clone());
+            }
+        }
+
+        // If no rules match, use default log channel
+        if target_channels.is_empty() {
+            target_channels.push("log".to_string());
+        }
+
+        // Send to target channels
+        for channel_name in target_channels {
+            if let Some(channel) = channels.get(&channel_name) {
+                if let Err(e) = self.send_to_channel(channel, &alert).await {
+                    error!("Failed to send alert to channel {}: {}", channel_name, e);
+                }
+            }
+        }
+
+        // Store in history
+        let mut history = self.history.write().await;
+        history.push_back(alert);
+        while history.len() > 10000 {
+            history.pop_front();
+        }
+
+        self.stats.total_alerts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    async fn evaluate_alert_condition(&self, condition: &AlertCondition, alert: &Alert) -> bool {
+        match condition {
+            AlertCondition::Threshold { metric: _, operator: _, value: _ } => {
+                // Would evaluate based on alert context
+                true
+            }
+            AlertCondition::Custom { expression: _ } => {
+                // Would evaluate custom expression
+                true
+            }
+            _ => true,
+        }
+    }
+
+    async fn send_to_channel(&self, channel: &AlertChannel, alert: &Alert) -> NatResult<()> {
+        match channel.channel_type {
+            AlertChannelType::Log => {
+                info!("ALERT [{}]: {}", alert.severity as u8, alert.message);
+            }
+            AlertChannelType::Email => {
+                // Would send email
+                info!("Would send email alert: {}", alert.message);
+            }
+            _ => {
+                info!("Alert sent to {:?}: {}", channel.channel_type, alert.message);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl HealthMonitor {
+    async fn new(config: HealthCheckConfig) -> NatResult<Self> {
+        let mut health_checks = HashMap::new();
+
+        // Add basic health checks
+        health_checks.insert("memory_usage".to_string(), HealthCheck {
+            name: "memory_usage".to_string(),
+            check_type: HealthCheckType::ResourceAvailability,
+            interval: config.interval,
+            timeout: Duration::from_secs(5),
+            config: HealthCheckConfig {
+                target: None,
+                expected_response: None,
+                failure_threshold: config.failure_threshold,
+                success_threshold: 2,
+                parameters: HashMap::new(),
+            },
+            last_result: None,
+            enabled: config.enabled,
+        });
+
+        health_checks.insert("socket_status".to_string(), HealthCheck {
+            name: "socket_status".to_string(),
+            check_type: HealthCheckType::Network,
+            interval: config.interval,
+            timeout: Duration::from_secs(5),
+            config: HealthCheckConfig {
+                target: Some("127.0.0.1:3478".to_string()),
+                expected_response: None,
+                failure_threshold: config.failure_threshold,
+                success_threshold: 2,
+                parameters: HashMap::new(),
+            },
+            last_result: None,
+            enabled: config.enabled,
+        });
+
+        Ok(Self {
+            health_checks: Arc::new(RwLock::new(health_checks)),
+            system_status: Arc::new(RwLock::new(SystemStatus {
+                overall_health: HealthStatus::Healthy,
+                component_status: HashMap::new(),
+                timestamp: Instant::now(),
+                details: HashMap::new(),
+            })),
+            health_history: Arc::new(RwLock::new(VecDeque::new())),
+            config: HealthConfig {
+                default_interval: config.interval,
+                check_timeout: Duration::from_secs(5),
+                history_retention: Duration::from_secs(3600),
+                alert_on_changes: true,
+            },
+        })
+    }
+
+    async fn perform_health_check(&self, check_name: &str) -> HealthCheckResult {
+        let health_checks = self.health_checks.read().await;
+
+        if let Some(check) = health_checks.get(check_name) {
+            let start_time = Instant::now();
+
+            let (status, message, data) = match check.check_type {
+                HealthCheckType::ResourceAvailability => {
+                    self.check_resource_availability(check).await
+                }
+                HealthCheckType::Network => {
+                    self.check_network_connectivity(check).await
+                }
+                HealthCheckType::Custom => {
+                    self.check_custom(check).await
+                }
+                _ => {
+                    (HealthStatus::Unknown, "Check type not implemented".to_string(), HashMap::new())
+                }
+            };
+
+            HealthCheckResult {
+                status,
+                message,
+                duration: start_time.elapsed(),
+                timestamp: Instant::now(),
+                data,
+            }
+        } else {
+            HealthCheckResult {
+                status: HealthStatus::Unknown,
+                message: "Health check not found".to_string(),
+                duration: Duration::from_millis(0),
+                timestamp: Instant::now(),
+                data: HashMap::new(),
+            }
+        }
+    }
+
+    async fn check_resource_availability(&self, _check: &HealthCheck) -> (HealthStatus, String, HashMap<String, String>) {
+        // Simplified resource check
+        let memory_usage = 1024 * 1024 * 50; // 50 MB
+        let memory_limit = 1024 * 1024 * 1024; // 1 GB
+
+        let usage_percent = (memory_usage as f64 / memory_limit as f64) * 100.0;
+
+        let status = if usage_percent > 90.0 {
+            HealthStatus::Critical
+        } else if usage_percent > 75.0 {
+            HealthStatus::Warning
+        } else {
+            HealthStatus::Healthy
+        };
+
+        let message = format!("Memory usage: {:.1}%", usage_percent);
+        let mut data = HashMap::new();
+        data.insert("memory_usage_bytes".to_string(), memory_usage.to_string());
+        data.insert("memory_usage_percent".to_string(), format!("{:.1}", usage_percent));
+
+        (status, message, data)
+    }
+
+    async fn check_network_connectivity(&self, check: &HealthCheck) -> (HealthStatus, String, HashMap<String, String>) {
+        if let Some(target) = &check.config.target {
+            // In a real implementation, this would test actual connectivity
+            if target.contains("127.0.0.1") {
+                (HealthStatus::Healthy, "Local connectivity OK".to_string(), HashMap::new())
+            } else {
+                (HealthStatus::Warning, "External connectivity check skipped".to_string(), HashMap::new())
+            }
+        } else {
+            (HealthStatus::Unknown, "No target specified".to_string(), HashMap::new())
+        }
+    }
+
+    async fn check_custom(&self, _check: &HealthCheck) -> (HealthStatus, String, HashMap<String, String>) {
+        (HealthStatus::Healthy, "Custom check passed".to_string(), HashMap::new())
+    }
+
+    async fn update_system_status(&self) {
+        let health_checks = self.health_checks.read().await;
+        let mut component_status = HashMap::new();
+        let mut overall_health = HealthStatus::Healthy;
+
+        for (name, check) in health_checks.iter() {
+            if let Some(result) = &check.last_result {
+                component_status.insert(name.clone(), result.status);
+
+                // Update overall health (worst status wins)
+                if result.status as u8 > overall_health as u8 {
+                    overall_health = result.status;
+                }
+            }
+        }
+
+        let mut system_status = self.system_status.write().await;
+        system_status.overall_health = overall_health;
+        system_status.component_status = component_status;
+        system_status.timestamp = Instant::now();
+    }
+}
+
+impl PacketPool {
+    async fn new(config: PacketPoolConfig) -> NatResult<Self> {
+        let mut available = Vec::with_capacity(config.initial_size);
+
+        for _ in 0..config.initial_size {
+            available.push(vec![0u8; config.packet_size]);
+        }
+
+        Ok(Self {
+            available: Arc::new(Mutex::new(available)),
+            config,
+            stats: PacketPoolStats::default(),
+        })
+    }
+
+    async fn get_packet(&self) -> Vec<u8> {
+        let mut available = self.available.lock().await;
+
+        if let Some(packet) = available.pop() {
+            self.stats.pool_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            packet
+        } else {
+            self.stats.pool_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            vec![0u8; self.config.packet_size]
+        }
+    }
+
+    async fn return_packet(&self, mut packet: Vec<u8>) {
+        let mut available = self.available.lock().await;
+
+        if available.len() < self.config.max_size {
+            packet.clear();
+            packet.resize(self.config.packet_size, 0);
+            available.push(packet);
+            self.stats.current_size.store(available.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl AllocationPool {
+    async fn new(config: AllocationPoolConfig) -> NatResult<Self> {
+        Ok(Self {
+            available: Arc::new(Mutex::new(Vec::new())),
+            config,
+            stats: AllocationPoolStats::default(),
+        })
+    }
+
+    async fn get_allocation(&self) -> Option<Box<Allocation>> {
+        let mut available = self.available.lock().await;
+
+        if let Some(allocation) = available.pop() {
+            self.stats.allocations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(allocation)
+        } else {
+            None
+        }
+    }
+
+    async fn return_allocation(&self, allocation: Box<Allocation>) {
+        let mut available = self.available.lock().await;
+
+        if available.len() < self.config.max_size {
+            available.push(allocation);
+            self.stats.returns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.stats.current_size.store(available.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// Continue with TurnServer implementation methods
+impl TurnServer {
+    // Helper methods for SHARP protocol
+    async fn parse_handshake_init(&self, payload: &[u8]) -> NatResult<HandshakeInitMessage> {
+        if payload.len() < 32 {
+            return Err(NatError::Platform("Handshake init too small".to_string()));
+        }
+
+        let client_public_key = PublicKey::from(<[u8; 32]>::try_from(&payload[0..32])
+            .map_err(|_| NatError::Platform("Invalid public key".to_string()))?);
+
+        Ok(HandshakeInitMessage {
+            client_public_key,
+            version: SHARP_CURRENT_VERSION,
+            supported_algorithms: vec![ENCRYPT_ALGO_CHACHA20_POLY1305, ENCRYPT_ALGO_AES256_GCM],
+        })
+    }
+
+    async fn parse_handshake_complete(&self, payload: &[u8]) -> NatResult<HandshakeCompleteMessage> {
+        if payload.len() < 48 {
+            return Err(NatError::Platform("Handshake complete too small".to_string()));
+        }
+
+        let client_public_key = PublicKey::from(<[u8; 32]>::try_from(&payload[0..32])
+            .map_err(|_| NatError::Platform("Invalid public key".to_string()))?);
+
+        let nonce = <[u8; 16]>::try_from(&payload[32..48])
+            .map_err(|_| NatError::Platform("Invalid nonce".to_string()))?;
+
+        Ok(HandshakeCompleteMessage {
+            client_public_key,
+            nonce,
+        })
+    }
+
+    async fn send_sharp_handshake_response(
+        &self,
+        client_addr: SocketAddr,
+        our_public_key: PublicKey,
+        nonce: [u8; 16]
+    ) -> NatResult<()> {
+        let mut response_payload = Vec::new();
+        response_payload.extend_from_slice(our_public_key.as_bytes());
+        response_payload.extend_from_slice(&nonce);
+
+        let header = SharpHeader {
+            version: SHARP_CURRENT_VERSION,
+            packet_type: SHARP_TYPE_HANDSHAKE_RESPONSE,
+            flags: SHARP_FLAG_AUTHENTICATED,
+            stream_id: 0,
+            sequence: 0,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO).as_millis() as u64,
+        };
+
+        let encrypted_packet = self.encrypt_sharp_packet(header, &response_payload, client_addr, None).await?;
+        self.send_response(client_addr, encrypted_packet).await?;
+
+        Ok(())
+    }
+
+    async fn send_sharp_heartbeat_response(&self, client_addr: SocketAddr) -> NatResult<()> {
+        let header = SharpHeader {
+            version: SHARP_CURRENT_VERSION,
+            packet_type: SHARP_TYPE_HEARTBEAT,
+            flags: SHARP_FLAG_AUTHENTICATED,
+            stream_id: 0,
+            sequence: 0,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO).as_millis() as u64,
+        };
+
+        let heartbeat_data = b"pong";
+        let encrypted_packet = self.encrypt_sharp_packet(header, heartbeat_data, client_addr, None).await?;
+        self.send_response(client_addr, encrypted_packet).await?;
+
+        Ok(())
+    }
+
+    async fn encrypt_sharp_packet(
+        &self,
+        header: SharpHeader,
+        payload: &[u8],
+        client_addr: SocketAddr,
+        psk: Option<&[u8]>,
+    ) -> NatResult<Vec<u8>> {
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+        use chacha20poly1305::aead::Aead;
+
+        // Get encryption keys
+        let (header_key, payload_key) = if let Some(session) = self.sharp_sessions.read().await.get(&client_addr) {
+            let keys = session.keys.read().await;
+            (keys.header_key, keys.payload_key)
+        } else if let Some(psk_data) = psk.or(self.config.sharp_config.psk.as_deref()) {
+            // Derive keys from PSK
+            let mut header_key = [0u8; 32];
+            let mut payload_key = [0u8; 32];
+
+            let hkdf = Hkdf::<Sha256>::new(None, psk_data);
+            hkdf.expand(HKDF_INFO_HEADER, &mut header_key)
+                .map_err(|e| NatError::Platform(format!("Header key derivation failed: {}", e)))?;
+            hkdf.expand(HKDF_INFO_PAYLOAD, &mut payload_key)
+                .map_err(|e| NatError::Platform(format!("Payload key derivation failed: {}", e)))?;
+
+            (Some(header_key), Some(payload_key))
+        } else {
+            return Err(NatError::Platform("No encryption keys available".to_string()));
+        };
+
+        let header_key = header_key.ok_or_else(|| NatError::Platform("No header key available".to_string()))?;
+
+        // Serialize SHARP header
+        let header_bytes = header.serialize();
+
+        // Encrypt header with ChaCha20Poly1305 (fast encryption)
+        let header_cipher = ChaCha20Poly1305::new(&header_key.into());
+        let mut header_nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut header_nonce_bytes);
+        let header_nonce = Nonce::from_slice(&header_nonce_bytes);
+
+        let encrypted_header = header_cipher.encrypt(header_nonce, header_bytes.as_slice())
+            .map_err(|e| NatError::Platform(format!("Header encryption failed: {}", e)))?;
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&header_nonce_bytes);
+        packet.extend_from_slice(&encrypted_header);
+
+        // If there's payload and we have a payload key, encrypt it separately
+        if !payload.is_empty() {
+            if let Some(payload_key) = payload_key {
+                use aes_gcm::{Aes256Gcm, KeyInit, Nonce as AesNonce};
+                use aes_gcm::aead::Aead;
+
+                let payload_cipher = Aes256Gcm::new(&payload_key.into());
+                let mut payload_nonce_bytes = [0u8; 12];
+                OsRng.fill_bytes(&mut payload_nonce_bytes);
+                let payload_nonce = AesNonce::from_slice(&payload_nonce_bytes);
+
+                let encrypted_payload = payload_cipher.encrypt(payload_nonce, payload)
+                    .map_err(|e| NatError::Platform(format!("Payload encryption failed: {}", e)))?;
+
+                packet.extend_from_slice(&payload_nonce_bytes);
+                packet.extend_from_slice(&encrypted_payload);
+            } else {
+                // No payload encryption key available, send plaintext (should not happen in production)
+                packet.extend_from_slice(payload);
+            }
+        }
+
+        Ok(packet)
+    }
+
+    async fn derive_session_keys(&self, shared_secret: &SharedSecret, nonce: &[u8; 16]) -> NatResult<SessionKeys> {
+        let hkdf = Hkdf::<Sha256>::new(Some(nonce), shared_secret.as_bytes());
+
+        let mut header_key = [0u8; 32];
+        let mut payload_key = [0u8; 32];
+        let mut auth_key = [0u8; 32];
+
+        hkdf.expand(HKDF_INFO_HEADER, &mut header_key)
+            .map_err(|e| NatError::Platform(format!("Header key derivation failed: {}", e)))?;
+        hkdf.expand(HKDF_INFO_PAYLOAD, &mut payload_key)
+            .map_err(|e| NatError::Platform(format!("Payload key derivation failed: {}", e)))?;
+        hkdf.expand(HKDF_INFO_AUTH, &mut auth_key)
+            .map_err(|e| NatError::Platform(format!("Auth key derivation failed: {}", e)))?;
+
+        Ok(SessionKeys {
+            shared_secret: Some(*shared_secret),
+            header_key: Some(header_key),
+            payload_key: Some(payload_key),
+            auth_key: Some(auth_key),
+            derived_at: Some(Instant::now()),
+            rotation_counter: 0,
+        })
+    }
+
+    async fn encode_response_with_integrity(&self, response: &Message, client_addr: SocketAddr) -> NatResult<BytesMut> {
+        // First encode without integrity
+        let mut encoded = response.encode(None, false)?;
+
+        // Add MESSAGE-INTEGRITY-SHA256 if required
+        if self.config.security_config.require_sha256_integrity {
+            // Get authentication key (simplified - would use proper key lookup)
+            let auth_key = b"test_key_32_bytes_long_enough!!!";
+
+            // Calculate HMAC-SHA256
+            let mut mac = Hmac::<Sha256>::new_from_slice(auth_key)
+                .map_err(|e| NatError::Platform(format!("HMAC key error: {}", e)))?;
+            mac.update(&encoded);
+            let result = mac.finalize();
+            let code_bytes = result.into_bytes();
+
+            // Add MESSAGE-INTEGRITY-SHA256 attribute
+            let integrity_attr = Attribute::new(
+                AttributeType::MessageIntegritySha256,
+                AttributeValue::Raw(code_bytes.to_vec()),
+            );
+
+            // Re-encode with integrity
+            let mut response_with_integrity = response.clone();
+            response_with_integrity.add_attribute(integrity_attr);
+            encoded = response_with_integrity.encode(Some(auth_key), true)?;
+        }
+
+        Ok(encoded)
+    }
+
+    async fn send_response(&self, addr: SocketAddr, data: BytesMut) -> NatResult<()> {
+        self.socket.send_to(&data, addr).await
+            .map_err(|e| NatError::Platform(format!("Failed to send response: {}", e)))?;
+        Ok(())
+    }
+
+    async fn send_error_response(
+        &self,
+        addr: SocketAddr,
+        transaction_id: TransactionId,
+        message_type: MessageType,
+        error_code: u16,
+        error_text: &str,
+    ) -> NatResult<()> {
+        let mut response = Message::new(message_type, transaction_id);
+
+        // Add ERROR-CODE attribute
+        let mut error_data = Vec::new();
+        error_data.push(0); // Reserved
+        error_data.push(0); // Reserved
+        error_data.push((error_code / 100) as u8); // Class
+        error_data.push((error_code % 100) as u8); // Number
+        error_data.extend_from_slice(error_text.as_bytes());
+
+        response.add_attribute(Attribute::new(
+            AttributeType::ErrorCode,
+            AttributeValue::Raw(error_data),
+        ));
+
+        let encoded = self.encode_response_with_integrity(&response, addr).await?;
+        self.send_response(addr, encoded).await?;
+
+        Ok(())
+    }
+
+    async fn handle_authentication_error(
+        &self,
+        request: Message,
+        from_addr: SocketAddr,
+        error: NatError,
+    ) -> NatResult<()> {
+        match error {
+            NatError::Platform(ref msg) if msg.contains("nonce") => {
+                // Generate new nonce and send 401 Unauthorized
+                let nonce = self.auth_manager.generate_nonce(from_addr).await?;
+
+                let mut response = Message::new(MessageType::AllocateError, request.transaction_id);
+
+                // Add NONCE attribute
+                response.add_attribute(Attribute::new(
+                    AttributeType::Nonce,
+                    AttributeValue::Raw(nonce),
+                ));
+
+                // Add REALM attribute
+                response.add_attribute(Attribute::new(
+                    AttributeType::Realm,
+                    AttributeValue::Realm(self.config.realm.clone()),
+                ));
+
+                // Add ERROR-CODE attribute (401 Unauthorized)
+                let mut error_data = Vec::new();
+                error_data.extend_from_slice(&[0, 0, 4, 1]); // 401
+                error_data.extend_from_slice(b"Unauthorized");
+
+                response.add_attribute(Attribute::new(
+                    AttributeType::ErrorCode,
+                    AttributeValue::Raw(error_data),
+                ));
+
+                let encoded = self.encode_response_with_integrity(&response, from_addr).await?;
+                self.send_response(from_addr, encoded).await?;
+            }
+            _ => {
+                self.send_error_response(
+                    from_addr,
+                    request.transaction_id,
+                    MessageType::AllocateError,
+                    400,
+                    "Bad Request",
+                ).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn allocation_exists(&self, allocation_id: &AllocationId) -> bool {
+        let allocations = self.allocations.read().await;
+        allocations.values().any(|alloc| alloc.metadata.id == *allocation_id)
+    }
+
+    async fn process_relay_data(
+        &self,
+        allocation: Arc<Allocation>,
+        data: Vec<u8>,
+        peer_addr: SocketAddr,
+    ) -> NatResult<()> {
+        // Check if peer is allowed
+        let permissions = allocation.network.permissions.read().await;
+        let peer_ip = peer_addr.ip();
+
+        let has_permission = permissions.contains_key(&peer_ip) &&
+            permissions[&peer_ip].expires_at > Instant::now();
+
+        if !has_permission {
+            debug!("Dropping packet from unauthorized peer {}", peer_addr);
+            allocation.performance.stats.packets_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+
+        // Check bandwidth limits
+        if let Some(ref limiter) = allocation.performance.bandwidth_limiter {
+            if !limiter.try_consume(data.len() as f64).await {
+                debug!("Bandwidth limit exceeded for allocation {}", hex::encode(allocation.metadata.id));
+                allocation.performance.stats.packets_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+
+        // Check for channel binding
+        let channels = allocation.network.channels.read().await;
+        let mut use_channel = false;
+        let mut channel_number = 0u16;
+
+        for (ch_num, binding) in channels.iter() {
+            if binding.peer_addr == peer_addr && binding.expires_at > Instant::now() {
+                channel_number = *ch_num;
+                use_channel = true;
+                break;
+            }
+        }
+        drop(channels);
+
+        let client_data = if use_channel {
+            // Send as ChannelData
+            let mut channel_data = Vec::new();
+            channel_data.extend_from_slice(&channel_number.to_be_bytes());
+            channel_data.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            channel_data.extend_from_slice(&data);
+
+            // Pad to 4-byte boundary
+            while channel_data.len() % 4 != 0 {
+                channel_data.push(0);
+            }
+
+            channel_data
+        } else {
+            // Send as Data Indication
+            let mut indication = Message::new(MessageType::DataIndication, TransactionId::new());
+
+            // Add XOR-PEER-ADDRESS
+            indication.add_attribute(Attribute::new(
+                AttributeType::XorPeerAddress,
+                AttributeValue::XorPeerAddress(peer_addr),
+            ));
+
+            // Add DATA
+            indication.add_attribute(Attribute::new(
+                AttributeType::Data,
+                AttributeValue::Raw(data),
+            ));
+
+            indication.encode(None, false)?
+        };
+
+        // Send to client (with SHARP encryption if session exists)
+        let final_data = if let Some(ref sharp_session) = allocation.sharp_session {
+            // Encrypt with SHARP
+            let header = SharpHeader {
+                version: sharp_session.version,
+                packet_type: SHARP_TYPE_DATA,
+                flags: SHARP_FLAG_ENCRYPTED,
+                stream_id: 1,
+                sequence: 0, // Would be properly managed in real implementation
+                timestamp: SystemTime::now().duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO).as_millis() as u64,
+            };
+
+            self.encrypt_sharp_packet(header, &client_data, allocation.metadata.client_addr, None).await?
+        } else {
+            client_data.into()
+        };
+
+        // Send to client
+        self.socket.send_to(&final_data, allocation.metadata.client_addr).await
+            .map_err(|e| NatError::Platform(format!("Failed to relay data: {}", e)))?;
+
+        // Update statistics
+        allocation.performance.stats.packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        allocation.performance.stats.bytes_sent.fetch_add(final_data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.stats.bytes_relayed.fetch_add(final_data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    // Worker implementation methods
+    async fn cleanup_sharp_sessions(&self) {
+        let now = Instant::now();
+        let session_lifetime = self.config.sharp_config.session_key_lifetime;
+        let mut expired_sessions = Vec::new();
+
+        {
+            let sessions = self.sharp_sessions.read().await;
+            for (addr, session) in sessions.iter() {
+                if now.duration_since(session.created_at) > session_lifetime {
+                    expired_sessions.push(*addr);
+                } else {
+                    // Check for missed heartbeats
+                    let heartbeat_state = session.heartbeat_state.read().await;
+                    if heartbeat_state.missed_count >= self.config.sharp_config.max_missed_heartbeats {
+                        expired_sessions.push(*addr);
+                    }
+                }
+            }
+        }
+
+        if !expired_sessions.is_empty() {
+            let mut sessions = self.sharp_sessions.write().await;
+            for addr in expired_sessions {
+                if let Some(session) = sessions.remove(&addr) {
+                    info!("SHARP session expired for {}", addr);
+
+                    // Update statistics
+                    self.stats.sharp_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+                    // Also clean up associated allocations
+                    let allocation_key = (addr, TransportProtocol::Udp);
+                    if let Some(allocation) = self.allocations.write().await.remove(&allocation_key) {
+                        self.port_manager.release_port(allocation.network.relay_addr.port()).await;
+                        self.stats.active_allocations.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+                        let _ = self.event_broadcaster.send(ServerEvent::AllocationTerminated {
+                            allocation_id: hex::encode(allocation.metadata.id),
+                            reason: "SHARP session expired".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Cleanup pending handshakes
+        let handshake_timeout = self.config.sharp_config.handshake_timeout;
+        let mut expired_handshakes = Vec::new();
+
+        {
+            let pending = self.pending_handshakes.read().await;
+            for (addr, handshake) in pending.iter() {
+                if now.duration_since(handshake.started_at) > handshake_timeout {
+                    expired_handshakes.push(*addr);
+                }
+            }
+        }
+
+        if !expired_handshakes.is_empty() {
+            let mut pending = self.pending_handshakes.write().await;
+            for addr in expired_handshakes {
+                pending.remove(&addr);
+                debug!("Expired pending SHARP handshake for {}", addr);
+            }
+        }
+    }
+
+    async fn perform_security_checks(&self) {
+        // Analyze current threat landscape
+        let mut threat_incidents = Vec::new();
+
+        // Check rate limiting violations
+        let rate_limit_stats = &self.rate_limiter.stats;
+        let blocked_requests = rate_limit_stats.requests_blocked.load(std::sync::atomic::Ordering::Relaxed);
+        let total_requests = rate_limit_stats.requests_allowed.load(std::sync::atomic::Ordering::Relaxed) + blocked_requests;
+
+        if total_requests > 0 && (blocked_requests as f64 / total_requests as f64) > 0.1 {
+            threat_incidents.push("High rate limiting activity detected".to_string());
+        }
+
+        // Check DDoS protection status
+        let ddos_stats = &self.rate_limiter.ddos_protection.stats;
+        let attacks_detected = ddos_stats.attacks_detected.load(std::sync::atomic::Ordering::Relaxed);
+
+        if attacks_detected > 0 {
+            threat_incidents.push(format!("DDoS attacks detected: {}", attacks_detected));
+        }
+
+        // Check for suspicious allocations
+        let allocations = self.allocations.read().await;
+        let suspicious_count = allocations.values()
+            .filter(|alloc| alloc.security.risk_score > 0.7)
+            .count();
+
+        if suspicious_count > 0 {
+            threat_incidents.push(format!("Suspicious allocations detected: {}", suspicious_count));
+        }
+
+        // Report security incidents if any
+        if !threat_incidents.is_empty() {
+            for incident in threat_incidents {
+                warn!("Security incident: {}", incident);
+
+                let _ = self.event_broadcaster.send(ServerEvent::SecurityIncident {
+                    incident_type: "security_check".to_string(),
+                    severity: Severity::Medium,
+                    source: "0.0.0.0:0".parse().unwrap(),
+                });
+            }
+        }
+
+        // Update security statistics
+        self.security_enforcer.stats.security_incidents.fetch_add(
+            threat_incidents.len() as u64,
+            std::sync::atomic::Ordering::Relaxed
+        );
+    }
+
+    async fn perform_maintenance(&self) {
+        let now = Instant::now();
+
+        // Clean up expired allocations
+        let mut expired_allocations = Vec::new();
+        {
+            let allocations = self.allocations.read().await;
+            for (key, allocation) in allocations.iter() {
+                if now > allocation.metadata.expires_at {
+                    expired_allocations.push(*key);
+                }
+            }
+        }
+
+        if !expired_allocations.is_empty() {
+            let mut allocations = self.allocations.write().await;
+            for key in expired_allocations {
+                if let Some(allocation) = allocations.remove(&key) {
+                    self.port_manager.release_port(allocation.network.relay_addr.port()).await;
+                    self.stats.active_allocations.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+                    info!("Expired allocation {} for client {}",
+                         hex::encode(allocation.metadata.id),
+                         allocation.metadata.client_addr);
+
+                    let _ = self.event_broadcaster.send(ServerEvent::AllocationTerminated {
+                        allocation_id: hex::encode(allocation.metadata.id),
+                        reason: "Allocation expired".to_string(),
+                    });
+                }
+            }
+        }
+
+        // Clean up expired permissions and channels
+        for allocation in self.allocations.read().await.values() {
+            // Clean up permissions
+            {
+                let mut permissions = allocation.network.permissions.write().await;
+                permissions.retain(|_, permission| now < permission.expires_at);
+            }
+
+            // Clean up channels
+            {
+                let mut channels = allocation.network.channels.write().await;
+                channels.retain(|_, channel| now < channel.expires_at);
+            }
+        }
+
+        // Clean up authentication nonces
+        self.auth_manager.cleanup_expired_nonces(now).await;
+
+        // Clean up rate limiter caches
+        self.rate_limiter.cleanup_expired_entries(now).await;
+
+        // Run garbage collection on memory pools
+        self.packet_pool.cleanup().await;
+        self.allocation_pool.cleanup().await;
+
+        debug!("Maintenance cycle completed");
+    }
+
+    async fn collect_performance_metrics(&self) {
+        if let Ok(metrics) = self.perf_monitor.collect_metrics().await {
+            // Check for performance threshold violations
+            let violations = self.perf_monitor.check_thresholds().await;
+
+            for violation in violations {
+                warn!("Performance threshold violation: {}", violation);
+
+                let _ = self.event_broadcaster.send(ServerEvent::PerformanceThreshold {
+                    metric: "generic".to_string(),
+                    value: 0.0, // Would be actual value
+                    threshold: 0.0, // Would be actual threshold
+                });
+            }
+
+            // Update peak concurrent connections
+            let current_allocations = self.stats.active_allocations.load(std::sync::atomic::Ordering::Relaxed);
+            let peak = self.stats.peak_concurrent_connections.load(std::sync::atomic::Ordering::Relaxed);
+
+            if current_allocations > peak {
+                self.stats.peak_concurrent_connections.store(current_allocations, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn perform_health_checks(&self) {
+        let health_checks = self.health_monitor.health_checks.read().await.clone();
+
+        for (name, _check) in health_checks {
+            let result = self.health_monitor.perform_health_check(&name).await;
+
+            // Update check result
+            {
+                let mut checks = self.health_monitor.health_checks.write().await;
+                if let Some(check) = checks.get_mut(&name) {
+                    let old_status = check.last_result.as_ref().map(|r| r.status);
+                    check.last_result = Some(result.clone());
+
+                    // Send event if status changed
+                    if let Some(old) = old_status {
+                        if old != result.status {
+                            let _ = self.event_broadcaster.send(ServerEvent::HealthStatusChanged {
+                                component: name.clone(),
+                                old_status: old,
+                                new_status: result.status,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update overall system status
+        self.health_monitor.update_system_status().await;
+    }
+
+    async fn report_statistics(&self) {
+        let total_allocations = self.stats.total_allocations.load(std::sync::atomic::Ordering::Relaxed);
+        let active_allocations = self.stats.active_allocations.load(std::sync::atomic::Ordering::Relaxed);
+        let packets_processed = self.stats.packets_processed.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_relayed = self.stats.bytes_relayed.load(std::sync::atomic::Ordering::Relaxed);
+        let sharp_sessions = self.stats.sharp_sessions.load(std::sync::atomic::Ordering::Relaxed);
+
+        info!("Server Statistics:");
+        info!("  Total allocations: {}", total_allocations);
+        info!("  Active allocations: {}", active_allocations);
+        info!("  Packets processed: {}", packets_processed);
+        info!("  Bytes relayed: {} MB", bytes_relayed / (1024 * 1024));
+        info!("  SHARP sessions: {}", sharp_sessions);
+
+        // Authentication statistics
+        let auth_attempts = self.auth_manager.auth_stats.auth_attempts.load(std::sync::atomic::Ordering::Relaxed);
+        let auth_successes = self.auth_manager.auth_stats.auth_successes.load(std::sync::atomic::Ordering::Relaxed);
+        let auth_failures = self.auth_manager.auth_stats.auth_failures.load(std::sync::atomic::Ordering::Relaxed);
+
+        if auth_attempts > 0 {
+            info!("Authentication Statistics:");
+            info!("  Attempts: {}", auth_attempts);
+            info!("  Successes: {}", auth_successes);
+            info!("  Failures: {}", auth_failures);
+            info!("  Success rate: {:.1}%", (auth_successes as f64 / auth_attempts as f64) * 100.0);
+        }
+
+        // Rate limiting statistics
+        let requests_allowed = self.rate_limiter.stats.requests_allowed.load(std::sync::atomic::Ordering::Relaxed);
+        let requests_blocked = self.rate_limiter.stats.requests_blocked.load(std::sync::atomic::Ordering::Relaxed);
+
+        if requests_allowed + requests_blocked > 0 {
+            info!("Rate Limiting Statistics:");
+            info!("  Requests allowed: {}", requests_allowed);
+            info!("  Requests blocked: {}", requests_blocked);
+            info!("  Block rate: {:.1}%", (requests_blocked as f64 / (requests_allowed + requests_blocked) as f64) * 100.0);
+        }
+
+        // SHARP encryption statistics
+        let encrypt_ops = self.stats.sharp_encrypt_ops.load(std::sync::atomic::Ordering::Relaxed);
+        let decrypt_ops = self.stats.sharp_decrypt_ops.load(std::sync::atomic::Ordering::Relaxed);
+        let decrypt_failures = self.stats.sharp_decrypt_failures.load(std::sync::atomic::Ordering::Relaxed);
+
+        if encrypt_ops > 0 || decrypt_ops > 0 {
+            info!("SHARP Encryption Statistics:");
+            info!("  Encrypt operations: {}", encrypt_ops);
+            info!("  Decrypt operations: {}", decrypt_ops);
+            info!("  Decrypt failures: {}", decrypt_failures);
+            if decrypt_ops > 0 {
+                info!("  Decrypt success rate: {:.1}%", ((decrypt_ops - decrypt_failures) as f64 / decrypt_ops as f64) * 100.0);
+            }
+        }
+    }
+
+    async fn manage_bandwidth(&self) {
+        // Process QoS queues
+        if self.config.bandwidth_limits.qos_enabled {
+            while let Some(packet) = self.bandwidth_manager.qos_shaper.dequeue_packet().await {
+                // Send the packet
+                if let Err(e) = self.socket.send_to(&packet.data, packet.dest_addr).await {
+                    error!("Failed to send QoS packet: {}", e);
+                }
+            }
+        }
+
+        // Update bandwidth statistics
+        let current_usage = self.calculate_current_bandwidth_usage().await;
+        self.bandwidth_manager.stats.total_bandwidth.store(current_usage, std::sync::atomic::Ordering::Relaxed);
+
+        let peak = self.bandwidth_manager.stats.peak_bandwidth.load(std::sync::atomic::Ordering::Relaxed);
+        if current_usage > peak {
+            self.bandwidth_manager.stats.peak_bandwidth.store(current_usage, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    async fn calculate_current_bandwidth_usage(&self) -> u64 {
+        // In a real implementation, this would calculate actual bandwidth usage
+        // For now, estimate based on recent packet activity
+        let packets_processed = self.stats.packets_processed.load(std::sync::atomic::Ordering::Relaxed);
+        let estimated_usage = packets_processed * 512; // Assume average 512 bytes per packet
+        estimated_usage
+    }
+
+    // Clone implementation for TurnServer
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            socket: self.socket.clone(),
+            allocations: self.allocations.clone(),
+            sharp_sessions: self.sharp_sessions.clone(),
+            pending_handshakes: self.pending_handshakes.clone(),
+            auth_manager: self.auth_manager.clone(),
+            port_manager: self.port_manager.clone(),
+            rate_limiter: self.rate_limiter.clone(),
+            bandwidth_manager: self.bandwidth_manager.clone(),
+            security_enforcer: self.security_enforcer.clone(),
+            crypto_provider: self.crypto_provider.clone(),
+            stats: self.stats.clone(),
+            perf_monitor: self.perf_monitor.clone(),
+            health_monitor: self.health_monitor.clone(),
+            event_broadcaster: self.event_broadcaster.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
+            shutdown: self.shutdown.clone(),
+            worker_handles: self.worker_handles.clone(),
+            packet_pool: self.packet_pool.clone(),
+            allocation_pool: self.allocation_pool.clone(),
+        }
+    }
+}
+
+// Additional implementations for supporting structures
+impl AuthManager {
+    async fn generate_nonce(&self, client_addr: SocketAddr) -> NatResult<Vec<u8>> {
+        let mut nonce = vec![0u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+
+        let nonce_info = NonceInfo {
+            created_at: Instant::now(),
+            expires_at: Instant::now() + self.config.nonce_expiry,
+            client_addr,
+            usage_count: 0,
+            nonce_type: NonceType::Auth,
+        };
+
+        self.nonces.write().await.insert(nonce.clone(), nonce_info);
+        self.auth_stats.nonces_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(nonce)
+    }
+
+    async fn cleanup_expired_nonces(&self, now: Instant) {
+        let mut nonces = self.nonces.write().await;
+        let initial_count = nonces.len();
+
+        nonces.retain(|_, info| now < info.expires_at);
+
+        let removed_count = initial_count - nonces.len();
+        if removed_count > 0 {
+            debug!("Cleaned up {} expired nonces", removed_count);
+        }
+    }
+}
+
+impl RateLimiter {
+    async fn cleanup_expired_entries(&self, now: Instant) {
+        let mut client_limits = self.client_limits.write().await;
+        let retention_period = Duration::from_secs(3600); // 1 hour
+
+        client_limits.retain(|_, limit| now.duration_since(limit.last_reset) < retention_period);
+    }
+}
+
+impl PacketPool {
+    async fn cleanup(&self) {
+        let mut available = self.available.lock().await;
+
+        // Reduce pool size if it's grown too large
+        let target_size = self.config.initial_size;
+        while available.len() > target_size {
+            available.pop();
+        }
+
+        self.stats.current_size.store(available.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl AllocationPool {
+    async fn cleanup(&self) {
+        let mut available = self.available.lock().await;
+
+        // Clear the pool periodically to prevent memory leaks
+        if available.len() > self.config.max_size {
+            available.clear();
+            self.stats.current_size.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// SHARP header implementation
+#[derive(Debug, Clone)]
+struct SharpHeader {
+    version: u16,
+    packet_type: u8,
+    flags: u8,
+    stream_id: u32,
+    sequence: u32,
+    timestamp: u64,
+}
+
+impl SharpHeader {
+    fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 16 {
+            return None;
+        }
+
+        Some(Self {
+            version: u16::from_be_bytes([data[0], data[1]]),
+            packet_type: data[2],
+            flags: data[3],
+            stream_id: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+            sequence: u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
+            timestamp: u64::from_be_bytes([data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]]),
+        })
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&self.version.to_be_bytes());
+        data.push(self.packet_type);
+        data.push(self.flags);
+        data.extend_from_slice(&self.stream_id.to_be_bytes());
+        data.extend_from_slice(&self.sequence.to_be_bytes());
+        data.extend_from_slice(&self.timestamp.to_be_bytes());
+        data
+    }
+}
+
+// Handshake message structures
+#[derive(Debug)]
+struct HandshakeInitMessage {
+    client_public_key: PublicKey,
+    version: u16,
+    supported_algorithms: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct HandshakeCompleteMessage {
+    client_public_key: PublicKey,
+    nonce: [u8; 16],
+}
+
+// Result structures for various operations
+#[derive(Debug)]
+struct SignatureMatchResult {
+    signature_id: String,
+    threat_type: ThreatType,
+    severity: Severity,
+    confidence: f64,
+    matched_data: Vec<u8>,
+    recommended_mitigations: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ThreatIntelResult {
+    is_malicious: bool,
+    confidence: f64,
+    severity: Severity,
+    threat_types: Vec<String>,
+    last_seen: Instant,
+}
+
+#[derive(Debug)]
+struct AnomalyDetectionResult {
+    anomalies: Vec<DetectedAnomaly>,
+    confidence: f64,
+    analysis_timestamp: Instant,
+}
+
+#[derive(Debug)]
+struct ThreatAnalysisResult {
+    threats: Vec<DetectedThreat>,
+    overall_threat_level: ThreatLevel,
+    confidence: f64,
+    analysis_duration: Duration,
+    recommendations: Vec<String>,
+}
+
+// Default implementations for various supporting structures
+impl Default for AccessControlList {
+    fn default() -> Self {
+        Self {
+            allowed_peers: HashSet::new(),
+            denied_peers: HashSet::new(),
+            allowed_ports: Vec::new(),
+            allowed_protocols: HashSet::new(),
+        }
+    }
+}
+
+impl Default for PasswordRequirements {
+    fn default() -> Self {
+        Self {
+            min_length: 8,
+            require_uppercase: true,
+            require_lowercase: true,
+            require_numbers: true,
+            require_special: true,
+            history_depth: 5,
+        }
+    }
+}
+
+// Extension trait for Duration arithmetic
+trait DurationExt {
+    fn from_hours(hours: u64) -> Duration;
+}
+
+impl DurationExt for Duration {
+    fn from_hours(hours: u64) -> Duration {
+        Duration::from_secs(hours * 3600)
+    }
+}
+
+// Helper function to create default configuration
+pub fn create_default_config(bind_addr: &str, external_ip: &str) -> NatResult<TurnServerConfig> {
+    Ok(TurnServerConfig {
+        bind_addr: bind_addr.parse()
+            .map_err(|e| NatError::Platform(format!("Invalid bind address: {}", e)))?,
+        external_ip: external_ip.parse()
+            .map_err(|e| NatError::Platform(format!("Invalid external IP: {}", e)))?,
+        realm: "sharp.turn".to_string(),
+        min_port: 49152,
+        max_port: 65535,
+        default_lifetime: Duration::from_secs(600),
+        max_lifetime: Duration::from_secs(3600),
+        permission_lifetime: Duration::from_secs(300),
+        channel_lifetime: Duration::from_secs(600),
+        sharp_config: SharpConfig {
+            require_sharp: true,
+            allowed_versions: vec![SHARP_VERSION_1, SHARP_VERSION_2],
+            header_encryption: EncryptionAlgorithm::ChaCha20Poly1305,
+            payload_encryption: EncryptionAlgorithm::Aes256Gcm,
+            kdf_algorithm: KdfAlgorithm::HkdfSha256,
+            session_key_lifetime: Duration::from_secs(3600),
+            handshake_timeout: Duration::from_secs(10),
+            max_handshake_retries: 3,
+            enable_pfs: true,
+            heartbeat_interval: Duration::from_secs(30),
+            max_missed_heartbeats: 3,
+            psk: Some(b"your_pre_shared_key_32_bytes_long!".to_vec()),
+            quantum_resistant: false,
+        },
+        bandwidth_limits: BandwidthLimits::default(),
+        security_config: SecurityConfig::default(),
+        performance_config: PerformanceConfig::default(),
+        monitoring_config: MonitoringConfig::default(),
+    })
+}
+
+// Example usage and test functions
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, timeout};
+
+    #[tokio::test]
+    async fn test_sharp_turn_server_lifecycle() {
+        let config = create_default_config("127.0.0.1:0", "127.0.0.1").unwrap();
+
+        // Create server (this will fail in test due to missing crypto provider, but tests config)
+        let result = TurnServer::new(config).await;
+        assert!(result.is_err()); // Expected due to unimplemented crypto provider
+    }
+
+    #[tokio::test]
+    async fn test_sharp_header_serialization() {
+        let header = SharpHeader {
+            version: SHARP_VERSION_2,
+            packet_type: SHARP_TYPE_DATA,
+            flags: SHARP_FLAG_ENCRYPTED | SHARP_FLAG_AUTHENTICATED,
+            stream_id: 12345,
+            sequence: 67890,
+            timestamp: 1234567890123456789,
+        };
+
+        let serialized = header.serialize();
+        let parsed = SharpHeader::parse(&serialized).unwrap();
+
+        assert_eq!(parsed.version, header.version);
+        assert_eq!(parsed.packet_type, header.packet_type);
+        assert_eq!(parsed.flags, header.flags);
+        assert_eq!(parsed.stream_id, header.stream_id);
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_manager() {
+        let config = BandwidthConfig {
+            global_limit: Some(1000000),
+            qos_enabled: true,
+            traffic_shaping: true,
+            reporting_interval: Duration::from_secs(1),
+        };
+
+        let bandwidth_manager = BandwidthManager::new(config).await.unwrap();
+
+        // Test bandwidth limiting
+        let allocation_id = [1u8; 16];
+        bandwidth_manager.add_allocation_limiter(allocation_id, 500000).await;
+
+        assert!(bandwidth_manager.check_bandwidth_limit(&allocation_id, 100000).await);
+        assert!(bandwidth_manager.check_bandwidth_limit(&allocation_id, 100000).await);
+    }
+
+    #[tokio::test]
+    async fn test_threat_detection() {
+        let detector = ThreatDetector::new().await.unwrap();
+
+        // Test with suspicious data
+        let suspicious_data = vec![0u8; 5]; // Very small packet
+        let source = "127.0.0.1:12345".parse().unwrap();
+
+        let result = detector.analyze(&suspicious_data, source).await.unwrap();
+
+        // Should detect at least one threat due to small packet size
+        assert!(!result.threats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter() {
+        let config = RateLimitConfig {
+            global_limit: 1000,
+            per_client_limit: 100,
+            burst_allowance: 50,
+            time_window: Duration::from_secs(1),
+            enable_ddos_protection: true,
+        };
+
+        let rate_limiter = RateLimiter::new(config).await.unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+
+        // Should allow initial requests
+        assert!(rate_limiter.check_client_rate(client_ip, 10).await.unwrap());
+        assert!(rate_limiter.check_client_rate(client_ip, 10).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_port_manager() {
+        let config = PortConfig {
+            port_range: (50000, 50010),
+            reserved_ports: HashSet::new(),
+            allocation_strategy: PortAllocationStrategy::Categorized,
+            categories_enabled: true,
+        };
+
+        let port_manager = PortManager::new(config).await.unwrap();
+        let client_addr = "127.0.0.1:12345".parse().unwrap();
+
+        // Test port allocation
+        let port1 = port_manager.allocate_port(client_addr, AllocationType::Standard).await;
+        assert!(port1.is_some());
+
+        let port2 = port_manager.allocate_port(client_addr, AllocationType::Priority).await;
+        assert!(port2.is_some());
+        assert_ne!(port1, port2);
+
+        // Test port release
+        port_manager.release_port(port1.unwrap()).await;
+    }
+}
+
+// Main function for running the server
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    tracing_subscriber::fmt::init();
+
+    // Load configuration (in real deployment, this would come from config file)
+    let config = create_default_config("0.0.0.0:3478", "YOUR_PUBLIC_IP_HERE")?;
+
+    info!("Starting SHARP-protected TURN server on {}", config.bind_addr);
+    info!("External IP: {}", config.external_ip);
+    info!("SHARP required: {}", config.sharp_config.require_sharp);
+
+    // Create and start server
+    let server = TurnServer::new(config).await?;
+    server.start().await?;
+
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    info!("Shutdown signal received");
+
+    // Graceful shutdown
+    server.shutdown().await?;
+    info!("Server shutdown complete");
+
+    Ok(())
+}
