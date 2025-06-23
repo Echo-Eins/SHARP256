@@ -473,9 +473,9 @@ impl IceAgent {
     /// Perform ICE restart
     pub async fn restart(&self) -> NatResult<()> {
         info!("Performing ICE restart");
-
+        let new_credentials = IceCredentials::generate();
         // Generate new credentials
-        self.local_credentials = IceCredentials::generate();
+        *self.local_credentials.write().await = new_credentials;
 
         // Clear selected pairs
         self.selected_pairs.write().await.clear();
