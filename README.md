@@ -355,7 +355,7 @@ cargo tarpaulin --out Html
 
 ## License
 
-This project is licensed under the MIT License - see LICENSE file for details.
+This project is licensed under the SHARP License - see LICENSE file for details.
 
 ## Acknowledgments
 
@@ -368,4 +368,4 @@ This project is licensed under the MIT License - see LICENSE file for details.
 
 - Issues: [GitHub Issues](https://github.com/your-repo/sharp-256/issues)
 - Discussions: [GitHub Discussions](https://github.com/your-repo/sharp-256/discussions)
-- Security: security@sharp256.dev
+- Security: alexandererich642@gmail.com
