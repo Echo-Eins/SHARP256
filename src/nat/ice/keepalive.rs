@@ -577,7 +577,7 @@ impl ConsentManager {
                     self.stats.write().await.successful_consent_checks += 1;
 
                     let _ = self.event_sender.send(ConsentEvent::ConsentFresh {
-                        connection_id: conn_id,
+                        connection_id: conn_id.clone(),
                         timestamp: now,
                     });
 
@@ -601,7 +601,7 @@ impl ConsentManager {
                         });
 
                         let _ = self.event_sender.send(ConsentEvent::ConnectionTerminated {
-                            connection_id: conn_id,
+                            connection_id: conn_id.clone(),
                             reason: "Consent check failures".to_string(),
                             timestamp: now,
                         });
@@ -755,7 +755,7 @@ impl ConsentManager {
             });
 
             let _ = self.event_sender.send(ConsentEvent::ConnectionTerminated {
-                connection_id,
+                connection_id: connection_id.clone(),
                 reason: "Consent expired".to_string(),
                 timestamp: now,
             });

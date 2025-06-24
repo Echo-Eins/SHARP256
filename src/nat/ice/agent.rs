@@ -47,6 +47,12 @@ pub enum IceState {
     Closed,
 }
 
+impl Default for IceState {
+    fn default() -> Self {
+        IceState::Gathering
+    }
+}
+
 /// ICE transport policy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IceTransportPolicy {
@@ -564,6 +570,7 @@ impl IceAgent {
 }
 
 /// Task wrapper for background processing
+#[derive(Clone)]
 struct IceAgentTask {
     config: IceConfig,
     state: Arc<RwLock<IceState>>,
@@ -590,9 +597,9 @@ struct IceAgentTask {
 impl IceAgentTask {
     /// Start background tasks
     async fn start_background_tasks(self) -> NatResult<()> {
-        let command_task = self.process_commands();
-        let stun_task = self.process_stun_messages();
-        let event_task = self.process_events();
+        let command_task = self.clone().process_commands();
+        let stun_task = self.clone().process_stun_messages();
+        let event_task = self.clone().process_events();
         let keepalive_task = self.process_keepalive();
 
         tokio::select! {

@@ -18,14 +18,13 @@ use tracing::{debug, info, warn, error, trace};
 use rand::{thread_rng, Rng};
 use serde::{Serialize, Deserialize};
 
-use crate::nat::error::{NatError, NatResult};
+use crate::nat::error::{NatError, NatResult, StunError};
 use crate::nat::ice::candidate::{
     Candidate, CandidateType, TransportProtocol, CandidatePair, CandidatePairState
 };
 use crate::nat::ice::priority;
 use crate::nat::stun::{
     Message, MessageType, TransactionId, Attribute, AttributeType, AttributeValue,
-    StunError
 };
 
 /// Connectivity check intervals per RFC 8445

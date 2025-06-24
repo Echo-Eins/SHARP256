@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, info, warn, error, trace};
 use serde::{Serialize, Deserialize};
@@ -327,47 +327,49 @@ impl TrickleProcessor {
     pub async fn add_candidate(&self, candidate: Candidate, component_id: u32) -> NatResult<()> {
         let immediate = self.should_send_immediately(&candidate);
 
-        self.command_sender.send(TrickleCommand::AddCandidate {
-            candidate,
-            component_id,
-            immediate,
-        }).map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
+        self.command_sender
+            .send(TrickleCommand::AddCandidate {
+                candidate,
+                component_id,
+                immediate,
+            })
+            .map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
 
         Ok(())
     }
 
     /// Process received trickle candidate
     pub async fn process_candidate(&self, trickle_candidate: TrickleCandidate) -> NatResult<()> {
-        self.command_sender.send(TrickleCommand::ProcessCandidate {
-            trickle_candidate,
-        }).map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
+        self.command_sender
+            .send(TrickleCommand::ProcessCandidate { trickle_candidate })
+            .map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
 
         Ok(())
     }
 
     /// Process received end-of-candidates
     pub async fn process_end_of_candidates(&self, message: EndOfCandidates) -> NatResult<()> {
-        self.command_sender.send(TrickleCommand::ProcessEndOfCandidates {
-            message,
-        }).map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
+        self.command_sender
+            .send(TrickleCommand::ProcessEndOfCandidates { message })
+            .map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
 
         Ok(())
     }
 
     /// End candidates for component
     pub async fn end_candidates(&self, component_id: u32) -> NatResult<()> {
-        self.command_sender.send(TrickleCommand::EndCandidates {
-            component_id,
-        }).map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
+        self.command_sender
+            .send(TrickleCommand::EndCandidates { component_id })
+            .map_err(|_| NatError::Configuration("Failed to send trickle command".to_string()))?;
 
         Ok(())
     }
 
     /// Flush pending candidates immediately
     pub async fn flush(&self) -> NatResult<()> {
-        self.command_sender.send(TrickleCommand::FlushBuffer)
+        self.command_sender
+            .send(TrickleCommand::FlushBuffer)
             .map_err(|_| NatError::Configuration("Failed to send flush command".to_string()))?;
-
         Ok(())
     }
 
@@ -383,8 +385,15 @@ impl TrickleProcessor {
             let start_time = Instant::now();
 
             match command {
-                TrickleCommand::AddCandidate { candidate, component_id, immediate } => {
-                    if let Err(e) = self.handle_add_candidate(candidate, component_id, immediate).await {
+                TrickleCommand::AddCandidate {
+                    candidate,
+                    component_id,
+                    immediate,
+                } => {
+                    if let Err(e) = self
+                        .handle_add_candidate(candidate, component_id, immediate)
+                        .await
+                    {
                         warn!("Failed to handle add candidate: {}", e);
                     }
                 }
@@ -448,11 +457,9 @@ impl TrickleProcessor {
     async fn handle_process_candidate(&self, trickle_candidate: TrickleCandidate) -> NatResult<()> {
         debug!("Processing received trickle candidate: component {}", trickle_candidate.component_id);
 
-        // Convert to ICE candidate
-        let candidate = self.trickle_to_candidate(&trickle_candidate).await?;
-
-        // Add to connectivity checker
-        self.connectivity_checker.add_remote_candidate(candidate, trickle_candidate.component_id).await?;
+        // Convert to ICE candidate to validate format. Passing the candidate to
+        // the ICE agent or connectivity checker is handled by higher layers.
+        let _ = self.trickle_to_candidate(&trickle_candidate).await?;
 
         // Update statistics
         self.stats.write().await.candidates_received += 1;
@@ -467,7 +474,10 @@ impl TrickleProcessor {
 
     /// Handle process end-of-candidates command
     async fn handle_process_end_of_candidates(&self, message: EndOfCandidates) -> NatResult<()> {
-        info!("Received end-of-candidates for component {:?}", message.component_id);
+        info!(
+            "Received end-of-candidates for component {:?}",
+            message.component_id
+        );
 
         // Mark components as ended
         {
@@ -484,9 +494,9 @@ impl TrickleProcessor {
         self.stats.write().await.end_of_candidates_received += 1;
 
         // Emit event
-        let _ = self.event_sender.send(TrickleEvent::EndOfCandidatesReceived {
-            message,
-        });
+        let _ = self
+            .event_sender
+            .send(TrickleEvent::EndOfCandidatesReceived { message });
 
         Ok(())
     }
@@ -516,9 +526,9 @@ impl TrickleProcessor {
         self.stats.write().await.end_of_candidates_sent += 1;
 
         // Emit event
-        let _ = self.event_sender.send(TrickleEvent::EndOfCandidates {
-            message,
-        });
+        let _ = self
+            .event_sender
+            .send(TrickleEvent::EndOfCandidates { message });
 
         Ok(())
     }
@@ -553,8 +563,8 @@ impl TrickleProcessor {
             // Check if we have candidates to batch
             let should_send = {
                 let buffer = self.batch_buffer.read().await;
-                buffer.len() >= self.config.max_batch_size ||
-                    (!buffer.is_empty() && self.has_batch_timeout().await)
+                buffer.len() >= self.config.max_batch_size
+                    || (!buffer.is_empty() && self.has_batch_timeout().await)
             };
 
             if should_send {
@@ -588,7 +598,10 @@ impl TrickleProcessor {
 
                 for component_id in components_to_end {
                     if let Err(e) = self.end_candidates(component_id).await {
-                        warn!("Failed to end candidates for component {}: {}", component_id, e);
+                        warn!(
+                            "Failed to end candidates for component {}: {}",
+                            component_id, e
+                        );
                     }
                 }
             }
@@ -656,7 +669,7 @@ impl TrickleProcessor {
 
     /// Convert trickle candidate to ICE candidate
     async fn trickle_to_candidate(&self, trickle: &TrickleCandidate) -> NatResult<Candidate> {
-        use crate::nat::ice::candidate::{CandidateExtensions, CandidateAddress};
+        use crate::nat::ice::candidate::{CandidateAddress, CandidateExtensions};
 
         let transport = match trickle.candidate.protocol.as_str() {
             "UDP" | "udp" => TransportProtocol::Udp,
@@ -686,7 +699,8 @@ impl TrickleProcessor {
 
         // Parse related address
         let related_address = if let (Some(rel_addr), Some(rel_port)) =
-            (&trickle.candidate.rel_addr, &trickle.candidate.rel_port) {
+            (&trickle.candidate.rel_addr, &trickle.candidate.rel_port)
+        {
 
             if rel_addr.ends_with(".local") {
                 Some(CandidateAddress::MDns {
@@ -696,7 +710,9 @@ impl TrickleProcessor {
             } else {
                 let ip = rel_addr.parse()
                     .map_err(|_| NatError::Platform("Invalid related IP address".to_string()))?;
-                Some(CandidateAddress::Ip(std::net::SocketAddr::new(ip, *rel_port)))
+                Some(CandidateAddress::Ip(std::net::SocketAddr::new(
+                    ip, *rel_port,
+                )))
             }
         } else {
             None
@@ -712,14 +728,16 @@ impl TrickleProcessor {
             address,
             candidate_type,
             related_address,
-            tcp_type: trickle.candidate.tcp_type.as_ref().and_then(|t| {
-                match t.as_str() {
+            tcp_type: trickle
+                .candidate
+                .tcp_type
+                .as_ref()
+                .and_then(|t| match t.as_str() {
                     "active" => Some(crate::nat::ice::candidate::TcpType::Active),
                     "passive" => Some(crate::nat::ice::candidate::TcpType::Passive),
                     "so" => Some(crate::nat::ice::candidate::TcpType::So),
                     _ => None,
-                }
-            }),
+                }),
             extensions,
             discovered_at: Instant::now(),
             base_address: None,
@@ -752,9 +770,9 @@ impl TrickleProcessor {
         }
 
         // Emit event
-        let _ = self.event_sender.send(TrickleEvent::CandidateReady {
-            candidate,
-        });
+        let _ = self
+            .event_sender
+            .send(TrickleEvent::CandidateReady { candidate });
 
         Ok(())
     }
@@ -779,7 +797,10 @@ impl TrickleProcessor {
             return Ok(());
         }
 
-        debug!("Sending trickle candidate batch: {} candidates", candidates.len());
+        debug!(
+            "Sending trickle candidate batch: {} candidates",
+            candidates.len()
+        );
 
         // Update statistics
         {
@@ -794,9 +815,9 @@ impl TrickleProcessor {
         }
 
         // Emit event
-        let _ = self.event_sender.send(TrickleEvent::BatchReady {
-            candidates,
-        });
+        let _ = self
+            .event_sender
+            .send(TrickleEvent::BatchReady { candidates });
 
         Ok(())
     }

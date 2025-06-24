@@ -227,7 +227,7 @@ impl InterfaceType {
         let lower = name.to_lowercase();
 
         // Check for specific patterns
-        if lower.contains("eth") || lower.contains("en") && !lower.contains("wlan") {
+        if (lower.contains("eth") || lower.contains("en")) && !lower.contains("wlan") {
             if lower.contains("thunderbolt") || lower.contains("usbc") {
                 Self::ThunderboltEthernet
             } else {
@@ -697,7 +697,7 @@ impl AdvancedPriorityCalculator {
             ((final_local_preference as u64) << 8) +
             ((256 - component_id.clamp(1, MAX_COMPONENT_ID)) as u64);
 
-        let final_priority = (priority as u32).min(u32::MAX);
+        let final_priority = priority.min(u32::MAX as u64) as u32;
 
         // Update statistics
         self.stats.add_priority(final_priority, candidate_type);
