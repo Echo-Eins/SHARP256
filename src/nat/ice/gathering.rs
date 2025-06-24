@@ -645,7 +645,7 @@ impl StunClient {
             Arc::new(UdpSocket::bind(local_addr).await.map_err(NatError::Network)?)
         };
 
-        let transaction_id = TransactionId::generate();
+        let transaction_id = TransactionId::new();
         let mut request = Message::new(MessageType::BindingRequest, transaction_id);
 
         // Add FINGERPRINT for RFC 5389 compliance
@@ -684,7 +684,7 @@ impl StunClient {
 
         match response_result {
             Ok(Ok(response)) => {
-                if response.message_type == MessageType::BindingSuccessResponse {
+                if response.message_type == MessageType::BindingResponse {
                     if let Some(mapped_addr) = response.get_xor_mapped_address() {
                         Ok(mapped_addr)
                     } else {
@@ -736,20 +736,20 @@ impl TurnClient {
 
         // For this implementation, we'll simulate TURN allocation
         // In real implementation, this would follow RFC 5766
-        let transaction_id = TransactionId::generate();
+        let transaction_id = TransactionId::new();
         let mut request = Message::new(MessageType::AllocateRequest, transaction_id);
 
         // Add REQUESTED-TRANSPORT (UDP)
         request.add_attribute(Attribute {
-            attribute_type: AttributeType::RequestedTransport,
+            attr_type: AttributeType::RequestedTransport,
             value: AttributeValue::RequestedTransport(17), // UDP protocol number
-        })?;
+        });
 
         // Add USERNAME
         request.add_attribute(Attribute {
-            attribute_type: AttributeType::Username,
+            attr_type: AttributeType::Username,
             value: AttributeValue::Username(self.config.username.clone()),
-        })?;
+        });
 
         // Add MESSAGE-INTEGRITY
         request.add_message_integrity(&self.config.password)?;
@@ -808,20 +808,20 @@ impl TurnClient {
     /// Refresh allocation
     pub async fn refresh(&mut self) -> NatResult<()> {
         if let Some(socket) = &self.socket {
-            let transaction_id = TransactionId::generate();
+            let transaction_id = TransactionId::new();
             let mut request = Message::new(MessageType::RefreshRequest, transaction_id);
 
             // Add LIFETIME
             request.add_attribute(Attribute {
-                attribute_type: AttributeType::Lifetime,
+                attr_type: AttributeType::Lifetime,
                 value: AttributeValue::Lifetime(self.config.allocation_lifetime.as_secs() as u32),
-            })?;
+            });
 
             // Add USERNAME
             request.add_attribute(Attribute {
-                attribute_type: AttributeType::Username,
+                attr_type: AttributeType::Username,
                 value: AttributeValue::Username(self.config.username.clone()),
-            })?;
+            });
 
             // Add MESSAGE-INTEGRITY
             request.add_message_integrity(&self.config.password)?;

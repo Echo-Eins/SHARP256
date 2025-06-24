@@ -1,6 +1,6 @@
 [package]
 name = "SHARP3"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["SHARP Protocol Team"]
 description = "Swift Hash Assurance Rust Protocol - High-performance file transfer protocol"

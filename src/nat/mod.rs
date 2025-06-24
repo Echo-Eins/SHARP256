@@ -30,8 +30,10 @@ pub mod hole_punch;
 pub mod coordinator;
 pub mod metrics;
 pub mod port_forwarding;
-//pub mod ice;
+pub mod stun_turn_manager;
 pub mod turn;
+
+pub use stun_turn_manager::StunTurnMessageManager;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -45,7 +47,6 @@ use self::hole_punch::{HolePuncher, HolePunchConfig, CoordinatedHolePunch};
 use self::coordinator::AdvancedNatTraversal;
 use self::error::{NatError, NatResult};
 
-pub use turn::TurnRelay;
 pub mod ice;
 pub mod ice_integration;
 
@@ -135,6 +136,63 @@ pub enum NatProtocol {
     HolePunch,
     /// TURN relay
     Turn,
+}
+
+use futures::future::BoxFuture;
+use crate::nat::ice::validate_ice_config;
+
+/// Interface for external NAT traversal managers.
+///
+/// A manager implementing this trait can supply server
+/// reflexive and relay candidates obtained through existing
+/// STUN and TURN subsystems.
+pub trait IceNatManager: Send + Sync + 'static {
+    /// Acquire a server reflexive candidate for the given component.
+    fn get_server_reflexive(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>>;
+
+    /// Acquire a relay candidate via TURN for the given component.
+    fn get_relay_candidate(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>>;
+}
+
+/// Wrapper that binds an [`IceAgent`] with an external [`IceNatManager`].
+///
+/// This structure exposes simplified methods used by higher level
+/// networking components while keeping the ICE internals hidden.
+pub struct IceSession<M: IceNatManager> {
+    agent: Arc<IceAgent>,
+    nat_manager: Arc<M>,
+}
+
+impl<M: IceNatManager> IceSession<M> {
+    /// Create a new ICE session using the provided manager.
+    pub async fn new(config: IceConfig, manager: Arc<M>) -> NatResult<Self> {
+        validate_ice_config(&config)?;
+        let agent = Arc::new(IceAgent::new(config).await?);
+        Ok(Self { agent, nat_manager: manager })
+    }
+
+    /// Access the underlying [`IceAgent`].
+    pub fn agent(&self) -> Arc<IceAgent> {
+        self.agent.clone()
+    }
+
+    /// Start ICE processing with the specified role.
+    pub async fn start(&self, role: IceRole) -> NatResult<()> {
+        self.agent.start(role).await
+    }
+
+    /// Get a handle to the associated NAT manager.
+    pub fn nat_manager(&self) -> Arc<M> {
+        self.nat_manager.clone()
+    }
 }
 
 impl Default for NatConfig {

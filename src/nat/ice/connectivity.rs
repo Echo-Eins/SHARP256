@@ -467,44 +467,44 @@ impl ConnectivityChecker {
             .clone();
 
         // Create binding request
-        let transaction_id = TransactionId::generate();
+        let transaction_id = TransactionId::new();
         let mut request = Message::new(MessageType::BindingRequest, transaction_id);
 
         // Add USERNAME attribute
         let username = format!("{}:{}", remote_creds.ufrag, self.local_credentials.ufrag);
         request.add_attribute(Attribute {
-            attribute_type: AttributeType::Username,
+            attr_type: AttributeType::Username,
             value: AttributeValue::Username(username),
-        })?;
+        });
 
         // Add PRIORITY attribute
         request.add_attribute(Attribute {
-            attribute_type: AttributeType::Priority,
+            attr_type: AttributeType::Priority,
             value: AttributeValue::Priority(pair.local.priority),
-        })?;
+        });
 
         // Add USE-CANDIDATE for controlling agent (RFC 8445 Section 7.3.1.1)
         let controlling = *self.controlling.read().await;
         if controlling {
             // Add ICE-CONTROLLING attribute
             request.add_attribute(Attribute {
-                attribute_type: AttributeType::IceControlling,
+                attr_type: AttributeType::IceControlling,
                 value: AttributeValue::IceControlling(generate_tie_breaker()),
-            })?;
+            });
 
             // Add USE-CANDIDATE for nomination
             if self.aggressive_nomination || pair.nominated {
                 request.add_attribute(Attribute {
-                    attribute_type: AttributeType::UseCandidate,
+                    attr_type: AttributeType::UseCandidate,
                     value: AttributeValue::Flag,
-                })?;
+                });
             }
         } else {
             // Add ICE-CONTROLLED attribute
             request.add_attribute(Attribute {
-                attribute_type: AttributeType::IceControlled,
+                attr_type: AttributeType::IceControlled,
                 value: AttributeValue::IceControlled(generate_tie_breaker()),
-            })?;
+            });
         }
 
         // Add MESSAGE-INTEGRITY
@@ -564,7 +564,7 @@ impl ConnectivityChecker {
             MessageType::BindingRequest => {
                 self.process_binding_request(message, from, to).await
             }
-            MessageType::BindingSuccessResponse => {
+            MessageType::BindingResponse => {
                 self.process_binding_response(message, from).await?;
                 Ok(None)
             }
@@ -604,15 +604,15 @@ impl ConnectivityChecker {
 
         // Create success response
         let mut response = Message::new(
-            MessageType::BindingSuccessResponse,
+            MessageType::BindingResponse,
             request.transaction_id,
         );
 
         // Add XOR-MAPPED-ADDRESS
         response.add_attribute(Attribute {
-            attribute_type: AttributeType::XorMappedAddress,
+            attr_type: AttributeType::XorMappedAddress,
             value: AttributeValue::XorMappedAddress(from),
-        })?;
+        });
 
         // Add MESSAGE-INTEGRITY
         response.add_message_integrity(&self.local_credentials.password)?;

@@ -676,15 +676,15 @@ impl ConsentManager {
         };
 
         // Create binding request for consent check
-        let transaction_id = TransactionId::generate();
+        let transaction_id = TransactionId::new();
         let mut request = Message::new(MessageType::BindingRequest, transaction_id);
 
         // Add USERNAME attribute
         let username = format!("{}:{}", credentials.ufrag, self.local_credentials.ufrag);
         request.add_attribute(Attribute {
-            attribute_type: AttributeType::Username,
+            attr_type: AttributeType::Username,
             value: AttributeValue::Username(username),
-        })?;
+        });
 
         // Add MESSAGE-INTEGRITY
         request.add_message_integrity(&credentials.password)?;
@@ -940,15 +940,15 @@ pub fn create_consent_binding_request(
     local_credentials: &IceCredentials,
     remote_credentials: &IceCredentials,
 ) -> NatResult<Message> {
-    let transaction_id = TransactionId::generate();
+    let transaction_id = TransactionId::new();
     let mut request = Message::new(MessageType::BindingRequest, transaction_id);
 
     // Add USERNAME
     let username = format!("{}:{}", remote_credentials.ufrag, local_credentials.ufrag);
     request.add_attribute(Attribute {
-        attribute_type: AttributeType::Username,
+        attr_type: AttributeType::Username,
         value: AttributeValue::Username(username),
-    })?;
+    });
 
     // Add MESSAGE-INTEGRITY
     request.add_message_integrity(&remote_credentials.password)?;
@@ -971,7 +971,7 @@ pub fn is_valid_consent_response(
     }
 
     // Check message type
-    if message.message_type != MessageType::BindingSuccessResponse {
+    if message.message_type != MessageType::BindingResponse {
         return false;
     }
 

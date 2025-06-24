@@ -311,6 +311,11 @@ impl Message {
         Ok(buf.freeze())
     }
 
+    /// Convenience helper to decode from a byte slice
+    pub fn from_bytes(data: &[u8]) -> NatResult<Self> {
+        Self::decode(BytesMut::from(data))
+    }
+
     /// Decode message from bytes
     pub fn decode(mut buf: BytesMut) -> NatResult<Self> {
         if buf.len() < HEADER_SIZE {
@@ -460,6 +465,36 @@ impl Message {
         } else {
             Ok(false)
         }
+    }
+
+    /// Serialize the message into bytes without integrity or fingerprint
+    pub fn to_bytes(&self) -> NatResult<Bytes> {
+        self.encode(None, false)
+    }
+
+    /// Add MESSAGE-INTEGRITY attribute (placeholder)
+    pub fn add_message_integrity(&mut self, _password: &str) -> NatResult<()> {
+        // Full implementation would compute HMAC over the message
+        // For now we simply add an empty placeholder attribute
+        self.add_attribute(Attribute {
+            attr_type: AttributeType::MessageIntegrity,
+            value: AttributeValue::Raw(Vec::new()),
+        });
+        Ok(())
+    }
+
+    /// Add FINGERPRINT attribute (placeholder)
+    pub fn add_fingerprint(&mut self) -> NatResult<()> {
+        self.add_attribute(Attribute {
+            attr_type: AttributeType::Fingerprint,
+            value: AttributeValue::Raw(Vec::new()),
+        });
+        Ok(())
+    }
+
+    /// Validate MESSAGE-INTEGRITY attribute (placeholder)
+    pub fn validate_message_integrity(&self, _password: &str) -> NatResult<bool> {
+        Ok(true)
     }
 
     /// Find attribute position in raw message
