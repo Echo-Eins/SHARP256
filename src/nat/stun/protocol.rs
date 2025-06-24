@@ -542,6 +542,9 @@ pub enum AttributeValue {
     PasswordAlgorithm { algorithm: u16, parameters: Vec<u8> },
     PasswordAlgorithms(Vec<PasswordAlgorithm>),
     AlternateDomain(String),
+    RequestedTransport(u8),
+    Lifetime(u32),
+    XorRelayedAddress(SocketAddr),
     Raw(Vec<u8>),
 }
 
@@ -619,6 +622,16 @@ impl Attribute {
             }
             AttributeValue::AlternateDomain(domain) => {
                 buf.put_slice(domain.as_bytes());
+            }
+            AttributeValue::RequestedTransport(proto) => {
+                buf.put_u8(*proto);
+                buf.extend_from_slice(&[0, 0, 0]); // RFFU
+            }
+            AttributeValue::Lifetime(seconds) => {
+                buf.put_u32(*seconds);
+            }
+            AttributeValue::XorRelayedAddress(addr) => {
+                encode_address(buf, addr, true, tid)?;
             }
             AttributeValue::Raw(data) => {
                 buf.put_slice(data);
@@ -724,6 +737,15 @@ impl Attribute {
                 String::from_utf8(attr_buf.to_vec())
                     .map_err(|e| StunError::ParseError(format!("Invalid alternate domain: {}", e)))?
             ),
+            0x0019 => {
+                let proto = if attr_buf.remaining() >= 1 { attr_buf.get_u8() } else { 0 };
+                AttributeValue::RequestedTransport(proto)
+            }
+            0x000D => {
+                let lifetime = if attr_buf.remaining() >= 4 { attr_buf.get_u32() } else { 0 };
+                AttributeValue::Lifetime(lifetime)
+            }
+            0x0016 => AttributeValue::XorRelayedAddress(decode_address(&mut attr_buf, true, tid)?),
             _ => AttributeValue::Raw(attr_buf.to_vec()),
         };
 
@@ -747,6 +769,9 @@ impl Attribute {
             0x8028 => AttributeType::Fingerprint,
             0x8002 => AttributeType::PasswordAlgorithms,
             0x8003 => AttributeType::AlternateDomain,
+            0x0019 => AttributeType::RequestedTransport,
+            0x000D => AttributeType::Lifetime,
+            0x0016 => AttributeType::XorRelayedAddress,
             _ => {
                 if attr_type_raw < 0x8000 {
                     return Err(StunError::UnknownComprehensionRequired(vec![attr_type_raw]).into());

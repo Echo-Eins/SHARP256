@@ -72,7 +72,7 @@ impl Default for ConsentConfig {
 }
 
 /// Consent state for a connection
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConsentState {
     /// Consent is fresh (recently confirmed)
     Fresh,

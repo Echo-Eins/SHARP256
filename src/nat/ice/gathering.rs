@@ -58,7 +58,7 @@ const STUN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const TURN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Gathering phase state with detailed tracking
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GatheringPhase {
     /// Not started
     New,
@@ -1522,7 +1522,11 @@ impl CandidateGatherer {
 
             // Apply interface filtering
             if !self.should_use_interface(&interface).await {
-                debug!("Filtering out interface: {} ({})", name, interface.interface_type);
+                debug!(
+                    "Filtering out interface: {} ({:?})",
+                    name,
+                    interface.interface_type
+                );
                 continue;
             }
 
@@ -1676,23 +1680,13 @@ impl CandidateGatherer {
 
         // Try ip command first (Linux), then ifconfig (macOS/FreeBSD)
         let output = if cfg!(target_os = "linux") {
-            Command::new("ip")
-                .args(&["addr", "show"])
-                .output()
-                .await
-                .or_else(|_| async {
-                    Command::new("ifconfig")
-                        .output()
-                        .await
-                })
-                .await
+            match Command::new("ip").args(&["addr", "show"]).output().await {
+                Ok(out) => out,
+                Err(_) => Command::new("ifconfig").output().await.map_err(NatError::Network)?,
+            }
         } else {
-            Command::new("ifconfig")
-                .output()
-                .await
+            Command::new("ifconfig").output().await.map_err(NatError::Network)?
         };
-
-        let output = output.map_err(|e| NatError::Platform(format!("Failed to get interface info: {}", e)))?;
 
         if !output.status.success() {
             return Err(NatError::Platform("Interface enumeration command failed".to_string()));
@@ -3301,10 +3295,10 @@ impl From<TurnMessageType> for MessageType {
 #[allow(dead_code)]
 impl MessageType {
     const AllocateRequest: Self = MessageType::BindingRequest; // Placeholder
-    const AllocateSuccessResponse: Self = MessageType::BindingSuccessResponse; // Placeholder
+    const AllocateSuccessResponse: Self = MessageType::BindingResponse; // Placeholder
     const AllocateErrorResponse: Self = MessageType::BindingErrorResponse; // Placeholder
     const RefreshRequest: Self = MessageType::BindingRequest; // Placeholder
-    const RefreshSuccessResponse: Self = MessageType::BindingSuccessResponse; // Placeholder
+    const RefreshSuccessResponse: Self = MessageType::BindingResponse; // Placeholder
     const RefreshErrorResponse: Self = MessageType::BindingErrorResponse; // Placeholder
 }
 

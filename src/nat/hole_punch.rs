@@ -1230,13 +1230,14 @@ impl IceCompatibleHolePunch {
         let nat_behavior = self.infer_nat_behavior(local_candidate, remote_candidate);
 
         // Perform hole punching
-        self.puncher
-            .punch_hole(
-                socket,
-                remote_candidate.addr,
-                is_controlling,
-                nat_behavior.as_ref(),
-            )
+        let peer_addr = remote_candidate
+            .address
+            .socket_addr()
+            .ok_or_else(|| NatError::Platform("Remote candidate missing address".to_string()))?;
+
+        self
+            .puncher
+            .punch_hole(socket, peer_addr, is_controlling, nat_behavior.as_ref())
             .await
     }
 
@@ -1247,14 +1248,14 @@ impl IceCompatibleHolePunch {
         remote: &Candidate,
     ) -> Option<NatBehavior> {
         // Basic inference based on candidate types
-        let mapping = match local.typ {
+        let mapping = match local.candidate_type {
             CandidateType::Host => MappingBehavior::EndpointIndependent,
             CandidateType::ServerReflexive => MappingBehavior::EndpointIndependent,
             CandidateType::PeerReflexive => MappingBehavior::AddressDependent,
             CandidateType::Relay => MappingBehavior::AddressPortDependent,
         };
 
-        let filtering = match remote.typ {
+        let filtering = match remote.candidate_type {
             CandidateType::Host => FilteringBehavior::EndpointIndependent,
             CandidateType::ServerReflexive => FilteringBehavior::AddressDependent,
             CandidateType::PeerReflexive => FilteringBehavior::AddressPortDependent,
@@ -1266,7 +1267,11 @@ impl IceCompatibleHolePunch {
             filtering,
             hairpinning: false,
             mapping_lifetime: None,
-            public_addresses: vec![local.addr],
+            public_addresses: local
+                .address
+                .socket_addr()
+                .into_iter()
+                .collect(),
             confidence: 0.5, // Low confidence from inference
         })
     }
