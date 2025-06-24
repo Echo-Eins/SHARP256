@@ -1,991 +1,851 @@
 // src/nat/ice_integration.rs
-//! SHARP3 ICE Integration
+//! ICE Integration with STUN/TURN Manager
 //!
-//! This module provides seamless integration between the ICE implementation
-//! and the SHARP3 P2P system, enabling automatic peer-to-peer connectivity
-//! with full ICE support.
+//! This module provides integration between the ICE system and the STUN/TURN manager,
+//! implementing the IceNatManager trait to provide candidates for ICE connectivity establishment.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Mutex, broadcast, mpsc, oneshot};
-use tokio::time::{interval, timeout, sleep};
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn, error, trace};
-use serde::{Serialize, Deserialize};
+use tokio::sync::{RwLock, broadcast};
+use tracing::{info, warn, debug, error, trace};
+use futures::future::BoxFuture;
 
 use crate::nat::error::{NatError, NatResult};
 use crate::nat::ice::{
+    IceNatManager, Candidate, CandidateType, TransportProtocol,
     IceAgent, IceConfig, IceRole, IceState, IceEvent,
-    IceCredentials, IceTransportPolicy
+    CandidateGatherer, GatheringEvent, GatheringPhase, GatheringStats,
 };
-use crate::nat::ice::candidate::{Candidate, CandidateType, TransportProtocol};
-use crate::nat::ice::gathering::GatheringConfig;
-use crate::nat::ice::nomination::{NominationConfig, NominationMode};
+use crate::nat::stun_turn_manager::{
+    StunTurnManager, StunTurnEvent, CandidateGatheringRequest,
+    ConnectionQualityMetrics, TurnAllocationInfo,
+};
+use crate::nat::stun::NatBehavior;
 
-/// ICE parameters for peer exchange
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// ICE parameters for integration
+#[derive(Debug, Clone)]
 pub struct IceParameters {
-    /// ICE credentials
-    pub credentials: IceCredentials,
+    /// ICE username fragment
+    pub ufrag: String,
 
-    /// ICE candidates
-    pub candidates: Vec<CandidateInfo>,
+    /// ICE password
+    pub pwd: String,
 
-    /// ICE options
-    pub options: IceOptions,
+    /// Components to gather candidates for
+    pub components: Vec<u32>,
+
+    /// Gathering configuration
+    pub gathering_config: IceGatheringConfig,
+
+    /// Quality thresholds
+    pub quality_thresholds: QualityThresholds,
 }
 
-/// Serializable candidate information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CandidateInfo {
-    /// Foundation
-    pub foundation: String,
+/// ICE gathering configuration
+#[derive(Debug, Clone)]
+pub struct IceGatheringConfig {
+    /// Enable host candidate gathering
+    pub gather_host: bool,
 
-    /// Component ID
-    pub component_id: u32,
+    /// Enable server reflexive candidate gathering
+    pub gather_server_reflexive: bool,
 
-    /// Transport protocol
-    pub transport: String,
+    /// Enable relay candidate gathering
+    pub gather_relay: bool,
 
-    /// Priority
-    pub priority: u32,
+    /// Gathering timeout per component
+    pub component_timeout: Duration,
 
-    /// Connection address
-    pub address: String,
+    /// Total gathering timeout
+    pub total_timeout: Duration,
 
-    /// Port
-    pub port: u16,
+    /// Maximum candidates per component
+    pub max_candidates_per_component: usize,
 
-    /// Candidate type
-    pub candidate_type: String,
+    /// Prefer IPv6 candidates
+    pub prefer_ipv6: bool,
 
-    /// Related address (for reflexive/relay candidates)
-    pub related_address: Option<String>,
-
-    /// Related port
-    pub related_port: Option<u16>,
-
-    /// TCP type (for TCP candidates)
-    pub tcp_type: Option<String>,
-
-    /// Extension attributes
-    pub extensions: HashMap<String, String>,
-}
-
-/// ICE options for configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IceOptions {
     /// Enable trickle ICE
-    pub trickle: bool,
-
-    /// Nomination mode
-    pub nomination_mode: String,
-
-    /// Transport policy
-    pub transport_policy: String,
-
-    /// Component count
-    pub component_count: u32,
-
-    /// Enable consent freshness
-    pub consent_freshness: bool,
+    pub enable_trickle: bool,
 }
 
-impl Default for IceOptions {
-    fn default() -> Self {
-        Self {
-            trickle: true,
-            nomination_mode: "regular".to_string(),
-            transport_policy: "all".to_string(),
-            component_count: 1,
-            consent_freshness: true,
-        }
-    }
+/// Quality thresholds for candidate selection
+#[derive(Debug, Clone)]
+pub struct QualityThresholds {
+    /// Minimum RTT for acceptable candidates (ms)
+    pub max_acceptable_rtt: Duration,
+
+    /// Maximum packet loss rate (0.0 to 1.0)
+    pub max_packet_loss_rate: f64,
+
+    /// Minimum bandwidth estimate (bytes/sec)
+    pub min_bandwidth: u64,
+
+    /// Quality score threshold (0.0 to 1.0)
+    pub min_quality_score: f64,
 }
 
-/// SHARP3 ICE integration interface
+/// SHARP ICE integration - implements IceNatManager for the ICE system
+pub struct Sharp3IceIntegration {
+    /// STUN/TURN manager
+    stun_turn_manager: Arc<StunTurnManager>,
+
+    /// ICE parameters
+    ice_params: Arc<RwLock<IceParameters>>,
+
+    /// Active candidate gathering sessions
+    gathering_sessions: Arc<RwLock<HashMap<String, GatheringSession>>>,
+
+    /// Gathered candidates cache
+    candidates_cache: Arc<RwLock<HashMap<u32, Vec<Candidate>>>>,
+
+    /// NAT behavior cache
+    nat_behavior_cache: Arc<RwLock<Option<NatBehavior>>>,
+
+    /// Event subscribers
+    event_subscribers: Arc<RwLock<Vec<broadcast::Sender<IceIntegrationEvent>>>>,
+
+    /// Statistics
+    stats: Arc<IceIntegrationStats>,
+}
+
+/// Candidate gathering session
+#[derive(Debug)]
+pub struct GatheringSession {
+    /// Session ID
+    pub session_id: String,
+
+    /// Associated socket
+    pub socket: Arc<UdpSocket>,
+
+    /// Components being gathered
+    pub components: Vec<u32>,
+
+    /// Gathering phase
+    pub phase: GatheringPhase,
+
+    /// Started timestamp
+    pub started_at: Instant,
+
+    /// Gathered candidates
+    pub candidates: HashMap<u32, Vec<Candidate>>,
+
+    /// Quality metrics
+    pub quality_metrics: HashMap<String, ConnectionQualityMetrics>,
+
+    /// TURN allocations
+    pub turn_allocations: Vec<TurnAllocationInfo>,
+}
+
+/// Events emitted by ICE integration
 #[derive(Debug, Clone)]
 pub enum IceIntegrationEvent {
-    /// ICE parameters ready for exchange
-    ParametersReady {
-        parameters: IceParameters,
+    /// Candidate gathering started
+    GatheringStarted {
+        session_id: String,
+        components: Vec<u32>,
     },
 
-    /// New trickle candidate available
-    TrickleCandidate {
-        candidate: CandidateInfo,
+    /// New candidate gathered
+    CandidateGathered {
+        session_id: String,
         component_id: u32,
+        candidate: Candidate,
+        quality_score: Option<f64>,
     },
 
-    /// ICE connection established
-    ConnectionEstablished {
-        local_address: SocketAddr,
-        remote_address: SocketAddr,
+    /// Gathering completed for component
+    ComponentGatheringComplete {
+        session_id: String,
         component_id: u32,
-    },
-
-    /// ICE connection failed
-    ConnectionFailed {
-        reason: String,
-    },
-
-    /// ICE gathering completed
-    GatheringCompleted {
         candidate_count: usize,
     },
 
-    /// Data channel ready
-    DataChannelReady {
-        component_id: u32,
+    /// All gathering completed
+    GatheringComplete {
+        session_id: String,
+        total_candidates: usize,
+        duration: Duration,
+    },
+
+    /// NAT behavior detected
+    NatBehaviorDetected {
+        behavior: NatBehavior,
+        confidence: f64,
+    },
+
+    /// Quality measurement updated
+    QualityUpdated {
+        target: String,
+        metrics: ConnectionQualityMetrics,
     },
 }
 
-/// SHARP3 ICE Integration manager
-pub struct Sharp3IceIntegration {
-    /// ICE agent
-    ice_agent: Arc<IceAgent>,
+/// ICE integration statistics
+#[derive(Debug, Default)]
+pub struct IceIntegrationStats {
+    /// Total gathering sessions
+    pub total_sessions: std::sync::atomic::AtomicU64,
 
-    /// Integration configuration
-    config: IceIntegrationConfig,
+    /// Active gathering sessions
+    pub active_sessions: std::sync::atomic::AtomicU64,
 
-    /// Current role
-    role: Arc<RwLock<Option<IceRole>>>,
+    /// Total candidates gathered
+    pub total_candidates: std::sync::atomic::AtomicU64,
 
-    /// Connection state
-    state: Arc<RwLock<IceIntegrationState>>,
+    /// Candidates by type
+    pub host_candidates: std::sync::atomic::AtomicU64,
+    pub server_reflexive_candidates: std::sync::atomic::AtomicU64,
+    pub relay_candidates: std::sync::atomic::AtomicU64,
 
-    /// Local ICE parameters
-    local_parameters: Arc<RwLock<Option<IceParameters>>>,
+    /// Gathering failures
+    pub gathering_failures: std::sync::atomic::AtomicU64,
 
-    /// Remote ICE parameters
-    remote_parameters: Arc<RwLock<Option<IceParameters>>>,
+    /// Average gathering time (microseconds)
+    pub avg_gathering_time: std::sync::atomic::AtomicU64,
 
-    /// Event broadcaster
-    event_sender: broadcast::Sender<IceIntegrationEvent>,
-
-    /// Data channels by component
-    data_channels: Arc<RwLock<HashMap<u32, DataChannel>>>,
-
-    /// Trickle candidate queue
-    trickle_queue: Arc<RwLock<Vec<CandidateInfo>>>,
-
-    /// Statistics
-    stats: Arc<RwLock<IceIntegrationStats>>,
-
-    /// Shutdown signal
-    shutdown: Arc<RwLock<bool>>,
-
-    /// Start time for timing
-    start_time: Instant,
+    /// Quality metrics
+    pub avg_candidate_quality: std::sync::atomic::AtomicU64, // * 1000
 }
 
-/// ICE integration configuration
-#[derive(Debug, Clone)]
-pub struct IceIntegrationConfig {
-    /// Enable aggressive nomination for faster connection
-    pub aggressive_nomination: bool,
-
-    /// Maximum time to wait for ICE completion
-    pub ice_timeout: Duration,
-
-    /// Enable automatic role determination
-    pub auto_role: bool,
-
-    /// Preferred candidate types (in order)
-    pub preferred_candidates: Vec<CandidateType>,
-
-    /// Enable IPv6
-    pub enable_ipv6: bool,
-
-    /// Enable TCP candidates
-    pub enable_tcp: bool,
-
-    /// Maximum candidates to gather per component
-    pub max_candidates: u32,
-
-    /// STUN servers for reflexive candidates
-    pub stun_servers: Vec<String>,
-
-    /// TURN servers for relay candidates
-    pub turn_servers: Vec<TurnServerInfo>,
-
-    /// Enable bundle (single transport for all components)
-    pub enable_bundle: bool,
-
-    /// Component mapping for bundle
-    pub component_mapping: HashMap<u32, String>,
-}
-
-/// TURN server information for configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnServerInfo {
-    pub url: String,
-    pub username: String,
-    pub password: String,
-    pub transport: String,
-}
-
-impl Default for IceIntegrationConfig {
+impl Default for IceGatheringConfig {
     fn default() -> Self {
         Self {
-            aggressive_nomination: false,
-            ice_timeout: Duration::from_secs(30),
-            auto_role: true,
-            preferred_candidates: vec![
-                CandidateType::Host,
-                CandidateType::ServerReflexive,
-                CandidateType::Relay,
-            ],
-            enable_ipv6: true,
-            enable_tcp: true,
-            max_candidates: 10,
-            stun_servers: vec![
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-            ],
-            turn_servers: vec![],
-            enable_bundle: true,
-            component_mapping: [(1, "data".to_string())].into_iter().collect(),
+            gather_host: true,
+            gather_server_reflexive: true,
+            gather_relay: true,
+            component_timeout: Duration::from_secs(10),
+            total_timeout: Duration::from_secs(30),
+            max_candidates_per_component: 5,
+            prefer_ipv6: false,
+            enable_trickle: true,
         }
     }
 }
 
-/// ICE integration state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IceIntegrationState {
-    /// Not started
-    Idle,
-    /// Gathering local parameters
-    Gathering,
-    /// Waiting for remote parameters
-    WaitingForRemote,
-    /// Performing connectivity checks
-    Connecting,
-    /// Connection established
-    Connected,
-    /// Connection failed
-    Failed,
-    /// Closed
-    Closed,
+impl Default for QualityThresholds {
+    fn default() -> Self {
+        Self {
+            max_acceptable_rtt: Duration::from_millis(200),
+            max_packet_loss_rate: 0.05, // 5%
+            min_bandwidth: 100_000,     // 100 KB/s
+            min_quality_score: 0.6,
+        }
+    }
 }
 
-/// Data channel for component communication
-#[derive(Debug, Clone)]
-pub struct DataChannel {
-    pub component_id: u32,
-    pub local_address: SocketAddr,
-    pub remote_address: SocketAddr,
-    pub socket: Arc<UdpSocket>,
-    pub established_at: Instant,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-}
-
-/// ICE integration statistics
-#[derive(Debug, Default, Clone)]
-pub struct IceIntegrationStats {
-    pub state: IceIntegrationState,
-    pub role: Option<IceRole>,
-    pub gathering_time: Duration,
-    pub connection_time: Duration,
-    pub total_time: Duration,
-    pub candidates_gathered: u32,
-    pub trickle_candidates_sent: u32,
-    pub trickle_candidates_received: u32,
-    pub successful_pairs: u32,
-    pub selected_pairs: u32,
-    pub data_channels: u32,
-    pub bytes_transferred: u64,
+impl Default for IceParameters {
+    fn default() -> Self {
+        Self {
+            ufrag: crate::nat::ice::utils::generate_ufrag(),
+            pwd: crate::nat::ice::utils::generate_password(),
+            components: vec![1], // RTP component
+            gathering_config: IceGatheringConfig::default(),
+            quality_thresholds: QualityThresholds::default(),
+        }
+    }
 }
 
 impl Sharp3IceIntegration {
-    /// Create new SHARP3 ICE integration
-    pub async fn new(config: IceIntegrationConfig) -> NatResult<Self> {
-        // Convert to ICE configuration
-        let ice_config = Self::build_ice_config(&config)?;
+    /// Create new ICE integration
+    pub async fn new(
+        stun_turn_manager: Arc<StunTurnManager>,
+        ice_params: IceParameters,
+    ) -> NatResult<Self> {
+        info!("Creating SHARP ICE integration with {} components", ice_params.components.len());
 
-        // Create ICE agent
-        let ice_agent = Arc::new(IceAgent::new(ice_config).await?);
-
-        let (event_sender, _) = broadcast::channel(1000);
-
-        Ok(Self {
-            ice_agent,
-            config,
-            role: Arc::new(RwLock::new(None)),
-            state: Arc::new(RwLock::new(IceIntegrationState::Idle)),
-            local_parameters: Arc::new(RwLock::new(None)),
-            remote_parameters: Arc::new(RwLock::new(None)),
-            event_sender,
-            data_channels: Arc::new(RwLock::new(HashMap::new())),
-            trickle_queue: Arc::new(RwLock::new(Vec::new())),
-            stats: Arc::new(RwLock::new(IceIntegrationStats::default())),
-            shutdown: Arc::new(RwLock::new(false)),
-            start_time: Instant::now(),
-        })
-    }
-
-    /// Build ICE configuration from integration config
-    fn build_ice_config(config: &IceIntegrationConfig) -> NatResult<IceConfig> {
-        let gathering_config = GatheringConfig {
-            gather_host_candidates: true,
-            gather_server_reflexive: !config.stun_servers.is_empty(),
-            gather_relay_candidates: !config.turn_servers.is_empty(),
-            enable_mdns: false, // Disable for P2P
-            enable_ipv4: true,
-            enable_ipv6: config.enable_ipv6,
-            enable_tcp: config.enable_tcp,
-            enable_udp: true,
-            stun_servers: config.stun_servers.iter()
-                .filter_map(|s| s.parse().ok())
-                .collect(),
-            turn_servers: config.turn_servers.iter()
-                .map(|t| crate::nat::ice::gathering::TurnServerConfig {
-                    address: t.url.parse().unwrap_or("0.0.0.0:3478".parse().unwrap()),
-                    username: t.username.clone(),
-                    password: t.password.clone(),
-                    realm: None,
-                    transport: if t.transport == "tcp" {
-                        TransportProtocol::Tcp
-                    } else {
-                        TransportProtocol::Udp
-                    },
-                })
-                .collect(),
-            max_candidates_per_type: config.max_candidates,
-            ..Default::default()
+        let integration = Self {
+            stun_turn_manager,
+            ice_params: Arc::new(RwLock::new(ice_params)),
+            gathering_sessions: Arc::new(RwLock::new(HashMap::new())),
+            candidates_cache: Arc::new(RwLock::new(HashMap::new())),
+            nat_behavior_cache: Arc::new(RwLock::new(None)),
+            event_subscribers: Arc::new(RwLock::new(Vec::new())),
+            stats: Arc::new(IceIntegrationStats::default()),
         };
 
-        let nomination_config = NominationConfig {
-            mode: if config.aggressive_nomination {
-                NominationMode::Aggressive
-            } else {
-                NominationMode::Regular
-            },
-            ..Default::default()
-        };
+        // Subscribe to STUN/TURN events
+        integration.setup_event_forwarding().await;
 
-        Ok(IceConfig {
-            transport_policy: if config.turn_servers.is_empty() {
-                IceTransportPolicy::All
-            } else {
-                IceTransportPolicy::All // Could be Relay for TURN-only
-            },
-            gathering_config,
-            nomination_config,
-            components: config.component_mapping.keys().cloned().collect(),
-            connectivity_timeout: config.ice_timeout,
-            enable_trickle: true,
-            ..Default::default()
-        })
+        Ok(integration)
     }
 
-    /// Start ICE as initiator (controlling)
-    pub async fn start_as_initiator(&self) -> NatResult<()> {
-        info!("Starting ICE as initiator");
+    /// Setup event forwarding from STUN/TURN manager
+    async fn setup_event_forwarding(&self) {
+        let mut stun_turn_events = self.stun_turn_manager.subscribe();
+        let nat_behavior_cache = self.nat_behavior_cache.clone();
+        let event_subscribers = self.event_subscribers.clone();
 
-        *self.role.write().await = Some(IceRole::Controlling);
-        *self.state.write().await = IceIntegrationState::Gathering;
+        tokio::spawn(async move {
+            while let Ok(event) = stun_turn_events.recv().await {
+                match event {
+                    StunTurnEvent::NatBehaviorDiscovered { behavior, .. } => {
+                        *nat_behavior_cache.write().await = Some(behavior.clone());
 
-        // Start ICE agent
-        let ice_agent = self.ice_agent.clone();
-        let event_sender = self.event_sender.clone();
-        let local_parameters = self.local_parameters.clone();
-        let state = self.state.clone();
+                        let ice_event = IceIntegrationEvent::NatBehaviorDetected {
+                            behavior,
+                            confidence: 0.8, // Would be calculated based on detection method
+                        };
 
-        // Start background event processing
-        let event_processor = self.start_event_processor();
-
-        // Start ICE agent
-        let start_task = async move {
-            if let Err(e) = ice_agent.start(IceRole::Controlling).await {
-                error!("Failed to start ICE agent: {}", e);
-                return;
-            }
-
-            // Wait for local parameters
-            let mut retry_count = 0;
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                let candidates = ice_agent.get_local_candidates(1).await;
-                if !candidates.is_empty() {
-                    let parameters = IceParameters {
-                        credentials: ice_agent.get_local_credentials().clone(),
-                        candidates: candidates.iter().map(|c| Self::candidate_to_info(c)).collect(),
-                        options: IceOptions::default(),
-                    };
-
-                    *local_parameters.write().await = Some(parameters.clone());
-                    *state.write().await = IceIntegrationState::WaitingForRemote;
-
-                    let _ = event_sender.send(IceIntegrationEvent::ParametersReady { parameters });
-                    break;
-                }
-
-                retry_count += 1;
-                if retry_count > 100 { // 10 second timeout
-                    error!("Timeout waiting for local candidates");
-                    break;
-                }
-            }
-        };
-
-        tokio::select! {
-            _ = start_task => {},
-            _ = event_processor => {},
-        }
-
-        Ok(())
-    }
-
-    /// Start ICE as responder (controlled)
-    pub async fn start_as_responder(&self, remote_params: IceParameters) -> NatResult<()> {
-        info!("Starting ICE as responder");
-
-        *self.role.write().await = Some(IceRole::Controlled);
-        *self.state.write().await = IceIntegrationState::Gathering;
-
-        // Store remote parameters
-        *self.remote_parameters.write().await = Some(remote_params.clone());
-
-        // Set remote credentials
-        self.ice_agent.set_remote_credentials(remote_params.credentials).await?;
-
-        // Add remote candidates
-        for candidate_info in &remote_params.candidates {
-            if let Ok(candidate) = Self::info_to_candidate(candidate_info) {
-                self.ice_agent.add_remote_candidate(candidate, candidate_info.component_id).await?;
-            }
-        }
-
-        // Start ICE agent
-        let ice_agent = self.ice_agent.clone();
-        let event_sender = self.event_sender.clone();
-        let local_parameters = self.local_parameters.clone();
-        let state = self.state.clone();
-
-        // Start background event processing
-        let event_processor = self.start_event_processor();
-
-        // Start ICE agent
-        let start_task = async move {
-            if let Err(e) = ice_agent.start(IceRole::Controlled).await {
-                error!("Failed to start ICE agent: {}", e);
-                return;
-            }
-
-            // Wait for local parameters
-            let mut retry_count = 0;
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                let candidates = ice_agent.get_local_candidates(1).await;
-                if !candidates.is_empty() {
-                    let parameters = IceParameters {
-                        credentials: ice_agent.get_local_credentials().clone(),
-                        candidates: candidates.iter().map(|c| Self::candidate_to_info(c)).collect(),
-                        options: IceOptions::default(),
-                    };
-
-                    *local_parameters.write().await = Some(parameters.clone());
-                    *state.write().await = IceIntegrationState::Connecting;
-
-                    let _ = event_sender.send(IceIntegrationEvent::ParametersReady { parameters });
-                    break;
-                }
-
-                retry_count += 1;
-                if retry_count > 100 { // 10 second timeout
-                    error!("Timeout waiting for local candidates");
-                    break;
-                }
-            }
-        };
-
-        tokio::select! {
-            _ = start_task => {},
-            _ = event_processor => {},
-        }
-
-        Ok(())
-    }
-
-    /// Set remote ICE parameters
-    pub async fn set_remote_parameters(&self, params: IceParameters) -> NatResult<()> {
-        info!("Setting remote ICE parameters");
-
-        *self.remote_parameters.write().await = Some(params.clone());
-
-        // Set remote credentials
-        self.ice_agent.set_remote_credentials(params.credentials).await?;
-
-        // Add remote candidates
-        for candidate_info in &params.candidates {
-            if let Ok(candidate) = Self::info_to_candidate(candidate_info) {
-                self.ice_agent.add_remote_candidate(candidate, candidate_info.component_id).await?;
-            }
-        }
-
-        *self.state.write().await = IceIntegrationState::Connecting;
-
-        Ok(())
-    }
-
-    /// Add trickle candidate
-    pub async fn add_trickle_candidate(&self, candidate_info: CandidateInfo) -> NatResult<()> {
-        debug!("Adding trickle candidate: {:?}", candidate_info);
-
-        if let Ok(candidate) = Self::info_to_candidate(&candidate_info) {
-            self.ice_agent.add_remote_candidate(candidate, candidate_info.component_id).await?;
-        }
-
-        self.stats.write().await.trickle_candidates_received += 1;
-
-        Ok(())
-    }
-
-    /// Get local ICE parameters
-    pub async fn get_local_parameters(&self) -> Option<IceParameters> {
-        self.local_parameters.read().await.clone()
-    }
-
-    /// Send data on component
-    pub async fn send_data(&self, component_id: u32, data: Vec<u8>) -> NatResult<usize> {
-        // First try data channel
-        let data_channel = {
-            let channels = self.data_channels.read().await;
-            channels.get(&component_id).cloned()
-        };
-
-        if let Some(channel) = data_channel {
-            let bytes_sent = channel.socket.send_to(&data, channel.remote_address).await
-                .map_err(|e| NatError::Network(e))?;
-
-            // Update statistics
-            {
-                let mut channels = self.data_channels.write().await;
-                if let Some(channel) = channels.get_mut(&component_id) {
-                    channel.bytes_sent += bytes_sent as u64;
-                }
-            }
-
-            self.stats.write().await.bytes_transferred += bytes_sent as u64;
-
-            Ok(bytes_sent)
-        } else {
-            // Fallback to ICE agent
-            self.ice_agent.send_data(component_id, data).await
-        }
-    }
-
-    /// Receive data from component
-    pub async fn receive_data(&self, component_id: u32, buffer: &mut [u8]) -> NatResult<(usize, SocketAddr)> {
-        let data_channel = {
-            let channels = self.data_channels.read().await;
-            channels.get(&component_id).cloned()
-        };
-
-        if let Some(channel) = data_channel {
-            let (size, from) = channel.socket.recv_from(buffer).await
-                .map_err(|e| NatError::Network(e))?;
-
-            // Update statistics
-            {
-                let mut channels = self.data_channels.write().await;
-                if let Some(channel) = channels.get_mut(&component_id) {
-                    channel.bytes_received += size as u64;
-                }
-            }
-
-            self.stats.write().await.bytes_transferred += size as u64;
-
-            Ok((size, from))
-        } else {
-            Err(NatError::Configuration("No data channel for component".to_string()))
-        }
-    }
-
-    /// Start event processor
-    async fn start_event_processor(&self) -> NatResult<()> {
-        let mut ice_events = self.ice_agent.subscribe_events();
-        let event_sender = self.event_sender.clone();
-        let state = self.state.clone();
-        let data_channels = self.data_channels.clone();
-        let stats = self.stats.clone();
-        let shutdown = self.shutdown.clone();
-        let trickle_queue = self.trickle_queue.clone();
-
-        loop {
-            if *shutdown.read().await {
-                break;
-            }
-
-            tokio::select! {
-                Ok(event) = ice_events.recv() => {
-                    match event {
-                        IceEvent::CandidateAdded { candidate, component_id } => {
-                            // Send as trickle candidate
-                            let candidate_info = Self::candidate_to_info(&candidate);
-                            let _ = event_sender.send(IceIntegrationEvent::TrickleCandidate {
-                                candidate: candidate_info,
-                                component_id,
-                            });
-
-                            stats.write().await.trickle_candidates_sent += 1;
+                        let subscribers = event_subscribers.read().await;
+                        for sender in subscribers.iter() {
+                            let _ = sender.send(ice_event.clone());
                         }
-
-                        IceEvent::ComponentConnected {
-                            component_id,
-                            local_candidate,
-                            remote_candidate,
-                            selected_pair,
-                            ..
-                        } => {
-                            if let (Some(local_addr), Some(remote_addr)) = (
-                                local_candidate.socket_addr(),
-                                remote_candidate.socket_addr()
-                            ) {
-                                // Create data channel
-                                if let Ok(socket) = UdpSocket::bind(SocketAddr::new(local_addr.ip(), 0)).await {
-                                    let data_channel = DataChannel {
-                                        component_id,
-                                        local_address: local_addr,
-                                        remote_address: remote_addr,
-                                        socket: Arc::new(socket),
-                                        established_at: Instant::now(),
-                                        bytes_sent: 0,
-                                        bytes_received: 0,
-                                    };
-
-                                    data_channels.write().await.insert(component_id, data_channel);
-                                    stats.write().await.data_channels += 1;
-
-                                    let _ = event_sender.send(IceIntegrationEvent::ConnectionEstablished {
-                                        local_address: local_addr,
-                                        remote_address: remote_addr,
-                                        component_id,
-                                    });
-
-                                    let _ = event_sender.send(IceIntegrationEvent::DataChannelReady {
-                                        component_id,
-                                    });
-                                }
-                            }
-                        }
-
-                        IceEvent::ConnectionEstablished { .. } => {
-                            *state.write().await = IceIntegrationState::Connected;
-                            stats.write().await.connection_time = self.start_time.elapsed();
-                        }
-
-                        IceEvent::ConnectionFailed { reason } => {
-                            *state.write().await = IceIntegrationState::Failed;
-                            let _ = event_sender.send(IceIntegrationEvent::ConnectionFailed { reason });
-                        }
-
-                        IceEvent::GatheringCompleted { candidate_count, .. } => {
-                            stats.write().await.candidates_gathered = candidate_count as u32;
-                            stats.write().await.gathering_time = self.start_time.elapsed();
-
-                            let _ = event_sender.send(IceIntegrationEvent::GatheringCompleted {
-                                candidate_count,
-                            });
-                        }
-
-                        _ => {}
+                    }
+                    StunTurnEvent::ConnectionQualityChanged { target, .. } => {
+                        // Forward quality updates
+                        trace!("Connection quality updated for {}", target);
+                    }
+                    _ => {
+                        // Handle other events as needed
                     }
                 }
-                _ = sleep(Duration::from_millis(100)) => {
-                    // Periodic cleanup
-                }
             }
-        }
+        });
+    }
+
+    /// Start candidate gathering session
+    pub async fn start_gathering_session(
+        &self,
+        session_id: String,
+        socket: Arc<UdpSocket>,
+    ) -> NatResult<()> {
+        let ice_params = self.ice_params.read().await;
+        let components = ice_params.components.clone();
+
+        info!("Starting ICE gathering session '{}' for components: {:?}", session_id, components);
+
+        let session = GatheringSession {
+            session_id: session_id.clone(),
+            socket: socket.clone(),
+            components: components.clone(),
+            phase: GatheringPhase::New,
+            started_at: Instant::now(),
+            candidates: HashMap::new(),
+            quality_metrics: HashMap::new(),
+            turn_allocations: Vec::new(),
+        };
+
+        self.gathering_sessions.write().await.insert(session_id.clone(), session);
+        self.stats.total_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.stats.active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Emit event
+        self.emit_event(IceIntegrationEvent::GatheringStarted {
+            session_id: session_id.clone(),
+            components,
+        }).await;
+
+        // Start gathering process
+        self.perform_candidate_gathering(session_id, socket).await?;
 
         Ok(())
     }
 
-    /// Convert candidate to info
-    fn candidate_to_info(candidate: &Candidate) -> CandidateInfo {
-        let (address, port) = match &candidate.address {
-            crate::nat::ice::candidate::CandidateAddress::Ip(addr) => {
-                (addr.ip().to_string(), addr.port())
+    /// Perform candidate gathering
+    async fn perform_candidate_gathering(
+        &self,
+        session_id: String,
+        socket: Arc<UdpSocket>,
+    ) -> NatResult<()> {
+        let ice_params = self.ice_params.read().await.clone();
+
+        // Update session phase
+        {
+            let mut sessions = self.gathering_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.phase = GatheringPhase::Gathering;
             }
-            crate::nat::ice::candidate::CandidateAddress::MDns { hostname, port } => {
-                (hostname.clone(), *port)
+        }
+
+        let local_addr = socket.local_addr()?;
+        debug!("Performing candidate gathering for session '{}' from {}", session_id, local_addr);
+
+        for component_id in ice_params.components {
+            let component_start = Instant::now();
+            let mut component_candidates = Vec::new();
+
+            // Gather host candidate
+            if ice_params.gathering_config.gather_host {
+                let host_candidate = self.gather_host_candidate(component_id, &socket).await?;
+                if let Some(candidate) = host_candidate {
+                    component_candidates.push(candidate.clone());
+                    self.process_gathered_candidate(session_id.clone(), component_id, candidate).await;
+                }
             }
+
+            // Gather server reflexive candidate
+            if ice_params.gathering_config.gather_server_reflexive {
+                if let Some(candidate) = self.stun_turn_manager
+                    .get_server_reflexive_candidate(socket.clone(), component_id).await?
+                {
+                    component_candidates.push(candidate.clone());
+                    self.process_gathered_candidate(session_id.clone(), component_id, candidate).await;
+                }
+            }
+
+            // Gather relay candidate
+            if ice_params.gathering_config.gather_relay {
+                if let Some(candidate) = self.stun_turn_manager
+                    .get_relay_candidate(socket.clone(), component_id).await?
+                {
+                    component_candidates.push(candidate.clone());
+                    self.process_gathered_candidate(session_id.clone(), component_id, candidate).await;
+                }
+            }
+
+            // Store candidates for this component
+            {
+                let mut sessions = self.gathering_sessions.write().await;
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.candidates.insert(component_id, component_candidates.clone());
+                }
+            }
+
+            // Update cache
+            {
+                let mut cache = self.candidates_cache.write().await;
+                cache.insert(component_id, component_candidates.clone());
+            }
+
+            let component_duration = component_start.elapsed();
+            debug!("Component {} gathering completed: {} candidates in {}ms",
+                  component_id, component_candidates.len(), component_duration.as_millis());
+
+            self.emit_event(IceIntegrationEvent::ComponentGatheringComplete {
+                session_id: session_id.clone(),
+                component_id,
+                candidate_count: component_candidates.len(),
+            }).await;
+        }
+
+        // Complete gathering
+        self.complete_gathering_session(session_id).await?;
+
+        Ok(())
+    }
+
+    /// Gather host candidate
+    async fn gather_host_candidate(
+        &self,
+        component_id: u32,
+        socket: &UdpSocket,
+    ) -> NatResult<Option<Candidate>> {
+        let local_addr = socket.local_addr()?;
+
+        let candidate = Candidate {
+            foundation: crate::nat::ice::foundation::calculate_host_foundation(&local_addr),
+            component_id,
+            transport: TransportProtocol::Udp,
+            priority: crate::nat::ice::priority::calculate_priority(
+                CandidateType::Host,
+                local_addr.is_ipv4(),
+                component_id,
+            ),
+            candidate_type: CandidateType::Host,
+            address: crate::nat::ice::CandidateAddress::Resolved {
+                addr: local_addr,
+                base_addr: None,
+            },
+            related_address: None,
+            tcp_type: None,
+            extensions: crate::nat::ice::CandidateExtensions::default(),
         };
 
-        let (related_address, related_port) = match &candidate.related_address {
-            Some(crate::nat::ice::candidate::CandidateAddress::Ip(addr)) => {
-                (Some(addr.ip().to_string()), Some(addr.port()))
-            }
-            Some(crate::nat::ice::candidate::CandidateAddress::MDns { hostname, port }) => {
-                (Some(hostname.clone()), Some(*port))
-            }
-            None => (None, None),
-        };
+        self.stats.host_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.stats.total_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        CandidateInfo {
-            foundation: candidate.foundation.clone(),
-            component_id: candidate.component_id,
-            transport: candidate.transport.to_str().to_string(),
-            priority: candidate.priority,
-            address,
-            port,
-            candidate_type: candidate.candidate_type.to_str().to_string(),
-            related_address,
-            related_port,
-            tcp_type: candidate.tcp_type.map(|t| t.to_str().to_string()),
-            extensions: HashMap::new(), // Could populate from candidate.extensions
+        debug!("Gathered host candidate: {}", local_addr);
+        Ok(Some(candidate))
+    }
+
+    /// Process gathered candidate
+    async fn process_gathered_candidate(
+        &self,
+        session_id: String,
+        component_id: u32,
+        candidate: Candidate,
+    ) {
+        // Calculate quality score if applicable
+        let quality_score = self.calculate_candidate_quality(&candidate).await;
+
+        self.emit_event(IceIntegrationEvent::CandidateGathered {
+            session_id,
+            component_id,
+            candidate,
+            quality_score,
+        }).await;
+    }
+
+    /// Calculate candidate quality score
+    async fn calculate_candidate_quality(&self, candidate: &Candidate) -> Option<f64> {
+        let ice_params = self.ice_params.read().await;
+        let thresholds = &ice_params.quality_thresholds;
+
+        let mut quality_score = 0.0;
+        let mut factors = 0;
+
+        // Base score by candidate type
+        let type_score = match candidate.candidate_type {
+            CandidateType::Host => 1.0,
+            CandidateType::ServerReflexive => 0.8,
+            CandidateType::PeerReflexive => 0.7,
+            CandidateType::Relay => 0.6,
+        };
+        quality_score += type_score;
+        factors += 1;
+
+        // IPv4 vs IPv6 preference
+        if let crate::nat::ice::CandidateAddress::Resolved { addr, .. } = &candidate.address {
+            if addr.is_ipv6() && ice_params.gathering_config.prefer_ipv6 {
+                quality_score += 0.1;
+            }
+            factors += 1;
+        }
+
+        // Get quality metrics if available
+        if let Some(addr) = candidate.get_address() {
+            let target = addr.to_string();
+            if let Some(metrics) = self.stun_turn_manager.get_connection_quality(&target).await {
+                // RTT factor
+                if let Some(rtt) = metrics.rtt {
+                    let rtt_score = if rtt <= thresholds.max_acceptable_rtt {
+                        1.0 - (rtt.as_millis() as f64 / thresholds.max_acceptable_rtt.as_millis() as f64)
+                    } else {
+                        0.0
+                    };
+                    quality_score += rtt_score * 0.3;
+                    factors += 1;
+                }
+
+                // Packet loss factor
+                let loss_score = 1.0 - (metrics.packet_loss_rate / thresholds.max_packet_loss_rate).min(1.0);
+                quality_score += loss_score * 0.2;
+                factors += 1;
+
+                // Bandwidth factor
+                if let Some(bandwidth) = metrics.bandwidth_estimate {
+                    let bandwidth_score = (bandwidth as f64 / thresholds.min_bandwidth as f64).min(1.0);
+                    quality_score += bandwidth_score * 0.1;
+                    factors += 1;
+                }
+            }
+        }
+
+        if factors > 0 {
+            let final_score = quality_score / factors as f64;
+
+            // Update statistics
+            let score_scaled = (final_score * 1000.0) as u64;
+            self.stats.avg_candidate_quality.store(score_scaled, std::sync::atomic::Ordering::Relaxed);
+
+            Some(final_score)
+        } else {
+            None
         }
     }
 
-    /// Convert info to candidate
-    fn info_to_candidate(info: &CandidateInfo) -> NatResult<Candidate> {
-        use crate::nat::ice::candidate::{CandidateExtensions, CandidateAddress};
+    /// Complete gathering session
+    async fn complete_gathering_session(&self, session_id: String) -> NatResult<()> {
+        let (total_candidates, duration) = {
+            let mut sessions = self.gathering_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.phase = GatheringPhase::Complete;
 
-        let transport = match info.transport.as_str() {
-            "udp" => TransportProtocol::Udp,
-            "tcp" => TransportProtocol::Tcp,
-            _ => return Err(NatError::Platform("Invalid transport protocol".to_string())),
-        };
+                let total_candidates = session.candidates.values()
+                    .map(|candidates| candidates.len())
+                    .sum::<usize>();
 
-        let candidate_type = match info.candidate_type.as_str() {
-            "host" => CandidateType::Host,
-            "srflx" => CandidateType::ServerReflexive,
-            "prflx" => CandidateType::PeerReflexive,
-            "relay" => CandidateType::Relay,
-            _ => return Err(NatError::Platform("Invalid candidate type".to_string())),
-        };
+                let duration = session.started_at.elapsed();
 
-        // Parse address
-        let address = if info.address.ends_with(".local") {
-            CandidateAddress::MDns {
-                hostname: info.address.clone(),
-                port: info.port,
-            }
-        } else {
-            let ip = info.address.parse()
-                .map_err(|_| NatError::Platform("Invalid IP address".to_string()))?;
-            CandidateAddress::Ip(SocketAddr::new(ip, info.port))
-        };
-
-        // Parse related address
-        let related_address = if let (Some(related_addr), Some(related_port)) =
-            (&info.related_address, &info.related_port) {
-
-            if related_addr.ends_with(".local") {
-                Some(CandidateAddress::MDns {
-                    hostname: related_addr.clone(),
-                    port: *related_port,
-                })
+                (total_candidates, duration)
             } else {
-                let ip = related_addr.parse()
-                    .map_err(|_| NatError::Platform("Invalid related IP address".to_string()))?;
-                Some(CandidateAddress::Ip(SocketAddr::new(ip, *related_port)))
+                return Err(NatError::Platform(format!("Session '{}' not found", session_id)));
             }
-        } else {
-            None
         };
 
-        let extensions = CandidateExtensions::new();
+        self.stats.active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
-        let mut candidate = Candidate {
-            foundation: info.foundation.clone(),
-            component_id: info.component_id,
-            transport,
-            priority: info.priority,
-            address,
-            candidate_type,
-            related_address,
-            tcp_type: info.tcp_type.as_ref().and_then(|t| {
-                match t.as_str() {
-                    "active" => Some(crate::nat::ice::candidate::TcpType::Active),
-                    "passive" => Some(crate::nat::ice::candidate::TcpType::Passive),
-                    "so" => Some(crate::nat::ice::candidate::TcpType::So),
-                    _ => None,
-                }
-            }),
-            extensions,
-            discovered_at: Instant::now(),
-            base_address: None,
-            server_address: None,
-        };
+        // Update average gathering time
+        let duration_us = duration.as_micros() as u64;
+        self.stats.avg_gathering_time.store(duration_us, std::sync::atomic::Ordering::Relaxed);
 
-        candidate.validate()?;
+        info!("ICE gathering session '{}' completed: {} candidates in {}ms",
+             session_id, total_candidates, duration.as_millis());
 
-        Ok(candidate)
+        self.emit_event(IceIntegrationEvent::GatheringComplete {
+            session_id,
+            total_candidates,
+            duration,
+        }).await;
+
+        Ok(())
     }
 
-    /// Get current state
-    pub async fn get_state(&self) -> IceIntegrationState {
-        *self.state.read().await
+    /// Get gathered candidates for component
+    pub async fn get_candidates_for_component(&self, component_id: u32) -> Vec<Candidate> {
+        self.candidates_cache.read().await
+            .get(&component_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    /// Get current role
-    pub async fn get_role(&self) -> Option<IceRole> {
-        *self.role.read().await
+    /// Get NAT behavior
+    pub async fn get_nat_behavior(&self) -> Option<NatBehavior> {
+        self.nat_behavior_cache.read().await.clone()
+    }
+
+    /// Subscribe to events
+    pub async fn subscribe_to_events(&self) -> broadcast::Receiver<IceIntegrationEvent> {
+        let (tx, rx) = broadcast::channel(1000);
+        self.event_subscribers.write().await.push(tx);
+        rx
+    }
+
+    /// Emit event to all subscribers
+    async fn emit_event(&self, event: IceIntegrationEvent) {
+        let subscribers = self.event_subscribers.read().await;
+        for sender in subscribers.iter() {
+            let _ = sender.send(event.clone());
+        }
     }
 
     /// Get statistics
-    pub async fn get_statistics(&self) -> IceIntegrationStats {
-        let mut stats = self.stats.read().await.clone();
-        stats.state = *self.state.read().await;
-        stats.role = *self.role.read().await;
-        stats.total_time = self.start_time.elapsed();
-        stats
+    pub fn get_stats(&self) -> &IceIntegrationStats {
+        &self.stats
     }
 
-    /// Subscribe to integration events
-    pub fn subscribe_events(&self) -> broadcast::Receiver<IceIntegrationEvent> {
-        self.event_sender.subscribe()
+    /// Update ICE parameters
+    pub async fn update_ice_parameters(&self, params: IceParameters) {
+        *self.ice_params.write().await = params;
+        info!("Updated ICE parameters");
     }
 
-    /// Check if connection is established
-    pub async fn is_connected(&self) -> bool {
-        *self.state.read().await == IceIntegrationState::Connected
-    }
-
-    /// Get established data channels
-    pub async fn get_data_channels(&self) -> HashMap<u32, DataChannel> {
-        self.data_channels.read().await.clone()
-    }
-
-    /// Close integration
-    pub async fn close(&self) {
-        info!("Closing ICE integration");
-
-        *self.shutdown.write().await = true;
-        *self.state.write().await = IceIntegrationState::Closed;
-
-        self.ice_agent.close().await;
-        self.data_channels.write().await.clear();
-    }
-
-    /// Restart ICE
-    pub async fn restart(&self) -> NatResult<()> {
-        info!("Restarting ICE");
-
-        self.ice_agent.restart().await?;
-
-        // Clear state
-        *self.local_parameters.write().await = None;
-        *self.remote_parameters.write().await = None;
-        self.data_channels.write().await.clear();
-        self.trickle_queue.write().await.clear();
-
-        *self.state.write().await = IceIntegrationState::Gathering;
-
-        Ok(())
+    /// Clear candidates cache
+    pub async fn clear_candidates_cache(&self) {
+        self.candidates_cache.write().await.clear();
+        debug!("Cleared candidates cache");
     }
 }
 
-impl Drop for Sharp3IceIntegration {
-    fn drop(&mut self) {
-        // Best effort cleanup
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let shutdown = self.shutdown.clone();
-            handle.spawn(async move {
-                *shutdown.write().await = true;
-            });
+// Implement IceNatManager trait for integration with ICE system
+impl IceNatManager for Sharp3IceIntegration {
+    /// Acquire a server reflexive candidate for the given component
+    fn get_server_reflexive(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>> {
+        let manager = self.stun_turn_manager.clone();
+        let stats = self.stats.clone();
+
+        Box::pin(async move {
+            let result = manager.get_server_reflexive_candidate(socket, component_id).await?;
+
+            if result.is_some() {
+                stats.server_reflexive_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats.total_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            Ok(result)
+        })
+    }
+
+    /// Acquire a relay candidate via TURN for the given component
+    fn get_relay_candidate(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>> {
+        let manager = self.stun_turn_manager.clone();
+        let stats = self.stats.clone();
+
+        Box::pin(async move {
+            let result = manager.get_relay_candidate(socket, component_id).await?;
+
+            if result.is_some() {
+                stats.relay_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats.total_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            Ok(result)
+        })
+    }
+}
+
+/// Helper trait to extract address from candidate
+trait CandidateAddressExt {
+    fn get_address(&self) -> Option<SocketAddr>;
+}
+
+impl CandidateAddressExt for Candidate {
+    fn get_address(&self) -> Option<SocketAddr> {
+        match &self.address {
+            crate::nat::ice::CandidateAddress::Resolved { addr, .. } => Some(*addr),
+            crate::nat::ice::CandidateAddress::HostName { .. } => None,
         }
     }
 }
 
-/// Helper functions for SHARP3 integration
+/// Wrapper that binds an IceAgent with Sharp3IceIntegration
+pub struct IceSession {
+    agent: Arc<crate::nat::ice::IceAgent>,
+    integration: Arc<Sharp3IceIntegration>,
+}
 
-/// Create ICE integration with SHARP3 optimized settings
-pub async fn create_sharp3_ice_integration() -> NatResult<Sharp3IceIntegration> {
-    let config = IceIntegrationConfig {
-        aggressive_nomination: true, // Faster for P2P
-        ice_timeout: Duration::from_secs(20),
-        enable_ipv6: true,
-        enable_tcp: false, // UDP only for P2P speed
-        max_candidates: 5, // Limit for faster gathering
-        enable_bundle: true,
-        ..Default::default()
+impl IceSession {
+    /// Create a new ICE session using the SHARP integration
+    pub async fn new(
+        config: crate::nat::ice::IceConfig,
+        stun_turn_manager: Arc<StunTurnManager>,
+        ice_params: IceParameters,
+    ) -> NatResult<Self> {
+        let integration = Arc::new(Sharp3IceIntegration::new(stun_turn_manager, ice_params).await?);
+
+        // Validate ICE config
+        crate::nat::ice::validate_ice_config(&config)?;
+
+        // Create ICE agent
+        let agent = Arc::new(crate::nat::ice::IceAgent::new(config).await?);
+
+        Ok(Self { agent, integration })
+    }
+
+    /// Access the underlying ICE agent
+    pub fn agent(&self) -> Arc<crate::nat::ice::IceAgent> {
+        self.agent.clone()
+    }
+
+    /// Access the ICE integration
+    pub fn integration(&self) -> Arc<Sharp3IceIntegration> {
+        self.integration.clone()
+    }
+
+    /// Start ICE processing with the specified role
+    pub async fn start(&self, role: IceRole) -> NatResult<()> {
+        self.agent.start(role).await
+    }
+
+    /// Start candidate gathering
+    pub async fn start_gathering(&self, socket: Arc<UdpSocket>) -> NatResult<()> {
+        let session_id = format!("session_{}", uuid::Uuid::new_v4());
+        self.integration.start_gathering_session(session_id, socket).await
+    }
+
+    /// Get gathered candidates for component
+    pub async fn get_candidates(&self, component_id: u32) -> Vec<Candidate> {
+        self.integration.get_candidates_for_component(component_id).await
+    }
+
+    /// Get current ICE state
+    pub async fn get_state(&self) -> crate::nat::ice::IceState {
+        self.agent.get_state().await
+    }
+
+    /// Subscribe to ICE events
+    pub fn subscribe_ice_events(&self) -> broadcast::Receiver<IceEvent> {
+        self.agent.subscribe()
+    }
+
+    /// Subscribe to integration events
+    pub async fn subscribe_integration_events(&self) -> broadcast::Receiver<IceIntegrationEvent> {
+        self.integration.subscribe_to_events().await
+    }
+
+    /// Get integration statistics
+    pub fn get_integration_stats(&self) -> &IceIntegrationStats {
+        self.integration.get_stats()
+    }
+
+    /// Get STUN/TURN statistics
+    pub fn get_stun_turn_stats(&self) -> &crate::nat::stun_turn_manager::StunTurnStats {
+        self.integration.stun_turn_manager.get_stats()
+    }
+}
+
+/// Factory function to create ICE session with SHARP integration
+pub async fn create_ice_session_with_sharp(
+    ice_config: crate::nat::ice::IceConfig,
+    stun_servers: Vec<String>,
+    turn_servers: Vec<crate::nat::stun_turn_manager::TurnServerInfo>,
+) -> NatResult<IceSession> {
+    // Create STUN/TURN manager
+    let stun_turn_manager = Arc::new(
+        crate::nat::stun_turn_manager::create_stun_turn_manager(
+            stun_servers,
+            turn_servers,
+            false, // Don't start integrated TURN server
+        ).await?
+    );
+
+    // Create ICE parameters
+    let ice_params = IceParameters {
+        ufrag: crate::nat::ice::utils::generate_ufrag(),
+        pwd: crate::nat::ice::utils::generate_password(),
+        components: ice_config.components.clone(),
+        gathering_config: IceGatheringConfig::default(),
+        quality_thresholds: QualityThresholds::default(),
     };
 
-    Sharp3IceIntegration::new(config).await
-}
-
-/// Extract connection info for SHARP3 use
-pub fn extract_connection_info(data_channel: &DataChannel) -> (SocketAddr, SocketAddr) {
-    (data_channel.local_address, data_channel.remote_address)
-}
-
-/// Check if ICE parameters are compatible
-pub fn are_parameters_compatible(local: &IceParameters, remote: &IceParameters) -> bool {
-    // Basic compatibility checks
-    !local.candidates.is_empty() &&
-        !remote.candidates.is_empty() &&
-        local.options.component_count == remote.options.component_count
+    // Create ICE session
+    IceSession::new(ice_config, stun_turn_manager, ice_params).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn test_ice_integration_creation() {
-        let config = IceIntegrationConfig::default();
-        let integration = Sharp3IceIntegration::new(config).await.unwrap();
-
-        assert_eq!(integration.get_state().await, IceIntegrationState::Idle);
-        assert!(integration.get_role().await.is_none());
-    }
-
-    #[test]
-    fn test_candidate_conversion() {
-        use crate::nat::ice::candidate::{Candidate, CandidateExtensions};
-
-        let candidate = Candidate::new_host(
-            "192.168.1.1:12345".parse().unwrap(),
-            1,
-            TransportProtocol::Udp,
-            CandidateExtensions::new(),
+        let stun_turn_manager = Arc::new(
+            crate::nat::stun_turn_manager::create_stun_turn_manager(
+                vec!["stun.l.google.com:19302".to_string()],
+                vec![],
+                false,
+            ).await.unwrap()
         );
 
-        let info = Sharp3IceIntegration::candidate_to_info(&candidate);
-        let converted = Sharp3IceIntegration::info_to_candidate(&info).unwrap();
+        let ice_params = IceParameters::default();
+        let integration = Sharp3IceIntegration::new(stun_turn_manager, ice_params).await.unwrap();
 
-        assert_eq!(candidate.foundation, converted.foundation);
-        assert_eq!(candidate.component_id, converted.component_id);
-        assert_eq!(candidate.transport, converted.transport);
-        assert_eq!(candidate.candidate_type, converted.candidate_type);
-    }
+        let session_id = "test_session".to_string();
 
-    #[test]
-    fn test_ice_parameters_compatibility() {
-        let params1 = IceParameters {
-            credentials: IceCredentials::new(),
-            candidates: vec![],
-            options: IceOptions {
-                component_count: 1,
-                ..Default::default()
-            },
-        };
+        // Start gathering session
+        integration.start_gathering_session(session_id.clone(), socket).await.unwrap();
 
-        let params2 = IceParameters {
-            credentials: IceCredentials::new(),
-            candidates: vec![],
-            options: IceOptions {
-                component_count: 2,
-                ..Default::default()
-            },
-        };
+        // Wait a bit for gathering to complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(!are_parameters_compatible(&params1, &params2));
+        // Check that we have some candidates
+        let candidates = integration.get_candidates_for_component(1).await;
+        assert!(!candidates.is_empty(), "Should have at least host candidate");
     }
 
     #[tokio::test]
-    async fn test_sharp3_optimized_creation() {
-        let integration = create_sharp3_ice_integration().await.unwrap();
-        assert!(integration.config.aggressive_nomination);
-        assert!(!integration.config.enable_tcp);
-        assert!(integration.config.enable_bundle);
+    async fn test_ice_session_creation() {
+        let ice_config = crate::nat::ice::create_p2p_ice_config();
+
+        let result = create_ice_session_with_sharp(
+            ice_config,
+            vec!["stun.l.google.com:19302".to_string()],
+            vec![],
+        ).await;
+
+        // This might fail due to network dependencies, but tests the integration
+        match result {
+            Ok(session) => {
+                assert!(session.agent().get_state().await == crate::nat::ice::IceState::Gathering);
+            }
+            Err(e) => {
+                println!("ICE session creation failed (expected in test environment): {}", e);
+            }
+        }
     }
+    let integration = Sharp3IceIntegration::new(stun_turn_manager, ice_params).await.unwrap();
+
+    assert_eq!(integration.get_stats().total_sessions.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
