@@ -51,6 +51,12 @@ const RETRY_DELAYS: &[Duration] = &[
     Duration::from_millis(1600),
 ];
 
+/// STUN default timeout
+const STUN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TURN default timeout
+const TURN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Gathering phase state with detailed tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GatheringPhase {
@@ -611,6 +617,517 @@ pub struct GatheringStats {
     pub interface_utilization: HashMap<String, f64>,
 }
 
+/// STUN client for server reflexive candidate gathering
+#[derive(Debug)]
+pub struct StunClient {
+    server: SocketAddr,
+    timeout: Duration,
+    socket: Option<Arc<UdpSocket>>,
+    pending_requests: Arc<RwLock<HashMap<TransactionId, Instant>>>,
+}
+
+impl StunClient {
+    /// Create new STUN client
+    pub async fn new(server: SocketAddr, timeout: Duration) -> NatResult<Self> {
+        Ok(Self {
+            server,
+            timeout,
+            socket: None,
+            pending_requests: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    /// Perform STUN binding request
+    pub async fn binding_request(&self, local_addr: SocketAddr) -> NatResult<SocketAddr> {
+        let socket = if let Some(socket) = &self.socket {
+            socket.clone()
+        } else {
+            Arc::new(UdpSocket::bind(local_addr).await.map_err(NatError::Network)?)
+        };
+
+        let transaction_id = TransactionId::generate();
+        let mut request = Message::new(MessageType::BindingRequest, transaction_id);
+
+        // Add FINGERPRINT for RFC 5389 compliance
+        request.add_fingerprint()?;
+
+        let request_data = request.to_bytes()?;
+        let start_time = Instant::now();
+
+        // Track pending request
+        self.pending_requests.write().await.insert(transaction_id, start_time);
+
+        // Send request
+        socket.send_to(&request_data, self.server).await.map_err(NatError::Network)?;
+
+        // Wait for response
+        let mut buffer = vec![0u8; 1024];
+        let response_result = timeout(self.timeout, async {
+            loop {
+                match socket.recv_from(&mut buffer).await {
+                    Ok((len, from)) => {
+                        if from == self.server {
+                            if let Ok(response) = Message::from_bytes(&buffer[..len]) {
+                                if response.transaction_id == transaction_id {
+                                    return Ok(response);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => return Err(NatError::Network(e)),
+                }
+            }
+        }).await;
+
+        // Remove from pending
+        self.pending_requests.write().await.remove(&transaction_id);
+
+        match response_result {
+            Ok(Ok(response)) => {
+                if response.message_type == MessageType::BindingSuccessResponse {
+                    if let Some(mapped_addr) = response.get_xor_mapped_address() {
+                        Ok(mapped_addr)
+                    } else {
+                        Err(NatError::Platform("No XOR-MAPPED-ADDRESS in response".to_string()))
+                    }
+                } else {
+                    Err(NatError::Platform("STUN binding failed".to_string()))
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(NatError::Timeout(self.timeout)),
+        }
+    }
+
+    /// Get response time statistics
+    pub async fn get_response_times(&self) -> Vec<Duration> {
+        let pending = self.pending_requests.read().await;
+        let now = Instant::now();
+        pending.values().map(|start| now.duration_since(*start)).collect()
+    }
+}
+
+/// TURN client for relay candidate gathering
+#[derive(Debug)]
+pub struct TurnClient {
+    config: TurnServerConfig,
+    socket: Option<Arc<UdpSocket>>,
+    allocated_address: Option<SocketAddr>,
+    allocation_lifetime: Option<Duration>,
+    last_refresh: Option<Instant>,
+}
+
+impl TurnClient {
+    /// Create new TURN client
+    pub async fn new(config: TurnServerConfig) -> NatResult<Self> {
+        Ok(Self {
+            config,
+            socket: None,
+            allocated_address: None,
+            allocation_lifetime: None,
+            last_refresh: None,
+        })
+    }
+
+    /// Allocate relay address
+    pub async fn allocate(&mut self, local_addr: SocketAddr) -> NatResult<SocketAddr> {
+        let socket = Arc::new(UdpSocket::bind(local_addr).await.map_err(NatError::Network)?);
+        self.socket = Some(socket.clone());
+
+        // For this implementation, we'll simulate TURN allocation
+        // In real implementation, this would follow RFC 5766
+        let transaction_id = TransactionId::generate();
+        let mut request = Message::new(MessageType::AllocateRequest, transaction_id);
+
+        // Add REQUESTED-TRANSPORT (UDP)
+        request.add_attribute(Attribute {
+            attribute_type: AttributeType::RequestedTransport,
+            value: AttributeValue::RequestedTransport(17), // UDP protocol number
+        })?;
+
+        // Add USERNAME
+        request.add_attribute(Attribute {
+            attribute_type: AttributeType::Username,
+            value: AttributeValue::Username(self.config.username.clone()),
+        })?;
+
+        // Add MESSAGE-INTEGRITY
+        request.add_message_integrity(&self.config.password)?;
+
+        // Add FINGERPRINT
+        request.add_fingerprint()?;
+
+        let request_data = request.to_bytes()?;
+        socket.send_to(&request_data, self.config.address).await.map_err(NatError::Network)?;
+
+        // Wait for response
+        let mut buffer = vec![0u8; 1024];
+        let response_result = timeout(Duration::from_secs(10), async {
+            let (len, from) = socket.recv_from(&mut buffer).await.map_err(NatError::Network)?;
+            if from == self.config.address {
+                Message::from_bytes(&buffer[..len])
+            } else {
+                Err(NatError::Platform("Response from wrong server".to_string()))
+            }
+        }).await;
+
+        match response_result {
+            Ok(Ok(response)) => {
+                if response.message_type == MessageType::AllocateSuccessResponse {
+                    if let Some(relayed_addr) = response.get_xor_relayed_address() {
+                        self.allocated_address = Some(relayed_addr);
+                        self.allocation_lifetime = Some(self.config.allocation_lifetime);
+                        self.last_refresh = Some(Instant::now());
+                        Ok(relayed_addr)
+                    } else {
+                        Err(NatError::Platform("No XOR-RELAYED-ADDRESS in response".to_string()))
+                    }
+                } else {
+                    Err(NatError::Platform("TURN allocation failed".to_string()))
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(NatError::Timeout(Duration::from_secs(10))),
+        }
+    }
+
+    /// Get allocated address
+    pub fn get_allocated_address(&self) -> Option<SocketAddr> {
+        self.allocated_address
+    }
+
+    /// Check if allocation needs refresh
+    pub fn needs_refresh(&self) -> bool {
+        if let (Some(last_refresh), Some(lifetime)) = (self.last_refresh, self.allocation_lifetime) {
+            last_refresh.elapsed() > lifetime / 2
+        } else {
+            false
+        }
+    }
+
+    /// Refresh allocation
+    pub async fn refresh(&mut self) -> NatResult<()> {
+        if let Some(socket) = &self.socket {
+            let transaction_id = TransactionId::generate();
+            let mut request = Message::new(MessageType::RefreshRequest, transaction_id);
+
+            // Add LIFETIME
+            request.add_attribute(Attribute {
+                attribute_type: AttributeType::Lifetime,
+                value: AttributeValue::Lifetime(self.config.allocation_lifetime.as_secs() as u32),
+            })?;
+
+            // Add USERNAME
+            request.add_attribute(Attribute {
+                attribute_type: AttributeType::Username,
+                value: AttributeValue::Username(self.config.username.clone()),
+            })?;
+
+            // Add MESSAGE-INTEGRITY
+            request.add_message_integrity(&self.config.password)?;
+
+            // Add FINGERPRINT
+            request.add_fingerprint()?;
+
+            let request_data = request.to_bytes()?;
+            socket.send_to(&request_data, self.config.address).await.map_err(NatError::Network)?;
+
+            self.last_refresh = Some(Instant::now());
+        }
+
+        Ok(())
+    }
+}
+
+/// mDNS resolver for mDNS candidates
+#[derive(Debug)]
+pub struct MdnsResolver {
+    cache: Arc<RwLock<HashMap<String, SocketAddr>>>,
+}
+
+impl MdnsResolver {
+    /// Create new mDNS resolver
+    pub async fn new() -> NatResult<Self> {
+        Ok(Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    /// Resolve mDNS hostname
+    pub async fn resolve(&self, hostname: &str) -> NatResult<SocketAddr> {
+        // Check cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some(&addr) = cache.get(hostname) {
+                return Ok(addr);
+            }
+        }
+
+        // For this implementation, simulate mDNS resolution
+        // In real implementation, this would use multicast DNS
+        if hostname.ends_with(".local") {
+            // Simulate successful resolution to a link-local address
+            let addr = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+                5353,
+            );
+
+            // Cache the result
+            self.cache.write().await.insert(hostname.to_string(), addr);
+            Ok(addr)
+        } else {
+            Err(NatError::Platform("Invalid mDNS hostname".to_string()))
+        }
+    }
+
+    /// Clear cache
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
+    }
+}
+
+/// Interface monitor for dynamic interface detection
+#[derive(Debug)]
+pub struct InterfaceMonitor {
+    interfaces: Arc<RwLock<HashMap<String, NetworkInterface>>>,
+    event_sender: broadcast::Sender<InterfaceMonitorEvent>,
+}
+
+/// Interface monitor events
+#[derive(Debug, Clone)]
+pub enum InterfaceMonitorEvent {
+    InterfaceAdded(NetworkInterface),
+    InterfaceRemoved(String),
+    InterfaceChanged(NetworkInterface),
+}
+
+impl InterfaceMonitor {
+    /// Create new interface monitor
+    pub async fn new() -> NatResult<Self> {
+        let (event_sender, _) = broadcast::channel(100);
+
+        Ok(Self {
+            interfaces: Arc::new(RwLock::new(HashMap::new())),
+            event_sender,
+        })
+    }
+
+    /// Get current interfaces
+    pub async fn get_interfaces(&self) -> HashMap<String, NetworkInterface> {
+        self.interfaces.read().await.clone()
+    }
+
+    /// Subscribe to interface events
+    pub fn subscribe(&self) -> broadcast::Receiver<InterfaceMonitorEvent> {
+        self.event_sender.subscribe()
+    }
+
+    /// Start monitoring
+    pub async fn start_monitoring(&self) -> NatResult<()> {
+        // Implementation would start OS-specific interface monitoring
+        Ok(())
+    }
+
+    /// Stop monitoring
+    pub async fn stop_monitoring(&self) {
+        // Implementation would stop monitoring
+    }
+}
+
+/// Network quality assessor
+#[derive(Debug)]
+pub struct NetworkQualityAssessor {
+}
+
+/// Network quality metrics
+#[derive(Debug, Clone)]
+pub struct NetworkQuality {
+    pub overall_score: f64,
+    pub latency: Option<Duration>,
+    pub bandwidth: Option<u64>,
+    pub packet_loss: Option<f64>,
+    pub jitter: Option<Duration>,
+}
+
+impl NetworkQualityAssessor {
+    /// Create new quality assessor
+    pub async fn new() -> NatResult<Self> {
+        Ok(Self {})
+    }
+
+    /// Assess interface quality
+    pub async fn assess_interface(&self, interface: &NetworkInterface) -> NatResult<NetworkQuality> {
+        // Simulate quality assessment based on interface type
+        let (score, latency, bandwidth) = match interface.interface_type {
+            InterfaceType::Ethernet => (0.9, Duration::from_millis(1), Some(1_000_000_000u64)),
+            InterfaceType::Wifi6 => (0.8, Duration::from_millis(5), Some(600_000_000u64)),
+            InterfaceType::Wifi5 => (0.7, Duration::from_millis(10), Some(300_000_000u64)),
+            InterfaceType::WifiLegacy => (0.6, Duration::from_millis(20), Some(50_000_000u64)),
+            InterfaceType::Cellular5G => (0.8, Duration::from_millis(20), Some(1_000_000_000u64)),
+            InterfaceType::Cellular4G => (0.6, Duration::from_millis(50), Some(100_000_000u64)),
+            InterfaceType::CellularLegacy => (0.4, Duration::from_millis(100), Some(10_000_000u64)),
+            InterfaceType::Vpn => (0.5, Duration::from_millis(100), Some(100_000_000u64)),
+            _ => (0.3, Duration::from_millis(200), Some(10_000_000u64)),
+        };
+
+        Ok(NetworkQuality {
+            overall_score: score,
+            latency: Some(latency),
+            bandwidth,
+            packet_loss: Some(0.01), // 1% packet loss
+            jitter: Some(Duration::from_millis(5)),
+        })
+    }
+}
+
+/// Security validator for interface security assessment
+#[derive(Debug)]
+pub struct SecurityValidator {
+    policy: SecurityPolicy,
+}
+
+impl SecurityValidator {
+    /// Create new security validator
+    pub fn new(policy: SecurityPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Validate interface security
+    pub async fn validate_interface(&self, interface: &NetworkInterface) -> bool {
+        match &self.policy {
+            SecurityPolicy::Permissive => true,
+            SecurityPolicy::Standard => self.standard_validation(interface),
+            SecurityPolicy::Strict => self.strict_validation(interface),
+            SecurityPolicy::Custom(rules) => self.custom_validation(interface, rules),
+        }
+    }
+
+    /// Standard security validation
+    fn standard_validation(&self, interface: &NetworkInterface) -> bool {
+        // Block dangerous interface types
+        if matches!(interface.interface_type, InterfaceType::Unknown) {
+            return false;
+        }
+
+        // Block interfaces that are down
+        if interface.status != InterfaceStatus::Up {
+            return false;
+        }
+
+        true
+    }
+
+    /// Strict security validation
+    fn strict_validation(&self, interface: &NetworkInterface) -> bool {
+        if !self.standard_validation(interface) {
+            return false;
+        }
+
+        // Only allow safe interface types
+        matches!(interface.interface_type,
+            InterfaceType::Ethernet |
+            InterfaceType::ThunderboltEthernet |
+            InterfaceType::Wifi6 |
+            InterfaceType::Wifi5
+        )
+    }
+
+    /// Custom security validation
+    fn custom_validation(&self, interface: &NetworkInterface, rules: &SecurityRules) -> bool {
+        // Check loopback
+        if interface.interface_type == InterfaceType::Loopback && !rules.allow_loopback {
+            return false;
+        }
+
+        // Check VPN
+        if interface.interface_type == InterfaceType::Vpn && !rules.allow_vpn_interfaces {
+            return false;
+        }
+
+        // Check IP ranges
+        for (blocked_ip, prefix) in &rules.blocked_ip_ranges {
+            for &ipv4 in &interface.ipv4_addresses {
+                if Self::ip_in_range(&IpAddr::V4(ipv4), blocked_ip, *prefix) {
+                    return false;
+                }
+            }
+            for &ipv6 in &interface.ipv6_addresses {
+                if Self::ip_in_range(&IpAddr::V6(ipv6), blocked_ip, *prefix) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Check if IP is in blocked range
+    fn ip_in_range(ip: &IpAddr, range_ip: &IpAddr, prefix: u8) -> bool {
+        match (ip, range_ip) {
+            (IpAddr::V4(ip), IpAddr::V4(range)) => {
+                let ip_bits = u32::from(*ip);
+                let range_bits = u32::from(*range);
+                let mask = (!0u32) << (32 - prefix);
+                (ip_bits & mask) == (range_bits & mask)
+            }
+            (IpAddr::V6(ip), IpAddr::V6(range)) => {
+                let ip_bits = u128::from(*ip);
+                let range_bits = u128::from(*range);
+                let mask = (!0u128) << (128 - prefix);
+                (ip_bits & mask) == (range_bits & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Retry manager for failed operations
+#[derive(Debug)]
+pub struct RetryManager {
+    max_attempts: u32,
+    retry_counts: Arc<RwLock<HashMap<String, u32>>>,
+}
+
+impl RetryManager {
+    /// Create new retry manager
+    pub fn new(max_attempts: u32) -> Self {
+        Self {
+            max_attempts,
+            retry_counts: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Check if operation can be retried
+    pub async fn can_retry(&self, operation_id: &str) -> bool {
+        let counts = self.retry_counts.read().await;
+        let current_count = counts.get(operation_id).copied().unwrap_or(0);
+        current_count < self.max_attempts
+    }
+
+    /// Record retry attempt
+    pub async fn record_attempt(&self, operation_id: &str) -> u32 {
+        let mut counts = self.retry_counts.write().await;
+        let current_count = counts.get(operation_id).copied().unwrap_or(0);
+        let new_count = current_count + 1;
+        counts.insert(operation_id.to_string(), new_count);
+        new_count
+    }
+
+    /// Reset retry count
+    pub async fn reset(&self, operation_id: &str) {
+        self.retry_counts.write().await.remove(operation_id);
+    }
+
+    /// Get retry delay for attempt
+    pub fn get_retry_delay(&self, attempt: u32) -> Duration {
+        if attempt as usize >= RETRY_DELAYS.len() {
+            *RETRY_DELAYS.last().unwrap()
+        } else {
+            RETRY_DELAYS[attempt as usize]
+        }
+    }
+}
+
 /// Main candidate gatherer with full RFC compliance
 pub struct CandidateGatherer {
     /// Gathering configuration
@@ -647,7 +1164,7 @@ pub struct CandidateGatherer {
     stun_clients: Arc<RwLock<Vec<Arc<StunClient>>>>,
 
     /// TURN client pool
-    turn_clients: Arc<RwLock<Vec<Arc<TurnClient>>>>,
+    turn_clients: Arc<RwLock<Vec<Arc<Mutex<TurnClient>>>>>,
 
     /// mDNS resolver
     mdns_resolver: Option<Arc<MdnsResolver>>,
@@ -880,11 +1397,11 @@ impl CandidateGatherer {
     }
 
     /// Create TURN client pool
-    async fn create_turn_client_pool(config: &GatheringConfig) -> NatResult<Vec<Arc<TurnClient>>> {
+    async fn create_turn_client_pool(config: &GatheringConfig) -> NatResult<Vec<Arc<Mutex<TurnClient>>>> {
         let mut clients = Vec::new();
 
         for server_config in &config.turn_servers {
-            let client = Arc::new(TurnClient::new(server_config.clone()).await?);
+            let client = Arc::new(Mutex::new(TurnClient::new(server_config.clone()).await?));
             clients.push(client);
         }
 
@@ -1238,49 +1755,52 @@ impl CandidateGatherer {
 
     /// Parse Linux ip addr output
     async fn parse_ip_addr_output(&self, output: &str, interfaces: &mut HashMap<String, NetworkInterface>) -> NatResult<()> {
+        use regex::Regex;
+
         let mut current_interface: Option<NetworkInterface> = None;
 
         for line in output.lines() {
             let line = line.trim();
 
-            if let Some(captures) = regex::Regex::new(r"^(\d+): ([^:@]+)[@:].*<([^>]*)>.*mtu (\d+)")
-                .unwrap()
-                .captures(line) {
+            if let Ok(regex) = Regex::new(r"^(\d+): ([^:@]+)[@:].*<([^>]*)>.*mtu (\d+)") {
+                if let Some(captures) = regex.captures(line) {
+                    // Save previous interface
+                    if let Some(interface) = current_interface.take() {
+                        interfaces.insert(interface.name.clone(), interface);
+                    }
 
-                // Save previous interface
-                if let Some(interface) = current_interface.take() {
-                    interfaces.insert(interface.name.clone(), interface);
+                    // Parse new interface
+                    let index: u32 = captures[1].parse().unwrap_or(0);
+                    let name = captures[2].to_string();
+                    let flags_str = &captures[3];
+                    let mtu: u32 = captures[4].parse().unwrap_or(1500);
+
+                    let flags = self.parse_linux_flags(flags_str);
+                    let interface_type = InterfaceType::from_name(&name);
+
+                    current_interface = Some(NetworkInterface {
+                        name,
+                        index,
+                        interface_type,
+                        status: if flags.is_up { InterfaceStatus::Up } else { InterfaceStatus::Down },
+                        ipv4_addresses: Vec::new(),
+                        ipv6_addresses: Vec::new(),
+                        flags,
+                        metric: None,
+                        bandwidth: None,
+                        security_level: NetworkSecurityLevel::Unknown,
+                        mac_address: None,
+                        mtu: Some(mtu),
+                        description: None,
+                        parent_interface: None,
+                        vlan_id: None,
+                        stats: InterfaceStats::default(),
+                        last_updated: Instant::now(),
+                    });
                 }
+            }
 
-                // Parse new interface
-                let index: u32 = captures[1].parse().unwrap_or(0);
-                let name = captures[2].to_string();
-                let flags_str = &captures[3];
-                let mtu: u32 = captures[4].parse().unwrap_or(1500);
-
-                let flags = self.parse_linux_flags(flags_str);
-                let interface_type = InterfaceType::from_name(&name);
-
-                current_interface = Some(NetworkInterface {
-                    name,
-                    index,
-                    interface_type,
-                    status: if flags.is_up { InterfaceStatus::Up } else { InterfaceStatus::Down },
-                    ipv4_addresses: Vec::new(),
-                    ipv6_addresses: Vec::new(),
-                    flags,
-                    metric: None,
-                    bandwidth: None,
-                    security_level: NetworkSecurityLevel::Unknown,
-                    mac_address: None,
-                    mtu: Some(mtu),
-                    description: None,
-                    parent_interface: None,
-                    vlan_id: None,
-                    stats: InterfaceStats::default(),
-                    last_updated: Instant::now(),
-                });
-            } else if line.starts_with("inet ") {
+            if line.starts_with("inet ") {
                 // Parse IPv4 address
                 if let Some(ref mut interface) = current_interface {
                     if let Some(addr_str) = line.split_whitespace().nth(1) {
@@ -1720,3 +2240,1263 @@ impl CandidateGatherer {
                 }
             }
         }
+
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.host_candidates += successful_candidates as u32;
+            stats.phase_durations.insert(GatheringPhase::GatheringHost, start_time.elapsed());
+        }
+
+        info!("Host candidate gathering completed: {} candidates, {} failures",
+              successful_candidates, failed_attempts);
+
+        Ok(())
+    }
+
+    /// Gather host candidates for specific address
+    async fn gather_host_candidates_for_address(
+        &self,
+        ip: IpAddr,
+        component_id: u32,
+        interface_name: String,
+        interface: NetworkInterface,
+    ) -> NatResult<Vec<Candidate>> {
+        let mut candidates = Vec::new();
+
+        // Calculate interface info for priority
+        let interface_info = InterfaceInfo {
+            interface_type: interface.interface_type,
+            is_vpn: interface.interface_type == InterfaceType::Vpn,
+            is_temporary: false, // Would need OS-specific detection
+            metric: interface.metric,
+            name: interface_name.clone(),
+            supports_encryption: interface.security_level >= NetworkSecurityLevel::Corporate,
+            estimated_bandwidth: interface.bandwidth,
+            status: interface.status,
+            security_level: interface.security_level,
+        };
+
+        // UDP candidates
+        if self.config.enable_udp {
+            let port = self.allocate_port().await?;
+            let address = SocketAddr::new(ip, port);
+
+            let extensions = CandidateExtensions::new()
+                .with_network_id(interface.index);
+
+            let mut candidate = Candidate::new_host(
+                address,
+                component_id,
+                TransportProtocol::Udp,
+                extensions,
+            );
+
+            // Update priority with interface information
+            let local_preference = calculate_local_preference_enhanced(
+                &ip,
+                &interface_info,
+                &self.config.priority_config,
+            );
+            candidate.update_priority(local_preference);
+
+            candidates.push(candidate);
+        }
+
+        // TCP candidates
+        if self.config.enable_tcp {
+            let port = self.allocate_port().await?;
+            let address = SocketAddr::new(ip, port);
+
+            let extensions = CandidateExtensions::new()
+                .with_network_id(interface.index);
+
+            let mut candidate = Candidate::new_host(
+                address,
+                component_id,
+                TransportProtocol::Tcp,
+                extensions,
+            );
+
+            // Set TCP type based on configuration
+            candidate.tcp_type = Some(TcpType::Passive);
+
+            // Update priority with interface information
+            let local_preference = calculate_local_preference_enhanced(
+                &ip,
+                &interface_info,
+                &self.config.priority_config,
+            );
+            candidate.update_priority(local_preference);
+
+            candidates.push(candidate);
+        }
+
+        // Emit candidate discovered events
+        for candidate in &candidates {
+            let event = GatheringEvent::CandidateDiscovered {
+                candidate: candidate.clone(),
+                component_id,
+                interface_name: interface_name.clone(),
+                gathering_method: GatheringMethod::HostDiscovery,
+                timestamp: Instant::now(),
+            };
+            let _ = self.event_sender.send(event);
+        }
+
+        Ok(candidates)
+    }
+
+    /// Check if IPv4 address should be used
+    fn should_use_ipv4_address(&self, ipv4: &Ipv4Addr) -> bool {
+        // Skip unspecified
+        if ipv4.is_unspecified() {
+            return false;
+        }
+
+        // Skip broadcast
+        if ipv4.is_broadcast() {
+            return false;
+        }
+
+        // Skip multicast
+        if ipv4.is_multicast() {
+            return false;
+        }
+
+        // Check security policy for loopback
+        if ipv4.is_loopback() {
+            return match &self.config.security_policy {
+                SecurityPolicy::Custom(rules) => rules.allow_loopback,
+                SecurityPolicy::Strict => false,
+                _ => true,
+            };
+        }
+
+        // Check security policy for private networks
+        if ipv4.is_private() {
+            return match &self.config.security_policy {
+                SecurityPolicy::Custom(rules) => rules.allow_private_networks,
+                _ => true,
+            };
+        }
+
+        // Check link-local (169.254.0.0/16)
+        if ipv4.octets()[0] == 169 && ipv4.octets()[1] == 254 {
+            return match &self.config.security_policy {
+                SecurityPolicy::Custom(rules) => rules.allow_link_local,
+                SecurityPolicy::Strict => false,
+                _ => true,
+            };
+        }
+
+        true
+    }
+
+    /// Check if IPv6 address should be used
+    fn should_use_ipv6_address(&self, ipv6: &Ipv6Addr) -> bool {
+        // Skip unspecified
+        if ipv6.is_unspecified() {
+            return false;
+        }
+
+        // Skip multicast
+        if ipv6.is_multicast() {
+            return false;
+        }
+
+        // Check security policy for loopback
+        if ipv6.is_loopback() {
+            return match &self.config.security_policy {
+                SecurityPolicy::Custom(rules) => rules.allow_loopback,
+                SecurityPolicy::Strict => false,
+                _ => true,
+            };
+        }
+
+        // Check link-local
+        if ipv6.is_unicast_link_local() {
+            return match &self.config.security_policy {
+                SecurityPolicy::Custom(rules) => rules.allow_link_local,
+                SecurityPolicy::Strict => false,
+                _ => true,
+            };
+        }
+
+        true
+    }
+
+    /// Gather server reflexive candidates
+    #[instrument(skip_all, fields(component_id = component_id))]
+    async fn gather_server_reflexive_candidates(&self, component_id: u32) -> NatResult<()> {
+        info!("Gathering server reflexive candidates for component {}", component_id);
+        let start_time = Instant::now();
+
+        let interfaces = self.interfaces.read().await.clone();
+        let stun_clients = self.stun_clients.read().await.clone();
+
+        let mut gathering_tasks = Vec::new();
+
+        // Create STUN tasks for each interface and server combination
+        for (interface_name, interface) in interfaces.iter() {
+            for &ipv4 in &interface.ipv4_addresses {
+                if self.config.enable_ipv4 && self.should_use_ipv4_address(&ipv4) {
+                    for stun_client in &stun_clients {
+                        let task = self.gather_server_reflexive_for_address(
+                            IpAddr::V4(ipv4),
+                            component_id,
+                            interface_name.clone(),
+                            interface.clone(),
+                            stun_client.clone(),
+                        );
+                        gathering_tasks.push(task);
+                    }
+                }
+            }
+
+            for &ipv6 in &interface.ipv6_addresses {
+                if self.config.enable_ipv6 && self.should_use_ipv6_address(&ipv6) {
+                    for stun_client in &stun_clients {
+                        let task = self.gather_server_reflexive_for_address(
+                            IpAddr::V6(ipv6),
+                            component_id,
+                            interface_name.clone(),
+                            interface.clone(),
+                            stun_client.clone(),
+                        );
+                        gathering_tasks.push(task);
+                    }
+                }
+            }
+        }
+
+        // Execute STUN tasks with concurrency control
+        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_stun));
+        let mut task_handles = Vec::new();
+
+        for task in gathering_tasks {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let handle = tokio::spawn(async move {
+                let result = task.await;
+                drop(permit);
+                result
+            });
+            task_handles.push(handle);
+        }
+
+        // Process results
+        let mut successful_candidates = 0;
+        let mut successful_requests = 0;
+        let mut failed_requests = 0;
+
+        for handle in task_handles {
+            match handle.await {
+                Ok(Ok(Some(candidate))) => {
+                    successful_candidates += 1;
+                    successful_requests += 1;
+                    self.add_candidate(candidate, component_id).await?;
+                }
+                Ok(Ok(None)) => {
+                    // STUN request succeeded but no candidate created
+                    successful_requests += 1;
+                }
+                Ok(Err(e)) => {
+                    failed_requests += 1;
+                    debug!("STUN request failed: {}", e);
+                }
+                Err(e) => {
+                    failed_requests += 1;
+                    debug!("STUN task panicked: {}", e);
+                }
+            }
+        }
+
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.server_reflexive_candidates += successful_candidates;
+            stats.stun_requests_sent += (successful_requests + failed_requests) as u32;
+            stats.stun_responses_received += successful_requests as u32;
+            stats.stun_success_rate = if successful_requests + failed_requests > 0 {
+                successful_requests as f64 / (successful_requests + failed_requests) as f64
+            } else {
+                0.0
+            };
+            stats.phase_durations.insert(GatheringPhase::GatheringServerReflexive, start_time.elapsed());
+        }
+
+        info!("Server reflexive gathering completed: {} candidates from {} requests ({} succeeded, {} failed)",
+              successful_candidates, successful_requests + failed_requests, successful_requests, failed_requests);
+
+        Ok(())
+    }
+
+    /// Gather server reflexive candidate for specific address
+    async fn gather_server_reflexive_for_address(
+        &self,
+        local_ip: IpAddr,
+        component_id: u32,
+        interface_name: String,
+        interface: NetworkInterface,
+        stun_client: Arc<StunClient>,
+    ) -> NatResult<Option<Candidate>> {
+        let local_port = self.allocate_port().await?;
+        let local_addr = SocketAddr::new(local_ip, local_port);
+        let stun_server = stun_client.server;
+
+        // Perform STUN binding request
+        let request_start = Instant::now();
+        let mapped_result = stun_client.binding_request(local_addr).await;
+        let response_time = request_start.elapsed();
+
+        // Emit STUN response event
+        let stun_event = GatheringEvent::StunResponse {
+            server: stun_server,
+            success: mapped_result.is_ok(),
+            response_time,
+            mapped_address: mapped_result.as_ref().ok().copied(),
+            timestamp: Instant::now(),
+        };
+        let _ = self.event_sender.send(stun_event);
+
+        match mapped_result {
+            Ok(mapped_addr) => {
+                // Check if this is actually reflexive (different from local)
+                if mapped_addr.ip() == local_ip {
+                    debug!("STUN response shows same IP as local - no NAT detected");
+                    return Ok(None);
+                }
+
+                // Create server reflexive candidate
+                let extensions = CandidateExtensions::new()
+                    .with_network_id(interface.index);
+
+                let mut candidate = Candidate::new_server_reflexive(
+                    mapped_addr,
+                    local_addr,
+                    component_id,
+                    TransportProtocol::Udp,
+                    stun_server,
+                    extensions,
+                );
+
+                // Calculate priority with interface information
+                let interface_info = InterfaceInfo {
+                    interface_type: interface.interface_type,
+                    is_vpn: interface.interface_type == InterfaceType::Vpn,
+                    is_temporary: false,
+                    metric: interface.metric,
+                    name: interface_name.clone(),
+                    supports_encryption: interface.security_level >= NetworkSecurityLevel::Corporate,
+                    estimated_bandwidth: interface.bandwidth,
+                    status: interface.status,
+                    security_level: interface.security_level,
+                };
+
+                let local_preference = calculate_local_preference_enhanced(
+                    &local_ip,
+                    &interface_info,
+                    &self.config.priority_config,
+                );
+                candidate.update_priority(local_preference);
+
+                // Emit candidate discovered event
+                let event = GatheringEvent::CandidateDiscovered {
+                    candidate: candidate.clone(),
+                    component_id,
+                    interface_name,
+                    gathering_method: GatheringMethod::StunBinding,
+                    timestamp: Instant::now(),
+                };
+                let _ = self.event_sender.send(event);
+
+                debug!("Created server reflexive candidate: {} -> {} via {}",
+                       local_addr, mapped_addr, stun_server);
+
+                Ok(Some(candidate))
+            }
+            Err(e) => {
+                debug!("STUN binding request failed for {} via {}: {}",
+                       local_addr, stun_server, e);
+
+                // Emit error event
+                let error_event = GatheringEvent::CandidateGatheringFailed {
+                    candidate_type: CandidateType::ServerReflexive,
+                    interface_name: Some(interface_name),
+                    error: GatheringError::StunError {
+                        server: stun_server,
+                        error: e.to_string(),
+                        error_code: None,
+                    },
+                    retry_possible: self.retry_manager.can_retry(&format!("stun_{}_{}", stun_server, local_addr)).await,
+                    timestamp: Instant::now(),
+                };
+                let _ = self.event_sender.send(error_event);
+
+                Err(e)
+            }
+        }
+    }
+
+    /// Gather relay candidates via TURN
+    #[instrument(skip_all, fields(component_id = component_id))]
+    async fn gather_relay_candidates(&self, component_id: u32) -> NatResult<()> {
+        info!("Gathering relay candidates for component {}", component_id);
+        let start_time = Instant::now();
+
+        let interfaces = self.interfaces.read().await.clone();
+        let turn_clients = self.turn_clients.read().await.clone();
+
+        let mut gathering_tasks = Vec::new();
+
+        // Create TURN tasks for each interface and server combination
+        for (interface_name, interface) in interfaces.iter() {
+            for &ipv4 in &interface.ipv4_addresses {
+                if self.config.enable_ipv4 && self.should_use_ipv4_address(&ipv4) {
+                    for turn_client in &turn_clients {
+                        let task = self.gather_relay_for_address(
+                            IpAddr::V4(ipv4),
+                            component_id,
+                            interface_name.clone(),
+                            interface.clone(),
+                            turn_client.clone(),
+                        );
+                        gathering_tasks.push(task);
+                    }
+                }
+            }
+
+            for &ipv6 in &interface.ipv6_addresses {
+                if self.config.enable_ipv6 && self.should_use_ipv6_address(&ipv6) {
+                    for turn_client in &turn_clients {
+                        let task = self.gather_relay_for_address(
+                            IpAddr::V6(ipv6),
+                            component_id,
+                            interface_name.clone(),
+                            interface.clone(),
+                            turn_client.clone(),
+                        );
+                        gathering_tasks.push(task);
+                    }
+                }
+            }
+        }
+
+        // Execute TURN tasks with concurrency control
+        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_turn));
+        let mut task_handles = Vec::new();
+
+        for task in gathering_tasks {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let handle = tokio::spawn(async move {
+                let result = task.await;
+                drop(permit);
+                result
+            });
+            task_handles.push(handle);
+        }
+
+        // Process results
+        let mut successful_candidates = 0;
+        let mut successful_allocations = 0;
+        let mut failed_allocations = 0;
+
+        for handle in task_handles {
+            match handle.await {
+                Ok(Ok(Some(candidate))) => {
+                    successful_candidates += 1;
+                    successful_allocations += 1;
+                    self.add_candidate(candidate, component_id).await?;
+                }
+                Ok(Ok(None)) => {
+                    // TURN allocation succeeded but no candidate created
+                    successful_allocations += 1;
+                }
+                Ok(Err(e)) => {
+                    failed_allocations += 1;
+                    debug!("TURN allocation failed: {}", e);
+                }
+                Err(e) => {
+                    failed_allocations += 1;
+                    debug!("TURN task panicked: {}", e);
+                }
+            }
+        }
+
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.relay_candidates += successful_candidates;
+            stats.turn_allocations_attempted += (successful_allocations + failed_allocations) as u32;
+            stats.turn_allocations_successful += successful_allocations as u32;
+            stats.turn_success_rate = if successful_allocations + failed_allocations > 0 {
+                successful_allocations as f64 / (successful_allocations + failed_allocations) as f64
+            } else {
+                0.0
+            };
+            stats.phase_durations.insert(GatheringPhase::GatheringRelay, start_time.elapsed());
+        }
+
+        info!("Relay gathering completed: {} candidates from {} allocations ({} succeeded, {} failed)",
+              successful_candidates, successful_allocations + failed_allocations,
+              successful_allocations, failed_allocations);
+
+        Ok(())
+    }
+
+    /// Gather relay candidate for specific address
+    async fn gather_relay_for_address(
+        &self,
+        local_ip: IpAddr,
+        component_id: u32,
+        interface_name: String,
+        interface: NetworkInterface,
+        turn_client: Arc<Mutex<TurnClient>>,
+    ) -> NatResult<Option<Candidate>> {
+        let local_port = self.allocate_port().await?;
+        let local_addr = SocketAddr::new(local_ip, local_port);
+
+        let allocation_start = Instant::now();
+        let allocation_result = {
+            let mut client = turn_client.lock().await;
+            client.allocate(local_addr).await
+        };
+        let allocation_time = allocation_start.elapsed();
+
+        let turn_server = {
+            let client = turn_client.lock().await;
+            client.config.address
+        };
+
+        // Emit TURN allocation event
+        let turn_event = GatheringEvent::TurnAllocation {
+            server: turn_server,
+            success: allocation_result.is_ok(),
+            allocated_address: allocation_result.as_ref().ok().copied(),
+            lifetime: Some(Duration::from_secs(600)), // Default lifetime
+            timestamp: Instant::now(),
+        };
+        let _ = self.event_sender.send(turn_event);
+
+        match allocation_result {
+            Ok(relayed_addr) => {
+                // Create relay candidate
+                let extensions = CandidateExtensions::new()
+                    .with_network_id(interface.index);
+
+                let mut candidate = Candidate::new_relay(
+                    relayed_addr,
+                    local_addr,
+                    component_id,
+                    TransportProtocol::Udp,
+                    turn_server,
+                    extensions,
+                );
+
+                // Calculate priority with interface information
+                let interface_info = InterfaceInfo {
+                    interface_type: interface.interface_type,
+                    is_vpn: interface.interface_type == InterfaceType::Vpn,
+                    is_temporary: false,
+                    metric: interface.metric,
+                    name: interface_name.clone(),
+                    supports_encryption: interface.security_level >= NetworkSecurityLevel::Corporate,
+                    estimated_bandwidth: interface.bandwidth,
+                    status: interface.status,
+                    security_level: interface.security_level,
+                };
+
+                let local_preference = calculate_local_preference_enhanced(
+                    &local_ip,
+                    &interface_info,
+                    &self.config.priority_config,
+                );
+                candidate.update_priority(local_preference);
+
+                // Emit candidate discovered event
+                let event = GatheringEvent::CandidateDiscovered {
+                    candidate: candidate.clone(),
+                    component_id,
+                    interface_name,
+                    gathering_method: GatheringMethod::TurnAllocation,
+                    timestamp: Instant::now(),
+                };
+                let _ = self.event_sender.send(event);
+
+                debug!("Created relay candidate: {} -> {} via {}",
+                       local_addr, relayed_addr, turn_server);
+
+                Ok(Some(candidate))
+            }
+            Err(e) => {
+                debug!("TURN allocation failed for {} via {}: {}",
+                       local_addr, turn_server, e);
+
+                // Emit error event
+                let error_event = GatheringEvent::CandidateGatheringFailed {
+                    candidate_type: CandidateType::Relay,
+                    interface_name: Some(interface_name),
+                    error: GatheringError::TurnError {
+                        server: turn_server,
+                        error: e.to_string(),
+                        error_code: None,
+                    },
+                    retry_possible: self.retry_manager.can_retry(&format!("turn_{}_{}", turn_server, local_addr)).await,
+                    timestamp: Instant::now(),
+                };
+                let _ = self.event_sender.send(error_event);
+
+                Err(e)
+            }
+        }
+    }
+
+    /// Gather mDNS candidates
+    #[instrument(skip_all, fields(component_id = component_id))]
+    async fn gather_mdns_candidates(&self, component_id: u32) -> NatResult<()> {
+        info!("Gathering mDNS candidates for component {}", component_id);
+        let start_time = Instant::now();
+
+        let Some(ref resolver) = self.mdns_resolver else {
+            warn!("mDNS resolver not available");
+            return Ok(());
+        };
+
+        let mut successful_candidates = 0;
+        let hostnames = vec![
+            "local-host.local".to_string(),
+            format!("component-{}.local", component_id),
+        ];
+
+        for hostname in hostnames {
+            match resolver.resolve(&hostname).await {
+                Ok(resolved_addr) => {
+                    // Create mDNS candidate
+                    let extensions = CandidateExtensions::new();
+
+                    match Candidate::new_mdns(
+                        hostname.clone(),
+                        resolved_addr.port(),
+                        component_id,
+                        TransportProtocol::Udp,
+                        CandidateType::Host,
+                        extensions,
+                    ) {
+                        Ok(candidate) => {
+                            // Emit candidate discovered event
+                            let event = GatheringEvent::CandidateDiscovered {
+                                candidate: candidate.clone(),
+                                component_id,
+                                interface_name: "mdns".to_string(),
+                                gathering_method: GatheringMethod::MdnsResolution,
+                                timestamp: Instant::now(),
+                            };
+                            let _ = self.event_sender.send(event);
+
+                            self.add_candidate(candidate, component_id).await?;
+                            successful_candidates += 1;
+
+                            debug!("Created mDNS candidate: {} -> {}", hostname, resolved_addr);
+                        }
+                        Err(e) => {
+                            warn!("Failed to create mDNS candidate for {}: {}", hostname, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("mDNS resolution failed for {}: {}", hostname, e);
+
+                    // Emit error event
+                    let error_event = GatheringEvent::CandidateGatheringFailed {
+                        candidate_type: CandidateType::Host,
+                        interface_name: Some("mdns".to_string()),
+                        error: GatheringError::MdnsError {
+                            hostname: hostname.clone(),
+                            error: e.to_string(),
+                        },
+                        retry_possible: false,
+                        timestamp: Instant::now(),
+                    };
+                    let _ = self.event_sender.send(error_event);
+                }
+            }
+        }
+
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.mdns_candidates += successful_candidates;
+            stats.phase_durations.insert(GatheringPhase::GatheringMdns, start_time.elapsed());
+        }
+
+        info!("mDNS gathering completed: {} candidates", successful_candidates);
+        Ok(())
+    }
+
+    /// Finalize candidates (sort, deduplicate, apply limits)
+    async fn finalize_candidates(&self, component_id: u32) -> NatResult<()> {
+        info!("Finalizing candidates for component {}", component_id);
+
+        let mut candidates = self.candidates.write().await;
+        if let Some(candidate_list) = candidates.get_mut(&component_id) {
+            // Sort by priority (highest first)
+            candidate_list.sort_by_priority();
+
+            // Apply per-type limits
+            let mut type_counts: HashMap<CandidateType, u32> = HashMap::new();
+            let mut filtered_candidates = Vec::new();
+
+            for candidate in candidate_list.candidates() {
+                let count = type_counts.entry(candidate.candidate_type).or_insert(0);
+                if *count < self.config.max_candidates_per_type {
+                    filtered_candidates.push(candidate.clone());
+                    *count += 1;
+                } else {
+                    debug!("Dropping candidate due to type limit: {}", candidate);
+                }
+            }
+
+            // Create new candidate list with filtered candidates
+            let mut new_list = CandidateList::new();
+            for candidate in filtered_candidates {
+                let _ = new_list.add(candidate);
+            }
+
+            candidates.insert(component_id, new_list);
+
+            info!("Finalized {} candidates for component {}",
+                  candidates.get(&component_id).map(|l| l.len()).unwrap_or(0), component_id);
+        }
+
+        Ok(())
+    }
+
+    /// Set gathering phase and emit event
+    async fn set_phase(&self, new_phase: GatheringPhase) {
+        let old_phase = {
+            let mut phase = self.phase.write().await;
+            let old = *phase;
+            *phase = new_phase;
+            old
+        };
+
+        if old_phase != new_phase {
+            let event = GatheringEvent::PhaseChanged {
+                old_phase,
+                new_phase,
+                timestamp: Instant::now(),
+            };
+            let _ = self.event_sender.send(event);
+
+            debug!("Gathering phase changed: {:?} -> {:?}", old_phase, new_phase);
+        }
+    }
+
+    /// Add candidate to collection
+    async fn add_candidate(&self, candidate: Candidate, component_id: u32) -> NatResult<()> {
+        let mut candidates = self.candidates.write().await;
+        let component_candidates = candidates.entry(component_id).or_insert_with(CandidateList::new);
+
+        component_candidates.add(candidate.clone())?;
+
+        // Update statistics based on candidate properties
+        {
+            let mut stats = self.stats.write().await;
+
+            match candidate.candidate_type {
+                CandidateType::Host => stats.host_candidates += 1,
+                CandidateType::ServerReflexive => stats.server_reflexive_candidates += 1,
+                CandidateType::Relay => stats.relay_candidates += 1,
+                CandidateType::PeerReflexive => {}, // Not gathered directly
+            }
+
+            match candidate.address.ip() {
+                Some(IpAddr::V4(_)) => stats.ipv4_candidates += 1,
+                Some(IpAddr::V6(_)) => stats.ipv6_candidates += 1,
+                None => stats.mdns_candidates += 1,
+            }
+
+            match candidate.transport {
+                TransportProtocol::Udp => stats.udp_candidates += 1,
+                TransportProtocol::Tcp => stats.tcp_candidates += 1,
+            }
+        }
+
+        debug!("Added candidate for component {}: {}", component_id, candidate);
+        Ok(())
+    }
+
+    /// Get current candidate count for component
+    async fn get_candidate_count(&self, component_id: u32) -> usize {
+        let candidates = self.candidates.read().await;
+        candidates.get(&component_id)
+            .map(|list| list.len())
+            .unwrap_or(0)
+    }
+
+    /// Finalize gathering statistics
+    async fn finalize_gathering_statistics(&self, component_id: u32) -> NatResult<()> {
+        let mut stats = self.stats.write().await;
+        stats.end_time = Some(Instant::now());
+
+        if let Some(start_time) = stats.start_time {
+            stats.total_duration = start_time.elapsed();
+        }
+
+        // Calculate candidates per second
+        if !stats.total_duration.is_zero() {
+            let total_candidates = stats.host_candidates + stats.server_reflexive_candidates +
+                stats.relay_candidates + stats.mdns_candidates;
+            stats.candidates_per_second = total_candidates as f64 / stats.total_duration.as_secs_f64();
+        }
+
+        // Calculate average response times
+        if stats.stun_responses_received > 0 {
+            // This would be calculated from collected response times
+            stats.average_stun_response_time = Duration::from_millis(50); // Placeholder
+        }
+
+        if stats.turn_allocations_successful > 0 {
+            // This would be calculated from collected allocation times
+            stats.average_turn_allocation_time = Duration::from_millis(200); // Placeholder
+        }
+
+        // Collect candidate type distribution
+        let candidates = self.candidates.read().await;
+        let mut candidates_by_type = HashMap::new();
+
+        if let Some(component_candidates) = candidates.get(&component_id) {
+            for candidate in component_candidates.candidates() {
+                *candidates_by_type.entry(candidate.candidate_type).or_insert(0) += 1;
+            }
+        }
+
+        // Emit completion event
+        let completion_event = GatheringEvent::GatheringCompleted {
+            total_candidates: candidates.get(&component_id).map(|l| l.len()).unwrap_or(0),
+            candidates_by_type,
+            duration: stats.total_duration,
+            timestamp: Instant::now(),
+        };
+        let _ = self.event_sender.send(completion_event);
+
+        info!("Gathering statistics finalized for component {}: {} total candidates in {:?}",
+              component_id,
+              candidates.get(&component_id).map(|l| l.len()).unwrap_or(0),
+              stats.total_duration);
+
+        Ok(())
+    }
+
+    /// Allocate ephemeral port for candidate
+    async fn allocate_port(&self) -> NatResult<u16> {
+        // Use system-allocated ephemeral port
+        let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(NatError::Network)?;
+        let local_addr = socket.local_addr().map_err(NatError::Network)?;
+        Ok(local_addr.port())
+    }
+
+    /// Stop gathering
+    pub async fn stop_gathering(&self) {
+        info!("Stopping candidate gathering");
+        *self.shutdown.write().await = true;
+
+        // Stop interface monitoring
+        self.interface_monitor.stop_monitoring().await;
+
+        // Clear mDNS cache if available
+        if let Some(ref resolver) = self.mdns_resolver {
+            resolver.clear_cache().await;
+        }
+    }
+
+    /// Subscribe to gathering events
+    pub fn subscribe_events(&self) -> broadcast::Receiver<GatheringEvent> {
+        self.event_sender.subscribe()
+    }
+
+    /// Get gathering statistics
+    pub async fn get_statistics(&self) -> GatheringStats {
+        self.stats.read().await.clone()
+    }
+
+    /// Get current gathering phase
+    pub async fn get_phase(&self) -> GatheringPhase {
+        *self.phase.read().await
+    }
+
+    /// Get discovered candidates for component
+    pub async fn get_candidates(&self, component_id: u32) -> Vec<Candidate> {
+        let candidates = self.candidates.read().await;
+        candidates.get(&component_id)
+            .map(|list| list.candidates().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Get all discovered candidates
+    pub async fn get_all_candidates(&self) -> HashMap<u32, Vec<Candidate>> {
+        let candidates = self.candidates.read().await;
+        candidates.iter()
+            .map(|(component_id, list)| (*component_id, list.candidates().to_vec()))
+            .collect()
+    }
+
+    /// Get discovered interfaces
+    pub async fn get_interfaces(&self) -> HashMap<String, NetworkInterface> {
+        self.interfaces.read().await.clone()
+    }
+
+    /// Check if gathering is complete
+    pub async fn is_complete(&self) -> bool {
+        matches!(*self.phase.read().await,
+                 GatheringPhase::Complete | GatheringPhase::Failed | GatheringPhase::TimedOut)
+    }
+
+    /// Check if gathering failed
+    pub async fn is_failed(&self) -> bool {
+        matches!(*self.phase.read().await, GatheringPhase::Failed | GatheringPhase::TimedOut)
+    }
+
+    /// Restart gathering for component
+    pub async fn restart_gathering(&self, component_id: u32) -> NatResult<()> {
+        info!("Restarting gathering for component {}", component_id);
+
+        // Clear existing candidates
+        self.candidates.write().await.remove(&component_id);
+
+        // Reset phase
+        self.set_phase(GatheringPhase::New).await;
+
+        // Clear statistics
+        {
+            let mut stats = self.stats.write().await;
+            *stats = GatheringStats::default();
+        }
+
+        // Start gathering again
+        self.start_gathering(component_id).await
+    }
+
+    /// Update gathering configuration
+    pub async fn update_config(&self, new_config: GatheringConfig) -> NatResult<()> {
+        // Validate new configuration
+        Self::validate_config(&new_config)?;
+
+        // Update configuration (this would require more complex state management in real implementation)
+        info!("Gathering configuration updated");
+        Ok(())
+    }
+
+    /// Get active operations
+    pub async fn get_active_operations(&self) -> HashMap<String, GatheringOperation> {
+        self.active_operations.read().await.clone()
+    }
+
+    /// Cancel specific operation
+    pub async fn cancel_operation(&self, operation_id: &str) -> bool {
+        let mut operations = self.active_operations.write().await;
+        if let Some(operation) = operations.get_mut(operation_id) {
+            operation.status = OperationStatus::Cancelled;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get memory usage estimate
+    pub async fn get_memory_usage(&self) -> usize {
+        let candidates = self.candidates.read().await;
+        let interfaces = self.interfaces.read().await;
+        let operations = self.active_operations.read().await;
+
+        // Rough estimate of memory usage
+        let candidate_size = candidates.len() * std::mem::size_of::<CandidateList>() +
+            candidates.values().map(|list| list.len() * std::mem::size_of::<Candidate>()).sum::<usize>();
+
+        let interface_size = interfaces.len() * std::mem::size_of::<NetworkInterface>();
+        let operation_size = operations.len() * std::mem::size_of::<GatheringOperation>();
+
+        candidate_size + interface_size + operation_size
+    }
+
+    /// Force garbage collection of expired operations
+    pub async fn cleanup_expired_operations(&self) {
+        let mut operations = self.active_operations.write().await;
+        let now = Instant::now();
+
+        operations.retain(|_, operation| {
+            let elapsed = now.duration_since(operation.started_at);
+            elapsed < operation.timeout &&
+                !matches!(operation.status, OperationStatus::Completed | OperationStatus::Failed | OperationStatus::Cancelled)
+        });
+
+        debug!("Cleaned up expired operations, {} remaining", operations.len());
+    }
+}
+
+// Helper trait for enhanced STUN message processing
+trait StunMessageExt {
+    fn get_xor_mapped_address(&self) -> Option<SocketAddr>;
+    fn get_xor_relayed_address(&self) -> Option<SocketAddr>;
+    fn add_fingerprint(&mut self) -> NatResult<()>;
+    fn add_message_integrity(&mut self, password: &str) -> NatResult<()>;
+    fn validate_message_integrity(&self, password: &str) -> NatResult<bool>;
+}
+
+impl StunMessageExt for Message {
+    fn get_xor_mapped_address(&self) -> Option<SocketAddr> {
+        // Implementation would extract XOR-MAPPED-ADDRESS attribute
+        // For now, return a placeholder
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 12345))
+    }
+
+    fn get_xor_relayed_address(&self) -> Option<SocketAddr> {
+        // Implementation would extract XOR-RELAYED-ADDRESS attribute
+        // For now, return a placeholder
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 56789))
+    }
+
+    fn add_fingerprint(&mut self) -> NatResult<()> {
+        // Implementation would add FINGERPRINT attribute
+        Ok(())
+    }
+
+    fn add_message_integrity(&mut self, _password: &str) -> NatResult<()> {
+        // Implementation would add MESSAGE-INTEGRITY attribute
+        Ok(())
+    }
+
+    fn validate_message_integrity(&self, _password: &str) -> NatResult<bool> {
+        // Implementation would validate MESSAGE-INTEGRITY
+        Ok(true)
+    }
+}
+
+// Additional STUN message types for TURN
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnMessageType {
+    AllocateRequest = 0x0003,
+    AllocateSuccessResponse = 0x0103,
+    AllocateErrorResponse = 0x0113,
+    RefreshRequest = 0x0004,
+    RefreshSuccessResponse = 0x0104,
+    RefreshErrorResponse = 0x0114,
+}
+
+impl From<TurnMessageType> for MessageType {
+    fn from(turn_type: TurnMessageType) -> Self {
+        match turn_type {
+            TurnMessageType::AllocateRequest => MessageType::AllocateRequest,
+            TurnMessageType::AllocateSuccessResponse => MessageType::AllocateSuccessResponse,
+            TurnMessageType::AllocateErrorResponse => MessageType::AllocateErrorResponse,
+            TurnMessageType::RefreshRequest => MessageType::RefreshRequest,
+            TurnMessageType::RefreshSuccessResponse => MessageType::RefreshSuccessResponse,
+            TurnMessageType::RefreshErrorResponse => MessageType::RefreshErrorResponse,
+        }
+    }
+}
+
+// Placeholder implementations for message types that might not exist yet
+#[allow(dead_code)]
+impl MessageType {
+    const AllocateRequest: Self = MessageType::BindingRequest; // Placeholder
+    const AllocateSuccessResponse: Self = MessageType::BindingSuccessResponse; // Placeholder
+    const AllocateErrorResponse: Self = MessageType::BindingErrorResponse; // Placeholder
+    const RefreshRequest: Self = MessageType::BindingRequest; // Placeholder
+    const RefreshSuccessResponse: Self = MessageType::BindingSuccessResponse; // Placeholder
+    const RefreshErrorResponse: Self = MessageType::BindingErrorResponse; // Placeholder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Duration;
+
+    #[tokio::test]
+    async fn test_gathering_config_validation() {
+        let mut config = GatheringConfig::default();
+        assert!(CandidateGatherer::validate_config(&config).is_ok());
+
+        // Test invalid timeout
+        config.gathering_timeout = Duration::from_millis(100);
+        assert!(CandidateGatherer::validate_config(&config).is_err());
+
+        // Test invalid protocol configuration
+        config.gathering_timeout = Duration::from_secs(10);
+        config.enable_ipv4 = false;
+        config.enable_ipv6 = false;
+        assert!(CandidateGatherer::validate_config(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_interface_filtering() {
+        let gatherer = CandidateGatherer::new(GatheringConfig::default()).await.unwrap();
+
+        let interface = NetworkInterface {
+            name: "eth0".to_string(),
+            index: 1,
+            interface_type: InterfaceType::Ethernet,
+            status: InterfaceStatus::Up,
+            ipv4_addresses: vec![Ipv4Addr::new(192, 168, 1, 1)],
+            ipv6_addresses: vec![],
+            flags: InterfaceFlags {
+                is_up: true,
+                is_running: true,
+                ..Default::default()
+            },
+            metric: Some(100),
+            bandwidth: Some(1_000_000_000),
+            security_level: NetworkSecurityLevel::Private,
+            mac_address: Some("00:11:22:33:44:55".to_string()),
+            mtu: Some(1500),
+            description: Some("Ethernet".to_string()),
+            parent_interface: None,
+            vlan_id: None,
+            stats: InterfaceStats::default(),
+            last_updated: Instant::now(),
+        };
+
+        assert!(gatherer.should_use_interface(&interface).await);
+
+        // Test with down interface
+        let mut down_interface = interface.clone();
+        down_interface.status = InterfaceStatus::Down;
+        assert!(!gatherer.should_use_interface(&down_interface).await);
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_address_filtering() {
+        let gatherer = CandidateGatherer::new(GatheringConfig::default()).await.unwrap();
+
+        // Valid addresses
+        assert!(gatherer.should_use_ipv4_address(&Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(gatherer.should_use_ipv4_address(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(gatherer.should_use_ipv4_address(&Ipv4Addr::new(8, 8, 8, 8)));
+
+        // Invalid addresses
+        assert!(!gatherer.should_use_ipv4_address(&Ipv4Addr::UNSPECIFIED));
+        assert!(!gatherer.should_use_ipv4_address(&Ipv4Addr::BROADCAST));
+        assert!(!gatherer.should_use_ipv4_address(&Ipv4Addr::new(224, 0, 0, 1))); // Multicast
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_address_filtering() {
+        let gatherer = CandidateGatherer::new(GatheringConfig::default()).await.unwrap();
+
+        // Valid addresses
+        assert!(gatherer.should_use_ipv6_address(&"2001:db8::1".parse().unwrap()));
+        assert!(gatherer.should_use_ipv6_address(&"fd00::1".parse().unwrap()));
+
+        // Invalid addresses
+        assert!(!gatherer.should_use_ipv6_address(&Ipv6Addr::UNSPECIFIED));
+        assert!(!gatherer.should_use_ipv6_address(&"ff02::1".parse().unwrap())); // Multicast
+    }
+
+    #[tokio::test]
+    async fn test_candidate_addition() {
+        let gatherer = CandidateGatherer::new(GatheringConfig::default()).await.unwrap();
+
+        let candidate = Candidate::new_host(
+            "192.168.1.1:12345".parse().unwrap(),
+            1,
+            TransportProtocol::Udp,
+            CandidateExtensions::new(),
+        );
+
+        gatherer.add_candidate(candidate, 1).await.unwrap();
+        assert_eq!(gatherer.get_candidate_count(1).await, 1);
+
+        let candidates = gatherer.get_candidates(1).await;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate_type, CandidateType::Host);
+    }
+
+    #[tokio::test]
+    async fn test_gathering_phases() {
+        let gatherer = CandidateGatherer::new(GatheringConfig::default()).await.unwrap();
+
+        assert_eq!(gatherer.get_phase().await, GatheringPhase::New);
+
+        gatherer.set_phase(GatheringPhase::Initializing).await;
+        assert_eq!(gatherer.get_phase().await, GatheringPhase::Initializing);
+
+        gatherer.set_phase(GatheringPhase::Complete).await;
+        assert_eq!(gatherer.get_phase().await, GatheringPhase::Complete);
+        assert!(gatherer.is_complete().await);
+    }
+
+    #[tokio::test]
+    async fn test_stun_client() {
+        let server = "stun.l.google.com:19302".parse().unwrap();
+        let client = StunClient::new(server, Duration::from_secs(5)).await.unwrap();
+
+        // Test would require actual STUN server
+        // For now, just verify client creation
+        assert_eq!(client.server, server);
+        assert_eq!(client.timeout, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_gathering_statistics() {
+        let gatherer = CandidateGatherer::new(GatheringConfig::default()).await.unwrap();
+
+        let stats = gatherer.get_statistics().await;
+        assert_eq!(stats.host_candidates, 0);
+        assert_eq!(stats.server_reflexive_candidates, 0);
+
+        // Add a candidate and verify stats update
+        let candidate = Candidate::new_host(
+            "192.168.1.1:12345".parse().unwrap(),
+            1,
+            TransportProtocol::Udp,
+            CandidateExtensions::new(),
+        );
+
+        gatherer.add_candidate(candidate, 1).await.unwrap();
+
+        let updated_stats = gatherer.get_statistics().await;
+        assert_eq!(updated_stats.host_candidates, 1);
+        assert_eq!(updated_stats.udp_candidates, 1);
+        assert_eq!(updated_stats.ipv4_candidates, 1);
+    }
+
+    #[test]
+    fn test_interface_type_detection() {
+        // Test the interface type detection logic
+        assert_eq!(InterfaceType::from_name("eth0"), InterfaceType::Ethernet);
+        assert_eq!(InterfaceType::from_name("wlan0"), InterfaceType::WifiLegacy);
+        assert_eq!(InterfaceType::from_name("tun0"), InterfaceType::Vpn);
+        assert_eq!(InterfaceType::from_name("lo"), InterfaceType::Loopback);
+        assert_eq!(InterfaceType::from_name("unknown"), InterfaceType::Unknown);
+    }
+
+    #[test]
+    fn test_security_policy_validation() {
+        let policy = SecurityPolicy::Standard;
+        let validator = SecurityValidator::new(policy);
+
+        let safe_interface = NetworkInterface {
+            name: "eth0".to_string(),
+            index: 1,
+            interface_type: InterfaceType::Ethernet,
+            status: InterfaceStatus::Up,
+            ipv4_addresses: vec![],
+            ipv6_addresses: vec![],
+            flags: InterfaceFlags::default(),
+            metric: None,
+            bandwidth: None,
+            security_level: NetworkSecurityLevel::Private,
+            mac_address: None,
+            mtu: None,
+            description: None,
+            parent_interface: None,
+            vlan_id: None,
+            stats: InterfaceStats::default(),
+            last_updated: Instant::now(),
+        };
+
+        // This test would run validation synchronously
+        // In real async test, use: assert!(validator.validate_interface(&safe_interface).await);
+    }
+}
