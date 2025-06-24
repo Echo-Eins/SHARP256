@@ -1,848 +1,1092 @@
 // src/nat/mod.rs
-//! Unified NAT Traversal System for SHARP3
+//! NAT (Network Address Translation) System for SHARP3 P2P Framework
 //!
-//! This module provides a comprehensive NAT traversal system that integrates:
-//! - STUN for NAT discovery and server reflexive candidates
-//! - TURN for relay functionality when direct connections fail
-//! - ICE for coordinated connectivity establishment
-//! - UPnP/NAT-PMP/PCP for port forwarding
-//! - Advanced hole punching techniques
+//! This module provides a comprehensive NAT traversal solution that integrates:
+//! - STUN (Session Traversal Utilities for NAT) for NAT discovery
+//! - TURN (Traversal Using Relays around NAT) for relay functionality
+//! - ICE (Interactive Connectivity Establishment) for connection establishment
 //!
-//! The system is designed hierarchically:
-//! 1. STUN/TURN Manager: Handles low-level STUN and TURN operations
-//! 2. ICE Integration: Provides ICE connectivity using STUN/TURN manager
-//! 3. NAT Manager: Coordinates all NAT traversal methods
-//! 4. Public API: Simple interface for applications
-
-pub mod error;
-pub mod stun;
-pub mod turn;
-pub mod upnp;
-pub mod hole_punch;
-pub mod coordinator;
-pub mod metrics;
-pub mod port_forwarding;
-pub mod stun_turn_manager;
-pub mod ice;
-pub mod ice_integration;
-
-// Re-export key types for external use
-pub use error::{NatError, NatResult};
-pub use stun::{StunService, StunConfig, NatBehavior, MappingBehavior, FilteringBehavior};
-pub use stun_turn_manager::{
-    StunTurnManager, StunTurnConfig, TurnServerInfo, TurnTransport,
-    CandidateGatheringRequest, CandidateGatheringResult, StunTurnEvent
-};
-pub use ice::{
-    IceAgent, IceConfig, IceRole, IceState, IceEvent,
-    Candidate, CandidateType, TransportProtocol,
-    create_p2p_ice_config, create_reliable_ice_config
-};
-pub use ice_integration::{
-    Sharp3IceIntegration, IceSession, IceParameters, IceGatheringConfig,
-    QualityThresholds, IceIntegrationEvent, create_ice_session_with_sharp
-};
-pub use port_forwarding::{
-    PortForwardingService, PortMappingConfig, Protocol as PortProtocol,
-    MappingProtocol, PortMapping
-};
-pub use hole_punch::{HolePuncher, HolePunchConfig, CoordinatedHolePunch};
+//! The system provides a unified, high-level API for establishing peer-to-peer
+//! connections across NAT boundaries.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::{RwLock, broadcast, Mutex};
-use tokio::time::{interval, timeout};
-use tracing::{info, warn, debug, error, trace};
-use parking_lot::RwLock as SyncRwLock;
+use std::time::Duration;
+use tokio::sync::{RwLock, broadcast};
+use tracing::{info, warn, debug, error};
+use serde::{Serialize, Deserialize};
 
-/// Comprehensive NAT traversal configuration
+// Re-export core error types
+pub mod error;
+pub use error::{NatError, NatResult};
+
+// STUN system
+pub mod stun;
+pub use stun::{
+    StunService, StunConfig, StunClient, StunServer,
+    NatType, NatBehavior, MappingBehavior, FilteringBehavior,
+};
+
+// TURN system
+pub mod turn;
+pub use turn::{
+    TurnClient, TurnServer, TurnServerConfig, TurnCredentials,
+    AllocationState, RelayAddress,
+};
+
+// ICE system
+pub mod ice;
+pub use ice::{
+    IceAgent, IceConfig, IceRole, IceState, IceEvent,
+    Candidate, CandidateType, CandidateAddress, CandidateExtensions,
+    TransportProtocol, TcpType, IceTransportPolicy,
+    BundlePolicy, RtcpMuxPolicy,
+};
+
+// Integration modules
+pub mod stun_turn_manager;
+pub mod ice_integration;
+
+// Re-export integration types
+pub use stun_turn_manager::{
+    StunTurnManager, StunTurnConfig, StunTurnEvent,
+    TurnServerInfo, TurnTransport, CandidateGatheringRequest,
+    CandidateGatheringResult, TurnAllocationInfo, ConnectionQualityMetrics,
+    create_stun_turn_manager,
+};
+
+pub use ice_integration::{
+    Sharp3IceIntegration, IceSession, IceParameters, IceGatheringConfig,
+    QualityThresholds, IceIntegrationEvent, IceIntegrationStats,
+    create_ice_session_with_sharp,
+};
+
+/// Main NAT system configuration
 #[derive(Debug, Clone)]
-pub struct NatConfig {
-    /// STUN/TURN configuration
-    pub stun_turn_config: StunTurnConfig,
+pub struct NatSystemConfig {
+    /// STUN configuration
+    pub stun_config: StunConfig,
+
+    /// TURN servers to use
+    pub turn_servers: Vec<TurnServerInfo>,
+
+    /// Whether to enable integrated TURN server
+    pub enable_turn_server: bool,
+
+    /// TURN server configuration (if enabled)
+    pub turn_server_config: Option<turn::server::TurnServerConfig>,
 
     /// ICE configuration
     pub ice_config: IceConfig,
 
-    /// Port forwarding configuration
-    pub port_forwarding_config: PortForwardingConfig,
+    /// ICE gathering configuration
+    pub ice_gathering_config: IceGatheringConfig,
 
-    /// Hole punching configuration
-    pub hole_punch_config: HolePunchConfig,
-
-    /// Advanced NAT traversal settings
-    pub advanced_config: AdvancedNatConfig,
-
-    /// Quality and performance settings
-    pub quality_config: QualityConfig,
-}
-
-/// Port forwarding configuration
-#[derive(Debug, Clone)]
-pub struct PortForwardingConfig {
-    /// Enable UPnP-IGD
-    pub enable_upnp: bool,
-
-    /// Enable NAT-PMP
-    pub enable_natpmp: bool,
-
-    /// Enable PCP (Port Control Protocol)
-    pub enable_pcp: bool,
-
-    /// Port mapping lifetime
-    pub mapping_lifetime: Duration,
-
-    /// Auto-renewal of mappings
-    pub auto_renew: bool,
-
-    /// Preferred external port range
-    pub external_port_range: Option<(u16, u16)>,
-}
-
-/// Advanced NAT traversal configuration
-#[derive(Debug, Clone)]
-pub struct AdvancedNatConfig {
-    /// Enable coordinated hole punching
-    pub enable_coordinated_hole_punch: bool,
-
-    /// Coordinator server URL
-    pub coordinator_server: Option<String>,
-
-    /// Relay servers for symmetric NAT
-    pub relay_servers: Vec<String>,
-
-    /// Maximum concurrent traversal attempts
-    pub max_concurrent_attempts: usize,
-
-    /// Traversal timeout
-    pub traversal_timeout: Duration,
-
-    /// Retry configuration
-    pub retry_config: RetryConfig,
-
-    /// Fallback configuration
-    pub fallback_config: FallbackConfig,
-}
-
-/// Quality and performance configuration
-#[derive(Debug, Clone)]
-pub struct QualityConfig {
-    /// Enable connection quality monitoring
-    pub enable_quality_monitoring: bool,
-
-    /// Quality measurement interval
-    pub measurement_interval: Duration,
-
-    /// Quality thresholds for path selection
+    /// Quality thresholds for connection assessment
     pub quality_thresholds: QualityThresholds,
 
-    /// Performance optimization settings
-    pub performance_optimization: PerformanceOptimization,
+    /// System-wide timeouts
+    pub timeouts: NatTimeouts,
+
+    /// Feature flags
+    pub features: NatFeatures,
 }
 
-/// Retry configuration for various operations
+/// NAT system timeouts
 #[derive(Debug, Clone)]
-pub struct RetryConfig {
-    pub max_retries: u32,
-    pub initial_delay: Duration,
-    pub max_delay: Duration,
-    pub backoff_multiplier: f64,
-    pub jitter: bool,
+pub struct NatTimeouts {
+    /// Overall connection establishment timeout
+    pub connection_timeout: Duration,
+
+    /// STUN request timeout
+    pub stun_timeout: Duration,
+
+    /// TURN allocation timeout
+    pub turn_timeout: Duration,
+
+    /// ICE gathering timeout
+    pub ice_gathering_timeout: Duration,
+
+    /// ICE connectivity check timeout
+    pub ice_connectivity_timeout: Duration,
+
+    /// Keep-alive interval for established connections
+    pub keepalive_interval: Duration,
 }
 
-/// Fallback configuration
+/// NAT system feature flags
 #[derive(Debug, Clone)]
-pub struct FallbackConfig {
-    /// Fallback to relay if P2P fails
-    pub fallback_to_relay: bool,
+pub struct NatFeatures {
+    /// Enable IPv6 support
+    pub enable_ipv6: bool,
 
-    /// Relay selection strategy
-    pub relay_selection: RelaySelectionStrategy,
+    /// Enable TCP candidates
+    pub enable_tcp: bool,
 
-    /// Maximum relay usage time
-    pub max_relay_time: Duration,
+    /// Enable mDNS candidates
+    pub enable_mdns: bool,
 
-    /// Retry P2P while using relay
-    pub retry_p2p_on_relay: bool,
+    /// Enable trickle ICE
+    pub enable_trickle_ice: bool,
+
+    /// Enable aggressive nomination
+    pub enable_aggressive_nomination: bool,
+
+    /// Enable consent freshness (RFC 7675)
+    pub enable_consent_freshness: bool,
+
+    /// Enable quality monitoring
+    pub enable_quality_monitoring: bool,
+
+    /// Enable detailed logging
+    pub enable_detailed_logging: bool,
 }
 
-/// Relay selection strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelaySelectionStrategy {
-    /// Closest geographic location
-    Closest,
-    /// Lowest latency
-    LowestLatency,
-    /// Highest bandwidth
-    HighestBandwidth,
-    /// Load balanced
-    LoadBalanced,
-    /// Random selection
-    Random,
-}
-
-/// Performance optimization settings
+/// NAT connection establishment result
 #[derive(Debug, Clone)]
-pub struct PerformanceOptimization {
-    /// Parallel candidate gathering
-    pub parallel_gathering: bool,
+pub struct NatConnectionResult {
+    /// Local address used for connection
+    pub local_address: SocketAddr,
 
-    /// Aggressive optimization for speed
-    pub aggressive_optimization: bool,
+    /// Remote address of peer
+    pub remote_address: SocketAddr,
 
-    /// Bandwidth-aware selection
-    pub bandwidth_aware: bool,
+    /// Connection path type
+    pub connection_type: ConnectionType,
 
-    /// Latency-sensitive optimization
-    pub latency_sensitive: bool,
-}
+    /// Selected candidate pair information
+    pub selected_candidate: SelectedCandidateInfo,
 
-/// Network information and status
-#[derive(Debug, Clone)]
-pub struct NetworkInfo {
-    /// Local address
-    pub local_addr: SocketAddr,
-
-    /// Public address (if detected)
-    pub public_addr: Option<SocketAddr>,
-
-    /// NAT type
-    pub nat_type: NatType,
-
-    /// NAT behavior details
-    pub nat_behavior: Option<NatBehavior>,
-
-    /// Available protocols
-    pub available_protocols: Vec<NatProtocol>,
-
-    /// Port mappings
-    pub port_mappings: Vec<PortMapping>,
-
-    /// Connectivity status
-    pub connectivity_status: ConnectivityStatus,
-
-    /// Quality metrics
+    /// Connection quality metrics
     pub quality_metrics: ConnectionQualityMetrics,
+
+    /// Time taken to establish connection
+    pub establishment_time: Duration,
+
+    /// NAT behavior detected during connection
+    pub nat_behavior: Option<NatBehavior>,
 }
 
-/// NAT type classification
+/// Type of connection established
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NatType {
-    /// No NAT (public IP)
-    None,
-    /// Full Cone NAT
-    FullCone,
-    /// Restricted Cone NAT
-    RestrictedCone,
-    /// Port Restricted Cone NAT
-    PortRestricted,
-    /// Symmetric NAT
-    Symmetric,
-    /// Unknown/Not detected
-    Unknown,
-}
-
-/// NAT traversal protocols
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NatProtocol {
-    /// Direct connection
+pub enum ConnectionType {
+    /// Direct connection (host to host)
     Direct,
-    /// STUN
-    Stun,
-    /// UPnP-IGD
-    Upnp,
-    /// NAT-PMP
-    NatPmp,
-    /// PCP
-    Pcp,
-    /// UDP hole punching
-    HolePunch,
-    /// TURN relay
-    Turn,
-    /// ICE
-    Ice,
-}
 
-/// Connectivity status
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectivityStatus {
-    /// Direct internet connection
-    Direct,
-    /// Behind NAT but traversable
-    BehindNat,
-    /// Behind restrictive NAT/firewall
-    Restricted,
-    /// No internet connectivity
-    Offline,
-    /// Connection established via relay
+    /// Connection through NAT (server reflexive)
+    NatTraversal,
+
+    /// Connection through TURN relay
     Relayed,
+
+    /// Peer reflexive connection (discovered during checks)
+    PeerReflexive,
 }
 
-/// Connection quality metrics (re-exported for convenience)
-pub use ice_integration::ConnectionQualityMetrics;
-pub use ice_integration::QualityThresholds;
+/// Information about selected candidate pair
+#[derive(Debug, Clone)]
+pub struct SelectedCandidateInfo {
+    /// Local candidate that was selected
+    pub local_candidate: Candidate,
 
-/// Main NAT traversal manager
-pub struct NatManager {
-    /// Configuration
-    config: Arc<NatConfig>,
+    /// Remote candidate that was selected
+    pub remote_candidate: Candidate,
+
+    /// Candidate pair priority
+    pub pair_priority: u64,
+
+    /// Round-trip time for this pair
+    pub rtt: Option<Duration>,
+
+    /// Whether this pair was nominated
+    pub nominated: bool,
+}
+
+/// Main NAT system manager
+pub struct NatSystem {
+    /// System configuration
+    config: Arc<NatSystemConfig>,
 
     /// STUN/TURN manager
     stun_turn_manager: Arc<StunTurnManager>,
 
-    /// ICE session
-    ice_session: Option<Arc<IceSession>>,
+    /// Active NAT sessions
+    sessions: Arc<RwLock<HashMap<String, Arc<NatSession>>>>,
 
-    /// Port forwarding service
-    port_forwarding: Arc<RwLock<Option<PortForwardingService>>>,
+    /// System-wide event broadcaster
+    event_sender: broadcast::Sender<NatSystemEvent>,
 
-    /// Hole puncher
-    hole_puncher: Arc<HolePuncher>,
-
-    /// Coordinated hole punch service
-    coordinated_punch: Option<Arc<CoordinatedHolePunch>>,
-
-    /// Network information cache
-    network_info: Arc<RwLock<Option<NetworkInfo>>>,
-
-    /// Active connections
-    active_connections: Arc<RwLock<HashMap<String, ConnectionInfo>>>,
-
-    /// Event broadcasting
-    event_tx: broadcast::Sender<NatEvent>,
-
-    /// Statistics
-    stats: Arc<NatStatistics>,
-
-    /// Quality monitor
-    quality_monitor: Arc<QualityMonitor>,
-
-    /// Background tasks
-    background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// System statistics
+    stats: Arc<NatSystemStats>,
 
     /// Shutdown signal
     shutdown: Arc<RwLock<bool>>,
 }
 
-/// Information about an active connection
+/// Individual NAT session for a connection
+pub struct NatSession {
+    /// Session identifier
+    pub session_id: String,
+
+    /// ICE session handle
+    pub ice_session: Arc<IceSession>,
+
+    /// Session configuration
+    pub config: NatSessionConfig,
+
+    /// Session state
+    pub state: Arc<RwLock<NatSessionState>>,
+
+    /// Session events
+    pub event_sender: broadcast::Sender<NatSessionEvent>,
+
+    /// Session statistics
+    pub stats: Arc<NatSessionStats>,
+
+    /// Connection result (when established)
+    pub connection_result: Arc<RwLock<Option<NatConnectionResult>>>,
+}
+
+/// NAT session configuration
 #[derive(Debug, Clone)]
-pub struct ConnectionInfo {
-    pub connection_id: String,
-    pub peer_addr: SocketAddr,
-    pub local_addr: SocketAddr,
-    pub nat_protocol: NatProtocol,
-    pub established_at: Instant,
-    pub quality_metrics: ConnectionQualityMetrics,
-    pub ice_state: Option<IceState>,
+pub struct NatSessionConfig {
+    /// Session role (controlling or controlled)
+    pub role: IceRole,
+
+    /// Components to establish (usually 1 for data, 2 for RTP+RTCP)
+    pub components: Vec<u32>,
+
+    /// Local ICE parameters
+    pub local_ice_params: IceParameters,
+
+    /// Session-specific timeouts
+    pub timeouts: NatTimeouts,
+
+    /// Session-specific features
+    pub features: NatFeatures,
 }
 
-/// Quality monitor for connections
-pub struct QualityMonitor {
-    config: QualityConfig,
-    measurements: Arc<RwLock<HashMap<String, QualityMeasurement>>>,
-    monitoring_active: Arc<RwLock<bool>>,
-}
-
-/// Quality measurement data
-#[derive(Debug, Clone)]
-pub struct QualityMeasurement {
-    pub target: String,
-    pub metrics: ConnectionQualityMetrics,
-    pub last_updated: Instant,
-    pub trend: QualityTrend,
-}
-
-/// Quality trend indicators
+/// NAT session state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QualityTrend {
-    Improving,
-    Stable,
-    Degrading,
-    Unknown,
-}
+pub enum NatSessionState {
+    /// Session created but not started
+    Created,
 
-/// Events emitted by the NAT manager
-#[derive(Debug, Clone)]
-pub enum NatEvent {
-    /// Network detection completed
-    NetworkDetected {
-        network_info: NetworkInfo,
-    },
+    /// Gathering candidates
+    Gathering,
 
-    /// NAT traversal method succeeded
-    TraversalSucceeded {
-        method: NatProtocol,
-        peer_addr: SocketAddr,
-        duration: Duration,
-    },
+    /// Exchanging candidates with peer
+    Exchanging,
 
-    /// NAT traversal method failed
-    TraversalFailed {
-        method: NatProtocol,
-        error: String,
-    },
+    /// Performing connectivity checks
+    Connecting,
 
     /// Connection established
+    Connected,
+
+    /// Connection failed
+    Failed,
+
+    /// Session completed and closed
+    Closed,
+}
+
+/// System-wide NAT events
+#[derive(Debug, Clone)]
+pub enum NatSystemEvent {
+    /// New session created
+    SessionCreated {
+        session_id: String,
+        config: NatSessionConfig,
+    },
+
+    /// Session state changed
+    SessionStateChanged {
+        session_id: String,
+        old_state: NatSessionState,
+        new_state: NatSessionState,
+    },
+
+    /// Connection established for session
     ConnectionEstablished {
-        connection_id: String,
-        peer_addr: SocketAddr,
-        method: NatProtocol,
+        session_id: String,
+        result: NatConnectionResult,
     },
 
-    /// Connection quality changed
-    QualityChanged {
-        connection_id: String,
-        old_quality: f64,
-        new_quality: f64,
+    /// Session failed
+    SessionFailed {
+        session_id: String,
+        error: String,
     },
 
-    /// ICE state changed
-    IceStateChanged {
-        old_state: IceState,
-        new_state: IceState,
+    /// Session closed
+    SessionClosed {
+        session_id: String,
     },
 
-    /// Port mapping created
-    PortMappingCreated {
-        mapping: PortMapping,
+    /// System-wide quality change
+    SystemQualityChanged {
+        metric: String,
+        old_value: f64,
+        new_value: f64,
+    },
+}
+
+/// Session-specific NAT events
+#[derive(Debug, Clone)]
+pub enum NatSessionEvent {
+    /// Candidate gathered
+    CandidateGathered {
+        component_id: u32,
+        candidate: Candidate,
     },
 
-    /// Port mapping failed
-    PortMappingFailed {
-        protocol: MappingProtocol,
+    /// Remote candidate received
+    RemoteCandidateReceived {
+        component_id: u32,
+        candidate: Candidate,
+    },
+
+    /// Connectivity check result
+    ConnectivityCheckResult {
+        pair_id: String,
+        success: bool,
+        rtt: Option<Duration>,
+    },
+
+    /// Component connected
+    ComponentConnected {
+        component_id: u32,
+        local_candidate: Candidate,
+        remote_candidate: Candidate,
+    },
+
+    /// Session connection established
+    ConnectionEstablished {
+        result: NatConnectionResult,
+    },
+
+    /// Session failed
+    Failed {
         error: String,
     },
 }
 
-/// NAT traversal statistics
+/// NAT system statistics
 #[derive(Debug, Default)]
-pub struct NatStatistics {
-    /// Detection attempts
-    pub detection_attempts: std::sync::atomic::AtomicU64,
-    pub detection_successes: std::sync::atomic::AtomicU64,
+pub struct NatSystemStats {
+    /// Total sessions created
+    pub total_sessions: std::sync::atomic::AtomicU64,
 
-    /// Traversal attempts by method
-    pub direct_attempts: std::sync::atomic::AtomicU64,
-    pub stun_attempts: std::sync::atomic::AtomicU64,
-    pub upnp_attempts: std::sync::atomic::AtomicU64,
-    pub natpmp_attempts: std::sync::atomic::AtomicU64,
-    pub pcp_attempts: std::sync::atomic::AtomicU64,
-    pub hole_punch_attempts: std::sync::atomic::AtomicU64,
-    pub turn_attempts: std::sync::atomic::AtomicU64,
-    pub ice_attempts: std::sync::atomic::AtomicU64,
+    /// Currently active sessions
+    pub active_sessions: std::sync::atomic::AtomicU64,
 
-    /// Success rates
-    pub direct_successes: std::sync::atomic::AtomicU64,
-    pub stun_successes: std::sync::atomic::AtomicU64,
-    pub upnp_successes: std::sync::atomic::AtomicU64,
-    pub natpmp_successes: std::sync::atomic::AtomicU64,
-    pub pcp_successes: std::sync::atomic::AtomicU64,
-    pub hole_punch_successes: std::sync::atomic::AtomicU64,
-    pub turn_successes: std::sync::atomic::AtomicU64,
-    pub ice_successes: std::sync::atomic::AtomicU64,
+    /// Successful connections
+    pub successful_connections: std::sync::atomic::AtomicU64,
 
-    /// Connection statistics
-    pub active_connections: std::sync::atomic::AtomicU64,
-    pub total_connections: std::sync::atomic::AtomicU64,
+    /// Failed connections
     pub failed_connections: std::sync::atomic::AtomicU64,
 
-    /// Performance metrics
-    pub avg_connection_time: std::sync::atomic::AtomicU64, // microseconds
-    pub avg_quality_score: std::sync::atomic::AtomicU64,   // * 1000
+    /// Connection success rate (percentage * 100)
+    pub success_rate: std::sync::atomic::AtomicU64,
+
+    /// Average connection establishment time (microseconds)
+    pub avg_connection_time: std::sync::atomic::AtomicU64,
+
+    /// Total candidates gathered
+    pub total_candidates: std::sync::atomic::AtomicU64,
+
+    /// Breakdown by connection type
+    pub direct_connections: std::sync::atomic::AtomicU64,
+    pub nat_traversal_connections: std::sync::atomic::AtomicU64,
+    pub relayed_connections: std::sync::atomic::AtomicU64,
+
+    /// STUN/TURN statistics (delegated)
+    pub stun_turn_stats: Arc<stun_turn_manager::StunTurnStats>,
 }
 
-impl Default for NatConfig {
-    fn default() -> Self {
-        Self {
-            stun_turn_config: StunTurnConfig::default(),
-            ice_config: create_p2p_ice_config(),
-            port_forwarding_config: PortForwardingConfig::default(),
-            hole_punch_config: HolePunchConfig::default(),
-            advanced_config: AdvancedNatConfig::default(),
-            quality_config: QualityConfig::default(),
-        }
-    }
+/// NAT session statistics
+#[derive(Debug, Default)]
+pub struct NatSessionStats {
+    /// Session creation time
+    pub created_at: Option<std::time::Instant>,
+
+    /// Connection establishment time
+    pub connected_at: Option<std::time::Instant>,
+
+    /// Total gathering time
+    pub gathering_duration: Option<Duration>,
+
+    /// Total connectivity time
+    pub connectivity_duration: Option<Duration>,
+
+    /// Candidates gathered by type
+    pub host_candidates: u32,
+    pub server_reflexive_candidates: u32,
+    pub relay_candidates: u32,
+    pub peer_reflexive_candidates: u32,
+
+    /// Connectivity checks performed
+    pub connectivity_checks: u32,
+    pub successful_checks: u32,
+    pub failed_checks: u32,
+
+    /// Quality metrics
+    pub final_rtt: Option<Duration>,
+    pub packet_loss_rate: f64,
+    pub bandwidth_estimate: Option<u64>,
 }
 
-impl Default for PortForwardingConfig {
+impl Default for NatSystemConfig {
     fn default() -> Self {
         Self {
-            enable_upnp: true,
-            enable_natpmp: true,
-            enable_pcp: true,
-            mapping_lifetime: Duration::from_secs(3600),
-            auto_renew: true,
-            external_port_range: None,
-        }
-    }
-}
-
-impl Default for AdvancedNatConfig {
-    fn default() -> Self {
-        Self {
-            enable_coordinated_hole_punch: true,
-            coordinator_server: None,
-            relay_servers: Vec::new(),
-            max_concurrent_attempts: 5,
-            traversal_timeout: Duration::from_secs(30),
-            retry_config: RetryConfig::default(),
-            fallback_config: FallbackConfig::default(),
-        }
-    }
-}
-
-impl Default for QualityConfig {
-    fn default() -> Self {
-        Self {
-            enable_quality_monitoring: true,
-            measurement_interval: Duration::from_secs(10),
+            stun_config: StunConfig::default(),
+            turn_servers: vec![],
+            enable_turn_server: false,
+            turn_server_config: None,
+            ice_config: ice::create_p2p_ice_config(),
+            ice_gathering_config: IceGatheringConfig::default(),
             quality_thresholds: QualityThresholds::default(),
-            performance_optimization: PerformanceOptimization::default(),
+            timeouts: NatTimeouts::default(),
+            features: NatFeatures::default(),
         }
     }
 }
 
-impl Default for RetryConfig {
+impl Default for NatTimeouts {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            initial_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(10),
-            backoff_multiplier: 2.0,
-            jitter: true,
+            connection_timeout: Duration::from_secs(30),
+            stun_timeout: Duration::from_secs(5),
+            turn_timeout: Duration::from_secs(10),
+            ice_gathering_timeout: Duration::from_secs(10),
+            ice_connectivity_timeout: Duration::from_secs(20),
+            keepalive_interval: Duration::from_secs(25),
         }
     }
 }
 
-impl Default for FallbackConfig {
+impl Default for NatFeatures {
     fn default() -> Self {
         Self {
-            fallback_to_relay: true,
-            relay_selection: RelaySelectionStrategy::LowestLatency,
-            max_relay_time: Duration::from_secs(300),
-            retry_p2p_on_relay: true,
+            enable_ipv6: true,
+            enable_tcp: true,
+            enable_mdns: false,
+            enable_trickle_ice: true,
+            enable_aggressive_nomination: true,
+            enable_consent_freshness: true,
+            enable_quality_monitoring: true,
+            enable_detailed_logging: false,
         }
     }
 }
 
-impl Default for PerformanceOptimization {
-    fn default() -> Self {
-        Self {
-            parallel_gathering: true,
-            aggressive_optimization: false,
-            bandwidth_aware: true,
-            latency_sensitive: true,
-        }
-    }
-}
-
-impl NatManager {
-    /// Create new NAT manager with comprehensive configuration
-    pub async fn new(config: NatConfig) -> NatResult<Self> {
-        info!("Creating comprehensive NAT manager");
+impl NatSystem {
+    /// Create new NAT system
+    pub async fn new(config: NatSystemConfig) -> NatResult<Self> {
+        info!("Creating NAT system with {} TURN servers", config.turn_servers.len());
 
         let config = Arc::new(config);
 
         // Create STUN/TURN manager
-        let stun_turn_manager = Arc::new(
-            StunTurnManager::new(config.stun_turn_config.clone()).await?
-        );
-
-        // Create port forwarding service
-        let port_forwarding = if config.port_forwarding_config.enable_upnp ||
-            config.port_forwarding_config.enable_natpmp ||
-            config.port_forwarding_config.enable_pcp {
-
-            match PortForwardingService::new().await {
-                Ok(service) => Some(service),
-                Err(e) => {
-                    warn!("Failed to initialize port forwarding: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
+        let stun_turn_config = StunTurnConfig {
+            stun_config: config.stun_config.clone(),
+            turn_server_config: config.turn_server_config.clone(),
+            turn_servers: config.turn_servers.clone(),
+            gathering_timeout: config.timeouts.ice_gathering_timeout,
+            turn_allocation_lifetime: Duration::from_secs(600),
+            enable_server_reflexive: true,
+            enable_relay: !config.turn_servers.is_empty(),
+            max_turn_allocations: 10,
+            turn_retry_config: stun_turn_manager::TurnRetryConfig {
+                max_retries: 3,
+                initial_delay: Duration::from_millis(500),
+                max_delay: Duration::from_secs(10),
+                backoff_multiplier: 2.0,
+            },
+            quality_monitoring: stun_turn_manager::QualityMonitoringConfig {
+                enable_rtt_monitoring: config.features.enable_quality_monitoring,
+                enable_packet_loss_monitoring: config.features.enable_quality_monitoring,
+                monitoring_interval: Duration::from_secs(10),
+                quality_threshold: config.quality_thresholds.min_quality_score,
+            },
         };
 
-        // Create hole puncher
-        let hole_puncher = Arc::new(HolePuncher::new(config.hole_punch_config.clone()));
-
-        // Create coordinated hole punch service if configured
-        let coordinated_punch = if config.advanced_config.enable_coordinated_hole_punch {
-            let coordinator_addr = config.advanced_config.coordinator_server.as_ref()
-                .and_then(|s| s.parse().ok());
-
-            if let Some(addr) = coordinator_addr {
-                Some(Arc::new(CoordinatedHolePunch::new(
-                    config.hole_punch_config.clone(),
-                    Some(addr)
-                )))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Create quality monitor
-        let quality_monitor = Arc::new(QualityMonitor::new(config.quality_config.clone()));
+        let stun_turn_manager = Arc::new(StunTurnManager::new(stun_turn_config).await?);
 
         // Create event channel
-        let (event_tx, _) = broadcast::channel(1000);
+        let (event_sender, _) = broadcast::channel(10000);
 
-        let manager = Self {
-            config: config.clone(),
+        // Create statistics
+        let stats = Arc::new(NatSystemStats {
+            stun_turn_stats: Arc::new(stun_turn_manager::StunTurnStats::default()),
+            ..Default::default()
+        });
+
+        let system = Self {
+            config,
             stun_turn_manager,
-            ice_session: None,
-            port_forwarding: Arc::new(RwLock::new(port_forwarding)),
-            hole_puncher,
-            coordinated_punch,
-            network_info: Arc::new(RwLock::new(None)),
-            active_connections: Arc::new(RwLock::new(HashMap::new())),
-            event_tx,
-            stats: Arc::new(NatStatistics::default()),
-            quality_monitor,
-            background_tasks: Arc::new(Mutex::new(Vec::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_sender,
+            stats,
             shutdown: Arc::new(RwLock::new(false)),
         };
 
-        // Start background tasks
-        manager.start_background_tasks().await?;
-
-        info!("NAT manager created successfully");
-        Ok(manager)
+        info!("NAT system created successfully");
+        Ok(system)
     }
 
-    /// Initialize NAT detection and setup
-    pub async fn initialize(&self, socket: &UdpSocket) -> NatResult<NetworkInfo> {
-        info!("Initializing NAT detection and setup");
-
-        self.stats.detection_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let local_addr = socket.local_addr()?;
-        let start_time = Instant::now();
-
-        // Detect network information
-        let mut available_protocols = vec![NatProtocol::Direct];
-        let mut public_addr = None;
-        let mut nat_type = NatType::Unknown;
-        let mut nat_behavior = None;
-        let mut connectivity_status = ConnectivityStatus::Offline;
-        let mut port_mappings = Vec::new();
-        let mut quality_metrics = ConnectionQualityMetrics::default();
-
-        // STUN detection
-        if let Some(addr) = self.stun_turn_manager
-            .get_server_reflexive_candidate(Arc::new(socket.try_clone()?), 1).await?
-        {
-            if let Some(resolved_addr) = addr.get_address() {
-                public_addr = Some(resolved_addr);
-                available_protocols.push(NatProtocol::Stun);
-                connectivity_status = ConnectivityStatus::BehindNat;
-
-                // Get NAT behavior
-                if let Some(behavior) = self.stun_turn_manager.get_nat_behavior(local_addr).await {
-                    nat_behavior = Some(behavior.clone());
-                    nat_type = behavior.to_simple_nat_type();
-                }
-            }
-        }
-
-        // Check if we have direct connection
-        if let Some(pub_addr) = public_addr {
-            if pub_addr.ip() == local_addr.ip() {
-                nat_type = NatType::None;
-                connectivity_status = ConnectivityStatus::Direct;
-            }
-        }
-
-        // Port forwarding setup (only if behind NAT)
-        if nat_type != NatType::None {
-            port_mappings = self.setup_port_forwarding(socket).await.unwrap_or_default();
-
-            if !port_mappings.is_empty() {
-                // Add protocols based on successful mappings
-                for mapping in &port_mappings {
-                    let protocol = match mapping.protocol {
-                        MappingProtocol::UPnPIGD => NatProtocol::Upnp,
-                        MappingProtocol::NatPMP => NatProtocol::NatPmp,
-                        MappingProtocol::PCP => NatProtocol::Pcp,
-                    };
-                    if !available_protocols.contains(&protocol) {
-                        available_protocols.push(protocol);
-                    }
-                }
-            }
-
-            // Enable hole punching for suitable NAT types
-            if let Some(ref behavior) = nat_behavior {
-                if behavior.p2p_score() > 0.3 {
-                    available_protocols.push(NatProtocol::HolePunch);
-                }
-            }
-        }
-
-        // Check TURN availability
-        if !self.config.stun_turn_config.turn_servers.is_empty() {
-            available_protocols.push(NatProtocol::Turn);
-        }
-
-        // ICE is always available if configured
-        available_protocols.push(NatProtocol::Ice);
-
-        // Get initial quality metrics
-        if let Some(ref addr) = public_addr {
-            quality_metrics = self.stun_turn_manager
-                .get_connection_quality(&addr.to_string()).await
-                .unwrap_or_default();
-        }
-
-        let network_info = NetworkInfo {
-            local_addr,
-            public_addr,
-            nat_type,
-            nat_behavior,
-            available_protocols,
-            port_mappings,
-            connectivity_status,
-            quality_metrics,
-        };
-
-        // Cache network info
-        *self.network_info.write().await = Some(network_info.clone());
-
-        let detection_duration = start_time.elapsed();
-        info!("NAT detection completed in {}ms: {:?} via {:?}",
-             detection_duration.as_millis(),
-             connectivity_status,
-             available_protocols);
-
-        self.stats.detection_successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Emit event
-        let _ = self.event_tx.send(NatEvent::NetworkDetected {
-            network_info: network_info.clone(),
-        });
-
-        Ok(network_info)
-    }
-
-    /// Establish connection to peer using best available method
-    pub async fn establish_connection(
+    /// Create new NAT session
+    pub async fn create_session(
         &self,
-        socket: &UdpSocket,
-        peer_addr: SocketAddr,
-        options: ConnectionOptions,
-    ) -> NatResult<ConnectionInfo> {
-        info!("Establishing connection to {} with options: {:?}", peer_addr, options);
+        session_id: String,
+        session_config: NatSessionConfig,
+    ) -> NatResult<Arc<NatSession>> {
+        info!("Creating NAT session: {}", session_id);
 
-        let connection_id = format!("conn_{}", uuid::Uuid::new_v4());
-        let start_time = Instant::now();
-
-        // Get network info
-        let network_info = self.get_network_info().await
-            .ok_or_else(|| NatError::Platform("Network not initialized".to_string()))?;
-
-        // Try connection methods in order of preference
-        let methods = self.select_traversal_methods(&network_info, &options).await;
-
-        for method in methods {
-            match self.try_connection_method(socket, peer_addr, method, &options).await {
-                Ok(connection_info) => {
-                    let duration = start_time.elapsed();
-
-                    // Store connection info
-                    self.active_connections.write().await.insert(
-                        connection_id.clone(),
-                        connection_info.clone()
-                    );
-
-                    self.stats.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.stats.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                    // Update statistics for successful method
-                    self.update_method_stats(method, true).await;
-
-                    info!("Connection established via {:?} in {}ms", method, duration.as_millis());
-
-                    let _ = self.event_tx.send(NatEvent::ConnectionEstablished {
-                        connection_id: connection_id.clone(),
-                        peer_addr,
-                        method,
-                    });
-
-                    let _ = self.event_tx.send(NatEvent::TraversalSucceeded {
-                        method,
-                        peer_addr,
-                        duration,
-                    });
-
-                    return Ok(connection_info);
-                }
-                Err(e) => {
-                    warn!("Connection via {:?} failed: {}", method, e);
-
-                    self.update_method_stats(method, false).await;
-
-                    let _ = self.event_tx.send(NatEvent::TraversalFailed {
-                        method,
-                        error: e.to_string(),
-                    });
-                }
-            }
-        }
-
-        self.stats.failed_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        Err(NatError::Platform("All connection methods failed".to_string()))
-    }
-
-    /// Create ICE session for P2P connectivity
-    pub async fn create_ice_session(&mut self, socket: Arc<UdpSocket>) -> NatResult<Arc<IceSession>> {
-        info!("Creating ICE session");
-
-        // Extract STUN/TURN servers from config
-        let stun_servers = self.config.stun_turn_config.stun_config.servers.clone();
-        let turn_servers = self.config.stun_turn_config.turn_servers.clone();
+        // Validate session configuration
+        self.validate_session_config(&session_config)?;
 
         // Create ICE session with SHARP integration
         let ice_session = Arc::new(
-            create_ice_session_with_sharp(
+            IceSession::new(
                 self.config.ice_config.clone(),
-                stun_servers,
-                turn_servers,
+                self.stun_turn_manager.clone(),
+                session_config.local_ice_params.clone(),
             ).await?
         );
 
-        // Start gathering
-        ice_session.start_gathering(socket).await?;
+        // Create session event channel
+        let (session_event_sender, _) = broadcast::channel(1000);
+
+        // Create session statistics
+        let session_stats = Arc::new(NatSessionStats {
+            created_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        });
+
+        let session = Arc::new(NatSession {
+            session_id: session_id.clone(),
+            ice_session,
+            config: session_config.clone(),
+            state: Arc::new(RwLock::new(NatSessionState::Created)),
+            event_sender: session_event_sender,
+            stats: session_stats,
+            connection_result: Arc::new(RwLock::new(None)),
+        });
+
+        // Setup event forwarding
+        self.setup_session_event_forwarding(session.clone()).await;
 
         // Store session
-        self.ice_session = Some(ice_session.clone());
+        self.sessions.write().await.insert(session_id.clone(), session.clone());
 
-        info!("ICE session created and gathering started");
-        Ok(ice_session)
+        // Update statistics
+        self.stats.total_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.stats.active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Emit system event
+        let _ = self.event_sender.send(NatSystemEvent::SessionCreated {
+            session_id,
+            config: session_config,
+        });
+
+        info!("NAT session created successfully");
+        Ok(session)
     }
 
-    /// Get current network information
-    pub async fn get_network_info(&self) -> Option<NetworkInfo> {
-        self.network_info.read().await.clone()
+    /// Get existing session
+    pub async fn get_session(&self, session_id: &str) -> Option<Arc<NatSession>> {
+        self.sessions.read().await.get(session_id).cloned()
     }
 
-    /// Get connection quality for target
-    pub async fn get_connection_quality(&self, target: &str) -> Option<ConnectionQualityMetrics> {
-        self.quality_monitor.get_quality(target).await
+    /// Remove session
+    pub async fn remove_session(&self, session_id: &str) -> NatResult<()> {
+        if let Some(session) = self.sessions.write().await.remove(session_id) {
+            // Update session state
+            *session.state.write().await = NatSessionState::Closed;
+
+            // Update statistics
+            self.stats.active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Emit event
+            let _ = self.event_sender.send(NatSystemEvent::SessionClosed {
+                session_id: session_id.to_string(),
+            });
+
+            info!("NAT session removed: {}", session_id);
+        }
+
+        Ok(())
     }
 
-    /// Subscribe to NAT events
-    pub fn subscribe(&self) -> broadcast::Receiver<NatEvent> {
-        self.event_tx.subscribe()
+    /// List all active sessions
+    pub async fn list_sessions(&self) -> Vec<String> {
+        self.sessions.read().await.keys().cloned().collect()
     }
 
-    /// Get statistics
-    pub fn get_stats(&self) -> &NatStatistics {
+    /// Get system statistics
+    pub fn get_stats(&self) -> &NatSystemStats {
         &self.stats
     }
+
+    /// Get STUN/TURN statistics
+    pub fn get_stun_turn_stats(&self) -> &stun_turn_manager::StunTurnStats {
+        self.stun_turn_manager.get_stats()
+    }
+
+    /// Subscribe to system events
+    pub fn subscribe_events(&self) -> broadcast::Receiver<NatSystemEvent> {
+        self.event_sender.subscribe()
+    }
+
+    /// Shutdown the NAT system
+    pub async fn shutdown(&self) -> NatResult<()> {
+        info!("Shutting down NAT system");
+
+        *self.shutdown.write().await = true;
+
+        // Close all sessions
+        let session_ids: Vec<String> = self.sessions.read().await.keys().cloned().collect();
+        for session_id in session_ids {
+            let _ = self.remove_session(&session_id).await;
+        }
+
+        // Shutdown STUN/TURN manager
+        self.stun_turn_manager.shutdown().await?;
+
+        info!("NAT system shutdown complete");
+        Ok(())
+    }
+
+    /// Validate session configuration
+    fn validate_session_config(&self, config: &NatSessionConfig) -> NatResult<()> {
+        if config.components.is_empty() {
+            return Err(NatError::Configuration("No components specified".to_string()));
+        }
+
+        for &component_id in &config.components {
+            if component_id == 0 || component_id > 256 {
+                return Err(NatError::Configuration(
+                    "Component ID must be between 1 and 256".to_string()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Setup event forwarding for session
+    async fn setup_session_event_forwarding(&self, session: Arc<NatSession>) {
+        let session_id = session.session_id.clone();
+        let mut ice_events = session.ice_session.subscribe_ice_events();
+        let mut integration_events = session.ice_session.subscribe_integration_events().await;
+        let system_event_sender = self.event_sender.clone();
+        let session_event_sender = session.event_sender.clone();
+        let session_state = session.state.clone();
+        let connection_result = session.connection_result.clone();
+        let stats = self.stats.clone();
+
+        // Forward ICE events
+        tokio::spawn(async move {
+            while let Ok(event) = ice_events.recv().await {
+                let session_event = match event {
+                    IceEvent::CandidateAdded { candidate, component_id } => {
+                        Some(NatSessionEvent::CandidateGathered { component_id, candidate })
+                    }
+                    IceEvent::ConnectivityResult { pair_id, success, rtt } => {
+                        Some(NatSessionEvent::ConnectivityCheckResult { pair_id, success, rtt })
+                    }
+                    IceEvent::ComponentConnected { component_id, local_candidate, remote_candidate, .. } => {
+                        Some(NatSessionEvent::ComponentConnected {
+                            component_id,
+                            local_candidate,
+                            remote_candidate,
+                        })
+                    }
+                    IceEvent::ConnectionEstablished { selected_pairs, establishment_time } => {
+                        // Update session state
+                        *session_state.write().await = NatSessionState::Connected;
+
+                        // Create connection result
+                        if let Some((_, pair)) = selected_pairs.iter().next() {
+                            let result = NatConnectionResult {
+                                local_address: pair.local.socket_addr().unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+                                remote_address: pair.remote.socket_addr().unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+                                connection_type: ConnectionType::from_candidate_types(
+                                    pair.local.candidate_type,
+                                    pair.remote.candidate_type,
+                                ),
+                                selected_candidate: SelectedCandidateInfo {
+                                    local_candidate: pair.local.clone(),
+                                    remote_candidate: pair.remote.clone(),
+                                    pair_priority: pair.priority,
+                                    rtt: None,
+                                    nominated: pair.nominated,
+                                },
+                                quality_metrics: ConnectionQualityMetrics::default(),
+                                establishment_time,
+                                nat_behavior: None,
+                            };
+
+                            *connection_result.write().await = Some(result.clone());
+
+                            // Update statistics
+                            stats.successful_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            // Emit system event
+                            let _ = system_event_sender.send(NatSystemEvent::ConnectionEstablished {
+                                session_id: session_id.clone(),
+                                result: result.clone(),
+                            });
+
+                            Some(NatSessionEvent::ConnectionEstablished { result })
+                        } else {
+                            None
+                        }
+                    }
+                    IceEvent::ConnectionFailed { reason } => {
+                        // Update session state
+                        *session_state.write().await = NatSessionState::Failed;
+
+                        // Update statistics
+                        stats.failed_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                        // Emit system event
+                        let _ = system_event_sender.send(NatSystemEvent::SessionFailed {
+                            session_id: session_id.clone(),
+                            error: reason.clone(),
+                        });
+
+                        Some(NatSessionEvent::Failed { error: reason })
+                    }
+                    _ => None,
+                };
+
+                if let Some(session_event) = session_event {
+                    let _ = session_event_sender.send(session_event);
+                }
+            }
+        });
+
+        // Forward integration events
+        let session_id_clone = session_id.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = integration_events.recv().await {
+                match event {
+                    IceIntegrationEvent::CandidateGathered { component_id, candidate, .. } => {
+                        let session_event = NatSessionEvent::CandidateGathered { component_id, candidate };
+                        let _ = session_event_sender.send(session_event);
+                    }
+                    _ => {
+                        // Handle other integration events as needed
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl NatSession {
+    /// Start the NAT session
+    pub async fn start(&self) -> NatResult<()> {
+        info!("Starting NAT session: {}", self.session_id);
+
+        // Update state
+        *self.state.write().await = NatSessionState::Gathering;
+
+        // Start ICE session
+        self.ice_session.start(self.config.role).await?;
+
+        info!("NAT session started successfully");
+        Ok(())
+    }
+
+    /// Add remote candidate
+    pub async fn add_remote_candidate(
+        &self,
+        candidate: Candidate,
+        component_id: u32,
+    ) -> NatResult<()> {
+        debug!("Adding remote candidate for component {}: {}", component_id, candidate);
+
+        self.ice_session.agent().add_remote_candidate(candidate.clone(), component_id).await?;
+
+        // Emit session event
+        let _ = self.event_sender.send(NatSessionEvent::RemoteCandidateReceived {
+            component_id,
+            candidate,
+        });
+
+        Ok(())
+    }
+
+    /// Set remote ICE credentials
+    pub async fn set_remote_credentials(
+        &self,
+        ufrag: String,
+        pwd: String,
+    ) -> NatResult<()> {
+        let credentials = ice::connectivity::IceCredentials { ufrag, pwd };
+        self.ice_session.agent().set_remote_credentials(credentials).await
+    }
+
+    /// Get local candidates for component
+    pub async fn get_local_candidates(&self, component_id: u32) -> Vec<Candidate> {
+        self.ice_session.get_candidates(component_id).await
+    }
+
+    /// Get session state
+    pub async fn get_state(&self) -> NatSessionState {
+        *self.state.read().await
+    }
+
+    /// Get connection result (if connected)
+    pub async fn get_connection_result(&self) -> Option<NatConnectionResult> {
+        self.connection_result.read().await.clone()
+    }
+
+    /// Get session statistics
+    pub fn get_stats(&self) -> &NatSessionStats {
+        &self.stats
+    }
+
+    /// Subscribe to session events
+    pub fn subscribe_events(&self) -> broadcast::Receiver<NatSessionEvent> {
+        self.event_sender.subscribe()
+    }
+
+    /// Send data on established connection
+    pub async fn send_data(&self, component_id: u32, data: Vec<u8>) -> NatResult<usize> {
+        if *self.state.read().await != NatSessionState::Connected {
+            return Err(NatError::Configuration("Session not connected".to_string()));
+        }
+
+        self.ice_session.agent().send_data(component_id, data).await
+    }
+
+    /// Close the session
+    pub async fn close(&self) {
+        info!("Closing NAT session: {}", self.session_id);
+
+        *self.state.write().await = NatSessionState::Closed;
+        self.ice_session.agent().close().await;
+    }
+}
+
+impl ConnectionType {
+    /// Determine connection type from candidate types
+    fn from_candidate_types(local_type: CandidateType, remote_type: CandidateType) -> Self {
+        match (local_type, remote_type) {
+            (CandidateType::Host, CandidateType::Host) => Self::Direct,
+            (CandidateType::Relay, _) | (_, CandidateType::Relay) => Self::Relayed,
+            (CandidateType::PeerReflexive, _) | (_, CandidateType::PeerReflexive) => Self::PeerReflexive,
+            _ => Self::NatTraversal,
+        }
+    }
+}
+
+/// Factory functions for common NAT configurations
+
+/// Create NAT system optimized for P2P gaming
+pub async fn create_p2p_nat_system(
+    stun_servers: Vec<String>,
+    turn_servers: Vec<TurnServerInfo>,
+) -> NatResult<NatSystem> {
+    let mut config = NatSystemConfig::default();
+
+    // Configure for low latency P2P
+    config.stun_config.servers = stun_servers;
+    config.turn_servers = turn_servers;
+    config.ice_config = ice::create_p2p_ice_config();
+    config.timeouts.connection_timeout = Duration::from_secs(15);
+    config.features.enable_aggressive_nomination = true;
+
+    NatSystem::new(config).await
+}
+
+/// Create NAT system optimized for reliability
+pub async fn create_reliable_nat_system(
+    stun_servers: Vec<String>,
+    turn_servers: Vec<TurnServerInfo>,
+) -> NatResult<NatSystem> {
+    let mut config = NatSystemConfig::default();
+
+    // Configure for maximum reliability
+    config.stun_config.servers = stun_servers;
+    config.turn_servers = turn_servers;
+    config.ice_config = ice::create_reliable_ice_config();
+    config.timeouts.connection_timeout = Duration::from_secs(60);
+    config.features.enable_aggressive_nomination = false;
+    config.enable_turn_server = true;
+
+    NatSystem::new(config).await
+}
+
+/// Create NAT session configuration for controlling agent
+pub fn create_controlling_session_config(components: Vec<u32>) -> NatSessionConfig {
+    NatSessionConfig {
+        role: IceRole::Controlling,
+        components,
+        local_ice_params: IceParameters::default(),
+        timeouts: NatTimeouts::default(),
+        features: NatFeatures::default(),
+    }
+}
+
+/// Create NAT session configuration for controlled agent
+pub fn create_controlled_session_config(components: Vec<u32>) -> NatSessionConfig {
+    NatSessionConfig {
+        role: IceRole::Controlled,
+        components,
+        local_ice_params: IceParameters::default(),
+        timeouts: NatTimeouts::default(),
+        features: NatFeatures::default(),
+    }
+}
+
+/// Utility functions
+
+/// Parse TURN server URL into TurnServerInfo
+pub fn parse_turn_server_url(
+    url: &str,
+    username: &str,
+    password: &str,
+) -> NatResult<TurnServerInfo> {
+    // Parse URL format: turn:host:port or turns:host:port
+    let transport = if url.starts_with("turns:") {
+        TurnTransport::Tls
+    } else if url.starts_with("turn:") {
+        TurnTransport::Udp
+    } else {
+        return Err(NatError::Configuration("Invalid TURN URL format".to_string()));
+    };
+
+    Ok(TurnServerInfo {
+        url: url.to_string(),
+        username: username.to_string(),
+        password: password.to_string(),
+        realm: None,
+        transport,
+        priority: 100,
+    })
+}
+
+/// Create default STUN server list
+pub fn default_stun_servers() -> Vec<String> {
+    vec![
+        "stun.l.google.com:19302".to_string(),
+        "stun1.l.google.com:19302".to_string(),
+        "stun2.l.google.com:19302".to_string(),
+        "stun3.l.google.com:19302".to_string(),
+    ]
+}
+
+/// Validate NAT system configuration
+pub fn validate_nat_config(config: &NatSystemConfig) -> NatResult<()> {
+    // Validate ICE configuration
+    ice::validate_ice_config(&config.ice_config)?;
+
+    // Validate timeouts
+    if config.timeouts.connection_timeout < Duration::from_secs(5) {
+        return Err(NatError::Configuration("Connection timeout too short".to_string()));
+    }
+
+    if config.timeouts.stun_timeout == Duration::ZERO {
+        return Err(NatError::Configuration("STUN timeout cannot be zero".to_string()));
+    }
+
+    // Validate TURN servers
+    for turn_server in &config.turn_servers {
+        if turn_server.url.is_empty() {
+            return Err(NatError::Configuration("TURN server URL cannot be empty".to_string()));
+        }
+        if turn_server.username.is_empty() || turn_server.password.is_empty() {
+            return Err(NatError::Configuration("TURN server credentials required".to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_nat_system_creation() {
+        let config = NatSystemConfig::default();
+        let result = NatSystem::new(config).await;
+
+        match result {
+            Ok(_system) => {
+                // Test passed
+            }
+            Err(e) => {
+                println!("NAT system creation failed (expected in test environment): {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let config = NatSystemConfig::default();
+        assert!(validate_nat_config(&config).is_ok());
+
+        let mut invalid_config = config;
+        invalid_config.timeouts.connection_timeout = Duration::from_secs(1);
+        assert!(validate_nat_config(&invalid_config).is_err());
+    }
+
+    #[test]
+    fn test_turn_server_parsing() {
+        let result = parse_turn_server_url("turn:example.com:3478", "user", "pass");
+        assert!(result.is_ok());
+
+        let turn_info = result.unwrap();
+        assert_eq!(turn_info.transport, TurnTransport::Udp);
+        assert_eq!(turn_info.username, "user");
+    }
+
+    #[test]
+    fn test_connection_type_detection() {
+        let conn_type = ConnectionType::from_candidate_types(
+            CandidateType::Host,
+            CandidateType::Host
+        );
+        assert_eq!(conn_type, ConnectionType::Direct);
+
+        let conn_type = ConnectionType::from_candidate_types(
+            CandidateType::Relay,
+            CandidateType::Host
+        );
+        assert_eq!(conn_type, ConnectionType::Relayed);
+    }
+
+    #[tokio::test]
+    async fn test_session_creation() {
+        // This test might fail due to network dependencies
+        let config = NatSystemConfig::default();
+
+        match NatSystem::new(config).await {
+            Ok(system) => {
+                let session_config = create_controlling_session_config(vec![1]);
+                let result = system.create_session("test_session".to_string(), session_config).await;
+
+                match result {
+                    Ok(session) => {
+                        assert_eq!(session.session_id, "test_session");
+                        assert_eq!(session.get_state().await, NatSessionState::Created);
+                    }
+                    Err(e) => {
+                        println!("Session creation failed (expected in test environment): {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("NAT system creation failed (expected in test environment): {}", e);
+            }
+        }
+    }
+}

@@ -12,11 +12,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, broadcast};
 use tracing::{info, warn, debug, error, trace};
 use futures::future::BoxFuture;
+use serde::{Serialize, Deserialize};
 
 use crate::nat::error::{NatError, NatResult};
 use crate::nat::ice::{
-    IceNatManager, Candidate, CandidateType, TransportProtocol,
-    IceAgent, IceConfig, IceRole, IceState, IceEvent,
+    IceNatManager, Candidate, CandidateType, CandidateAddress, CandidateExtensions,
+    TransportProtocol, IceAgent, IceConfig, IceRole, IceState, IceEvent,
     CandidateGatherer, GatheringEvent, GatheringPhase, GatheringStats,
 };
 use crate::nat::stun_turn_manager::{
@@ -357,7 +358,7 @@ impl Sharp3IceIntegration {
         {
             let mut sessions = self.gathering_sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
-                session.phase = GatheringPhase::Gathering;
+                session.phase = GatheringPhase::GatheringHost;
             }
         }
 
@@ -437,22 +438,25 @@ impl Sharp3IceIntegration {
         let local_addr = socket.local_addr()?;
 
         let candidate = Candidate {
-            foundation: crate::nat::ice::foundation::calculate_host_foundation(&local_addr),
+            foundation: crate::nat::ice::foundation::calculate_host_foundation(
+                &local_addr.ip(),
+                TransportProtocol::Udp
+            ),
             component_id,
             transport: TransportProtocol::Udp,
             priority: crate::nat::ice::priority::calculate_priority(
                 CandidateType::Host,
-                local_addr.is_ipv4(),
+                65535, // Max local preference for host
                 component_id,
             ),
+            address: CandidateAddress::Ip(local_addr),
             candidate_type: CandidateType::Host,
-            address: crate::nat::ice::CandidateAddress::Resolved {
-                addr: local_addr,
-                base_addr: None,
-            },
             related_address: None,
             tcp_type: None,
-            extensions: crate::nat::ice::CandidateExtensions::default(),
+            extensions: CandidateExtensions::new(),
+            discovered_at: Instant::now(),
+            base_address: Some(local_addr.ip()),
+            server_address: None,
         };
 
         self.stats.host_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -499,15 +503,13 @@ impl Sharp3IceIntegration {
         factors += 1;
 
         // IPv4 vs IPv6 preference
-        if let crate::nat::ice::CandidateAddress::Resolved { addr, .. } = &candidate.address {
+        if let Some(addr) = candidate.socket_addr() {
             if addr.is_ipv6() && ice_params.gathering_config.prefer_ipv6 {
                 quality_score += 0.1;
             }
             factors += 1;
-        }
 
-        // Get quality metrics if available
-        if let Some(addr) = candidate.get_address() {
+            // Get quality metrics if available
             let target = addr.to_string();
             if let Some(metrics) = self.stun_turn_manager.get_connection_quality(&target).await {
                 // RTT factor
@@ -676,20 +678,6 @@ impl IceNatManager for Sharp3IceIntegration {
     }
 }
 
-/// Helper trait to extract address from candidate
-trait CandidateAddressExt {
-    fn get_address(&self) -> Option<SocketAddr>;
-}
-
-impl CandidateAddressExt for Candidate {
-    fn get_address(&self) -> Option<SocketAddr> {
-        match &self.address {
-            crate::nat::ice::CandidateAddress::Resolved { addr, .. } => Some(*addr),
-            crate::nat::ice::CandidateAddress::HostName { .. } => None,
-        }
-    }
-}
-
 /// Wrapper that binds an IceAgent with Sharp3IceIntegration
 pub struct IceSession {
     agent: Arc<crate::nat::ice::IceAgent>,
@@ -747,7 +735,7 @@ impl IceSession {
 
     /// Subscribe to ICE events
     pub fn subscribe_ice_events(&self) -> broadcast::Receiver<IceEvent> {
-        self.agent.subscribe()
+        self.agent.subscribe_events()
     }
 
     /// Subscribe to integration events
@@ -812,6 +800,23 @@ mod tests {
         let ice_params = IceParameters::default();
         let integration = Sharp3IceIntegration::new(stun_turn_manager, ice_params).await.unwrap();
 
+        assert_eq!(integration.get_stats().total_sessions.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_gathering_session() {
+        let stun_turn_manager = Arc::new(
+            crate::nat::stun_turn_manager::create_stun_turn_manager(
+                vec!["stun.l.google.com:19302".to_string()],
+                vec![],
+                false,
+            ).await.unwrap()
+        );
+
+        let ice_params = IceParameters::default();
+        let integration = Sharp3IceIntegration::new(stun_turn_manager, ice_params).await.unwrap();
+
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let session_id = "test_session".to_string();
 
         // Start gathering session
@@ -845,7 +850,4 @@ mod tests {
             }
         }
     }
-    let integration = Sharp3IceIntegration::new(stun_turn_manager, ice_params).await.unwrap();
-
-    assert_eq!(integration.get_stats().total_sessions.load(std::sync::atomic::Ordering::Relaxed), 0);
 }

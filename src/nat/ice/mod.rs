@@ -16,6 +16,12 @@
 //! - Consent freshness and keepalive mechanisms
 //! - Integration with SHARP3 P2P system
 
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use futures::future::BoxFuture;
+use crate::nat::error::NatResult;
+
 pub mod candidate;
 pub mod foundation;
 pub mod priority;
@@ -134,6 +140,23 @@ impl Default for IceFeatures {
             bundle_support: true,
         }
     }
+}
+
+/// NAT manager trait for ICE integration
+pub trait IceNatManager: Send + Sync {
+    /// Get server reflexive candidate for component
+    fn get_server_reflexive(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>>;
+
+    /// Get relay candidate for component
+    fn get_relay_candidate(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>>;
 }
 
 /// Get ICE implementation features
