@@ -20,7 +20,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use futures::future::BoxFuture;
-use crate::nat::error::NatResult;
 
 pub mod candidate;
 pub mod foundation;
