@@ -23,6 +23,7 @@ pub mod nat;
 // GUI module (feature-gated)
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod security;
 
 // Re-export main types
 pub use sender::Sender;

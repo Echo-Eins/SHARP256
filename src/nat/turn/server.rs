@@ -23,12 +23,13 @@ use hkdf::Hkdf;
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 use hmac::{Hmac, Mac};
 use ring::digest;
-
 use crate::nat::stun::{
     Message, MessageType, TransactionId, Attribute, AttributeType, AttributeValue,
-    StunError, compute_message_integrity_sha256, MAGIC_COOKIE,
+    compute_message_integrity_sha256, MAGIC_COOKIE,
 };
-use crate::nat::error::{NatError, NatResult};
+
+use crate::nat;
+use crate::nat::error::{NatError, NatResult, StunError};
 use crate::security::crypto::{CryptoProvider, EncryptionAlgorithm, KeyExchangeResult};
 
 /// SHARP protocol version constants
