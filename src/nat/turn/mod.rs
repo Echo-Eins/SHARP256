@@ -18,13 +18,8 @@ use crate::nat::error::{NatError, NatResult};
 // MAIN MODULE: настоящий TURN сервер
 pub mod server;
 
-// Protocol definitions
-use stun::protocol;
-// Client implementation
-use stun::client;
-
-// Authentication modules
-use stun::auth;
+// Use STUN components from the NAT module
+use crate::nat::stun::{protocol, client, auth};
 
 
 // Re-export main types from server module
@@ -73,16 +68,6 @@ pub use auth::{
     LongTermCredentialMechanism,
 };
 
-// Re-export allocation types
-pub use allocation::{
-    Allocation,
-    AllocationKey,
-    AllocationState,
-    RelayAddress,
-    PortManager,
-    PortRange,
-};
-use crate::nat::stun;
 
 /// TURN credentials for client authentication
 #[derive(Debug, Clone)]

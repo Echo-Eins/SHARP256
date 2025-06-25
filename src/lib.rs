@@ -19,7 +19,7 @@ pub mod receiver;
 pub mod fragmentation;
 // NAT traversal module (always compiled, feature controls functionality)
 pub mod nat;
-
+pub mod security;
 // GUI module (feature-gated)
 #[cfg(feature = "gui")]
 pub mod gui;

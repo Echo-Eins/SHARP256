@@ -26,10 +26,10 @@ use ring::digest;
 
 use crate::nat::stun::{
     Message, MessageType, TransactionId, Attribute, AttributeType, AttributeValue,
-    StunError, compute_message_integrity_sha256, MAGIC_COOKIE,
+    compute_message_integrity_sha256, MAGIC_COOKIE,
 };
-use crate::nat::error::{NatError, NatResult};
-use crate::security::crypto::{CryptoProvider, EncryptionAlgorithm, KeyExchangeResult};
+use crate::nat::error::{NatError, NatResult, StunError};
+use crate::security::crypto::{CryptoProvider, EncryptionAlgorithm};
 
 /// SHARP protocol version constants
 const SHARP_VERSION_1: u16 = 1;
