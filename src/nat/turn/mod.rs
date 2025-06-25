@@ -19,16 +19,13 @@ use crate::nat::error::{NatError, NatResult};
 pub mod server;
 
 // Protocol definitions
-pub mod protocol;
-
+use stun::protocol;
 // Client implementation
-pub mod client;
+use stun::client;
 
 // Authentication modules
-pub mod auth;
+use stun::auth;
 
-// Port allocation management
-pub mod allocation;
 
 // Re-export main types from server module
 pub use server::{
@@ -85,6 +82,7 @@ pub use allocation::{
     PortManager,
     PortRange,
 };
+use crate::nat::stun;
 
 /// TURN credentials for client authentication
 #[derive(Debug, Clone)]

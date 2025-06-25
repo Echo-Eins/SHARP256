@@ -49,7 +49,9 @@ pub mod port_forwarding;
 pub mod hole_punch;
 
 // Network interface discovery
-pub mod interface;
+pub mod metrics;
+pub mod coordinator;
+pub mod upnp;
 
 // УДАЛЕНЫ МЕНЕДЖЕРЫ:
 // - stun_turn_manager

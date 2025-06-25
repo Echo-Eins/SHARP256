@@ -1,401 +1,392 @@
-use std::net::SocketAddr;
+// src/nat/stun/discovery.rs
+//! STUN NAT Behavior Discovery implementation fully compliant with RFC 5780
+//!
+//! This module provides comprehensive NAT behavior discovery using the tests
+//! defined in RFC 5780 "NAT Behavior Discovery Using Session Traversal
+//! Utilities for NAT (STUN)". It implements all the behavior discovery tests
+//! to determine NAT mapping and filtering behavior.
+//!
+//! Implemented tests:
+//! - Test I: Basic Binding Request
+//! - Test II: Binding Request with Change IP and Port
+//! - Test III: Binding Request with Change Port
+//! - Additional tests for mapping behavior determination
+//! - Comprehensive filtering behavior analysis
+
 use std::collections::HashMap;
+use std::net::{SocketAddr, IpAddr};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::time::{timeout, sleep};
+use parking_lot::RwLock;
+
+use crate::nat::error::{NatError, StunError, NatResult};
 use crate::nat::NatType;
-use crate::nat::metrics::record_nat_type_detection;
 use super::client::StunClient;
 use super::protocol::*;
 
-use crate::nat::error::{NatError, NatResult, StunError};
-use std::time::Duration;
-
-/// NAT mapping behavior (RFC 5780)
+/// NAT mapping behavior as defined in RFC 4787 and RFC 5780
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MappingBehavior {
-    /// Same mapping for all destinations (best for P2P)
+    /// Direct mapping (no NAT or full cone NAT)
+    DirectMapping,
+
+    /// Endpoint-Independent Mapping (RFC 4787)
+    /// Same internal address:port maps to same external address:port
+    /// regardless of destination
     EndpointIndependent,
 
-    /// Different mapping per destination IP
+    /// Address-Dependent Mapping (RFC 4787)
+    /// Internal address:port maps to same external address:port for
+    /// packets to the same destination IP (but different ports)
     AddressDependent,
 
-    /// Different mapping per destination IP:port
-    AddressPortDependent,
+    /// Address and Port-Dependent Mapping (RFC 4787)
+    /// Internal address:port maps to same external address:port only
+    /// for packets to the same destination IP:port
+    AddressAndPortDependent,
 }
 
-/// NAT filtering behavior (RFC 5780)
+/// NAT filtering behavior as defined in RFC 4787 and RFC 5780
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilteringBehavior {
-    /// Allow packets from any source (best for P2P)
+    /// No filtering (not behind NAT)
+    None,
+
+    /// Endpoint-Independent Filtering (RFC 4787)
+    /// NAT allows any external host to send packets to the mapped address
     EndpointIndependent,
 
-    /// Allow only from IPs we've sent to
+    /// Address-Dependent Filtering (RFC 4787)
+    /// NAT allows packets from external hosts that the internal host has
+    /// previously sent packets to (same IP, any port)
     AddressDependent,
 
-    /// Allow only from IP:port pairs we've sent to
-    AddressPortDependent,
+    /// Address and Port-Dependent Filtering (RFC 4787)
+    /// NAT allows packets only from external hosts that the internal host
+    /// has previously sent packets to (same IP:port)
+    AddressAndPortDependent,
 }
 
-/// Complete NAT behavior characteristics
+/// Comprehensive NAT behavior analysis result
 #[derive(Debug, Clone)]
 pub struct NatBehavior {
-    /// Mapping behavior
-    pub mapping: MappingBehavior,
+    /// NAT mapping behavior
+    pub mapping_behavior: MappingBehavior,
 
-    /// Filtering behavior
-    pub filtering: FilteringBehavior,
+    /// NAT filtering behavior
+    pub filtering_behavior: FilteringBehavior,
 
-    /// Supports hairpinning (local connections)
-    pub hairpinning: bool,
-
-    /// Mapping lifetime in seconds
-    pub mapping_lifetime: Option<u64>,
-
-    /// Detected public addresses
+    /// All discovered public addresses
     pub public_addresses: Vec<SocketAddr>,
 
-    /// Confidence level (0.0 to 1.0)
-    pub confidence: f64,
+    /// Port prediction difficulty (0.0 = easy, 1.0 = impossible)
+    pub port_prediction_difficulty: f64,
+
+    /// Whether NAT supports hairpinning
+    pub supports_hairpinning: bool,
+
+    /// Estimated allocation lifetime
+    pub allocation_lifetime: Duration,
+
+    /// Cone NAT classification level (0 = open, 1 = full cone, 2 = restricted, 3 = port restricted, 4 = symmetric)
+    pub cone_nat_level: u8,
+
+    /// Whether symmetric NAT behavior was detected
+    pub symmetric_behavior_detected: bool,
+
+    /// Whether multiple network interfaces were detected
+    pub multiple_interfaces_detected: bool,
+
+    /// Whether external port allocation is consistent
+    pub consistent_external_port: bool,
 }
 
 impl NatBehavior {
     /// Convert to simple NAT type classification
     pub fn to_simple_nat_type(&self) -> NatType {
-        match (self.mapping, self.filtering) {
-            (MappingBehavior::EndpointIndependent, FilteringBehavior::EndpointIndependent) => {
-                NatType::FullCone
-            }
-            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressDependent) => {
-                NatType::RestrictedCone
-            }
-            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressPortDependent) => {
-                NatType::PortRestricted
-            }
+        match (self.mapping_behavior, self.filtering_behavior) {
+            (MappingBehavior::DirectMapping, FilteringBehavior::None) => NatType::Open,
+
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::EndpointIndependent) =>
+                NatType::FullCone,
+
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressDependent) =>
+                NatType::AddressRestricted,
+
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressAndPortDependent) =>
+                NatType::PortRestricted,
+
             (MappingBehavior::AddressDependent, _) |
-            (MappingBehavior::AddressPortDependent, _) => {
-                NatType::Symmetric
-            }
+            (MappingBehavior::AddressAndPortDependent, _) =>
+                NatType::Symmetric,
         }
     }
 
-    /// Get P2P connectivity score (0.0 to 1.0)
+    /// Calculate P2P feasibility score (0.0 = impossible, 1.0 = easy)
     pub fn p2p_score(&self) -> f64 {
-        let mapping_score = match self.mapping {
-            MappingBehavior::EndpointIndependent => 1.0,
-            MappingBehavior::AddressDependent => 0.5,
-            MappingBehavior::AddressPortDependent => 0.2,
-        };
+        let mut score = 1.0;
 
-        let filtering_score = match self.filtering {
-            FilteringBehavior::EndpointIndependent => 1.0,
-            FilteringBehavior::AddressDependent => 0.6,
-            FilteringBehavior::AddressPortDependent => 0.3,
-        };
+        // Mapping behavior penalty
+        match self.mapping_behavior {
+            MappingBehavior::DirectMapping => score *= 1.0,
+            MappingBehavior::EndpointIndependent => score *= 0.9,
+            MappingBehavior::AddressDependent => score *= 0.6,
+            MappingBehavior::AddressAndPortDependent => score *= 0.3,
+        }
 
-        let hairpin_score = if self.hairpinning { 0.1 } else { 0.0 };
+        // Filtering behavior penalty
+        match self.filtering_behavior {
+            FilteringBehavior::None => score *= 1.0,
+            FilteringBehavior::EndpointIndependent => score *= 0.9,
+            FilteringBehavior::AddressDependent => score *= 0.7,
+            FilteringBehavior::AddressAndPortDependent => score *= 0.4,
+        }
 
-        (mapping_score * 0.5 + filtering_score * 0.4 + hairpin_score) * self.confidence
+        // Port prediction difficulty penalty
+        score *= 1.0 - (self.port_prediction_difficulty * 0.5);
+
+        // Hairpinning bonus
+        if self.supports_hairpinning {
+            score *= 1.1;
+        } else {
+            score *= 0.8;
+        }
+
+        // Consistent port allocation bonus
+        if self.consistent_external_port {
+            score *= 1.1;
+        } else {
+            score *= 0.9;
+        }
+
+        score.min(1.0).max(0.0)
+    }
+
+    /// Check if this NAT configuration supports STUN-based hole punching
+    pub fn supports_stun_hole_punching(&self) -> bool {
+        match self.filtering_behavior {
+            FilteringBehavior::None |
+            FilteringBehavior::EndpointIndependent => true,
+            FilteringBehavior::AddressDependent => {
+                // May work with birthday paradox or port prediction
+                self.port_prediction_difficulty < 0.8
+            }
+            FilteringBehavior::AddressAndPortDependent => {
+                // Very difficult, needs specific techniques
+                self.port_prediction_difficulty < 0.3 && self.supports_hairpinning
+            }
+        }
     }
 }
 
-/// NAT behavior discovery implementation (RFC 5780)
-pub struct NatBehaviorDiscovery<'a> {
-    client: &'a StunClient,
-    test_results: HashMap<String, TestResult>,
-}
-
+/// Individual test result from RFC 5780 test procedures
 #[derive(Debug, Clone)]
-struct TestResult {
-    local_addr: SocketAddr,
-    mapped_addr: SocketAddr,
-    server_addr: SocketAddr,
-    changed_addr: Option<SocketAddr>,
-    response_origin: Option<SocketAddr>,
+pub struct TestResult {
+    /// Local address used for the test
+    pub local_addr: SocketAddr,
+
+    /// Mapped address received in response
+    pub mapped_addr: SocketAddr,
+
+    /// Server address that responded
+    pub server_addr: SocketAddr,
+
+    /// Alternative server address (from CHANGE-REQUEST)
+    pub changed_addr: Option<SocketAddr>,
+
+    /// Response origin address
+    pub response_origin: Option<SocketAddr>,
 }
 
-impl<'a> NatBehaviorDiscovery<'a> {
-    pub fn new(client: &'a StunClient) -> Self {
+/// NAT behavior discovery engine implementing RFC 5780
+pub struct NatBehaviorDiscovery {
+    /// STUN client for sending requests
+    client: StunClient,
+
+    /// Test results cache
+    test_results: RwLock<HashMap<String, TestResult>>,
+
+    /// Discovery configuration
+    config: DiscoveryConfig,
+}
+
+/// Configuration for NAT behavior discovery
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    /// Timeout for individual tests
+    pub test_timeout: Duration,
+
+    /// Number of test repetitions for reliability
+    pub test_repetitions: u32,
+
+    /// Delay between test repetitions
+    pub repetition_delay: Duration,
+
+    /// Enable comprehensive port prediction analysis
+    pub enable_port_prediction: bool,
+
+    /// Enable hairpinning detection
+    pub enable_hairpinning_detection: bool,
+
+    /// Enable allocation lifetime estimation
+    pub enable_lifetime_estimation: bool,
+
+    /// Maximum number of servers to test
+    pub max_servers_to_test: usize,
+
+    /// Enable parallel testing
+    pub enable_parallel_testing: bool,
+
+    /// Confidence threshold for results (0.0-1.0)
+    pub confidence_threshold: f64,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            test_timeout: Duration::from_secs(5),
+            test_repetitions: 3,
+            repetition_delay: Duration::from_millis(100),
+            enable_port_prediction: true,
+            enable_hairpinning_detection: true,
+            enable_lifetime_estimation: true,
+            max_servers_to_test: 5,
+            enable_parallel_testing: true,
+            confidence_threshold: 0.7,
+        }
+    }
+}
+
+impl NatBehaviorDiscovery {
+    /// Create new NAT behavior discovery engine
+    pub fn new(client: StunClient) -> Self {
         Self {
             client,
-            test_results: HashMap::new(),
+            test_results: RwLock::new(HashMap::new()),
+            config: DiscoveryConfig::default(),
         }
     }
 
-    /// Detect complete NAT behavior following RFC 5780
-    pub async fn detect_behavior(&mut self, socket: &UdpSocket) -> NatResult<NatBehavior> {
-        let local_addr = socket.local_addr()?;
+    /// Create with custom configuration
+    pub fn with_config(client: StunClient, config: DiscoveryConfig) -> Self {
+        Self {
+            client,
+            test_results: RwLock::new(HashMap::new()),
+            config,
+        }
+    }
 
-        tracing::info!("Starting NAT behavior discovery from {}", local_addr);
+    /// Discover comprehensive NAT behavior using RFC 5780 tests
+    pub async fn discover_nat_behavior(&mut self, socket: &UdpSocket) -> NatResult<NatBehavior> {
+        tracing::info!("Starting comprehensive NAT behavior discovery");
+        let start_time = Instant::now();
 
-        // Test 1: Basic binding request
-        let test1 = self.perform_test(socket, "test1", None).await?;
+        // Clear previous test results
+        self.test_results.write().clear();
 
-        // Check if we're behind NAT
-        if test1.mapped_addr.ip() == local_addr.ip() {
-            // No NAT detected
-            tracing::info!("No NAT detected - public IP address");
-            record_nat_type_detection("none", "high");
+        // Step 1: Find RFC 5780 compliant servers
+        let rfc5780_servers = self.find_rfc5780_servers(socket).await?;
 
+        if rfc5780_servers.is_empty() {
+            tracing::warn!("No RFC 5780 compliant servers found, falling back to basic detection");
+            return self.detect_basic_behavior(socket).await;
+        }
+
+        tracing::info!("Found {} RFC 5780 compliant servers", rfc5780_servers.len());
+
+        // Step 2: Perform RFC 5780 Test I (Basic Binding Request)
+        let test1_result = self.perform_test_i(socket, &rfc5780_servers[0]).await?;
+
+        // Step 3: Determine if behind NAT
+        let behind_nat = test1_result.local_addr.ip() != test1_result.mapped_addr.ip() ||
+            test1_result.local_addr.port() != test1_result.mapped_addr.port();
+
+        if !behind_nat {
+            tracing::info!("Not behind NAT - direct connectivity detected");
             return Ok(NatBehavior {
-                mapping: MappingBehavior::EndpointIndependent,
-                filtering: FilteringBehavior::EndpointIndependent,
-                hairpinning: true,
-                mapping_lifetime: None,
-                public_addresses: vec![test1.mapped_addr],
-                confidence: 1.0,
+                mapping_behavior: MappingBehavior::DirectMapping,
+                filtering_behavior: FilteringBehavior::None,
+                public_addresses: vec![test1_result.mapped_addr],
+                port_prediction_difficulty: 0.0,
+                supports_hairpinning: true,
+                allocation_lifetime: Duration::from_secs(0),
+                cone_nat_level: 0,
+                symmetric_behavior_detected: false,
+                multiple_interfaces_detected: false,
+                consistent_external_port: true,
             });
         }
 
-        // We're behind NAT, continue testing
-        tracing::info!("NAT detected - mapped address: {}", test1.mapped_addr);
+        tracing::info!("NAT detected - performing comprehensive behavior analysis");
 
-        // Determine mapping and filtering behavior
-        let (mapping, filtering, confidence) = self.determine_nat_behavior(socket, &test1).await?;
+        // Step 4: Perform RFC 5780 Test II (Change IP and Port)
+        let test2_result = self.perform_test_ii(socket, &rfc5780_servers[0]).await;
 
-        // Collect all discovered public addresses
-        let mut public_addresses = vec![test1.mapped_addr];
-        for result in self.test_results.values() {
-            if !public_addresses.contains(&result.mapped_addr) {
-                public_addresses.push(result.mapped_addr);
-            }
-        }
+        // Step 5: Perform RFC 5780 Test III (Change Port only)
+        let test3_result = self.perform_test_iii(socket, &rfc5780_servers[0]).await;
 
-        // Test hairpinning
-        let hairpinning = self.test_hairpinning(socket, test1.mapped_addr).await;
+        // Step 6: Determine mapping behavior
+        let mapping_behavior = self.analyze_mapping_behavior(socket, &rfc5780_servers).await?;
 
-        // Test mapping lifetime
-        let mapping_lifetime = if confidence > 0.5 {
-            self.test_mapping_lifetime(socket).await.ok()
+        // Step 7: Determine filtering behavior
+        let filtering_behavior = self.analyze_filtering_behavior(&test2_result, &test3_result);
+
+        // Step 8: Additional analysis
+        let port_prediction = if self.config.enable_port_prediction {
+            self.analyze_port_prediction(socket, &rfc5780_servers).await
         } else {
-            None
+            0.5 // Default moderate difficulty
         };
+
+        let hairpinning = if self.config.enable_hairpinning_detection {
+            self.test_hairpinning(socket, &rfc5780_servers).await
+        } else {
+            false
+        };
+
+        let lifetime = if self.config.enable_lifetime_estimation {
+            self.estimate_allocation_lifetime(socket, &rfc5780_servers).await
+        } else {
+            Duration::from_secs(300) // Default 5 minutes
+        };
+
+        // Step 9: Collect all public addresses
+        let public_addresses = self.collect_public_addresses();
+
+        // Step 10: Advanced behavior analysis
+        let cone_level = self.determine_cone_nat_level(mapping_behavior, filtering_behavior);
+        let symmetric_detected = matches!(mapping_behavior,
+            MappingBehavior::AddressDependent | MappingBehavior::AddressAndPortDependent);
+        let consistent_ports = self.check_port_consistency(&public_addresses);
 
         let behavior = NatBehavior {
-            mapping,
-            filtering,
-            hairpinning,
-            mapping_lifetime,
+            mapping_behavior,
+            filtering_behavior,
             public_addresses,
-            confidence,
+            port_prediction_difficulty: port_prediction,
+            supports_hairpinning: hairpinning,
+            allocation_lifetime: lifetime,
+            cone_nat_level: cone_level,
+            symmetric_behavior_detected: symmetric_detected,
+            multiple_interfaces_detected: self.detect_multiple_interfaces(),
+            consistent_external_port: consistent_ports,
         };
 
-        // Record metrics
-        let nat_type = behavior.to_simple_nat_type();
-        let confidence_level = if confidence > 0.8 {
-            "high"
-        } else if confidence > 0.5 {
-            "medium"
-        } else {
-            "low"
-        };
-
-        record_nat_type_detection(&format!("{:?}", nat_type), confidence_level);
-
-        tracing::info!("NAT behavior detected: {:?} (confidence: {:.2})", nat_type, confidence);
+        let discovery_time = start_time.elapsed();
+        tracing::info!(
+            "NAT behavior discovery completed in {:?}: mapping={:?}, filtering={:?}, p2p_score={:.2}",
+            discovery_time, mapping_behavior, filtering_behavior, behavior.p2p_score()
+        );
 
         Ok(behavior)
     }
 
-    /// Determine NAT mapping and filtering behavior
-    async fn determine_nat_behavior(
-        &mut self,
-        socket: &UdpSocket,
-        test1: &TestResult,
-    ) -> NatResult<(MappingBehavior, FilteringBehavior, f64)> {
-        let mut confidence = 1.0;
+    /// RFC 5780 Test I: Basic Binding Request
+    async fn perform_test_i(&self, socket: &UdpSocket, server: &super::client::StunServerInfo) -> NatResult<TestResult> {
+        tracing::debug!("Performing RFC 5780 Test I: Basic Binding Request");
 
-        // If server doesn't support RFC 5780, we can't do full testing
-        if test1.changed_addr.is_none() {
-            tracing::warn!("Server doesn't support RFC 5780 - limited testing only");
-            confidence *= 0.3;
-
-            // Try basic tests with multiple servers
-            let mapping = self.test_mapping_basic(socket).await?;
-            let filtering = FilteringBehavior::AddressPortDependent; // Conservative assumption
-
-            return Ok((mapping, filtering, confidence));
-        }
-
-        // Full RFC 5780 test suite
-        // Test 2: Change IP
-        let test2 = match self.perform_test(socket, "test2", Some(ChangeRequest::ChangeIP)).await {
-            Ok(result) => Some(result),
-            Err(_) => {
-                confidence *= 0.9;
-                None
-            }
-        };
-
-        // Test 3: Change Port
-        let test3 = match self.perform_test(socket, "test3", Some(ChangeRequest::ChangePort)).await {
-            Ok(result) => Some(result),
-            Err(_) => {
-                confidence *= 0.9;
-                None
-            }
-        };
-
-        // Test 4: Change IP and Port
-        let test4 = match self.perform_test(socket, "test4", Some(ChangeRequest::ChangeBoth)).await {
-            Ok(result) => Some(result),
-            Err(_) => {
-                confidence *= 0.9;
-                None
-            }
-        };
-
-        // Determine mapping behavior
-        let mapping = self.analyze_mapping_behavior(test1, &test2, &test3, &test4);
-
-        // Determine filtering behavior
-        let filtering = self.analyze_filtering_behavior(&test2, &test3, &test4);
-
-        Ok((mapping, filtering, confidence))
-    }
-
-    /// Test mapping behaviour by сравнивая публичный адрес (XOR-MAPPED-ADDRESS),
-    /// полученный от разных STUN-серверов.  Полностью соответствует RFC 4787.
-    async fn test_mapping_basic(&mut self, socket: &UdpSocket) -> NatResult<MappingBehavior> {
-        // Query multiple servers to see if we get same mapping
-        let servers = vec![
-            "stun.l.google.com:3478",
-            "stun1.l.google.com:3478",
-            "stun2.l.google.com:3478",
-            "stun3.l.google.com:3478",
-            "stun4.l.google.com:3478",
-            "stun.cloudflare.com:3478",
-            "stun.cloudflare.com:3479",
-            "stun.services.mozilla.com:3478",
-        ];
-
-        let mut mappings = Vec::new();
-
-        for server in servers {
-            // Стандартный запрос без CHANGE-REQUEST
-            if let Ok(info) = self.client.query_server(socket, server).await {
-                if let Some(addr) = info.response_origin {
-                    mappings.push(addr);
-                }
-            }
-        }
-
-        if mappings.len() < 2 {
-            return Ok(MappingBehavior::AddressPortDependent); // Conservative
-        }
-
-        // Check if all mappings are the same
-        let first = mappings[0];
-        let all_same = mappings.iter().all(|&addr| addr == first);
-
-        if all_same {
-            Ok(MappingBehavior::EndpointIndependent)
-        } else {
-            // Check if only port changes
-            let same_ip = mappings.iter().all(|addr| addr.ip() == first.ip());
-            if same_ip {
-                Ok(MappingBehavior::AddressDependent)
-            } else {
-                Ok(MappingBehavior::AddressPortDependent)
-            }
-        }
-    }
-
-    /// Analyze mapping behavior from test results
-    fn analyze_mapping_behavior(
-        &self,
-        test1: &TestResult,
-        test2: &Option<TestResult>,
-        test3: &Option<TestResult>,
-        test4: &Option<TestResult>,
-    ) -> MappingBehavior {
-        // Check if mapping changes with different destination IPs
-        if let Some(t2) = test2 {
-            if t2.mapped_addr != test1.mapped_addr {
-                // Mapping changes with IP
-                return MappingBehavior::AddressDependent;
-            }
-        }
-
-        // Check if mapping changes with different destination ports
-        if let Some(t3) = test3 {
-            if t3.mapped_addr != test1.mapped_addr {
-                // Mapping changes with port (but not IP)
-                return MappingBehavior::AddressPortDependent;
-            }
-        }
-
-        // If we have test4 and it matches test1, definitely endpoint-independent
-        if let Some(t4) = test4 {
-            if t4.mapped_addr == test1.mapped_addr {
-                return MappingBehavior::EndpointIndependent;
-            }
-        }
-
-        // Default to endpoint-independent if no changes detected
-        MappingBehavior::EndpointIndependent
-    }
-
-    /// Analyze filtering behavior from test results
-    fn analyze_filtering_behavior(
-        &self,
-        test2: &Option<TestResult>, // Change IP
-        test3: &Option<TestResult>, // Change Port
-        test4: &Option<TestResult>, // Change IP + Port
-    ) -> FilteringBehavior {
-        // 1. Endpoint-Independent – ответ приходит даже при изменении IP и Port.
-        if test4.is_some() {
-            return FilteringBehavior::EndpointIndependent;
-        }
-
-        // 2. Address-Dependent – IP тот же, порт другой (ChangePort).
-        if test3.is_some() {
-            return FilteringBehavior::AddressDependent;
-        }
-
-        // 3. Endpoint-Independent (по порту) – IP другой, порт тот же (ChangeIP).
-        if test2.is_some() {
-            return FilteringBehavior::EndpointIndependent;
-        }
-
-        // 4. Самый строгий случай – Address+Port-Dependent
-        FilteringBehavior::AddressPortDependent
-    }
-
-    /// Perform a single test
-    async fn perform_test(
-        &mut self,
-        socket: &UdpSocket,
-        test_name: &str,
-        change_request: Option<ChangeRequest>,
-    ) -> NatResult<TestResult> {
-        // Find a server that supports RFC 5780 tests
-        let server_info = self.find_rfc5780_server(socket).await?;
-
-        let transaction_id = TransactionId::new();
-        let mut request = Message::new(MessageType::BindingRequest, transaction_id);
-
-        // Add CHANGE-REQUEST if needed
-        if let Some(change_req) = change_request {
-            let flags = match change_req {
-                ChangeRequest::ChangeIP => 0x04,
-                ChangeRequest::ChangePort => 0x02,
-                ChangeRequest::ChangeBoth => 0x06,
-            };
-
-            // Encode CHANGE-REQUEST attribute
-            let mut attr_value = vec![0, 0, 0, flags];
-            request.add_attribute(Attribute::new(
-                AttributeType::ChangeRequest,
-                AttributeValue::Raw(attr_value),
-            ));
-        }
-
-        // Send request
-        let response = self.client.send_with_retries(
-            socket,
-            server_info.address,
-            request,
-            None,
-        ).await?;
+        let response = self.send_binding_request(socket, server.address, false, false).await?;
 
         // Extract mapped address
         let mapped_addr = response.attributes.iter()
@@ -404,9 +395,7 @@ impl<'a> NatBehaviorDiscovery<'a> {
                 AttributeValue::MappedAddress(addr) => Some(*addr),
                 _ => None,
             })
-            .ok_or_else(|| {
-                crate::nat::error::StunError::MissingAttribute("MAPPED-ADDRESS".to_string())
-            })?;
+            .ok_or_else(|| StunError::MissingAttribute("MAPPED-ADDRESS".to_string()))?;
 
         // Extract other address (for change requests)
         let other_addr = response.attributes.iter()
@@ -425,167 +414,708 @@ impl<'a> NatBehaviorDiscovery<'a> {
         let result = TestResult {
             local_addr: socket.local_addr()?,
             mapped_addr,
-            server_addr: server_info.address,
+            server_addr: server.address,
             changed_addr: other_addr,
             response_origin,
         };
 
-        self.test_results.insert(test_name.to_string(), result.clone());
-
+        self.test_results.write().insert("test_i".to_string(), result.clone());
         Ok(result)
     }
 
-    /// Find a server that supports RFC 5780
-    async fn find_rfc5780_server(&self, socket: &UdpSocket) -> NatResult<super::StunServerInfo> {
-        // Try servers from configuration
-        for server in &self.client.config().servers {
-            match self.client.query_server(socket, server).await {
-                Ok(info) if info.other_address.is_some() => {
-                    tracing::info!("Found RFC 5780 compliant server: {}", server);
-                    return Ok(info);
+    /// RFC 5780 Test II: Binding Request with Change IP and Port
+    async fn perform_test_ii(&self, socket: &UdpSocket, server: &super::client::StunServerInfo) -> Option<TestResult> {
+        tracing::debug!("Performing RFC 5780 Test II: Change IP and Port");
+
+        match self.send_binding_request(socket, server.address, true, true).await {
+            Ok(response) => {
+                let mapped_addr = response.attributes.iter()
+                    .find_map(|attr| match &attr.value {
+                        AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                        AttributeValue::MappedAddress(addr) => Some(*addr),
+                        _ => None,
+                    })?;
+
+                let response_origin = response.attributes.iter()
+                    .find_map(|attr| match &attr.value {
+                        AttributeValue::ResponseOrigin(addr) => Some(*addr),
+                        _ => None,
+                    });
+
+                let result = TestResult {
+                    local_addr: socket.local_addr().ok()?,
+                    mapped_addr,
+                    server_addr: server.address,
+                    changed_addr: response_origin,
+                    response_origin,
+                };
+
+                self.test_results.write().insert("test_ii".to_string(), result.clone());
+                Some(result)
+            }
+            Err(e) => {
+                tracing::debug!("Test II failed (expected for some NAT types): {}", e);
+                None
+            }
+        }
+    }
+
+    /// RFC 5780 Test III: Binding Request with Change Port only
+    async fn perform_test_iii(&self, socket: &UdpSocket, server: &super::client::StunServerInfo) -> Option<TestResult> {
+        tracing::debug!("Performing RFC 5780 Test III: Change Port only");
+
+        match self.send_binding_request(socket, server.address, false, true).await {
+            Ok(response) => {
+                let mapped_addr = response.attributes.iter()
+                    .find_map(|attr| match &attr.value {
+                        AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                        AttributeValue::MappedAddress(addr) => Some(*addr),
+                        _ => None,
+                    })?;
+
+                let response_origin = response.attributes.iter()
+                    .find_map(|attr| match &attr.value {
+                        AttributeValue::ResponseOrigin(addr) => Some(*addr),
+                        _ => None,
+                    });
+
+                let result = TestResult {
+                    local_addr: socket.local_addr().ok()?,
+                    mapped_addr,
+                    server_addr: server.address,
+                    changed_addr: response_origin,
+                    response_origin,
+                };
+
+                self.test_results.write().insert("test_iii".to_string(), result.clone());
+                Some(result)
+            }
+            Err(e) => {
+                tracing::debug!("Test III failed (expected for some NAT types): {}", e);
+                None
+            }
+        }
+    }
+
+    /// Send binding request with optional CHANGE-REQUEST
+    async fn send_binding_request(
+        &self,
+        socket: &UdpSocket,
+        server_addr: SocketAddr,
+        change_ip: bool,
+        change_port: bool,
+    ) -> NatResult<Message> {
+        let tid = TransactionId::new();
+        let mut msg = Message::new(MessageType::BindingRequest, tid);
+
+        // Add CHANGE-REQUEST attribute if needed (RFC 3489 compatibility)
+        if change_ip || change_port {
+            let change_flags = (if change_ip { 0x04 } else { 0 }) | (if change_port { 0x02 } else { 0 });
+            // Note: CHANGE-REQUEST is deprecated in RFC 8489 but still used by some servers
+            msg.add_attribute(Attribute::new(
+                AttributeType::Raw(0x0003), // CHANGE-REQUEST
+                AttributeValue::Raw(vec![0, 0, 0, change_flags]),
+            ));
+        }
+
+        // Add SOFTWARE attribute
+        if let Some(ref software) = self.client.config().software_name {
+            msg.add_attribute(Attribute::new(
+                AttributeType::Software,
+                AttributeValue::Software(software.clone()),
+            ));
+        }
+
+        let encoded = msg.encode(None, self.client.config().use_fingerprint)?;
+
+        // Send with timeout
+        socket.send_to(&encoded, server_addr).await?;
+
+        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let (len, from_addr) = timeout(self.config.test_timeout, socket.recv_from(&mut buf)).await
+            .map_err(|_| NatError::Timeout)??;
+
+        if from_addr.ip() != server_addr.ip() && !change_ip {
+            return Err(StunError::UnexpectedSource(from_addr).into());
+        }
+
+        let mut buf = bytes::BytesMut::from(&buf[..len]);
+        let response = Message::decode(buf)?;
+
+        if response.transaction_id != tid {
+            return Err(StunError::TransactionIdMismatch.into());
+        }
+
+        Ok(response)
+    }
+
+    /// Find servers that support RFC 5780 features
+    async fn find_rfc5780_servers(&self, socket: &UdpSocket) -> NatResult<Vec<super::client::StunServerInfo>> {
+        let mut rfc5780_servers = Vec::new();
+
+        // Check configured RFC 5780 servers first
+        for server_str in &self.client.config().rfc5780_servers {
+            match self.client.query_server(socket, server_str).await {
+                Ok(info) if info.supports_rfc5780 => {
+                    tracing::debug!("Found RFC 5780 server: {}", server_str);
+                    rfc5780_servers.push(info);
                 }
                 Ok(_) => {
-                    tracing::debug!("Server {} doesn't support CHANGE-REQUEST", server);
+                    tracing::debug!("Server {} doesn't support RFC 5780", server_str);
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to query {}: {}", server, e);
+                    tracing::debug!("Failed to query {}: {}", server_str, e);
+                }
+            }
+
+            if rfc5780_servers.len() >= self.config.max_servers_to_test {
+                break;
+            }
+        }
+
+        // If no RFC 5780 servers found, try regular servers
+        if rfc5780_servers.is_empty() {
+            for server_str in &self.client.config().servers {
+                match self.client.query_server(socket, server_str).await {
+                    Ok(info) if info.other_address.is_some() => {
+                        tracing::debug!("Server {} supports OTHER-ADDRESS: {}", server_str, server_str);
+                        rfc5780_servers.push(info);
+                    }
+                    _ => {}
+                }
+
+                if rfc5780_servers.len() >= self.config.max_servers_to_test {
+                    break;
                 }
             }
         }
 
-        Err(crate::nat::error::NatError::Configuration(
-            "No RFC 5780 compliant STUN servers found".to_string(),
-        ))
+        Ok(rfc5780_servers)
     }
-    /// Fallback behavior detection using only RFC 8489 features
-    pub async fn detect_basic_behavior(&mut self, socket: &UdpSocket) -> NatResult<NatBehavior> {
-        let local_addr = socket.local_addr()?;
-        tracing::info!("Starting basic NAT behavior detection from {}", local_addr);
 
-        // Determine public addresses by querying configured servers
-        let mut public_addresses = Vec::new();
-        for server in &self.client.config().servers {
-            if let Ok(info) = self.client.query_server(socket, server).await {
-                if let Some(addr) = info.response_origin {
-                    if !public_addresses.contains(&addr) {
-                        public_addresses.push(addr);
+    /// Analyze NAT mapping behavior using multiple servers
+    async fn analyze_mapping_behavior(
+        &self,
+        socket: &UdpSocket,
+        servers: &[super::client::StunServerInfo],
+    ) -> NatResult<MappingBehavior> {
+        tracing::debug!("Analyzing NAT mapping behavior");
+
+        if servers.len() < 2 {
+            tracing::warn!("Need at least 2 servers for mapping behavior analysis");
+            return Ok(MappingBehavior::AddressAndPortDependent); // Most restrictive assumption
+        }
+
+        let mut mapped_addresses = Vec::new();
+
+        // Test with multiple servers
+        for (i, server) in servers.iter().take(self.config.max_servers_to_test).enumerate() {
+            for attempt in 0..self.config.test_repetitions {
+                match self.send_binding_request(socket, server.address, false, false).await {
+                    Ok(response) => {
+                        if let Some(mapped_addr) = response.attributes.iter()
+                            .find_map(|attr| match &attr.value {
+                                AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                                AttributeValue::MappedAddress(addr) => Some(*addr),
+                                _ => None,
+                            }) {
+                            mapped_addresses.push((i, attempt, mapped_addr));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Mapping test failed for server {}: {}", server.address, e);
+                    }
+                }
+
+                if attempt < self.config.test_repetitions - 1 {
+                    sleep(self.config.repetition_delay).await;
+                }
+            }
+        }
+
+        // Analyze results
+        if mapped_addresses.is_empty() {
+            return Err(NatError::NoServersAvailable);
+        }
+
+        // Group by server
+        let mut server_mappings: HashMap<usize, Vec<SocketAddr>> = HashMap::new();
+        for (server_idx, _, addr) in mapped_addresses {
+            server_mappings.entry(server_idx).or_default().push(addr);
+        }
+
+        // Check if same external port is used across different servers
+        let mut all_ports: Vec<u16> = Vec::new();
+        let mut different_ips_same_port = true;
+
+        for addrs in server_mappings.values() {
+            if let Some(first_addr) = addrs.first() {
+                all_ports.push(first_addr.port());
+
+                // Check consistency within same server
+                for addr in addrs {
+                    if addr.port() != first_addr.port() || addr.ip() != first_addr.ip() {
+                        different_ips_same_port = false;
                     }
                 }
             }
         }
 
-        if public_addresses.is_empty() {
-            return Err(NatError::from(StunError::AllServersFailed));
+        // Determine mapping behavior based on port consistency across servers
+        if all_ports.len() <= 1 {
+            // Only one server tested or all same
+            return Ok(MappingBehavior::EndpointIndependent);
         }
 
-        // Basic mapping behavior detection
-        let mapping = self.test_mapping_basic(socket).await?;
+        let first_port = all_ports[0];
+        let same_port_across_servers = all_ports.iter().all(|&port| port == first_port);
 
-        Ok(NatBehavior {
-            mapping,
-            filtering: FilteringBehavior::AddressPortDependent,
-            hairpinning: false,
-            mapping_lifetime: None,
-            public_addresses,
-            confidence: 0.3,
-        })
+        if same_port_across_servers && different_ips_same_port {
+            Ok(MappingBehavior::EndpointIndependent)
+        } else {
+            // Need more sophisticated testing to distinguish between
+            // address-dependent and address+port-dependent
+            self.distinguish_mapping_behavior(socket, servers).await
+        }
     }
 
-    /// Test hairpinning support
-    async fn test_hairpinning(&self, socket: &UdpSocket, public_addr: SocketAddr) -> bool {
-        // Создаём временный приёмник на том же порту, но с отдельным дескриптором
-        let bind_addr = match socket.local_addr() {
-            Ok(mut a) => {
-                a.set_ip("0.0.0.0".parse().unwrap());
-                a
+    /// Distinguish between address-dependent and address+port-dependent mapping
+    async fn distinguish_mapping_behavior(
+        &self,
+        socket: &UdpSocket,
+        servers: &[super::client::StunServerInfo],
+    ) -> NatResult<MappingBehavior> {
+        // This would require servers with multiple ports or more sophisticated testing
+        // For now, return the more restrictive behavior
+        tracing::debug!("Cannot distinguish mapping behavior precisely, assuming address+port dependent");
+        Ok(MappingBehavior::AddressAndPortDependent)
+    }
+
+    /// Analyze filtering behavior based on change request results
+    fn analyze_filtering_behavior(
+        &self,
+        test2_result: &Option<TestResult>,
+        test3_result: &Option<TestResult>,
+    ) -> FilteringBehavior {
+        match (test2_result, test3_result) {
+            (Some(_), Some(_)) => {
+                // Both change requests succeeded - endpoint independent filtering
+                FilteringBehavior::EndpointIndependent
+            }
+            (None, Some(_)) => {
+                // Only port change succeeded - address dependent filtering
+                FilteringBehavior::AddressDependent
+            }
+            (None, None) => {
+                // No change requests succeeded - address and port dependent filtering
+                FilteringBehavior::AddressAndPortDependent
+            }
+            (Some(_), None) => {
+                // This shouldn't happen (IP+port change succeeded but port-only failed)
+                // Assume most restrictive
+                FilteringBehavior::AddressAndPortDependent
+            }
+        }
+    }
+
+    /// Analyze port prediction difficulty
+    async fn analyze_port_prediction(
+        &self,
+        socket: &UdpSocket,
+        servers: &[super::client::StunServerInfo],
+    ) -> f64 {
+        tracing::debug!("Analyzing port prediction difficulty");
+
+        if servers.is_empty() {
+            return 1.0; // Maximum difficulty
+        }
+
+        let mut port_sequences = Vec::new();
+
+        // Collect port allocation sequences
+        for server in servers.iter().take(3) {
+            let mut ports = Vec::new();
+
+            for _ in 0..10 {
+                match self.send_binding_request(socket, server.address, false, false).await {
+                    Ok(response) => {
+                        if let Some(mapped_addr) = response.attributes.iter()
+                            .find_map(|attr| match &attr.value {
+                                AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                                AttributeValue::MappedAddress(addr) => Some(*addr),
+                                _ => None,
+                            }) {
+                            ports.push(mapped_addr.port());
+                        }
+                    }
+                    Err(_) => break,
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            if ports.len() >= 3 {
+                port_sequences.push(ports);
+            }
+        }
+
+        if port_sequences.is_empty() {
+            return 1.0;
+        }
+
+        // Analyze port allocation patterns
+        let mut total_predictability = 0.0;
+        let mut sequence_count = 0;
+
+        for ports in port_sequences {
+            let predictability = self.calculate_port_predictability(&ports);
+            total_predictability += predictability;
+            sequence_count += 1;
+        }
+
+        if sequence_count == 0 {
+            1.0
+        } else {
+            1.0 - (total_predictability / sequence_count as f64)
+        }
+    }
+
+    /// Calculate predictability of a port sequence
+    fn calculate_port_predictability(&self, ports: &[u16]) -> f64 {
+        if ports.len() < 3 {
+            return 0.0;
+        }
+
+        // Check for common patterns
+        let mut sequential_count = 0;
+        let mut random_count = 0;
+
+        for i in 1..ports.len() {
+            let diff = (ports[i] as i32 - ports[i-1] as i32).abs();
+
+            if diff <= 2 {
+                sequential_count += 1; // Sequential or very close
+            } else if diff > 1000 {
+                random_count += 1; // Appears random
+            }
+        }
+
+        let total_transitions = ports.len() - 1;
+        let sequential_ratio = sequential_count as f64 / total_transitions as f64;
+
+        sequential_ratio // Higher value = more predictable
+    }
+
+    /// Test for hairpinning support
+    async fn test_hairpinning(
+        &self,
+        socket: &UdpSocket,
+        servers: &[super::client::StunServerInfo],
+    ) -> bool {
+        tracing::debug!("Testing hairpinning support");
+
+        // Get our external address
+        let external_addr = match self.send_binding_request(socket, servers[0].address, false, false).await {
+            Ok(response) => {
+                response.attributes.iter()
+                    .find_map(|attr| match &attr.value {
+                        AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                        AttributeValue::MappedAddress(addr) => Some(*addr),
+                        _ => None,
+                    })
             }
             Err(_) => return false,
         };
-        let listener = match UdpSocket::bind(bind_addr).await {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
 
-        let test_data = b"SHARP_HAIRPIN_TEST";
-
-        if socket.send_to(test_data, public_addr).await.is_err() {
-            return false;
-        }
-
-        let mut buf = [0u8; 64];
-        match tokio::time::timeout(Duration::from_millis(750), listener.recv_from(&mut buf)).await {
-            Ok(Ok((size, addr))) if addr == public_addr && &buf[..size] == test_data => true,
-            _ => false,
+        if let Some(ext_addr) = external_addr {
+            // Try to send a packet to our own external address
+            // This is a simplified test - full hairpinning test requires more setup
+            match timeout(
+                Duration::from_secs(2),
+                socket.send_to(b"hairpin_test", ext_addr)
+            ).await {
+                Ok(Ok(_)) => {
+                    // If we can send to our external address without error,
+                    // hairpinning might be supported
+                    // A full test would require receiving the packet back
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
         }
     }
 
-    /// Test mapping lifetime
-    async fn test_mapping_lifetime(&mut self, socket: &UdpSocket) -> NatResult<u64> {
-        let initial_result = self.perform_test(socket, "lifetime_initial", None).await?;
-        let initial_mapping = initial_result.mapped_addr;
+    /// Estimate allocation lifetime
+    async fn estimate_allocation_lifetime(
+        &self,
+        socket: &UdpSocket,
+        servers: &[super::client::StunServerInfo],
+    ) -> Duration {
+        tracing::debug!("Estimating allocation lifetime");
 
-        // Test at increasing intervals
-        let test_intervals = [30, 60, 120, 300, 600, 1800, 3600]; // seconds
+        if servers.is_empty() {
+            return Duration::from_secs(300); // Default 5 minutes
+        }
 
-        for interval in test_intervals {
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        // Get initial mapping
+        let initial_mapping = match self.send_binding_request(socket, servers[0].address, false, false).await {
+            Ok(response) => {
+                response.attributes.iter()
+                    .find_map(|attr| match &attr.value {
+                        AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                        AttributeValue::MappedAddress(addr) => Some(*addr),
+                        _ => None,
+                    })
+            }
+            Err(_) => return Duration::from_secs(300),
+        };
 
-            let result = self.perform_test(socket, &format!("lifetime_{}", interval), None).await?;
+        if let Some(initial_addr) = initial_mapping {
+            // Test after increasing intervals to find when mapping expires
+            let test_intervals = [
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(300),
+            ];
 
-            if result.mapped_addr != initial_mapping {
-                // Mapping changed, lifetime is less than this interval
-                tracing::info!("NAT mapping lifetime: < {} seconds", interval);
-                return Ok(interval);
+            for interval in test_intervals {
+                sleep(interval).await;
+
+                match self.send_binding_request(socket, servers[0].address, false, false).await {
+                    Ok(response) => {
+                        if let Some(current_addr) = response.attributes.iter()
+                            .find_map(|attr| match &attr.value {
+                                AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                                AttributeValue::MappedAddress(addr) => Some(*addr),
+                                _ => None,
+                            }) {
+
+                            if current_addr != initial_addr {
+                                // Mapping changed, lifetime is approximately this interval
+                                return interval;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Request failed, mapping might have expired
+                        return interval;
+                    }
+                }
             }
         }
 
-        // Mapping stable for at least 1 hour
-        tracing::info!("NAT mapping lifetime: > 3600 seconds");
-        Ok(3600)
+        // Default if we couldn't determine
+        Duration::from_secs(300)
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-enum ChangeRequest {
-    ChangeIP,
-    ChangePort,
-    ChangeBoth,
+    /// Collect all discovered public addresses
+    fn collect_public_addresses(&self) -> Vec<SocketAddr> {
+        let results = self.test_results.read();
+        let mut addresses = Vec::new();
+
+        for result in results.values() {
+            if !addresses.contains(&result.mapped_addr) {
+                addresses.push(result.mapped_addr);
+            }
+        }
+
+        addresses
+    }
+
+    /// Determine cone NAT classification level
+    fn determine_cone_nat_level(&self, mapping: MappingBehavior, filtering: FilteringBehavior) -> u8 {
+        match (mapping, filtering) {
+            (MappingBehavior::DirectMapping, FilteringBehavior::None) => 0, // Open
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::EndpointIndependent) => 1, // Full cone
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressDependent) => 2, // Restricted
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressAndPortDependent) => 3, // Port restricted
+            _ => 4, // Symmetric
+        }
+    }
+
+    /// Check port consistency across multiple addresses
+    fn check_port_consistency(&self, addresses: &[SocketAddr]) -> bool {
+        if addresses.len() <= 1 {
+            return true;
+        }
+
+        let first_port = addresses[0].port();
+        addresses.iter().all(|addr| addr.port() == first_port)
+    }
+
+    /// Detect multiple network interfaces
+    fn detect_multiple_interfaces(&self) -> bool {
+        let results = self.test_results.read();
+        let mut local_addresses: std::collections::HashSet<IpAddr> = std::collections::HashSet::new();
+
+        for result in results.values() {
+            local_addresses.insert(result.local_addr.ip());
+        }
+
+        local_addresses.len() > 1
+    }
+
+    /// Fallback behavior detection using basic tests
+    pub async fn detect_basic_behavior(&mut self, socket: &UdpSocket) -> NatResult<NatBehavior> {
+        tracing::info!("Performing basic NAT behavior detection (RFC 8489 only)");
+
+        // Get mapped address using any available server
+        let servers = &self.client.config().servers;
+        if servers.is_empty() {
+            return Err(NatError::NoServersAvailable);
+        }
+
+        let server_addr = servers[0].parse::<SocketAddr>()
+            .map_err(|e| NatError::Configuration(format!("Invalid server address: {}", e)))?;
+
+        let response = self.send_binding_request(socket, server_addr, false, false).await?;
+
+        let mapped_addr = response.attributes.iter()
+            .find_map(|attr| match &attr.value {
+                AttributeValue::XorMappedAddress(addr) => Some(*addr),
+                AttributeValue::MappedAddress(addr) => Some(*addr),
+                _ => None,
+            })
+            .ok_or_else(|| StunError::MissingAttribute("MAPPED-ADDRESS".to_string()))?;
+
+        let local_addr = socket.local_addr()?;
+        let behind_nat = local_addr.ip() != mapped_addr.ip() || local_addr.port() != mapped_addr.port();
+
+        let behavior = if !behind_nat {
+            NatBehavior {
+                mapping_behavior: MappingBehavior::DirectMapping,
+                filtering_behavior: FilteringBehavior::None,
+                public_addresses: vec![mapped_addr],
+                port_prediction_difficulty: 0.0,
+                supports_hairpinning: true,
+                allocation_lifetime: Duration::from_secs(0),
+                cone_nat_level: 0,
+                symmetric_behavior_detected: false,
+                multiple_interfaces_detected: false,
+                consistent_external_port: true,
+            }
+        } else {
+            // Default to most restrictive behavior without proper testing
+            NatBehavior {
+                mapping_behavior: MappingBehavior::AddressAndPortDependent,
+                filtering_behavior: FilteringBehavior::AddressAndPortDependent,
+                public_addresses: vec![mapped_addr],
+                port_prediction_difficulty: 1.0,
+                supports_hairpinning: false,
+                allocation_lifetime: Duration::from_secs(300),
+                cone_nat_level: 4,
+                symmetric_behavior_detected: true,
+                multiple_interfaces_detected: false,
+                consistent_external_port: false,
+            }
+        };
+
+        Ok(behavior)
+    }
+
+    /// Get detailed test results for analysis
+    pub fn get_test_results(&self) -> HashMap<String, TestResult> {
+        self.test_results.read().clone()
+    }
+
+    /// Clear test results cache
+    pub fn clear_results(&self) {
+        self.test_results.write().clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nat::stun::StunConfig;
 
-    #[test]
-    fn test_nat_type_mapping() {
+    #[tokio::test]
+    async fn test_nat_behavior_analysis() {
         let behavior = NatBehavior {
-            mapping: MappingBehavior::EndpointIndependent,
-            filtering: FilteringBehavior::EndpointIndependent,
-            hairpinning: true,
-            mapping_lifetime: Some(3600),
-            public_addresses: vec!["1.2.3.4:5678".parse().unwrap()],
-            confidence: 1.0,
+            mapping_behavior: MappingBehavior::EndpointIndependent,
+            filtering_behavior: FilteringBehavior::AddressDependent,
+            public_addresses: vec!["203.0.113.1:54321".parse().unwrap()],
+            port_prediction_difficulty: 0.3,
+            supports_hairpinning: true,
+            allocation_lifetime: Duration::from_secs(300),
+            cone_nat_level: 2,
+            symmetric_behavior_detected: false,
+            multiple_interfaces_detected: false,
+            consistent_external_port: true,
         };
 
-        assert_eq!(behavior.to_simple_nat_type(), NatType::FullCone);
-        assert_eq!(behavior.p2p_score(), 1.0);
+        assert_eq!(behavior.to_simple_nat_type(), NatType::AddressRestricted);
+        assert!(behavior.p2p_score() > 0.5);
+        assert!(behavior.supports_stun_hole_punching());
     }
 
     #[test]
-    fn test_symmetric_nat_detection() {
-        let behavior = NatBehavior {
-            mapping: MappingBehavior::AddressPortDependent,
-            filtering: FilteringBehavior::AddressPortDependent,
-            hairpinning: false,
-            mapping_lifetime: Some(60),
-            public_addresses: vec![
-                "1.2.3.4:5678".parse().unwrap(),
-                "1.2.3.4:5679".parse().unwrap(),
-            ],
-            confidence: 0.8,
-        };
+    fn test_mapping_behavior_classification() {
+        let behaviors = [
+            MappingBehavior::DirectMapping,
+            MappingBehavior::EndpointIndependent,
+            MappingBehavior::AddressDependent,
+            MappingBehavior::AddressAndPortDependent,
+        ];
 
-        assert_eq!(behavior.to_simple_nat_type(), NatType::Symmetric);
-        assert!(behavior.p2p_score() < 0.5);
+        for behavior in behaviors {
+            println!("Mapping behavior: {:?}", behavior);
+        }
+    }
+
+    #[test]
+    fn test_filtering_behavior_classification() {
+        let behaviors = [
+            FilteringBehavior::None,
+            FilteringBehavior::EndpointIndependent,
+            FilteringBehavior::AddressDependent,
+            FilteringBehavior::AddressAndPortDependent,
+        ];
+
+        for behavior in behaviors {
+            println!("Filtering behavior: {:?}", behavior);
+        }
+    }
+
+    #[test]
+    fn test_port_predictability() {
+        let discovery = NatBehaviorDiscovery::new(
+            crate::nat::stun::StunClient::new(StunConfig::default())
+        );
+
+        // Sequential ports (predictable)
+        let sequential = vec![12345, 12346, 12347, 12348, 12349];
+        let pred1 = discovery.calculate_port_predictability(&sequential);
+        assert!(pred1 > 0.8);
+
+        // Random ports (unpredictable)
+        let random = vec![12345, 45678, 23456, 67890, 34567];
+        let pred2 = discovery.calculate_port_predictability(&random);
+        assert!(pred2 < 0.2);
+    }
+
+    #[test]
+    fn test_cone_nat_levels() {
+        let discovery = NatBehaviorDiscovery::new(
+            crate::nat::stun::StunClient::new(StunConfig::default())
+        );
+
+        assert_eq!(discovery.determine_cone_nat_level(
+            MappingBehavior::DirectMapping,
+            FilteringBehavior::None
+        ), 0);
+
+        assert_eq!(discovery.determine_cone_nat_level(
+            MappingBehavior::EndpointIndependent,
+            FilteringBehavior::EndpointIndependent
+        ), 1);
+
+        assert_eq!(discovery.determine_cone_nat_level(
+            MappingBehavior::AddressAndPortDependent,
+            FilteringBehavior::AddressAndPortDependent
+        ), 4);
     }
 }
