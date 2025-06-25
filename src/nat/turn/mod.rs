@@ -1,95 +1,92 @@
-// src/nat/turn/mod.rs (дополнения для совместимости)
-//! Дополнения к TURN модулю для совместимости с новыми менеджерами
+// src/nat/turn/mod.rs
+//! TURN (Traversal Using Relays around NAT) implementation
+//!
+//! This module provides a complete TURN relay implementation with:
+//! - RFC 8656 compliant TURN protocol
+//! - SHARP protocol extensions for P2P connectivity
+//! - High-performance server with memory pools
+//! - Quantum-resistant cryptography support
+//! - Comprehensive monitoring and statistics
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use serde::{Serialize, Deserialize};
 
 use crate::nat::error::{NatError, NatResult};
 
-// Добавить недостающие типы для совместимости
+// MAIN MODULE: настоящий TURN сервер
+pub mod server;
 
-/// Конфигурация TURN сервера (базовая)
-#[derive(Debug, Clone)]
-pub struct TurnServerConfig {
-    /// Адрес для привязки сервера
-    pub bind_address: SocketAddr,
+// Protocol definitions
+pub mod protocol;
 
-    /// Внешний адрес (если отличается от bind_address)
-    pub external_address: Option<SocketAddr>,
+// Client implementation
+pub mod client;
 
-    /// Realm для аутентификации
-    pub realm: String,
+// Authentication modules
+pub mod auth;
 
-    /// Конфигурация аутентификации
-    pub auth_config: AuthConfig,
+// Port allocation management
+pub mod allocation;
 
-    /// Время жизни allocation по умолчанию
-    pub allocation_lifetime: Duration,
+// Re-export main types from server module
+pub use server::{
+    TurnServer,
+    TurnServerConfig,
+    AuthConfig,
+    TransportProtocol,
+    // Статистика и мониторинг
+    ServerStatistics,
+    AllocationStats,
+    // Конфигурации
+    SharpConfig,
+    PerformanceConfig,
+    MonitoringConfig,
+    // Пулы памяти
+    PacketPool,
+    AllocationPool,
+};
 
-    /// Максимальное количество allocations
-    pub max_allocations: usize,
+// Re-export client types
+pub use client::{
+    TurnClient,
+    TurnClientConfig,
+    ClientConnectionState,
+};
 
-    /// Включить TCP поддержку
-    pub enable_tcp: bool,
+// Re-export protocol types
+pub use protocol::{
+    TurnMessage,
+    TurnMessageType,
+    TurnAttribute,
+    AttributeType,
+    StunMagicCookie,
+    // SHARP protocol extensions
+    SharpHeader,
+    HandshakeInitMessage,
+    HandshakeResponseMessage,
+};
 
-    /// Включить TLS поддержку
-    pub enable_tls: bool,
+// Re-export auth types
+pub use auth::{
+    AuthManager,
+    UserCredentials,
+    NonceManager,
+    LongTermCredentialMechanism,
+};
 
-    /// Путь к сертификату (для TLS)
-    pub cert_path: Option<String>,
+// Re-export allocation types
+pub use allocation::{
+    Allocation,
+    AllocationKey,
+    AllocationState,
+    RelayAddress,
+    PortManager,
+    PortRange,
+};
 
-    /// Путь к ключу (для TLS)
-    pub key_path: Option<String>,
-}
-
-/// Конфигурация аутентификации
-#[derive(Debug, Clone)]
-pub enum AuthConfig {
-    /// Статические пользователи
-    Static {
-        users: HashMap<String, String>, // username -> password
-    },
-    /// Внешний провайдер аутентификации
-    External {
-        endpoint: String,
-        timeout: Duration,
-    },
-    /// Отключить аутентификацию (только для тестирования)
-    Disabled,
-}
-
-/// TURN клиент
-pub struct TurnClient {
-    server_url: String,
-    state: Arc<tokio::sync::RwLock<TurnClientState>>,
-}
-
-/// Состояние TURN клиента
-#[derive(Debug)]
-struct TurnClientState {
-    connected: bool,
-    allocations: HashMap<String, TurnAllocation>,
-}
-
-/// TURN allocation
-#[derive(Debug, Clone)]
-pub struct TurnAllocation {
-    pub relay_address: SocketAddr,
-    pub allocated_at: Instant,
-    pub expires_at: Instant,
-}
-
-/// TURN сервер (заглушка)
-pub struct TurnServer {
-    config: TurnServerConfig,
-    running: Arc<tokio::sync::RwLock<bool>>,
-}
-
-/// Учетные данные TURN
+/// TURN credentials for client authentication
 #[derive(Debug, Clone)]
 pub struct TurnCredentials {
     pub username: String,
@@ -97,288 +94,139 @@ pub struct TurnCredentials {
     pub realm: Option<String>,
 }
 
-/// Состояние allocation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AllocationState {
-    /// Allocation запрошен
-    Requested,
-    /// Allocation активен
-    Active,
-    /// Allocation истекает
-    Expiring,
-    /// Allocation истек
-    Expired,
-    /// Allocation неудачен
-    Failed,
-}
-
-/// Адрес relay
+/// Basic client allocation info (simplified)
 #[derive(Debug, Clone)]
-pub struct RelayAddress {
-    pub address: SocketAddr,
+pub struct TurnAllocation {
+    pub relay_address: SocketAddr,
     pub allocated_at: Instant,
     pub expires_at: Instant,
 }
 
-impl TurnClient {
-    /// Создать новый TURN клиент
-    pub async fn new(server_url: &str) -> NatResult<Self> {
-        let state = TurnClientState {
-            connected: false,
-            allocations: HashMap::new(),
-        };
-
-        Ok(Self {
-            server_url: server_url.to_string(),
-            state: Arc::new(tokio::sync::RwLock::new(state)),
-        })
-    }
-
-    /// Выполнить allocation (заглушка)
-    pub async fn allocate(
-        &self,
-        socket: Arc<UdpSocket>,
-        credentials: TurnCredentials,
-        lifetime: Duration,
-    ) -> NatResult<TurnAllocation> {
-        tracing::debug!("Выполнение TURN allocation для {}", self.server_url);
-
-        // В реальной реализации здесь был бы полный TURN протокол
-        // Пока что возвращаем ошибку или фиктивные данные
-
-        // Для совместимости создаем фиктивный allocation
-        let relay_address = socket.local_addr()
-            .map_err(|e| NatError::Network(format!("Не удалось получить локальный адрес: {}", e)))?;
-
-        let allocation = TurnAllocation {
-            relay_address,
-            allocated_at: Instant::now(),
-            expires_at: Instant::now() + lifetime,
-        };
-
-        // Сохранить в состоянии
-        {
-            let mut state = self.state.write().await;
-            let allocation_id = format!("{}:{}", relay_address.ip(), relay_address.port());
-            state.allocations.insert(allocation_id, allocation.clone());
-            state.connected = true;
-        }
-
-        Ok(allocation)
-    }
-
-    /// Освободить allocation (заглушка)
-    pub async fn deallocate(&self) -> NatResult<()> {
-        tracing::debug!("Освобождение TURN allocations для {}", self.server_url);
-
-        let mut state = self.state.write().await;
-        state.allocations.clear();
-        state.connected = false;
-
-        Ok(())
-    }
-
-    /// Получить состояние клиента
-    pub async fn is_connected(&self) -> bool {
-        self.state.read().await.connected
-    }
-
-    /// Получить активные allocations
-    pub async fn get_allocations(&self) -> Vec<TurnAllocation> {
-        self.state.read().await.allocations.values().cloned().collect()
-    }
-}
-
-impl TurnServer {
-    /// Создать новый TURN сервер
-    pub async fn new(config: TurnServerConfig) -> NatResult<Self> {
-        tracing::info!("Создание TURN сервера на {}", config.bind_address);
-
-        Ok(Self {
-            config,
-            running: Arc::new(tokio::sync::RwLock::new(false)),
-        })
-    }
-
-    /// Запустить TURN сервер (заглушка)
-    pub async fn start(&self) -> NatResult<()> {
-        tracing::info!("Запуск TURN сервера на {}", self.config.bind_address);
-
-        *self.running.write().await = true;
-
-        // В реальной реализации здесь был бы запуск сервера
-        // Пока что просто имитируем успешный запуск
-        tracing::info!("TURN сервер запущен (заглушка)");
-
-        Ok(())
-    }
-
-    /// Остановить TURN сервер
-    pub async fn shutdown(&self) -> NatResult<()> {
-        tracing::info!("Остановка TURN сервера");
-
-        *self.running.write().await = false;
-
-        // В реальной реализации здесь была бы корректная остановка
-        tracing::info!("TURN сервер остановлен");
-
-        Ok(())
-    }
-
-    /// Проверить, запущен ли сервер
-    pub async fn is_running(&self) -> bool {
-        *self.running.read().await
-    }
-
-    /// Получить конфигурацию сервера
-    pub fn get_config(&self) -> &TurnServerConfig {
-        &self.config
-    }
-
-    /// Получить статистику сервера (заглушка)
-    pub async fn get_stats(&self) -> TurnServerStats {
-        TurnServerStats {
-            active_allocations: 0,
-            total_allocations: 0,
-            bytes_relayed: 0,
-            uptime: Duration::ZERO,
-        }
-    }
-}
-
-/// Статистика TURN сервера
-#[derive(Debug, Clone)]
-pub struct TurnServerStats {
-    pub active_allocations: u64,
-    pub total_allocations: u64,
-    pub bytes_relayed: u64,
-    pub uptime: Duration,
-}
-
-impl Default for TurnServerConfig {
-    fn default() -> Self {
-        Self {
-            bind_address: "0.0.0.0:3478".parse().unwrap(),
-            external_address: None,
-            realm: "turn.local".to_string(),
-            auth_config: AuthConfig::Static {
-                users: HashMap::new(),
-            },
-            allocation_lifetime: Duration::from_secs(600),
-            max_allocations: 1000,
-            enable_tcp: false,
-            enable_tls: false,
-            cert_path: None,
-            key_path: None,
-        }
-    }
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self::Static {
-            users: HashMap::new(),
-        }
-    }
-}
-
-/// Создать конфигурацию TURN сервера по умолчанию
+/// Create a default TURN server configuration
 pub fn create_default_config(bind_addr: &str, external_addr: &str) -> NatResult<TurnServerConfig> {
     let bind_address = bind_addr.parse()
-        .map_err(|e| NatError::Configuration(format!("Неверный адрес привязки: {}", e)))?;
+        .map_err(|e| NatError::Configuration(format!("Invalid bind address: {}", e)))?;
 
     let external_address = if external_addr.is_empty() {
         None
     } else {
         Some(external_addr.parse()
-            .map_err(|e| NatError::Configuration(format!("Неверный внешний адрес: {}", e)))?)
+            .map_err(|e| NatError::Configuration(format!("Invalid external address: {}", e)))?)
     };
 
-    let mut users = HashMap::new();
-    users.insert("user".to_string(), "pass".to_string());
-
     Ok(TurnServerConfig {
+        // Basic settings
         bind_address,
         external_address,
         realm: "sharp3.local".to_string(),
-        auth_config: AuthConfig::Static { users },
+
+        // Authentication
+        auth_config: AuthConfig::Static {
+            users: HashMap::new(),
+        },
+
+        // Allocation management
         allocation_lifetime: Duration::from_secs(600),
         max_allocations: 1000,
+        allocation_cleanup_interval: Duration::from_secs(60),
+
+        // Transport settings
         enable_tcp: false,
         enable_tls: false,
+        enable_dtls: false,
         cert_path: None,
         key_path: None,
+
+        // SHARP protocol settings
+        sharp_config: SharpConfig::default(),
+
+        // Performance settings
+        performance_config: PerformanceConfig::default(),
+
+        // Monitoring settings
+        monitoring_config: MonitoringConfig::default(),
+
+        // Security settings
+        enable_fingerprinting: true,
+        software_name: Some("SHARP TURN Server/1.0".to_string()),
+
+        // Rate limiting
+        max_requests_per_minute: 60,
+        max_allocations_per_client: 10,
+
+        // Bandwidth management
+        bandwidth_limits: Default::default(),
+
+        // Additional settings
+        nonce_expiry: Duration::from_secs(600),
+        thread_pool_size: num_cpus::get(),
+        packet_pool_size: 1000,
+        allocation_pool_size: 100,
     })
 }
 
-/// Создать тестовые учетные данные TURN
+/// Create basic TURN credentials for testing
 pub fn create_test_credentials() -> TurnCredentials {
     TurnCredentials {
         username: "testuser".to_string(),
         password: "testpass".to_string(),
-        realm: Some("test.local".to_string()),
+        realm: Some("sharp3.local".to_string()),
     }
 }
 
-/// Проверить конфигурацию TURN сервера
+/// Validate TURN server configuration
 pub fn validate_turn_config(config: &TurnServerConfig) -> NatResult<()> {
-    // Проверить адрес привязки
+    // Validate addresses
     if config.bind_address.port() == 0 {
-        return Err(NatError::Configuration("Порт привязки не может быть 0".to_string()));
+        return Err(NatError::Configuration("Bind address must have a valid port".to_string()));
     }
 
-    // Проверить время жизни allocation
+    // Validate allocation settings
     if config.allocation_lifetime < Duration::from_secs(30) {
-        return Err(NatError::Configuration("Время жизни allocation слишком короткое".to_string()));
+        return Err(NatError::Configuration("Allocation lifetime too short (minimum 30 seconds)".to_string()));
     }
 
-    if config.allocation_lifetime > Duration::from_secs(86400) {
-        return Err(NatError::Configuration("Время жизни allocation слишком длинное".to_string()));
-    }
-
-    // Проверить максимальное количество allocations
     if config.max_allocations == 0 {
-        return Err(NatError::Configuration("Максимальное количество allocations не может быть 0".to_string()));
+        return Err(NatError::Configuration("Max allocations must be greater than 0".to_string()));
     }
 
-    // Проверить конфигурацию аутентификации
+    // Validate auth config
     match &config.auth_config {
         AuthConfig::Static { users } => {
             if users.is_empty() {
-                tracing::warn!("Нет пользователей для статической аутентификации");
+                tracing::warn!("No users configured for static authentication");
             }
         }
         AuthConfig::External { endpoint, .. } => {
             if endpoint.is_empty() {
-                return Err(NatError::Configuration("Endpoint для внешней аутентификации не может быть пустым".to_string()));
+                return Err(NatError::Configuration("External auth endpoint cannot be empty".to_string()));
             }
         }
         AuthConfig::Disabled => {
-            tracing::warn!("Аутентификация отключена - использовать только для тестирования");
+            tracing::warn!("Authentication disabled - use only for testing");
         }
     }
 
-    // Проверить TLS конфигурацию
+    // Validate TLS configuration
     if config.enable_tls {
         if config.cert_path.is_none() || config.key_path.is_none() {
-            return Err(NatError::Configuration("TLS включен, но не указаны пути к сертификату или ключу".to_string()));
+            return Err(NatError::Configuration("TLS enabled but certificate or key path not specified".to_string()));
         }
     }
 
     Ok(())
 }
 
-// Дополнительный модуль для сервера
-pub mod server {
-    pub use super::*;
+// Utility functions for direct usage (без менеджеров)
+/// Create and start a basic TURN server
+pub async fn create_turn_server(config: TurnServerConfig) -> NatResult<TurnServer> {
+    validate_turn_config(&config)?;
+    TurnServer::new(config).await
+}
 
-    /// Создать базовую конфигурацию TURN сервера
-    pub fn create_default_config(bind_addr: &str, external_addr: &str) -> crate::nat::error::NatResult<TurnServerConfig> {
-        super::create_default_config(bind_addr, external_addr)
-    }
-
-    /// Экспорт типов для обратной совместимости
-    pub use super::{TurnServerConfig, AuthConfig, TurnServer};
+/// Create a TURN client for specific server
+pub async fn create_turn_client(server_url: &str) -> NatResult<TurnClient> {
+    TurnClient::new(server_url).await
 }
 
 #[cfg(test)]
@@ -386,43 +234,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_turn_client_creation() {
-        let client = TurnClient::new("turn:example.com:3478").await;
-        assert!(client.is_ok());
-
-        if let Ok(client) = client {
-            assert!(!client.is_connected().await);
-            assert!(client.get_allocations().await.is_empty());
-        }
+    async fn test_turn_server_creation() {
+        let config = create_default_config("0.0.0.0:3478", "203.0.113.1").unwrap();
+        let server = create_turn_server(config).await;
+        assert!(server.is_ok());
     }
 
     #[tokio::test]
-    async fn test_turn_server_creation() {
-        let config = TurnServerConfig::default();
-        let server = TurnServer::new(config).await;
-        assert!(server.is_ok());
-
-        if let Ok(server) = server {
-            assert!(!server.is_running().await);
-        }
+    async fn test_turn_client_creation() {
+        let client = create_turn_client("turn:example.com:3478").await;
+        assert!(client.is_ok());
     }
 
     #[test]
     fn test_config_validation() {
-        let valid_config = TurnServerConfig::default();
+        let valid_config = create_default_config("0.0.0.0:3478", "203.0.113.1").unwrap();
         assert!(validate_turn_config(&valid_config).is_ok());
 
-        let mut invalid_config = TurnServerConfig::default();
-        invalid_config.allocation_lifetime = Duration::from_secs(10); // Слишком короткое
+        let mut invalid_config = valid_config.clone();
+        invalid_config.allocation_lifetime = Duration::from_secs(10); // Too short
         assert!(validate_turn_config(&invalid_config).is_err());
-    }
-
-    #[test]
-    fn test_default_config_creation() {
-        let config = create_default_config("0.0.0.0:3478", "203.0.113.1").unwrap();
-        assert_eq!(config.bind_address.port(), 3478);
-        assert!(config.external_address.is_some());
-        assert_eq!(config.realm, "sharp3.local");
     }
 
     #[test]

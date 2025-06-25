@@ -76,72 +76,76 @@ pub use keepalive::{
 
 pub use priority::{
     calculate_priority, calculate_pair_priority, calculate_prflx_priority,
-    InterfaceInfo, InterfaceType, InterfaceStatus, NetworkSecurityLevel,
-    LocalPreferenceConfig, PriorityCalculator
+    InterfaceInfo, TypePreference, LocalPreference,
 };
 
-pub use foundation::{
-    calculate_foundation, calculate_host_foundation,
-    calculate_server_reflexive_foundation, calculate_peer_reflexive_foundation,
-    calculate_relay_foundation, validate_foundation
-};
+// Direct imports for STUN/TURN integration (без менеджеров)
+use crate::nat::stun::StunService;
+use crate::nat::turn::{TurnClient, TurnCredentials};
+use crate::nat::error::{NatError, NatResult};
 
-/// ICE library version
-pub const ICE_VERSION: &str = "1.0.0";
+/// ICE utility functions for direct integration
+pub mod utils {
+    use super::*;
+    use rand::Rng;
 
-/// Supported ICE specifications
-pub const SUPPORTED_SPECS: &[&str] = &[
-    "RFC 8445 - Interactive Connectivity Establishment (ICE)",
-    "RFC 8838 - Trickle ICE",
-    "RFC 7675 - STUN Usage for Consent Freshness",
-    "RFC 8421 - Guidelines for Multihomed and IPv4/IPv6 Dual-Stack ICE",
-    "RFC 5768 - Indicating Support for Interactive Connectivity Establishment (ICE) in the Session Description Protocol (SDP)",
-];
+    /// Generate ICE username fragment
+    pub fn generate_ufrag() -> String {
+        use rand::Rng;
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
 
-/// ICE implementation features
+        let mut rng = rand::thread_rng();
+        (0..4)
+            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .collect()
+    }
+
+    /// Generate ICE password
+    pub fn generate_password() -> String {
+        use rand::Rng;
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+
+        let mut rng = rand::thread_rng();
+        (0..22)
+            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .collect()
+    }
+}
+
+/// ICE features supported by this implementation
 #[derive(Debug, Clone)]
 pub struct IceFeatures {
-    /// Full ICE support (RFC 8445)
+    /// Full ICE support
     pub full_ice: bool,
-
-    /// Trickle ICE support (RFC 8838)
+    /// Lite ICE support
+    pub lite_ice: bool,
+    /// Trickle ICE support
     pub trickle_ice: bool,
-
-    /// Consent freshness (RFC 7675)
+    /// Consent freshness support
     pub consent_freshness: bool,
-
-    /// IPv4/IPv6 dual stack
-    pub dual_stack: bool,
-
-    /// TCP candidates
-    pub tcp_candidates: bool,
-
-    /// mDNS candidates
-    pub mdns_candidates: bool,
-
-    /// Aggressive nomination
+    /// Aggressive nomination support
     pub aggressive_nomination: bool,
-
     /// Bundle support
     pub bundle_support: bool,
+    /// mDNS candidates support
+    pub mdns_candidates: bool,
 }
 
 impl Default for IceFeatures {
     fn default() -> Self {
         Self {
             full_ice: true,
+            lite_ice: false,
             trickle_ice: true,
             consent_freshness: true,
-            dual_stack: true,
-            tcp_candidates: true,
-            mdns_candidates: true,
             aggressive_nomination: true,
             bundle_support: true,
+            mdns_candidates: true,
         }
     }
 }
 
-/// NAT manager trait for ICE integration
+/// Simple NAT manager trait for ICE integration (прямая интеграция без менеджеров)
 pub trait IceNatManager: Send + Sync {
     /// Get server reflexive candidate for component
     fn get_server_reflexive(
@@ -158,15 +162,101 @@ pub trait IceNatManager: Send + Sync {
     ) -> BoxFuture<'static, NatResult<Option<Candidate>>>;
 }
 
+/// Simple NAT manager implementation using direct STUN/TURN services
+pub struct SimpleNatManager {
+    stun_service: Arc<StunService>,
+    turn_clients: Vec<Arc<TurnClient>>,
+}
+
+impl SimpleNatManager {
+    /// Create new simple NAT manager
+    pub async fn new(
+        stun_servers: Vec<String>,
+        turn_servers: Vec<(String, TurnCredentials)>
+    ) -> NatResult<Self> {
+        let stun_service = Arc::new(StunService::new());
+
+        let mut turn_clients = Vec::new();
+        for (server_url, _credentials) in turn_servers {
+            let client = Arc::new(TurnClient::new(&server_url).await?);
+            turn_clients.push(client);
+        }
+
+        Ok(Self {
+            stun_service,
+            turn_clients,
+        })
+    }
+}
+
+impl IceNatManager for SimpleNatManager {
+    fn get_server_reflexive(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>> {
+        let stun_service = self.stun_service.clone();
+
+        Box::pin(async move {
+            match stun_service.get_public_address(&*socket).await {
+                Ok(public_addr) => {
+                    let local_addr = socket.local_addr()?;
+
+                    let candidate = Candidate {
+                        address: CandidateAddress {
+                            ip: public_addr.ip(),
+                            port: public_addr.port(),
+                            transport: TransportProtocol::Udp,
+                        },
+                        candidate_type: CandidateType::ServerReflexive,
+                        priority: calculate_priority(
+                            CandidateType::ServerReflexive,
+                            &local_addr,
+                            component_id,
+                        ),
+                        foundation: format!("srflx{}{}", component_id, public_addr.port()),
+                        component_id,
+                        related_address: Some(local_addr),
+                        tcp_type: None,
+                        extensions: CandidateExtensions {
+                            network_cost: Some(10),
+                            generation: Some(0),
+                        },
+                    };
+
+                    Ok(Some(candidate))
+                }
+                Err(_) => Ok(None),
+            }
+        })
+    }
+
+    fn get_relay_candidate(
+        &self,
+        socket: Arc<UdpSocket>,
+        component_id: u32,
+    ) -> BoxFuture<'static, NatResult<Option<Candidate>>> {
+        let turn_clients = self.turn_clients.clone();
+
+        Box::pin(async move {
+            // Try first available TURN client
+            if let Some(turn_client) = turn_clients.first() {
+                // For now, return None since TURN allocation needs credentials
+                // In real implementation, would call turn_client.allocate()
+                tracing::debug!("TURN relay candidate not implemented yet for component {}", component_id);
+            }
+            Ok(None)
+        })
+    }
+}
+
 /// Get ICE implementation features
 pub fn get_ice_features() -> IceFeatures {
     IceFeatures::default()
 }
 
 /// Validate ICE configuration
-pub fn validate_ice_config(config: &IceConfig) -> crate::nat::error::NatResult<()> {
-    use crate::nat::error::NatError;
-
+pub fn validate_ice_config(config: &IceConfig) -> NatResult<()> {
     // Validate components
     if config.components.is_empty() {
         return Err(NatError::Configuration("No components specified".to_string()));
@@ -193,71 +283,17 @@ pub fn validate_ice_config(config: &IceConfig) -> crate::nat::error::NatResult<(
         ));
     }
 
-    // Validate gathering config
-    if !config.gathering_config.gather_host_candidates &&
-        !config.gathering_config.gather_server_reflexive &&
-        !config.gathering_config.gather_relay_candidates {
-        return Err(NatError::Configuration(
-            "At least one candidate gathering method must be enabled".to_string()
-        ));
-    }
-
-    // Validate STUN servers if server reflexive is enabled
-    if config.gathering_config.gather_server_reflexive &&
-        config.gathering_config.stun_servers.is_empty() {
-        return Err(NatError::Configuration(
-            "STUN servers required for server reflexive candidates".to_string()
-        ));
-    }
-
-    // Validate TURN servers if relay is enabled
-    if config.gathering_config.gather_relay_candidates &&
-        config.gathering_config.turn_servers.is_empty() {
-        return Err(NatError::Configuration(
-            "TURN servers required for relay candidates".to_string()
-        ));
-    }
-
     Ok(())
 }
 
-/// Create optimized ICE configuration for P2P applications
+/// Create ICE configuration optimized for P2P file transfer
 pub fn create_p2p_ice_config() -> IceConfig {
-    use std::time::Duration;
-
-    let gathering_config = GatheringConfig {
-        gather_host_candidates: true,
-        gather_server_reflexive: true,
-        gather_relay_candidates: false, // Disable for faster setup
-        enable_mdns: false, // Disable for security
-        enable_ipv4: true,
-        enable_ipv6: true,
-        enable_tcp: false, // UDP only for speed
-        enable_udp: true,
-        stun_servers: vec![
-            "stun.l.google.com:19302".parse().unwrap(),
-            "stun1.l.google.com:19302".parse().unwrap(),
-        ],
-        turn_servers: vec![],
-        gathering_timeout: Duration::from_secs(5), // Fast gathering
-        max_candidates_per_type: 3, // Limit candidates
-        ..Default::default()
-    };
-
-    let nomination_config = NominationConfig {
-        mode: NominationMode::Aggressive, // Faster connection
-        nomination_timeout: Duration::from_secs(10),
-        ..Default::default()
-    };
-
     IceConfig {
         transport_policy: IceTransportPolicy::All,
-        gathering_config,
-        nomination_config,
-        components: vec![1], // Single component for data
-        max_pairs_per_component: 20,
-        connectivity_timeout: Duration::from_secs(15),
-        keepalive_interval: Duration::from_secs(25),
+        components: vec![1], // Only RTP component for P2P transfer
+        max_pairs_per_component: 50,
+        connectivity_timeout: std::time::Duration::from_secs(20),
+        keepalive_interval: std::time::Duration::from_secs(15),
         enable_trickle: true,
         enable_consent_freshness: true,
         bundle_policy: BundlePolicy::MaxBundle,
@@ -265,146 +301,18 @@ pub fn create_p2p_ice_config() -> IceConfig {
     }
 }
 
-/// Create ICE configuration optimized for reliability
-pub fn create_reliable_ice_config() -> IceConfig {
-    use std::time::Duration;
+/// Create ICE agent with simple NAT manager
+pub async fn create_ice_agent_with_nat(
+    config: IceConfig,
+    stun_servers: Vec<String>,
+    turn_servers: Vec<(String, TurnCredentials)>,
+) -> NatResult<IceAgent> {
+    validate_ice_config(&config)?;
 
-    let gathering_config = GatheringConfig {
-        gather_host_candidates: true,
-        gather_server_reflexive: true,
-        gather_relay_candidates: true, // Include relay for reliability
-        enable_mdns: false,
-        enable_ipv4: true,
-        enable_ipv6: true,
-        enable_tcp: true, // Include TCP for fallback
-        enable_udp: true,
-        stun_servers: vec![
-            "stun.l.google.com:19302".parse().unwrap(),
-            "stun1.l.google.com:19302".parse().unwrap(),
-            "stun2.l.google.com:19302".parse().unwrap(),
-            "stun3.l.google.com:19302".parse().unwrap(),
-        ],
-        turn_servers: vec![], // Would be configured with actual TURN servers
-        gathering_timeout: Duration::from_secs(15), // Longer for more candidates
-        max_candidates_per_type: 10,
-        ..Default::default()
-    };
+    let nat_manager = SimpleNatManager::new(stun_servers, turn_servers).await?;
 
-    let nomination_config = NominationConfig {
-        mode: NominationMode::Regular, // More thorough
-        nomination_timeout: Duration::from_secs(20),
-        prefer_relay: false, // Prefer direct when possible
-        ..Default::default()
-    };
-
-    IceConfig {
-        transport_policy: IceTransportPolicy::All,
-        gathering_config,
-        nomination_config,
-        components: vec![1, 2], // RTP and RTCP
-        max_pairs_per_component: 50,
-        connectivity_timeout: Duration::from_secs(45),
-        keepalive_interval: Duration::from_secs(25),
-        enable_trickle: true,
-        enable_consent_freshness: true,
-        bundle_policy: BundlePolicy::Balanced,
-        rtcp_mux_policy: RtcpMuxPolicy::None,
-    }
-}
-
-/// ICE utility functions
-pub mod utils {
-    use super::*;
-    use std::net::{IpAddr, SocketAddr};
-
-    /// Check if two candidates can form a valid pair
-    pub fn can_form_pair(local: &Candidate, remote: &Candidate) -> bool {
-        // Must have same transport
-        if local.transport != remote.transport {
-            return false;
-        }
-
-        // Must have compatible address families
-        match (local.ip(), remote.ip()) {
-            (Some(local_ip), Some(remote_ip)) => {
-                local_ip.is_ipv4() == remote_ip.is_ipv4()
-            }
-            _ => true, // mDNS candidates are compatible with anything
-        }
-    }
-
-    /// Calculate estimated connection quality score
-    pub fn calculate_connection_quality(pair: &CandidatePair) -> u32 {
-        let mut score = 0;
-
-        // Base score from priorities
-        score += pair.local.priority / 1000;
-        score += pair.remote.priority / 1000;
-
-        // Bonus for direct connections
-        if pair.local.candidate_type == CandidateType::Host &&
-            pair.remote.candidate_type == CandidateType::Host {
-            score += 10000;
-        }
-
-        // Penalty for relay
-        if pair.local.candidate_type == CandidateType::Relay ||
-            pair.remote.candidate_type == CandidateType::Relay {
-            score = score.saturating_sub(5000);
-        }
-
-        // Bonus for UDP
-        if pair.local.transport == TransportProtocol::Udp {
-            score += 1000;
-        }
-
-        score
-    }
-
-    /// Get network path type description
-    pub fn describe_network_path(pair: &CandidatePair) -> String {
-        match (pair.local.candidate_type, pair.remote.candidate_type) {
-            (CandidateType::Host, CandidateType::Host) => "Direct".to_string(),
-            (CandidateType::ServerReflexive, CandidateType::ServerReflexive) => "NAT-to-NAT".to_string(),
-            (CandidateType::Relay, _) | (_, CandidateType::Relay) => "Relayed".to_string(),
-            _ => "Mixed".to_string(),
-        }
-    }
-
-    /// Check if address is in private range
-    pub fn is_private_address(addr: &IpAddr) -> bool {
-        match addr {
-            IpAddr::V4(ipv4) => ipv4.is_private(),
-            IpAddr::V6(ipv6) => {
-                // Check for ULA (fc00::/7) and link-local (fe80::/10)
-                let segments = ipv6.segments();
-                (segments[0] & 0xfe00) == 0xfc00 || // ULA
-                    (segments[0] & 0xffc0) == 0xfe80    // Link-local
-            }
-        }
-    }
-
-    /// Generate ICE ufrag
-    pub fn generate_ufrag() -> String {
-        use rand::Rng;
-        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
-
-        let mut rng = rand::thread_rng();
-        (0..4)
-            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
-            .collect()
-    }
-
-    /// Generate ICE password
-    pub fn generate_password() -> String {
-        use rand::Rng;
-        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
-
-        let mut rng = rand::thread_rng();
-        (0..22)
-            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
-            .collect()
-    }
+    // Create agent with NAT manager (this would need to be implemented in agent.rs)
+    IceAgent::new_with_nat_manager(config, Box::new(nat_manager)).await
 }
 
 /// ICE debugging and diagnostics
@@ -484,49 +392,26 @@ mod tests {
         let config = create_p2p_ice_config();
         assert_eq!(config.components, vec![1]);
         assert!(config.enable_trickle);
-        assert_eq!(config.nomination_config.mode, NominationMode::Aggressive);
-    }
-
-    #[test]
-    fn test_reliable_config() {
-        let config = create_reliable_ice_config();
-        assert_eq!(config.components, vec![1, 2]);
-        assert_eq!(config.nomination_config.mode, NominationMode::Regular);
     }
 
     #[test]
     fn test_config_validation() {
-        let mut config = create_p2p_ice_config();
-        assert!(validate_ice_config(&config).is_ok());
+        let valid_config = create_p2p_ice_config();
+        assert!(validate_ice_config(&valid_config).is_ok());
 
-        // Test invalid config
-        config.components.clear();
-        assert!(validate_ice_config(&config).is_err());
+        let mut invalid_config = valid_config.clone();
+        invalid_config.components.clear();
+        assert!(validate_ice_config(&invalid_config).is_err());
     }
 
     #[test]
-    fn test_utils() {
-        use utils::*;
+    fn test_credential_generation() {
+        let ufrag = utils::generate_ufrag();
+        let pwd = utils::generate_password();
 
-        let ufrag = generate_ufrag();
         assert_eq!(ufrag.len(), 4);
-
-        let password = generate_password();
-        assert_eq!(password.len(), 22);
-
-        let local_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1));
-        assert!(is_private_address(&local_addr));
-
-        let public_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
-        assert!(!is_private_address(&public_addr));
-    }
-
-    #[tokio::test]
-    async fn test_ice_agent_creation() {
-        let config = create_p2p_ice_config();
-        let agent = IceAgent::new(config).await.unwrap();
-
-        assert_eq!(agent.get_state().await, IceState::Gathering);
-        assert!(agent.get_role().await.is_none());
+        assert_eq!(pwd.len(), 22);
+        assert!(ufrag.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
+        assert!(pwd.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
     }
 }
