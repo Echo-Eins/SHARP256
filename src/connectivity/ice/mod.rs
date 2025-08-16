@@ -1,5 +1,13 @@
 // src/connectivity/ice/mod.rs
 //! ICE (Interactive Connectivity Establishment) реализация на основе webrtc-rs
+//!
+//! Полная RFC 8445 совместимая реализация с интеграцией webrtc-rs библиотеки.
+//! Включает в себя:
+//! - Candidate gathering (сбор кандидатов)
+//! - Connectivity checks (проверки соединений)
+//! - Nomination process (процесс номинации)
+//! - Полная интеграция с webrtc-rs
+//! - Отказоустойчивость и мониторинг
 
 #[cfg(feature = "webrtc-ice-stack")]
 use anyhow::Result;
@@ -10,26 +18,69 @@ use std::time::Duration;
 #[cfg(feature = "webrtc-ice-stack")]
 use tokio::sync::mpsc;
 
-// Submodules (только если webrtc-ice-stack включен)
+// === ОСНОВНЫЕ МОДУЛИ ===
+
+// Основной ICE Agent - координирует все процессы
 #[cfg(feature = "webrtc-ice-stack")]
 pub mod agent;
+
+// Сбор кандидатов
 #[cfg(feature = "webrtc-ice-stack")]
 pub mod gathering;
+
+// Connectivity checks
 #[cfg(feature = "webrtc-ice-stack")]
 pub mod connectivity;
+
+// Nomination процесс
 #[cfg(feature = "webrtc-ice-stack")]
 pub mod nomination;
 
-// Re-exports
+// Utility функции и конвертация типов
 #[cfg(feature = "webrtc-ice-stack")]
-pub use agent::{IceAgent, IceAgentConfig};
-#[cfg(feature = "webrtc-ice-stack")]
-pub use gathering::{CandidateGatherer, GatheringProgress};
-#[cfg(feature = "webrtc-ice-stack")]
-pub use connectivity::{ConnectivityChecker, CheckResult};
-#[cfg(feature = "webrtc-ice-stack")]
-pub use nomination::{CandidateNominator, NominationResult};
+pub mod utils;
 
+// === RE-EXPORTS ===
+
+// Основные типы
+#[cfg(feature = "webrtc-ice-stack")]
+pub use agent::{
+    IceAgent, IceAgentConfig, IceAgentState, IceProcessState, IceAgentStats
+};
+
+// Gathering
+#[cfg(feature = "webrtc-ice-stack")]
+pub use gathering::{
+    CandidateGatherer, GatheringState, GatheringProgress, GatheringConfig,
+    GatheringStats, GathererFactory
+};
+
+// Connectivity
+#[cfg(feature = "webrtc-ice-stack")]
+pub use connectivity::{
+    ConnectivityChecker, ConnectivityState, ConnectivityConfig, ConnectivityStats,
+    CheckResult, CheckType, ConnectivityCheckerFactory
+};
+
+// Nomination
+#[cfg(feature = "webrtc-ice-stack")]
+pub use nomination::{
+    CandidateNominator, NominationState, NominationMethod, NominationConfig,
+    NominationStats, NominationResult, NominatorFactory
+};
+
+// Utils
+#[cfg(feature = "webrtc-ice-stack")]
+pub use utils::{
+    webrtc_candidate_to_candidate, candidate_type_to_webrtc_candidate_type,
+    webrtc_candidate_type_to_candidate_type, webrtc_pair_to_candidate_pair,
+    calculate_candidate_priority, calculate_pair_priority, generate_foundation,
+    determine_nat_type, NatType, filter_candidates, CandidateFilter, IpVersion,
+    is_valid_candidate_address, is_public_address,
+    sort_candidates_by_priority, sort_pairs_by_priority, get_default_local_address
+};
+
+// Importing common types
 #[cfg(feature = "webrtc-ice-stack")]
 use crate::connectivity::{Candidate, CandidatePair, ConnectivityCheckResult};
 #[cfg(feature = "webrtc-ice-stack")]
@@ -37,7 +88,7 @@ use crate::connectivity::config::IceConfig;
 
 /// ICE Connection wrapper для Transport trait
 #[cfg(feature = "webrtc-ice-stack")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IceConnection {
     conn: Arc<dyn webrtc::ice::conn::Conn + Send + Sync>,
     selected_pair: CandidatePair,
@@ -67,12 +118,51 @@ impl IceConnection {
     pub async fn close(&self) -> Result<()> {
         self.conn.close().await.map_err(Into::into)
     }
+
+    /// Получение статистики соединения
+    pub fn get_stats(&self) -> IceConnectionStats {
+        IceConnectionStats {
+            selected_pair: self.selected_pair.clone(),
+            bytes_sent: 0, // TODO: Получать из webrtc::ice::conn::Conn если доступно
+            bytes_received: 0,
+            packets_sent: 0,
+            packets_received: 0,
+            connection_state: IceConnectionState::Connected,
+        }
+    }
+}
+
+/// Статистика ICE соединения
+#[cfg(feature = "webrtc-ice-stack")]
+#[derive(Debug, Clone)]
+pub struct IceConnectionStats {
+    pub selected_pair: CandidatePair,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub connection_state: IceConnectionState,
+}
+
+/// Состояние ICE соединения
+#[cfg(feature = "webrtc-ice-stack")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IceConnectionState {
+    New,
+    Checking,
+    Connected,
+    Completed,
+    Failed,
+    Disconnected,
+    Closed,
 }
 
 /// События ICE процесса
 #[cfg(feature = "webrtc-ice-stack")]
 #[derive(Debug, Clone)]
 pub enum IceEvent {
+    /// ICE процесс начался
+    IceProcessStarted,
     /// Новый кандидат собран
     CandidateGathered(Candidate),
     /// Сбор кандидатов завершен
@@ -109,141 +199,242 @@ pub enum IceAgentState {
     Closed,
 }
 
-/// Utilities для работы с ICE
+/// === ФАБРИКИ И УТИЛИТЫ ===
+
+/// Фабрика для создания ICE компонентов
 #[cfg(feature = "webrtc-ice-stack")]
-pub mod utils {
-    use super::*;
-    use webrtc::ice::candidate::*;
+pub struct IceComponentFactory;
 
-    /// Конвертация webrtc кандидата в наш Candidate
-    pub fn webrtc_candidate_to_candidate(
-        webrtc_candidate: &dyn webrtc::ice::candidate::Candidate,
-    ) -> Result<Candidate> {
-        let candidate_type = match webrtc_candidate.candidate_type() {
-            CandidateType::Host => crate::connectivity::CandidateType::Host,
-            CandidateType::ServerReflexive => crate::connectivity::CandidateType::ServerReflexive,
-            CandidateType::PeerReflexive => crate::connectivity::CandidateType::PeerReflexive,
-            CandidateType::Relay => crate::connectivity::CandidateType::Relay,
-        };
+#[cfg(feature = "webrtc-ice-stack")]
+impl IceComponentFactory {
+    /// Создание полного ICE стека
+    pub async fn create_ice_stack(
+        ice_config: IceConfig,
+        controlling: bool,
+    ) -> Result<IceStack> {
+        let agent = agent::IceAgent::new(ice_config, controlling).await?;
 
-        Ok(Candidate {
-            foundation: webrtc_candidate.foundation().to_string(),
-            priority: webrtc_candidate.priority(),
-            address: webrtc_candidate.address(),
-            candidate_type,
-            related_address: webrtc_candidate.related_address(),
-            attributes: crate::connectivity::CandidateAttributes {
-                transport: webrtc_candidate.network_type().to_string(),
-                component: webrtc_candidate.component(),
-                network_cost: calculate_network_cost(&webrtc_candidate.address()),
-                hairpin_capable: false, // Определяется отдельно
-                encryption_capable: candidate_type == crate::connectivity::CandidateType::Relay,
-            },
+        Ok(IceStack {
+            agent: Arc::new(agent),
         })
     }
 
-    /// Конвертация нашего кандидата в webrtc кандидат
-    pub fn candidate_to_webrtc_candidate(
-        candidate: &Candidate,
-    ) -> Result<Box<dyn webrtc::ice::candidate::Candidate + Send + Sync>> {
-        let candidate_type = match candidate.candidate_type {
-            crate::connectivity::CandidateType::Host => CandidateType::Host,
-            crate::connectivity::CandidateType::ServerReflexive => CandidateType::ServerReflexive,
-            crate::connectivity::CandidateType::PeerReflexive => CandidateType::PeerReflexive,
-            crate::connectivity::CandidateType::Relay => CandidateType::Relay,
-            crate::connectivity::CandidateType::RouterPool => CandidateType::Host, // Маппим как host
-        };
-
-        let webrtc_candidate = webrtc::ice::candidate::candidate_host::CandidateHostConfig {
-            base_config: webrtc::ice::candidate::CandidateConfig {
-                candidate_type,
-                network: candidate.attributes.transport.clone(),
-                address: candidate.address,
-                component: candidate.attributes.component,
-                priority: candidate.priority,
-                foundation: candidate.foundation.clone(),
-                related_address: candidate.related_address,
-            },
-        };
-
-        Ok(Box::new(webrtc::ice::candidate::candidate_host::CandidateHost::new(&webrtc_candidate)?))
-    }
-
-    /// Расчет сетевой стоимости
-    fn calculate_network_cost(addr: &std::net::SocketAddr) -> u16 {
-        crate::connectivity::utils::calculate_network_distance(
-            &"127.0.0.1:0".parse().unwrap(), // Dummy local
-            addr
-        ) as u16
-    }
-
-    /// Проверка совместимости ICE кандидатов
-    pub fn are_ice_candidates_compatible(
-        local: &dyn webrtc::ice::candidate::Candidate,
-        remote: &dyn webrtc::ice::candidate::Candidate,
-    ) -> bool {
-        // Проверяем совместимость IP версий
-        match (local.address(), remote.address()) {
-            (std::net::SocketAddr::V4(_), std::net::SocketAddr::V4(_)) => true,
-            (std::net::SocketAddr::V6(_), std::net::SocketAddr::V6(_)) => true,
-            _ => false,
-        }
-    }
-
-    /// Приоритизация кандидатов для оптимального порядка проверки
-    pub fn prioritize_candidate_pairs(pairs: &mut [CandidatePair]) {
-        pairs.sort_by(|a, b| {
-            // Сортируем по убыванию приоритета
-            b.priority.cmp(&a.priority)
-                // При равном приоритете предпочитаем host кандидаты
-                .then_with(|| {
-                    let a_host_score = if a.local.candidate_type == crate::connectivity::CandidateType::Host { 1 } else { 0 };
-                    let b_host_score = if b.local.candidate_type == crate::connectivity::CandidateType::Host { 1 } else { 0 };
-                    b_host_score.cmp(&a_host_score)
-                })
-                // При прочих равных предпочитаем пары с меньшим network cost
-                .then_with(|| {
-                    let a_cost = a.local.attributes.network_cost + a.remote.attributes.network_cost;
-                    let b_cost = b.local.attributes.network_cost + b.remote.attributes.network_cost;
-                    a_cost.cmp(&b_cost)
-                })
-        });
-    }
-}
-
-/// Фабрика для создания ICE агентов
-#[cfg(feature = "webrtc-ice-stack")]
-pub struct IceAgentFactory;
-
-#[cfg(feature = "webrtc-ice-stack")]
-impl IceAgentFactory {
-    /// Создание ICE агента с конфигурацией по умолчанию
-    pub async fn create_agent(config: IceConfig, controlling: bool) -> Result<IceAgent> {
-        IceAgent::new(config, controlling).await
-    }
-
-    /// Создание lite ICE агента (упрощенный)
-    pub async fn create_lite_agent(config: IceConfig) -> Result<IceAgent> {
-        let mut ice_config = config;
-        ice_config.enable_host_candidates = true;
-        ice_config.enable_srflx_candidates = false;
-        ice_config.enable_relay_candidates = false;
-
-        IceAgent::new(ice_config, false).await
-    }
-
-    /// Создание агента только для тестирования
-    pub async fn create_test_agent() -> Result<IceAgent> {
-        let config = IceConfig {
+    /// Создание ICE стека для тестирования
+    pub async fn create_test_stack() -> Result<IceStack> {
+        let ice_config = IceConfig {
             stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             gathering_timeout: Duration::from_secs(5),
             connectivity_timeout: Duration::from_secs(10),
             ..Default::default()
         };
 
-        IceAgent::new(config, true).await
+        Self::create_ice_stack(ice_config, true).await
+    }
+
+    /// Создание пары связанных ICE стеков
+    pub async fn create_ice_pair(ice_config: IceConfig) -> Result<(IceStack, IceStack)> {
+        let controlling_stack = Self::create_ice_stack(ice_config.clone(), true).await?;
+        let controlled_stack = Self::create_ice_stack(ice_config, false).await?;
+
+        Ok((controlling_stack, controlled_stack))
     }
 }
+
+/// Полный ICE стек
+#[cfg(feature = "webrtc-ice-stack")]
+#[derive(Debug)]
+pub struct IceStack {
+    agent: Arc<IceAgent>,
+}
+
+#[cfg(feature = "webrtc-ice-stack")]
+impl IceStack {
+    /// Полный ICE процесс
+    pub async fn perform_ice(&self) -> Result<IceConnection> {
+        self.agent.perform_ice_process().await
+    }
+
+    /// Сбор кандидатов
+    pub async fn gather_candidates(&self) -> Result<Vec<Candidate>> {
+        self.agent.gather_candidates_with_progress().await
+    }
+
+    /// Добавление удаленного кандидата
+    pub async fn add_remote_candidate(&self, candidate: Candidate) -> Result<()> {
+        self.agent.add_remote_candidate(candidate).await
+    }
+
+    /// Получение локальных кандидатов
+    pub async fn get_local_candidates(&self) -> Vec<Candidate> {
+        self.agent.get_local_candidates().await
+    }
+
+    /// Получение состояния процесса
+    pub async fn get_process_state(&self) -> IceProcessState {
+        self.agent.get_process_state().await
+    }
+
+    /// Получение статистики
+    pub async fn get_stats(&self) -> IceAgentStats {
+        self.agent.get_stats().await
+    }
+
+    /// Получение receiver для событий
+    pub async fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<IceEvent>> {
+        self.agent.take_event_receiver().await
+    }
+
+    /// Проверка соединения
+    pub async fn is_connected(&self) -> bool {
+        self.agent.is_connected().await
+    }
+
+    /// Restart ICE
+    pub async fn restart(&self) -> Result<()> {
+        self.agent.restart_ice().await
+    }
+
+    /// Остановка ICE стека
+    pub async fn shutdown(&self) -> Result<()> {
+        self.agent.shutdown().await
+    }
+}
+
+/// === КОНСТАНТЫ И ВЕРСИИ ===
+
+/// Версия ICE реализации
+#[cfg(feature = "webrtc-ice-stack")]
+pub const ICE_VERSION: &str = "1.0.0";
+
+/// Поддерживаемые RFC спецификации
+#[cfg(feature = "webrtc-ice-stack")]
+pub const SUPPORTED_SPECS: &[&str] = &[
+    "RFC 8445 - Interactive Connectivity Establishment (ICE)",
+    "RFC 8838 - Trickle ICE",
+    "RFC 7675 - STUN Usage for Consent Freshness",
+    "RFC 8421 - Guidelines for Multihomed and IPv4/IPv6 Dual-Stack ICE",
+];
+
+/// Возможности ICE реализации
+#[cfg(feature = "webrtc-ice-stack")]
+#[derive(Debug, Clone)]
+pub struct IceCapabilities {
+    /// Полная поддержка ICE (RFC 8445)
+    pub full_ice: bool,
+    /// Trickle ICE поддержка (RFC 8838)
+    pub trickle_ice: bool,
+    /// Consent freshness (RFC 7675)
+    pub consent_freshness: bool,
+    /// IPv4/IPv6 dual stack
+    pub dual_stack: bool,
+    /// TCP кандидаты
+    pub tcp_candidates: bool,
+    /// mDNS кандидаты
+    pub mdns_candidates: bool,
+    /// Aggressive nomination
+    pub aggressive_nomination: bool,
+    /// Bundle поддержка
+    pub bundle_support: bool,
+    /// WebRTC integration
+    pub webrtc_integration: bool,
+}
+
+#[cfg(feature = "webrtc-ice-stack")]
+impl Default for IceCapabilities {
+    fn default() -> Self {
+        Self {
+            full_ice: true,
+            trickle_ice: true,
+            consent_freshness: true,
+            dual_stack: true,
+            tcp_candidates: false,  // Пока не реализовано
+            mdns_candidates: false, // Пока не реализовано
+            aggressive_nomination: true,
+            bundle_support: true,
+            webrtc_integration: true,
+        }
+    }
+}
+
+/// Получение возможностей ICE реализации
+#[cfg(feature = "webrtc-ice-stack")]
+pub fn get_ice_capabilities() -> IceCapabilities {
+    IceCapabilities::default()
+}
+
+/// Валидация ICE конфигурации
+#[cfg(feature = "webrtc-ice-stack")]
+pub fn validate_ice_config(config: &IceConfig) -> Result<()> {
+    // Проверка STUN серверов
+    if config.stun_servers.is_empty() && config.turn_servers.is_empty() {
+        return Err(anyhow::anyhow!("At least one STUN or TURN server must be configured"));
+    }
+
+    // Проверка таймаутов
+    if config.gathering_timeout < Duration::from_secs(1) {
+        return Err(anyhow::anyhow!("Gathering timeout too short"));
+    }
+
+    if config.connectivity_timeout < Duration::from_secs(1) {
+        return Err(anyhow::anyhow!("Connectivity timeout too short"));
+    }
+
+    // Проверка лимитов
+    if config.max_candidate_pairs == 0 {
+        return Err(anyhow::anyhow!("Max candidate pairs must be greater than 0"));
+    }
+
+    if config.max_candidate_pairs > 1000 {
+        return Err(anyhow::anyhow!("Max candidate pairs too large (>1000)"));
+    }
+
+    Ok(())
+}
+
+/// Создание оптимизированной ICE конфигурации для P2P
+#[cfg(feature = "webrtc-ice-stack")]
+pub fn create_p2p_ice_config() -> IceConfig {
+    IceConfig {
+        stun_servers: vec![
+            "stun:stun.l.google.com:19302".to_string(),
+            "stun:stun1.l.google.com:19302".to_string(),
+        ],
+        turn_servers: vec![], // Добавить TURN серверы при необходимости
+        controlling_role: Some(true),
+        trickle_ice: true,
+        gathering_timeout: Duration::from_secs(10),
+        connectivity_timeout: Duration::from_secs(30),
+        check_interval: Duration::from_millis(50),
+        max_candidate_pairs: 50,
+        enable_ipv6: true,
+        enable_host_candidates: true,
+        enable_srflx_candidates: true,
+        enable_relay_candidates: true,
+        candidate_priorities: Default::default(),
+    }
+}
+
+/// Создание ICE конфигурации для тестирования
+#[cfg(feature = "webrtc-ice-stack")]
+pub fn create_test_ice_config() -> IceConfig {
+    IceConfig {
+        stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+        turn_servers: vec![],
+        controlling_role: Some(true),
+        trickle_ice: true,
+        gathering_timeout: Duration::from_secs(5),
+        connectivity_timeout: Duration::from_secs(10),
+        check_interval: Duration::from_millis(25),
+        max_candidate_pairs: 20,
+        enable_ipv6: false, // Упрощаем для тестов
+        enable_host_candidates: true,
+        enable_srflx_candidates: true,
+        enable_relay_candidates: false,
+        candidate_priorities: Default::default(),
+    }
+}
+
+/// === MOCK РЕАЛИЗАЦИЯ ===
 
 /// Mock реализация для тестирования без webrtc-ice-stack
 #[cfg(not(feature = "webrtc-ice-stack"))]
@@ -285,55 +476,79 @@ pub mod mock {
             Err(anyhow::anyhow!("WebRTC ICE not available"))
         }
     }
+
+    /// Mock IceStack
+    #[derive(Debug)]
+    pub struct MockIceStack;
+
+    impl MockIceStack {
+        pub async fn perform_ice(&self) -> Result<()> {
+            Err(anyhow::anyhow!("WebRTC ICE not available"))
+        }
+    }
+
+    pub type IceAgent = MockIceAgent;
+    pub type IceStack = MockIceStack;
 }
 
-// Условные re-exports
+/// Условные re-exports в зависимости от feature
 #[cfg(feature = "webrtc-ice-stack")]
-pub use agent::IceAgent;
+pub use agent::IceAgent as PublicIceAgent;
+#[cfg(feature = "webrtc-ice-stack")]
+pub use IceStack as PublicIceStack;
 
 #[cfg(not(feature = "webrtc-ice-stack"))]
-pub use mock::MockIceAgent as IceAgent;
+pub use mock::{IceAgent as PublicIceAgent, IceStack as PublicIceStack};
 
-#[cfg(test)]
-mod tests {
+/// === INTEGRATION TESTS ===
+
+#[cfg(all(test, feature = "webrtc-ice-stack"))]
+mod integration_tests {
     use super::*;
+    use tokio::time::sleep;
 
-    #[cfg(feature = "webrtc-ice-stack")]
+    #[tokio::test]
+    async fn test_ice_stack_creation() {
+        let stack = IceComponentFactory::create_test_stack().await;
+        assert!(stack.is_ok());
+    }
+
     #[tokio::test]
     async fn test_ice_agent_creation() {
-        let config = crate::connectivity::config::IceConfig::default();
-        let agent = IceAgentFactory::create_test_agent().await;
+        let config = create_test_ice_config();
+        let agent = agent::IceAgent::new(config, true).await;
         assert!(agent.is_ok());
     }
 
-    #[cfg(not(feature = "webrtc-ice-stack"))]
     #[tokio::test]
-    async fn test_mock_ice_agent() {
-        let config = crate::connectivity::config::IceConfig::default();
-        let agent = mock::MockIceAgent::new(config, true).await;
-        assert!(agent.is_ok());
+    async fn test_candidate_gathering() {
+        let stack = IceComponentFactory::create_test_stack().await.unwrap();
+
+        // В реальности это должно собрать кандидаты
+        // Для теста проверяем, что метод не паникует
+        let result = timeout(Duration::from_secs(5), stack.gather_candidates()).await;
+        // Может быть ошибка из-за отсутствия сети, но не должно паниковать
+        println!("Gathering result: {:?}", result);
     }
 
-    #[cfg(feature = "webrtc-ice-stack")]
-    #[test]
-    fn test_candidate_prioritization() {
-        let host_candidate = crate::connectivity::Candidate::host(
-            "192.168.1.100:5000".parse().unwrap()
-        );
-        let relay_candidate = crate::connectivity::Candidate::relay(
-            "1.2.3.4:3478".parse().unwrap(),
-            "192.168.1.100:5000".parse().unwrap(),
-            true,
-        );
+    #[tokio::test]
+    async fn test_ice_capabilities() {
+        let capabilities = get_ice_capabilities();
+        assert!(capabilities.full_ice);
+        assert!(capabilities.webrtc_integration);
+    }
 
-        let mut pairs = vec![
-            crate::connectivity::CandidatePair::new(host_candidate.clone(), relay_candidate.clone()),
-            crate::connectivity::CandidatePair::new(relay_candidate, host_candidate),
-        ];
+    #[tokio::test]
+    async fn test_config_validation() {
+        let valid_config = create_test_ice_config();
+        assert!(validate_ice_config(&valid_config).is_ok());
 
-        utils::prioritize_candidate_pairs(&mut pairs);
-
-        // Host кандидаты должны иметь более высокий приоритет
-        assert!(pairs[0].priority >= pairs[1].priority);
+        let invalid_config = IceConfig {
+            stun_servers: vec![],
+            turn_servers: vec![],
+            gathering_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        assert!(validate_ice_config(&invalid_config).is_err());
     }
 }

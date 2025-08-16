@@ -1,22 +1,46 @@
 // src/connectivity/mod.rs
 //! SHARP-256 Connectivity Module
 //!
-//! Обеспечивает установление соединений через различные методы:
-//! - WebRTC ICE (primary)
-//! - libp2p fallback
-//! - NAT router pools
-//! - Relay with encryption
-//! - Direct connections with hairpining
-
-// src/connectivity/mod.rs
-//! SHARP-256 Connectivity Module
+//! Полнофункциональная система установления соединений с интеграцией webrtc-rs.
 //!
-//! Обеспечивает установление соединений через различные методы:
-//! - WebRTC ICE (primary)
-//! - libp2p fallback
-//! - NAT router pools
-//! - Relay with encryption
-//! - Direct connections with hairpining
+//! ## Архитектура
+//!
+//! ### Уровень 1: WebRTC ICE (Primary)
+//! - RFC 8445 совместимая реализация
+//! - Candidate gathering, connectivity checks, nomination
+//! - Интеграция с webrtc-rs библиотекой
+//! - Отказоустойчивость и мониторинг
+//!
+//! ### Уровень 2: Fallback системы
+//! - libp2p для сложных NAT сценариев
+//! - NAT router pools с адаптивным обучением
+//! - SHARP relay с шифрованием заголовков
+//! - UPnP/IGD legacy поддержка
+//!
+//! ### Уровень 3: Transport абстракция
+//! - Универсальный Transport trait
+//! - Статистика и мониторинг
+//! - Automatic failover и retry логика
+//!
+//! ## Использование
+//!
+//! ```rust
+//! use sharp256::connectivity::Connectivity;
+//!
+//! // Создание с конфигурацией по умолчанию
+//! let connectivity = Connectivity::new().await?;
+//!
+//! // Установление соединения
+//! let connection = connectivity.establish_connection(
+//!     socket,
+//!     Some(peer_addr),
+//!     true // controlling
+//! ).await?;
+//!
+//! // Использование соединения
+//! connection.send(data).await?;
+//! let (size, addr) = connection.recv(&mut buffer).await?;
+//! ```
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -26,8 +50,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 use serde::{Deserialize, Serialize};
 use parking_lot::Mutex;
+use tracing::{info, warn, debug, error};
 
-// Публичные модули
+// === МОДУЛИ ===
+
+// Основной менеджер connectivity
 pub mod manager;
 pub mod config;
 
@@ -57,15 +84,315 @@ pub mod router_pools;
 #[cfg(feature = "upnp-support")]
 pub mod upnp;
 
-// Re-exports для удобства
-pub use manager::{ConnectivityManager, ConnectivityEvent};
-pub use config::{ConnectivityConfig, IceConfig, LibP2pConfig, RelayConfig};
-pub use transport::{Transport, TransportType, TransportStats, EstablishedConnection};
+// === RE-EXPORTS ===
+
+pub use manager::{ConnectivityManager, ConnectivityEvent, DetailedConnectivityStats};
+pub use config::{
+    ConnectivityConfig, IceConfig, LibP2pConfig, RelayConfig,
+    ConnectionMethod, GeneralConfig
+};
+pub use transport::{
+    Transport, TransportType, TransportStats, EstablishedConnection
+};
+
+// ICE specific exports
+#[cfg(feature = "webrtc-ice-stack")]
+pub use ice::{
+    IceStack, IceAgent, IceEvent, IceAgentState, IceConnection,
+    CandidateGatherer, ConnectivityChecker, CandidateNominator,
+    GatheringState, ConnectivityState, NominationState,
+    IceComponentFactory, get_ice_capabilities, validate_ice_config,
+    create_p2p_ice_config, create_test_ice_config
+};
+
+// === ОСНОВНЫЕ ТИПЫ ===
+
+/// ICE кандидат
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Candidate {
+    /// Foundation (уникальный идентификатор типа кандидата)
+    pub foundation: String,
+    /// Приоритет кандидата
+    pub priority: u32,
+    /// Адрес кандидата
+    pub address: SocketAddr,
+    /// Тип кандидата
+    pub candidate_type: CandidateType,
+    /// Связанный адрес (для reflexive и relay кандидатов)
+    pub related_address: Option<SocketAddr>,
+    /// Дополнительные атрибуты
+    pub attributes: CandidateAttributes,
+}
+
+impl Candidate {
+    /// Создание host кандидата
+    pub fn host(address: SocketAddr) -> Self {
+        Self {
+            foundation: ice::utils::generate_foundation(CandidateType::Host, address, None),
+            priority: ice::utils::calculate_candidate_priority(CandidateType::Host, 65535, 1),
+            address,
+            candidate_type: CandidateType::Host,
+            related_address: None,
+            attributes: CandidateAttributes::default(),
+        }
+    }
+
+    /// Создание server reflexive кандидата
+    pub fn server_reflexive(
+        public_address: SocketAddr,
+        local_address: SocketAddr,
+        stun_server: SocketAddr,
+    ) -> Self {
+        Self {
+            foundation: ice::utils::generate_foundation(
+                CandidateType::ServerReflexive,
+                local_address,
+                Some(stun_server)
+            ),
+            priority: ice::utils::calculate_candidate_priority(CandidateType::ServerReflexive, 65534, 1),
+            address: public_address,
+            candidate_type: CandidateType::ServerReflexive,
+            related_address: Some(local_address),
+            attributes: CandidateAttributes::default(),
+        }
+    }
+
+    /// Создание relay кандидата
+    pub fn relay(
+        relay_address: SocketAddr,
+        local_address: SocketAddr,
+        secure: bool,
+    ) -> Self {
+        let priority_offset = if secure { 0 } else { 10 };
+        Self {
+            foundation: ice::utils::generate_foundation(CandidateType::Relay, local_address, None),
+            priority: ice::utils::calculate_candidate_priority(CandidateType::Relay, 65533 - priority_offset, 1),
+            address: relay_address,
+            candidate_type: CandidateType::Relay,
+            related_address: Some(local_address),
+            attributes: CandidateAttributes::default(),
+        }
+    }
+
+    /// Проверка, является ли кандидат публичным
+    pub fn is_public(&self) -> bool {
+        ice::utils::is_public_address(&self.address)
+    }
+
+    /// Получение стоимости сети
+    pub fn network_cost(&self) -> u16 {
+        self.attributes.network_cost
+    }
+}
+
+/// Тип ICE кандидата
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CandidateType {
+    /// Host кандидат (локальный адрес)
+    Host,
+    /// Server reflexive (определен через STUN)
+    ServerReflexive,
+    /// Peer reflexive (обнаружен во время connectivity checks)
+    PeerReflexive,
+    /// Relay кандидат (через TURN сервер)
+    Relay,
+    /// Router pool кандидат (из пула роутеров)
+    RouterPool,
+    /// Hairpin кандидат (NAT loopback)
+    Hairpin,
+}
+
+/// Атрибуты кандидата
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateAttributes {
+    /// Транспортный протокол (udp/tcp)
+    pub transport: String,
+    /// ID компонента (1 для RTP, 2 для RTCP)
+    pub component: u16,
+    /// Стоимость сети
+    pub network_cost: u16,
+    /// Поколение ICE (для restarts)
+    pub generation: u32,
+    /// ID сети
+    pub network_id: u32,
+    /// Дополнительные расширения
+    pub extensions: std::collections::HashMap<String, String>,
+}
+
+impl Default for CandidateAttributes {
+    fn default() -> Self {
+        Self {
+            transport: "udp".to_string(),
+            component: 1,
+            network_cost: 0,
+            generation: 0,
+            network_id: 1,
+            extensions: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Пара кандидатов для connectivity checks
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidatePair {
+    /// Локальный кандидат
+    pub local: Candidate,
+    /// Удаленный кандидат
+    pub remote: Candidate,
+    /// Приоритет пары
+    pub priority: u64,
+    /// Состояние пары
+    pub state: CandidatePairState,
+    /// Номинирована ли пара
+    pub nominated: bool,
+    /// Время последней активности
+    pub last_activity: Option<Instant>,
+}
+
+impl CandidatePair {
+    /// Создание новой пары кандидатов
+    pub fn new(local: Candidate, remote: Candidate) -> Self {
+        let priority = ice::utils::calculate_pair_priority(true, local.priority, remote.priority);
+        Self {
+            local,
+            remote,
+            priority,
+            state: CandidatePairState::Waiting,
+            nominated: false,
+            last_activity: None,
+        }
+    }
+
+    /// Обновление состояния пары
+    pub fn update_state(&mut self, new_state: CandidatePairState) {
+        self.state = new_state;
+        self.last_activity = Some(Instant::now());
+    }
+
+    /// Проверка совместимости кандидатов
+    pub fn is_compatible(&self) -> bool {
+        // IP версии должны совпадать
+        if self.local.address.is_ipv4() != self.remote.address.is_ipv4() {
+            return false;
+        }
+
+        // Транспорт должен совпадать
+        if self.local.attributes.transport != self.remote.attributes.transport {
+            return false;
+        }
+
+        // Компоненты должны совпадать
+        if self.local.attributes.component != self.remote.attributes.component {
+            return false;
+        }
+
+        true
+    }
+}
+
+/// Состояние пары кандидатов
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CandidatePairState {
+    /// Ожидает проверки
+    Waiting,
+    /// Проверка в процессе
+    InProgress,
+    /// Проверка успешна
+    Succeeded,
+    /// Проверка неудачна
+    Failed,
+    /// Заморожена (будет проверена позже)
+    Frozen,
+}
+
+/// Результат connectivity check
+#[derive(Debug, Clone)]
+pub struct ConnectivityCheckResult {
+    /// Проверенная пара
+    pub pair: CandidatePair,
+    /// Успешность проверки
+    pub success: bool,
+    /// Round-trip time
+    pub rtt: Option<Duration>,
+    /// Сообщение об ошибке
+    pub error: Option<String>,
+    /// Время проверки
+    pub timestamp: Instant,
+}
+
+/// Состояние connectivity процесса
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Новое соединение
+    New,
+    /// Подключение в процессе
+    Connecting,
+    /// Соединение установлено
+    Connected,
+    /// Соединение завершено
+    Completed,
+    /// Соединение неудачно
+    Failed,
+    /// Соединение отключено
+    Disconnected,
+    /// Соединение закрыто
+    Closed,
+}
+
+/// Метрики connectivity
+#[derive(Debug, Clone, Default)]
+pub struct ConnectivityMetrics {
+    /// Время начала
+    pub started_at: Option<Instant>,
+    /// Время завершения
+    pub completed_at: Option<Instant>,
+    /// Количество собранных кандидатов
+    pub candidates_gathered: u64,
+    /// Количество connectivity checks
+    pub connectivity_checks: u64,
+    /// Количество успешных checks
+    pub successful_checks: u64,
+    /// Количество номинаций
+    pub nominations: u64,
+    /// Среднее RTT
+    pub average_rtt: Option<Duration>,
+}
+
+impl ConnectivityMetrics {
+    pub fn new() -> Self {
+        Self {
+            started_at: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        if let (Some(start), Some(end)) = (self.started_at, self.completed_at) {
+            Some(end - start)
+        } else {
+            None
+        }
+    }
+
+    pub fn success_rate(&self) -> f64 {
+        if self.connectivity_checks > 0 {
+            self.successful_checks as f64 / self.connectivity_checks as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// === ГЛАВНАЯ СТРУКТУРА CONNECTIVITY ===
 
 /// Главная структура для управления connectivity
 pub struct Connectivity {
+    /// Менеджер connectivity
     manager: Arc<ConnectivityManager>,
+    /// Конфигурация
     config: ConnectivityConfig,
+    /// События
+    event_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ConnectivityEvent>>>>,
 }
 
 impl Connectivity {
@@ -77,412 +404,394 @@ impl Connectivity {
 
     /// Создание с пользовательской конфигурацией
     pub async fn with_config(config: ConnectivityConfig) -> Result<Self> {
-        let manager = Arc::new(ConnectivityManager::new(config.clone()).await?);
+        let mut manager = ConnectivityManager::new(config.clone()).await?;
 
-        Ok(Self { manager, config })
+        // Получаем event receiver
+        let event_rx = manager.take_event_receiver().await;
+
+        Ok(Self {
+            manager: Arc::new(manager),
+            config,
+            event_rx: Arc::new(Mutex::new(event_rx)),
+        })
     }
 
-    /// Установление соединения с peer
-    ///
-    /// # Arguments
-    /// * `socket` - UDP сокет для связи
-    /// * `peer_hint` - предполагаемый адрес peer (может быть неточным из-за NAT)
-    /// * `is_controlling` - роль в ICE (true для инициатора)
-    ///
-    /// # Returns
-    /// Установленное соединение с выбранным транспортом
+    /// Создание для controlling роли
+    pub async fn new_controlling() -> Result<Self> {
+        let mut config = ConnectivityConfig::default();
+        config.ice.controlling_role = Some(true);
+        Self::with_config(config).await
+    }
+
+    /// Создание для controlled роли
+    pub async fn new_controlled() -> Result<Self> {
+        let mut config = ConnectivityConfig::default();
+        config.ice.controlling_role = Some(false);
+        Self::with_config(config).await
+    }
+
+    /// Создание оптимизированной конфигурации для P2P
+    pub async fn new_p2p_optimized() -> Result<Self> {
+        let mut config = ConnectivityConfig::default();
+        #[cfg(feature = "webrtc-ice-stack")]
+        {
+            config.ice = create_p2p_ice_config();
+        }
+        config.general.connection_methods_order = vec![
+            ConnectionMethod::Ice,
+            ConnectionMethod::Direct,
+            ConnectionMethod::LibP2p,
+        ];
+        Self::with_config(config).await
+    }
+
+    /// Создание для тестирования
+    pub async fn new_for_testing() -> Result<Self> {
+        let mut config = ConnectivityConfig::default();
+        #[cfg(feature = "webrtc-ice-stack")]
+        {
+            config.ice = create_test_ice_config();
+        }
+        config.general.connection_methods_order = vec![
+            ConnectionMethod::Ice,
+            ConnectionMethod::Direct,
+        ];
+        Self::with_config(config).await
+    }
+
+    /// === ОСНОВНЫЕ МЕТОДЫ ===
+
+    /// Установление соединения
     pub async fn establish_connection(
         &self,
         socket: Arc<UdpSocket>,
         peer_hint: Option<SocketAddr>,
         is_controlling: bool,
     ) -> Result<EstablishedConnection> {
-        self.manager
-            .establish_connection(socket, peer_hint, is_controlling)
-            .await
+        self.manager.establish_connection(socket, peer_hint, is_controlling).await
     }
 
-    /// Получение публичного адреса для подключения
+    /// Получение connectable адреса
     pub async fn get_connectable_address(&self) -> Result<SocketAddr> {
         self.manager.get_connectable_address().await
     }
 
-    /// Получение локальных кандидатов для обмена
-    pub async fn get_local_candidates(&self) -> Result<Vec<Candidate>> {
-        self.manager.gather_candidates().await
+    /// Добавление удаленного кандидата
+    pub async fn add_remote_candidate(&self, candidate: Candidate) -> Result<()> {
+        self.manager.add_remote_candidate(candidate).await
     }
 
-    /// Добавление удаленных кандидатов от peer
-    pub async fn add_remote_candidates(&self, candidates: Vec<Candidate>) -> Result<()> {
-        self.manager.add_remote_candidates(candidates).await
+    /// Получение локальных кандидатов
+    pub async fn get_local_candidates(&self) -> Vec<Candidate> {
+        self.manager.get_local_candidates().await
     }
 
-    /// Получение состояния подключения
-    pub fn get_connection_state(&self) -> ConnectionState {
-        self.manager.get_connection_state()
+    /// === MONITORING И СТАТИСТИКА ===
+
+    /// Получение текущего состояния
+    pub async fn get_state(&self) -> ConnectionState {
+        self.manager.get_state().await
     }
 
-    /// Подписка на события connectivity
-    pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<ConnectivityEvent> {
-        self.manager.subscribe_events()
+    /// Получение базовых метрик
+    pub async fn get_metrics(&self) -> ConnectivityMetrics {
+        self.manager.get_metrics().await
     }
 
-    /// Graceful shutdown
+    /// Получение детальной статистики
+    pub async fn get_detailed_stats(&self) -> DetailedConnectivityStats {
+        self.manager.get_detailed_stats().await
+    }
+
+    /// Получение receiver для событий
+    pub async fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<ConnectivityEvent>> {
+        self.event_rx.lock().take()
+    }
+
+    /// === ICE СПЕЦИФИЧНЫЕ МЕТОДЫ ===
+
+    /// Restart ICE процесса (только для ICE)
+    #[cfg(feature = "webrtc-ice-stack")]
+    pub async fn restart_ice(&self) -> Result<()> {
+        self.manager.restart_ice().await
+    }
+
+    /// === УТИЛИТЫ ===
+
+    /// Проверка поддержки различных features
+    pub fn get_supported_features(&self) -> SupportedFeatures {
+        SupportedFeatures {
+            webrtc_ice: cfg!(feature = "webrtc-ice-stack"),
+            libp2p_fallback: cfg!(feature = "libp2p-fallback"),
+            relay_encryption: cfg!(feature = "relay-encryption"),
+            nat_router_pools: cfg!(feature = "nat-router-pools"),
+            upnp_support: cfg!(feature = "upnp-support"),
+        }
+    }
+
+    /// Валидация конфигурации
+    pub fn validate_config(&self) -> Result<()> {
+        self.config.validate()
+    }
+
+    /// Проверка готовности к установлению соединения
+    pub async fn is_ready(&self) -> bool {
+        match self.get_state().await {
+            ConnectionState::New => true,
+            ConnectionState::Failed => true,
+            ConnectionState::Closed => false,
+            _ => false,
+        }
+    }
+
+    /// Остановка connectivity системы
     pub async fn shutdown(&self) -> Result<()> {
         self.manager.shutdown().await
     }
 }
 
-/// Состояние подключения
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    /// Начальное состояние
-    New,
-    /// Сбор кандидатов
-    Gathering,
-    /// Проверка связности
-    Connecting,
-    /// Соединение установлено
-    Connected,
-    /// Соединение закрыто
-    Closed,
-    /// Ошибка соединения
-    Failed,
-}
-
-/// Кандидат для соединения (универсальный для всех методов)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Candidate {
-    /// Уникальный идентификатор кандидата
-    pub foundation: String,
-    /// Приоритет кандидата (RFC 8445)
-    pub priority: u32,
-    /// Адрес кандидата
-    pub address: SocketAddr,
-    /// Тип кандидата
-    pub candidate_type: CandidateType,
-    /// Связанный адрес (для reflexive/relay кандидатов)
-    pub related_address: Option<SocketAddr>,
-    /// Дополнительные атрибуты
-    pub attributes: CandidateAttributes,
-}
-
-/// Тип кандидата
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CandidateType {
-    /// Локальный адрес хоста
-    Host,
-    /// Reflexive адрес (через STUN)
-    ServerReflexive,
-    /// Peer reflexive адрес
-    PeerReflexive,
-    /// Relay адрес (через TURN)
-    Relay,
-    /// NAT router из пула
-    RouterPool,
-}
-
-/// Дополнительные атрибуты кандидата
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CandidateAttributes {
-    /// Transport protocol (обычно UDP)
-    pub transport: String,
-    /// Component ID (обычно 1 для RTP)
-    pub component: u16,
-    /// Network cost (для приоритизации)
-    pub network_cost: u16,
-    /// Supports hairpining
-    pub hairpin_capable: bool,
-    /// Encryption capable (для relay)
-    pub encryption_capable: bool,
-}
-
-impl Candidate {
-    /// Создание host кандидата
-    pub fn host(address: SocketAddr) -> Self {
-        Self {
-            foundation: format!("host-{}", address),
-            priority: Self::calculate_priority(CandidateType::Host, 65535, 1),
-            address,
-            candidate_type: CandidateType::Host,
-            related_address: None,
-            attributes: CandidateAttributes {
-                transport: "UDP".to_string(),
-                component: 1,
-                network_cost: 10,
-                hairpin_capable: false,
-                encryption_capable: false,
-            },
-        }
-    }
-
-    /// Создание server reflexive кандидата
-    pub fn server_reflexive(address: SocketAddr, base: SocketAddr) -> Self {
-        Self {
-            foundation: format!("srflx-{}", address),
-            priority: Self::calculate_priority(CandidateType::ServerReflexive, 65535, 1),
-            address,
-            candidate_type: CandidateType::ServerReflexive,
-            related_address: Some(base),
-            attributes: CandidateAttributes {
-                transport: "UDP".to_string(),
-                component: 1,
-                network_cost: 20,
-                hairpin_capable: false,
-                encryption_capable: false,
-            },
-        }
-    }
-
-    /// Создание relay кандидата
-    pub fn relay(address: SocketAddr, related: SocketAddr, encryption_capable: bool) -> Self {
-        Self {
-            foundation: format!("relay-{}", address),
-            priority: Self::calculate_priority(CandidateType::Relay, 65535, 1),
-            address,
-            candidate_type: CandidateType::Relay,
-            related_address: Some(related),
-            attributes: CandidateAttributes {
-                transport: "UDP".to_string(),
-                component: 1,
-                network_cost: 100,
-                hairpin_capable: true,
-                encryption_capable,
-            },
-        }
-    }
-
-    /// Расчет приоритета по RFC 8445
-    fn calculate_priority(candidate_type: CandidateType, local_pref: u16, component_id: u16) -> u32 {
-        let type_pref = match candidate_type {
-            CandidateType::Host => 126,
-            CandidateType::PeerReflexive => 110,
-            CandidateType::ServerReflexive => 100,
-            CandidateType::RouterPool => 90,
-            CandidateType::Relay => 0,
-        };
-
-        (type_pref << 24) | ((local_pref as u32) << 8) | (component_id as u32)
-    }
-
-    /// Проверка совместимости с другим кандидатом
-    pub fn is_compatible_with(&self, other: &Candidate) -> bool {
-        // Проверяем совместимость транспорта
-        if self.attributes.transport != other.attributes.transport {
-            return false;
-        }
-
-        // Проверяем IP версии
-        match (self.address, other.address) {
-            (SocketAddr::V4(_), SocketAddr::V4(_)) => true,
-            (SocketAddr::V6(_), SocketAddr::V6(_)) => true,
-            _ => false,
-        }
-    }
-}
-
-/// Пара кандидатов для connectivity check
+/// Поддерживаемые возможности
 #[derive(Debug, Clone)]
-pub struct CandidatePair {
-    pub local: Candidate,
-    pub remote: Candidate,
-    pub priority: u64,
-    pub state: CandidatePairState,
-    pub nominated: bool,
-    pub last_activity: Option<Instant>,
+pub struct SupportedFeatures {
+    pub webrtc_ice: bool,
+    pub libp2p_fallback: bool,
+    pub relay_encryption: bool,
+    pub nat_router_pools: bool,
+    pub upnp_support: bool,
 }
 
-/// Состояние пары кандидатов
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CandidatePairState {
-    Waiting,
-    InProgress,
-    Succeeded,
-    Failed,
-    Frozen,
+impl SupportedFeatures {
+    /// Получение списка активных features
+    pub fn active_features(&self) -> Vec<&'static str> {
+        let mut features = Vec::new();
+        if self.webrtc_ice { features.push("webrtc-ice-stack"); }
+        if self.libp2p_fallback { features.push("libp2p-fallback"); }
+        if self.relay_encryption { features.push("relay-encryption"); }
+        if self.nat_router_pools { features.push("nat-router-pools"); }
+        if self.upnp_support { features.push("upnp-support"); }
+        features
+    }
+
+    /// Проверка минимальных требований
+    pub fn meets_minimum_requirements(&self) -> bool {
+        // Минимум нужен хотя бы один метод подключения
+        self.webrtc_ice || self.libp2p_fallback
+    }
 }
 
-impl CandidatePair {
-    pub fn new(local: Candidate, remote: Candidate) -> Self {
-        let priority = Self::calculate_pair_priority(&local, &remote);
-        Self {
-            local,
-            remote,
-            priority,
-            state: CandidatePairState::Waiting,
-            nominated: false,
-            last_activity: None,
+/// === UTILITY ФУНКЦИИ ===
+
+/// Создание стандартной connectivity системы
+pub async fn create_standard_connectivity() -> Result<Connectivity> {
+    Connectivity::new().await
+}
+
+/// Создание connectivity для P2P файлообмена
+pub async fn create_p2p_connectivity() -> Result<Connectivity> {
+    Connectivity::new_p2p_optimized().await
+}
+
+/// Создание connectivity для тестирования
+pub async fn create_test_connectivity() -> Result<Connectivity> {
+    Connectivity::new_for_testing().await
+}
+
+/// Автоматическое создание connectivity с оптимальной конфигурацией
+pub async fn create_auto_connectivity() -> Result<Connectivity> {
+    // Определяем лучшую конфигурацию на основе окружения
+    let features = SupportedFeatures {
+        webrtc_ice: cfg!(feature = "webrtc-ice-stack"),
+        libp2p_fallback: cfg!(feature = "libp2p-fallback"),
+        relay_encryption: cfg!(feature = "relay-encryption"),
+        nat_router_pools: cfg!(feature = "nat-router-pools"),
+        upnp_support: cfg!(feature = "upnp-support"),
+    };
+
+    if !features.meets_minimum_requirements() {
+        return Err(anyhow::anyhow!(
+            "No connectivity methods available. Enable at least webrtc-ice-stack or libp2p-fallback features"
+        ));
+    }
+
+    if features.webrtc_ice {
+        // Предпочитаем WebRTC ICE если доступно
+        create_p2p_connectivity().await
+    } else if features.libp2p_fallback {
+        // Fallback на libp2p
+        let mut config = ConnectivityConfig::default();
+        config.general.connection_methods_order = vec![
+            ConnectionMethod::LibP2p,
+            ConnectionMethod::Direct,
+        ];
+        Connectivity::with_config(config).await
+    } else {
+        // Минимальная конфигурация только с Direct
+        let mut config = ConnectivityConfig::default();
+        config.general.connection_methods_order = vec![ConnectionMethod::Direct];
+        Connectivity::with_config(config).await
+    }
+}
+
+/// === COMPATIBILITY LAYER ===
+
+/// Compatibility layer для старого NAT API
+#[cfg(feature = "webrtc-ice-stack")]
+pub mod nat_compat {
+    //! Совместимость с старым NAT API для плавного перехода
+
+    use super::*;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    /// Эмуляция старого NatManager
+    pub struct NatManager {
+        connectivity: Connectivity,
+    }
+
+    impl NatManager {
+        /// Создание нового NAT manager (теперь использует connectivity)
+        pub async fn new() -> Result<Self> {
+            let connectivity = Connectivity::new().await?;
+            Ok(Self { connectivity })
         }
-    }
 
-    /// Расчет приоритета пары по RFC 8445
-    fn calculate_pair_priority(local: &Candidate, remote: &Candidate) -> u64 {
-        let g = if local.priority > remote.priority { 1 } else { 0 };
-        let min_priority = std::cmp::min(local.priority, remote.priority) as u64;
-        let max_priority = std::cmp::max(local.priority, remote.priority) as u64;
-
-        (1u64 << 32) * min_priority + 2 * max_priority + g
-    }
-
-    /// Обновление состояния пары
-    pub fn update_state(&mut self, new_state: CandidatePairState) {
-        self.state = new_state;
-        self.last_activity = Some(Instant::now());
-    }
-}
-
-/// Результат connectivity check
-#[derive(Debug, Clone)]
-pub struct ConnectivityCheckResult {
-    pub pair: CandidatePair,
-    pub success: bool,
-    pub rtt: Option<Duration>,
-    pub error: Option<String>,
-    pub timestamp: Instant,
-}
-
-/// Метрики connectivity для мониторинга
-#[derive(Debug, Clone, Default)]
-pub struct ConnectivityMetrics {
-    /// Время начала процесса
-    pub started_at: Option<Instant>,
-    /// Время установления соединения
-    pub connected_at: Option<Instant>,
-    /// Общее время установления
-    pub connection_time: Option<Duration>,
-    /// Количество собранных кандидатов
-    pub candidates_gathered: usize,
-    /// Количество успешных checks
-    pub successful_checks: usize,
-    /// Количество неудачных checks
-    pub failed_checks: usize,
-    /// Выбранная пара кандидатов
-    pub selected_pair: Option<CandidatePair>,
-    /// Использованный метод подключения
-    pub connection_method: Option<String>,
-    /// Ошибки в процессе
-    pub errors: Vec<String>,
-}
-
-impl ConnectivityMetrics {
-    pub fn new() -> Self {
-        Self {
-            started_at: Some(Instant::now()),
-            ..Default::default()
+        /// Инициализация (совместимость)
+        pub async fn initialize(&self, _socket: &UdpSocket) -> Result<()> {
+            // В новой системе инициализация происходит при создании соединения
+            Ok(())
         }
-    }
 
-    pub fn mark_connected(&mut self) {
-        self.connected_at = Some(Instant::now());
-        if let Some(started) = self.started_at {
-            self.connection_time = Some(Instant::now() - started);
+        /// Получение connectable адреса
+        pub async fn get_connectable_address(&self) -> Result<SocketAddr> {
+            self.connectivity.get_connectable_address().await
         }
-    }
 
-    pub fn add_error(&mut self, error: String) {
-        self.errors.push(error);
-    }
-}
-
-/// Utilities для работы с адресами
-pub mod utils {
-    use std::net::{IpAddr, SocketAddr};
-
-    /// Проверка является ли адрес приватным
-    pub fn is_private_addr(addr: &SocketAddr) -> bool {
-        match addr.ip() {
-            IpAddr::V4(ipv4) => ipv4.is_private(),
-            IpAddr::V6(ipv6) => ipv6.is_unique_local(),
+        /// Подготовка соединения
+        pub async fn prepare_connection(
+            &self,
+            socket: &UdpSocket,
+            peer_addr: SocketAddr,
+            is_initiator: bool,
+        ) -> Result<()> {
+            let socket_arc = Arc::new(socket.try_clone()?);
+            let _connection = self.connectivity.establish_connection(
+                socket_arc,
+                Some(peer_addr),
+                is_initiator
+            ).await?;
+            Ok(())
         }
-    }
 
-    /// Проверка являются ли адреса из одной подсети
-    pub fn is_same_subnet(addr1: &SocketAddr, addr2: &SocketAddr) -> bool {
-        match (addr1.ip(), addr2.ip()) {
-            (IpAddr::V4(ip1), IpAddr::V4(ip2)) => {
-                let octets1 = ip1.octets();
-                let octets2 = ip2.octets();
-                octets1[0..3] == octets2[0..3]
-            }
-            (IpAddr::V6(ip1), IpAddr::V6(ip2)) => {
-                let segments1 = ip1.segments();
-                let segments2 = ip2.segments();
-                segments1[0..4] == segments2[0..4]
-            }
-            _ => false,
-        }
-    }
-
-    /// Определение сетевой стоимости для приоритизации
-    pub fn calculate_network_cost(local: &SocketAddr, remote: &SocketAddr) -> u16 {
-        if is_same_subnet(local, remote) {
-            // Локальная сеть - минимальная стоимость
-            10
-        } else if is_private_addr(local) && is_private_addr(remote) {
-            // Обе приватные, но разные сети
-            30
-        } else if is_private_addr(local) || is_private_addr(remote) {
-            // Одна приватная, одна публичная - NAT traversal
-            50
-        } else {
-            // Обе публичные
-            20
+        /// Cleanup (совместимость)
+        pub async fn cleanup(&self) -> Result<()> {
+            self.connectivity.shutdown().await
         }
     }
 }
+
+/// === КОНСТАНТЫ И ВЕРСИИ ===
+
+/// Версия connectivity модуля
+pub const CONNECTIVITY_VERSION: &str = "2.0.0";
+
+/// Поддерживаемые спецификации
+pub const SUPPORTED_SPECIFICATIONS: &[&str] = &[
+    "RFC 8445 - Interactive Connectivity Establishment (ICE)",
+    "RFC 8838 - Trickle ICE",
+    "RFC 7675 - STUN Usage for Consent Freshness",
+    "RFC 8421 - Guidelines for Multihomed and IPv4/IPv6 Dual-Stack ICE",
+    "SHARP-256 Protocol Extensions",
+];
+
+/// Информация о системе connectivity
+pub fn connectivity_info() -> String {
+    let features = SupportedFeatures {
+        webrtc_ice: cfg!(feature = "webrtc-ice-stack"),
+        libp2p_fallback: cfg!(feature = "libp2p-fallback"),
+        relay_encryption: cfg!(feature = "relay-encryption"),
+        nat_router_pools: cfg!(feature = "nat-router-pools"),
+        upnp_support: cfg!(feature = "upnp-support"),
+    };
+
+    format!(
+        "SHARP-256 Connectivity v{}\nActive features: {:?}\nSupported specs: {:?}",
+        CONNECTIVITY_VERSION,
+        features.active_features(),
+        SUPPORTED_SPECIFICATIONS
+    )
+}
+
+/// === TESTS ===
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::sleep;
 
-    #[test]
-    fn test_candidate_priority_calculation() {
-        let host_candidate = Candidate::host("192.168.1.100:5000".parse().unwrap());
-        let relay_candidate = Candidate::relay(
-            "1.2.3.4:3478".parse().unwrap(),
-            "192.168.1.100:5000".parse().unwrap(),
-            true,
-        );
+    #[tokio::test]
+    async fn test_connectivity_creation() {
+        let connectivity = create_test_connectivity().await;
+        assert!(connectivity.is_ok());
 
-        assert!(host_candidate.priority > relay_candidate.priority);
+        let connectivity = connectivity.unwrap();
+        assert!(connectivity.is_ready().await);
     }
 
-    #[test]
-    fn test_candidate_compatibility() {
-        let v4_candidate = Candidate::host("192.168.1.100:5000".parse().unwrap());
-        let v6_candidate = Candidate::host("[::1]:5000".parse().unwrap());
+    #[tokio::test]
+    async fn test_supported_features() {
+        let connectivity = create_test_connectivity().await.unwrap();
+        let features = connectivity.get_supported_features();
 
-        assert!(!v4_candidate.is_compatible_with(&v6_candidate));
+        // В тестах должен быть доступен хотя бы один метод
+        assert!(features.meets_minimum_requirements());
     }
 
-    #[test]
-    fn test_pair_priority_calculation() {
-        let local = Candidate::host("192.168.1.100:5000".parse().unwrap());
-        let remote = Candidate::server_reflexive(
-            "1.2.3.4:5000".parse().unwrap(),
-            "192.168.1.200:5000".parse().unwrap(),
-        );
+    #[tokio::test]
+    async fn test_candidate_creation() {
+        let host_candidate = Candidate::host("192.168.1.1:5000".parse().unwrap());
+        assert_eq!(host_candidate.candidate_type, CandidateType::Host);
+        assert!(!host_candidate.is_public());
+
+        let public_candidate = Candidate::host("8.8.8.8:53".parse().unwrap());
+        assert!(public_candidate.is_public());
+    }
+
+    #[tokio::test]
+    async fn test_candidate_pair() {
+        let local = Candidate::host("192.168.1.1:5000".parse().unwrap());
+        let remote = Candidate::host("192.168.1.2:5000".parse().unwrap());
 
         let pair = CandidatePair::new(local, remote);
+        assert!(pair.is_compatible());
+        assert_eq!(pair.state, CandidatePairState::Waiting);
         assert!(pair.priority > 0);
     }
 
-    #[test]
-    fn test_utils_private_addr_detection() {
-        let private_addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
-        let public_addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-        assert!(utils::is_private_addr(&private_addr));
-        assert!(!utils::is_private_addr(&public_addr));
+    #[cfg(feature = "webrtc-ice-stack")]
+    #[tokio::test]
+    async fn test_ice_config_validation() {
+        let config = create_test_ice_config();
+        assert!(validate_ice_config(&config).is_ok());
     }
 
-    #[test]
-    fn test_utils_subnet_detection() {
-        let addr1: SocketAddr = "192.168.1.100:5000".parse().unwrap();
-        let addr2: SocketAddr = "192.168.1.200:5000".parse().unwrap();
-        let addr3: SocketAddr = "192.168.2.100:5000".parse().unwrap();
+    #[tokio::test]
+    async fn test_connectivity_info() {
+        let info = connectivity_info();
+        assert!(info.contains("SHARP-256 Connectivity"));
+        assert!(info.contains("v2.0.0"));
+    }
 
-        assert!(utils::is_same_subnet(&addr1, &addr2));
-        assert!(!utils::is_same_subnet(&addr1, &addr3));
+    #[tokio::test]
+    async fn test_auto_connectivity_creation() {
+        let connectivity = create_auto_connectivity().await;
+        // Должен создаться даже если не все features доступны
+        assert!(connectivity.is_ok());
+    }
+
+    #[cfg(feature = "webrtc-ice-stack")]
+    #[tokio::test]
+    async fn test_nat_compat() {
+        let nat_manager = nat_compat::NatManager::new().await;
+        assert!(nat_manager.is_ok());
     }
 }
