@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
 // src/nat/stun/discovery.rs
 //! STUN NAT Behavior Discovery implementation fully compliant with RFC 5780
 //!
@@ -100,11 +101,71 @@ pub struct NatBehavior {
 
     /// Whether external port allocation is consistent
     pub consistent_external_port: bool,
+=======
+use std::net::SocketAddr;
+use std::collections::HashMap;
+use tokio::net::UdpSocket;
+use crate::nat::NatType;
+use crate::nat::metrics::record_nat_type_detection;
+use super::client::StunClient;
+use super::protocol::*;
+
+use crate::nat::error::{NatError, NatResult, StunError};
+use std::time::Duration;
+
+/// NAT mapping behavior (RFC 5780)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingBehavior {
+    /// Same mapping for all destinations (best for P2P)
+    EndpointIndependent,
+
+    /// Different mapping per destination IP
+    AddressDependent,
+
+    /// Different mapping per destination IP:port
+    AddressPortDependent,
+}
+
+/// NAT filtering behavior (RFC 5780)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilteringBehavior {
+    /// Allow packets from any source (best for P2P)
+    EndpointIndependent,
+
+    /// Allow only from IPs we've sent to
+    AddressDependent,
+
+    /// Allow only from IP:port pairs we've sent to
+    AddressPortDependent,
+}
+
+/// Complete NAT behavior characteristics
+#[derive(Debug, Clone)]
+pub struct NatBehavior {
+    /// Mapping behavior
+    pub mapping: MappingBehavior,
+
+    /// Filtering behavior
+    pub filtering: FilteringBehavior,
+
+    /// Supports hairpinning (local connections)
+    pub hairpinning: bool,
+
+    /// Mapping lifetime in seconds
+    pub mapping_lifetime: Option<u64>,
+
+    /// Detected public addresses
+    pub public_addresses: Vec<SocketAddr>,
+
+    /// Confidence level (0.0 to 1.0)
+    pub confidence: f64,
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
 }
 
 impl NatBehavior {
     /// Convert to simple NAT type classification
     pub fn to_simple_nat_type(&self) -> NatType {
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
         match (self.mapping_behavior, self.filtering_behavior) {
             (MappingBehavior::DirectMapping, FilteringBehavior::None) => NatType::Open,
 
@@ -378,15 +439,352 @@ impl NatBehaviorDiscovery {
             "NAT behavior discovery completed in {:?}: mapping={:?}, filtering={:?}, p2p_score={:.2}",
             discovery_time, mapping_behavior, filtering_behavior, behavior.p2p_score()
         );
+=======
+        match (self.mapping, self.filtering) {
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::EndpointIndependent) => {
+                NatType::FullCone
+            }
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressDependent) => {
+                NatType::RestrictedCone
+            }
+            (MappingBehavior::EndpointIndependent, FilteringBehavior::AddressPortDependent) => {
+                NatType::PortRestricted
+            }
+            (MappingBehavior::AddressDependent, _) |
+            (MappingBehavior::AddressPortDependent, _) => {
+                NatType::Symmetric
+            }
+        }
+    }
+
+    /// Get P2P connectivity score (0.0 to 1.0)
+    pub fn p2p_score(&self) -> f64 {
+        let mapping_score = match self.mapping {
+            MappingBehavior::EndpointIndependent => 1.0,
+            MappingBehavior::AddressDependent => 0.5,
+            MappingBehavior::AddressPortDependent => 0.2,
+        };
+
+        let filtering_score = match self.filtering {
+            FilteringBehavior::EndpointIndependent => 1.0,
+            FilteringBehavior::AddressDependent => 0.6,
+            FilteringBehavior::AddressPortDependent => 0.3,
+        };
+
+        let hairpin_score = if self.hairpinning { 0.1 } else { 0.0 };
+
+        (mapping_score * 0.5 + filtering_score * 0.4 + hairpin_score) * self.confidence
+    }
+}
+
+/// NAT behavior discovery implementation (RFC 5780)
+pub struct NatBehaviorDiscovery<'a> {
+    client: &'a StunClient,
+    test_results: HashMap<String, TestResult>,
+}
+
+#[derive(Debug, Clone)]
+struct TestResult {
+    local_addr: SocketAddr,
+    mapped_addr: SocketAddr,
+    server_addr: SocketAddr,
+    changed_addr: Option<SocketAddr>,
+    response_origin: Option<SocketAddr>,
+}
+
+impl<'a> NatBehaviorDiscovery<'a> {
+    pub fn new(client: &'a StunClient) -> Self {
+        Self {
+            client,
+            test_results: HashMap::new(),
+        }
+    }
+
+    /// Detect complete NAT behavior following RFC 5780
+    pub async fn detect_behavior(&mut self, socket: &UdpSocket) -> NatResult<NatBehavior> {
+        let local_addr = socket.local_addr()?;
+
+        tracing::info!("Starting NAT behavior discovery from {}", local_addr);
+
+        // Test 1: Basic binding request
+        let test1 = self.perform_test(socket, "test1", None).await?;
+
+        // Check if we're behind NAT
+        if test1.mapped_addr.ip() == local_addr.ip() {
+            // No NAT detected
+            tracing::info!("No NAT detected - public IP address");
+            record_nat_type_detection("none", "high");
+
+            return Ok(NatBehavior {
+                mapping: MappingBehavior::EndpointIndependent,
+                filtering: FilteringBehavior::EndpointIndependent,
+                hairpinning: true,
+                mapping_lifetime: None,
+                public_addresses: vec![test1.mapped_addr],
+                confidence: 1.0,
+            });
+        }
+
+        // We're behind NAT, continue testing
+        tracing::info!("NAT detected - mapped address: {}", test1.mapped_addr);
+
+        // Determine mapping and filtering behavior
+        let (mapping, filtering, confidence) = self.determine_nat_behavior(socket, &test1).await?;
+
+        // Collect all discovered public addresses
+        let mut public_addresses = vec![test1.mapped_addr];
+        for result in self.test_results.values() {
+            if !public_addresses.contains(&result.mapped_addr) {
+                public_addresses.push(result.mapped_addr);
+            }
+        }
+
+        // Test hairpinning
+        let hairpinning = self.test_hairpinning(socket, test1.mapped_addr).await;
+
+        // Test mapping lifetime
+        let mapping_lifetime = if confidence > 0.5 {
+            self.test_mapping_lifetime(socket).await.ok()
+        } else {
+            None
+        };
+
+        let behavior = NatBehavior {
+            mapping,
+            filtering,
+            hairpinning,
+            mapping_lifetime,
+            public_addresses,
+            confidence,
+        };
+
+        // Record metrics
+        let nat_type = behavior.to_simple_nat_type();
+        let confidence_level = if confidence > 0.8 {
+            "high"
+        } else if confidence > 0.5 {
+            "medium"
+        } else {
+            "low"
+        };
+
+        record_nat_type_detection(&format!("{:?}", nat_type), confidence_level);
+
+        tracing::info!("NAT behavior detected: {:?} (confidence: {:.2})", nat_type, confidence);
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
 
         Ok(behavior)
     }
 
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
     /// RFC 5780 Test I: Basic Binding Request
     async fn perform_test_i(&self, socket: &UdpSocket, server: &super::client::StunServerInfo) -> NatResult<TestResult> {
         tracing::debug!("Performing RFC 5780 Test I: Basic Binding Request");
 
         let response = self.send_binding_request(socket, server.address, false, false).await?;
+=======
+    /// Determine NAT mapping and filtering behavior
+    async fn determine_nat_behavior(
+        &mut self,
+        socket: &UdpSocket,
+        test1: &TestResult,
+    ) -> NatResult<(MappingBehavior, FilteringBehavior, f64)> {
+        let mut confidence = 1.0;
+
+        // If server doesn't support RFC 5780, we can't do full testing
+        if test1.changed_addr.is_none() {
+            tracing::warn!("Server doesn't support RFC 5780 - limited testing only");
+            confidence *= 0.3;
+
+            // Try basic tests with multiple servers
+            let mapping = self.test_mapping_basic(socket).await?;
+            let filtering = FilteringBehavior::AddressPortDependent; // Conservative assumption
+
+            return Ok((mapping, filtering, confidence));
+        }
+
+        // Full RFC 5780 test suite
+        // Test 2: Change IP
+        let test2 = match self.perform_test(socket, "test2", Some(ChangeRequest::ChangeIP)).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                confidence *= 0.9;
+                None
+            }
+        };
+
+        // Test 3: Change Port
+        let test3 = match self.perform_test(socket, "test3", Some(ChangeRequest::ChangePort)).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                confidence *= 0.9;
+                None
+            }
+        };
+
+        // Test 4: Change IP and Port
+        let test4 = match self.perform_test(socket, "test4", Some(ChangeRequest::ChangeBoth)).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                confidence *= 0.9;
+                None
+            }
+        };
+
+        // Determine mapping behavior
+        let mapping = self.analyze_mapping_behavior(test1, &test2, &test3, &test4);
+
+        // Determine filtering behavior
+        let filtering = self.analyze_filtering_behavior(&test2, &test3, &test4);
+
+        Ok((mapping, filtering, confidence))
+    }
+
+    /// Test mapping behaviour by сравнивая публичный адрес (XOR-MAPPED-ADDRESS),
+    /// полученный от разных STUN-серверов.  Полностью соответствует RFC 4787.
+    async fn test_mapping_basic(&mut self, socket: &UdpSocket) -> NatResult<MappingBehavior> {
+        // Query multiple servers to see if we get same mapping
+        let servers = vec![
+            "stun.l.google.com:3478",
+            "stun1.l.google.com:3478",
+            "stun2.l.google.com:3478",
+            "stun3.l.google.com:3478",
+            "stun4.l.google.com:3478",
+            "stun.cloudflare.com:3478",
+            "stun.cloudflare.com:3479",
+            "stun.services.mozilla.com:3478",
+        ];
+
+        let mut mappings = Vec::new();
+
+        for server in servers {
+            // Стандартный запрос без CHANGE-REQUEST
+            if let Ok(info) = self.client.query_server(socket, server).await {
+                if let Some(addr) = info.response_origin {
+                    mappings.push(addr);
+                }
+            }
+        }
+
+        if mappings.len() < 2 {
+            return Ok(MappingBehavior::AddressPortDependent); // Conservative
+        }
+
+        // Check if all mappings are the same
+        let first = mappings[0];
+        let all_same = mappings.iter().all(|&addr| addr == first);
+
+        if all_same {
+            Ok(MappingBehavior::EndpointIndependent)
+        } else {
+            // Check if only port changes
+            let same_ip = mappings.iter().all(|addr| addr.ip() == first.ip());
+            if same_ip {
+                Ok(MappingBehavior::AddressDependent)
+            } else {
+                Ok(MappingBehavior::AddressPortDependent)
+            }
+        }
+    }
+
+    /// Analyze mapping behavior from test results
+    fn analyze_mapping_behavior(
+        &self,
+        test1: &TestResult,
+        test2: &Option<TestResult>,
+        test3: &Option<TestResult>,
+        test4: &Option<TestResult>,
+    ) -> MappingBehavior {
+        // Check if mapping changes with different destination IPs
+        if let Some(t2) = test2 {
+            if t2.mapped_addr != test1.mapped_addr {
+                // Mapping changes with IP
+                return MappingBehavior::AddressDependent;
+            }
+        }
+
+        // Check if mapping changes with different destination ports
+        if let Some(t3) = test3 {
+            if t3.mapped_addr != test1.mapped_addr {
+                // Mapping changes with port (but not IP)
+                return MappingBehavior::AddressPortDependent;
+            }
+        }
+
+        // If we have test4 and it matches test1, definitely endpoint-independent
+        if let Some(t4) = test4 {
+            if t4.mapped_addr == test1.mapped_addr {
+                return MappingBehavior::EndpointIndependent;
+            }
+        }
+
+        // Default to endpoint-independent if no changes detected
+        MappingBehavior::EndpointIndependent
+    }
+
+    /// Analyze filtering behavior from test results
+    fn analyze_filtering_behavior(
+        &self,
+        test2: &Option<TestResult>, // Change IP
+        test3: &Option<TestResult>, // Change Port
+        test4: &Option<TestResult>, // Change IP + Port
+    ) -> FilteringBehavior {
+        // 1. Endpoint-Independent – ответ приходит даже при изменении IP и Port.
+        if test4.is_some() {
+            return FilteringBehavior::EndpointIndependent;
+        }
+
+        // 2. Address-Dependent – IP тот же, порт другой (ChangePort).
+        if test3.is_some() {
+            return FilteringBehavior::AddressDependent;
+        }
+
+        // 3. Endpoint-Independent (по порту) – IP другой, порт тот же (ChangeIP).
+        if test2.is_some() {
+            return FilteringBehavior::EndpointIndependent;
+        }
+
+        // 4. Самый строгий случай – Address+Port-Dependent
+        FilteringBehavior::AddressPortDependent
+    }
+
+    /// Perform a single test
+    async fn perform_test(
+        &mut self,
+        socket: &UdpSocket,
+        test_name: &str,
+        change_request: Option<ChangeRequest>,
+    ) -> NatResult<TestResult> {
+        // Find a server that supports RFC 5780 tests
+        let server_info = self.find_rfc5780_server(socket).await?;
+
+        let transaction_id = TransactionId::new();
+        let mut request = Message::new(MessageType::BindingRequest, transaction_id);
+
+        // Add CHANGE-REQUEST if needed
+        if let Some(change_req) = change_request {
+            let flags = match change_req {
+                ChangeRequest::ChangeIP => 0x04,
+                ChangeRequest::ChangePort => 0x02,
+                ChangeRequest::ChangeBoth => 0x06,
+            };
+
+            // Encode CHANGE-REQUEST attribute
+            let mut attr_value = vec![0, 0, 0, flags];
+            request.add_attribute(Attribute::new(
+                AttributeType::ChangeRequest,
+                AttributeValue::Raw(attr_value),
+            ));
+        }
+
+        // Send request
+        let response = self.client.send_with_retries(
+            socket,
+            server_info.address,
+            request,
+            None,
+        ).await?;
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
 
         // Extract mapped address
         let mapped_addr = response.attributes.iter()
@@ -395,7 +793,13 @@ impl NatBehaviorDiscovery {
                 AttributeValue::MappedAddress(addr) => Some(*addr),
                 _ => None,
             })
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
             .ok_or_else(|| StunError::MissingAttribute("MAPPED-ADDRESS".to_string()))?;
+=======
+            .ok_or_else(|| {
+                crate::nat::error::StunError::MissingAttribute("MAPPED-ADDRESS".to_string())
+            })?;
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
 
         // Extract other address (for change requests)
         let other_addr = response.attributes.iter()
@@ -414,11 +818,16 @@ impl NatBehaviorDiscovery {
         let result = TestResult {
             local_addr: socket.local_addr()?,
             mapped_addr,
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
             server_addr: server.address,
+=======
+            server_addr: server_info.address,
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
             changed_addr: other_addr,
             response_origin,
         };
 
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
         self.test_results.write().insert("test_i".to_string(), result.clone());
         Ok(result)
     }
@@ -586,10 +995,32 @@ impl NatBehaviorDiscovery {
 
                 if rfc5780_servers.len() >= self.config.max_servers_to_test {
                     break;
+=======
+        self.test_results.insert(test_name.to_string(), result.clone());
+
+        Ok(result)
+    }
+
+    /// Find a server that supports RFC 5780
+    async fn find_rfc5780_server(&self, socket: &UdpSocket) -> NatResult<super::StunServerInfo> {
+        // Try servers from configuration
+        for server in &self.client.config().servers {
+            match self.client.query_server(socket, server).await {
+                Ok(info) if info.other_address.is_some() => {
+                    tracing::info!("Found RFC 5780 compliant server: {}", server);
+                    return Ok(info);
+                }
+                Ok(_) => {
+                    tracing::debug!("Server {} doesn't support CHANGE-REQUEST", server);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to query {}: {}", server, e);
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
                 }
             }
         }
 
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
         Ok(rfc5780_servers)
     }
 
@@ -656,11 +1087,30 @@ impl NatBehaviorDiscovery {
                 for addr in addrs {
                     if addr.port() != first_addr.port() || addr.ip() != first_addr.ip() {
                         different_ips_same_port = false;
+=======
+        Err(crate::nat::error::NatError::Configuration(
+            "No RFC 5780 compliant STUN servers found".to_string(),
+        ))
+    }
+    /// Fallback behavior detection using only RFC 8489 features
+    pub async fn detect_basic_behavior(&mut self, socket: &UdpSocket) -> NatResult<NatBehavior> {
+        let local_addr = socket.local_addr()?;
+        tracing::info!("Starting basic NAT behavior detection from {}", local_addr);
+
+        // Determine public addresses by querying configured servers
+        let mut public_addresses = Vec::new();
+        for server in &self.client.config().servers {
+            if let Ok(info) = self.client.query_server(socket, server).await {
+                if let Some(addr) = info.response_origin {
+                    if !public_addresses.contains(&addr) {
+                        public_addresses.push(addr);
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
                     }
                 }
             }
         }
 
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
         // Determine mapping behavior based on port consistency across servers
         if all_ports.len() <= 1 {
             // Only one server tested or all same
@@ -1025,11 +1475,90 @@ impl NatBehaviorDiscovery {
     pub fn clear_results(&self) {
         self.test_results.write().clear();
     }
+=======
+        if public_addresses.is_empty() {
+            return Err(NatError::from(StunError::AllServersFailed));
+        }
+
+        // Basic mapping behavior detection
+        let mapping = self.test_mapping_basic(socket).await?;
+
+        Ok(NatBehavior {
+            mapping,
+            filtering: FilteringBehavior::AddressPortDependent,
+            hairpinning: false,
+            mapping_lifetime: None,
+            public_addresses,
+            confidence: 0.3,
+        })
+    }
+
+    /// Test hairpinning support
+    async fn test_hairpinning(&self, socket: &UdpSocket, public_addr: SocketAddr) -> bool {
+        // Создаём временный приёмник на том же порту, но с отдельным дескриптором
+        let bind_addr = match socket.local_addr() {
+            Ok(mut a) => {
+                a.set_ip("0.0.0.0".parse().unwrap());
+                a
+            }
+            Err(_) => return false,
+        };
+        let listener = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let test_data = b"SHARP_HAIRPIN_TEST";
+
+        if socket.send_to(test_data, public_addr).await.is_err() {
+            return false;
+        }
+
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_millis(750), listener.recv_from(&mut buf)).await {
+            Ok(Ok((size, addr))) if addr == public_addr && &buf[..size] == test_data => true,
+            _ => false,
+        }
+    }
+
+    /// Test mapping lifetime
+    async fn test_mapping_lifetime(&mut self, socket: &UdpSocket) -> NatResult<u64> {
+        let initial_result = self.perform_test(socket, "lifetime_initial", None).await?;
+        let initial_mapping = initial_result.mapped_addr;
+
+        // Test at increasing intervals
+        let test_intervals = [30, 60, 120, 300, 600, 1800, 3600]; // seconds
+
+        for interval in test_intervals {
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+            let result = self.perform_test(socket, &format!("lifetime_{}", interval), None).await?;
+
+            if result.mapped_addr != initial_mapping {
+                // Mapping changed, lifetime is less than this interval
+                tracing::info!("NAT mapping lifetime: < {} seconds", interval);
+                return Ok(interval);
+            }
+        }
+
+        // Mapping stable for at least 1 hour
+        tracing::info!("NAT mapping lifetime: > 3600 seconds");
+        Ok(3600)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChangeRequest {
+    ChangeIP,
+    ChangePort,
+    ChangeBoth,
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+<<<<<<< Updated upstream:src/nat/stun/discovery.rs
     use crate::nat::stun::StunConfig;
 
     #[tokio::test]
@@ -1117,5 +1646,39 @@ mod tests {
             MappingBehavior::AddressAndPortDependent,
             FilteringBehavior::AddressAndPortDependent
         ), 4);
+=======
+
+    #[test]
+    fn test_nat_type_mapping() {
+        let behavior = NatBehavior {
+            mapping: MappingBehavior::EndpointIndependent,
+            filtering: FilteringBehavior::EndpointIndependent,
+            hairpinning: true,
+            mapping_lifetime: Some(3600),
+            public_addresses: vec!["1.2.3.4:5678".parse().unwrap()],
+            confidence: 1.0,
+        };
+
+        assert_eq!(behavior.to_simple_nat_type(), NatType::FullCone);
+        assert_eq!(behavior.p2p_score(), 1.0);
+    }
+
+    #[test]
+    fn test_symmetric_nat_detection() {
+        let behavior = NatBehavior {
+            mapping: MappingBehavior::AddressPortDependent,
+            filtering: FilteringBehavior::AddressPortDependent,
+            hairpinning: false,
+            mapping_lifetime: Some(60),
+            public_addresses: vec![
+                "1.2.3.4:5678".parse().unwrap(),
+                "1.2.3.4:5679".parse().unwrap(),
+            ],
+            confidence: 0.8,
+        };
+
+        assert_eq!(behavior.to_simple_nat_type(), NatType::Symmetric);
+        assert!(behavior.p2p_score() < 0.5);
+>>>>>>> Stashed changes:previous NAT/nat/stun/discovery.rs
     }
 }

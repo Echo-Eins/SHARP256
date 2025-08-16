@@ -1,0 +1,26 @@
+Архитектура Connectivity
+SHARP-256 использует многоуровневую систему установления соединений:
+Уровень 1: ICE (WebRTC-based)
+
+STUN servers для определения публичного адреса
+TURN servers для relay через публичные серверы
+Connectivity checks по RFC 8445
+Candidate nomination для выбора лучшего пути
+
+Уровень 2: libp2p Fallback
+
+AutoNAT для определения типа NAT
+Hole punching через libp2p протоколы
+mDNS discovery для локальных сетей
+
+Уровень 3: NAT Router Pools
+
+Автоматический выбор из пулов роутеров
+Адаптивное обучение успешных маршрутов
+Региональные пулы для оптимизации
+
+Уровень 4: SHARP Relay
+
+Шифрование заголовков для обхода DPI
+ChaCha20-Poly1305 или AES-GCM шифрование
+Relay coordination для сложных NAT

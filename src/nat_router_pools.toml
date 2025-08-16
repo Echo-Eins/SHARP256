@@ -1,0 +1,244 @@
+# SHARP-256 NAT Router Pools Configuration
+# Пулы роутеров для обхода NAT при невозможности прямого соединения
+
+[metadata]
+version = "1.0"
+description = "NAT router pools for SHARP-256 protocol"
+last_updated = "2025-01-01"
+
+# Общие настройки router pools
+[general]
+enabled = true
+max_routers_to_try = 5
+router_check_timeout_ms = 2000
+default_priority = 50
+
+# Домашние роутеры (наиболее распространенные)
+[[pools]]
+name = "home-routers-common"
+description = "Common home router default gateways"
+region = "global"
+priority = 80
+enabled = true
+
+[pools.metadata]
+success_rate = 0.7
+average_rtt_ms = 5
+reliability = "high"
+
+[[pools.routers]]
+address = "192.168.1.1:53"
+description = "Most common home router gateway"
+[[pools.routers]]
+address = "192.168.0.1:53"
+description = "Alternative common gateway"
+[[pools.routers]]
+address = "192.168.1.1:80"
+description = "HTTP port on common gateway"
+[[pools.routers]]
+address = "192.168.0.1:80"
+description = "HTTP port on alternative gateway"
+
+# Корпоративные сети
+[[pools]]
+name = "corporate-networks"
+description = "Corporate network gateways"
+region = "global"
+priority = 60
+enabled = true
+
+[pools.metadata]
+success_rate = 0.5
+average_rtt_ms = 10
+reliability = "medium"
+
+[[pools.routers]]
+address = "10.0.0.1:53"
+description = "Class A private network gateway"
+[[pools.routers]]
+address = "172.16.0.1:53"
+description = "Class B private network gateway"
+[[pools.routers]]
+address = "172.16.1.1:53"
+description = "Alternative Class B gateway"
+[[pools.routers]]
+address = "10.1.0.1:53"
+description = "Alternative Class A gateway"
+
+# Популярные ISP роутеры в России
+[[pools]]
+name = "russia-isp-routers"
+description = "Popular ISP routers in Russia"
+region = "russia"
+priority = 70
+enabled = true
+
+[pools.metadata]
+success_rate = 0.6
+average_rtt_ms = 8
+reliability = "medium"
+
+[[pools.routers]]
+address = "192.168.1.1:80"
+description = "Ростелеком standard gateway"
+[[pools.routers]]
+address = "192.168.0.1:80"
+description = "Билайн standard gateway"
+[[pools.routers]]
+address = "192.168.1.254:53"
+description = "МТС router gateway"
+[[pools.routers]]
+address = "192.168.100.1:53"
+description = "Дом.ru gateway"
+
+# Альтернативные порты для обхода блокировок
+[[pools]]
+name = "alternative-ports"
+description = "Alternative ports for NAT traversal"
+region = "global"
+priority = 40
+enabled = true
+
+[pools.metadata]
+success_rate = 0.4
+average_rtt_ms = 15
+reliability = "low"
+
+[[pools.routers]]
+address = "192.168.1.1:8080"
+description = "Alternative HTTP port"
+[[pools.routers]]
+address = "192.168.1.1:443"
+description = "HTTPS port"
+[[pools.routers]]
+address = "192.168.0.1:8080"
+description = "Alternative HTTP port"
+[[pools.routers]]
+address = "192.168.0.1:443"
+description = "HTTPS port"
+
+# Мобильные операторы
+[[pools]]
+name = "mobile-carriers"
+description = "Mobile carrier gateways"
+region = "global"
+priority = 50
+enabled = true
+
+[pools.metadata]
+success_rate = 0.3
+average_rtt_ms = 25
+reliability = "low"
+
+[[pools.routers]]
+address = "10.0.0.1:80"
+description = "Mobile carrier gateway"
+[[pools.routers]]
+address = "172.16.0.1:80"
+description = "Alternative mobile gateway"
+[[pools.routers]]
+address = "192.168.43.1:53"
+description = "Android hotspot gateway"
+[[pools.routers]]
+address = "172.20.10.1:53"
+description = "iOS hotspot gateway"
+
+# Публичные DNS как fallback
+[[pools]]
+name = "public-dns-fallback"
+description = "Public DNS servers as last resort"
+region = "global"
+priority = 20
+enabled = false  # Отключено по умолчанию
+
+[pools.metadata]
+success_rate = 0.1
+average_rtt_ms = 50
+reliability = "very-low"
+
+[[pools.routers]]
+address = "8.8.8.8:53"
+description = "Google DNS"
+[[pools.routers]]
+address = "8.8.4.4:53"
+description = "Google DNS secondary"
+[[pools.routers]]
+address = "1.1.1.1:53"
+description = "Cloudflare DNS"
+[[pools.routers]]
+address = "1.0.0.1:53"
+description = "Cloudflare DNS secondary"
+
+# Специальные роутеры для тестирования
+[[pools]]
+name = "testing-routers"
+description = "Special routers for development and testing"
+region = "development"
+priority = 90
+enabled = false  # Включается только для разработки
+
+[pools.metadata]
+success_rate = 0.9
+average_rtt_ms = 2
+reliability = "high"
+
+[[pools.routers]]
+address = "127.0.0.1:5555"
+description = "Local test server"
+[[pools.routers]]
+address = "127.0.0.1:8080"
+description = "Local HTTP test server"
+[[pools.routers]]
+address = "192.168.1.100:53"
+description = "Local network test router"
+
+# Экспериментальные методы (IPv6)
+[[pools]]
+name = "ipv6-experimental"
+description = "IPv6 router gateways (experimental)"
+region = "global"
+priority = 30
+enabled = false
+
+[pools.metadata]
+success_rate = 0.2
+average_rtt_ms = 20
+reliability = "experimental"
+
+[[pools.routers]]
+address = "[::1]:53"
+description = "IPv6 localhost"
+[[pools.routers]]
+address = "[fe80::1]:53"
+description = "IPv6 link-local router"
+[[pools.routers]]
+address = "[2001:4860:4860::8888]:53"
+description = "Google IPv6 DNS"
+
+# Blacklist для проблемных роутеров
+[blacklist]
+enabled = true
+description = "Routers to avoid due to known issues"
+
+[[blacklist.routers]]
+address = "0.0.0.0:0"
+reason = "Invalid address"
+[[blacklist.routers]]
+address = "255.255.255.255:53"
+reason = "Broadcast address"
+[[blacklist.routers]]
+address = "127.0.0.1:22"
+reason = "SSH port security risk"
+
+# Дополнительные настройки
+[advanced]
+# Максимальное время ожидания ответа от роутера (мс)
+max_response_time_ms = 5000
+# Количество попыток для каждого роутера
+retry_attempts = 2
+# Интервал между попытками (мс)
+retry_interval_ms = 500
+# Включить адаптивное обучение (запоминать успешные роутеры)
+enable_adaptive_learning = true
+# Файл для сохранения статистики успешности
+stats_file = "router_pools_stats.json"

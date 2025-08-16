@@ -1,6 +1,7 @@
 // src/nat/stun/mod.rs
 //! STUN (Session Traversal Utilities for NAT) implementation
 //!
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
 //! This module provides a complete, production-ready STUN implementation
 //! fully compliant with RFC 8489 and RFC 5780 standards, including:
 //!
@@ -37,28 +38,44 @@
 //! - Optimized retransmission logic
 //!
 //! ## Usage Examples
+=======
+//! Fully compliant with RFC 8489 and RFC 5780 for NAT traversal
+//! and behavior discovery.
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 
 pub mod protocol;
 pub mod client;
 pub mod auth;
 pub mod discovery;
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
 pub mod utils;
 pub mod monitoring;
 
 // Re-export core types for easy access
+=======
+
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 pub use protocol::{
     Message, MessageType, MessageClass, TransactionId,
     Attribute, AttributeType, AttributeValue,
     MAGIC_COOKIE, HEADER_SIZE, MAX_MESSAGE_SIZE,
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
+=======
+    PasswordAlgorithm
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 };
 
 pub use client::{
     StunClient, StunConfig, StunServerInfo,
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
     LoadBalancingStrategy, TransportProtocol, ServerHealthStatus,
+=======
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 };
 
 pub use auth::{
     Credentials, CredentialType, SecurityFeatures, NonceCookie,
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
     PasswordAlgorithm, PasswordAlgorithmParams, NonceManager,
     compute_message_integrity_sha256, verify_message_integrity_sha256,
     generate_random_bytes, generate_anonymous_username, PasswordValidator,
@@ -81,10 +98,22 @@ pub use monitoring::{
 
 use std::net::SocketAddr;
 use std::time::Duration;
+=======
+    compute_message_integrity_sha256, verify_message_integrity_sha256, PasswordAlgorithmParams,
+};
+
+pub use discovery::{
+    NatBehavior, NatBehaviorDiscovery,
+    MappingBehavior, FilteringBehavior,
+};
+
+use std::net::SocketAddr;
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 use tokio::net::UdpSocket;
 use crate::nat::error::NatResult;
 use crate::nat::NatType;
 
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
 /// High-level STUN service interface for simple NAT traversal operations
 ///
 /// This is the main entry point for most applications. It provides a simplified
@@ -92,10 +121,16 @@ use crate::nat::NatType;
 pub struct StunService {
     client: StunClient,
     monitor: Option<StunMonitor>,
+=======
+/// High-level STUN interface for NAT traversal
+pub struct StunService {
+    client: StunClient,
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 }
 
 impl StunService {
     /// Create new STUN service with default configuration
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
     ///
     /// Uses a curated list of reliable public STUN servers and
     /// conservative timeout/retry settings suitable for most applications.
@@ -239,10 +274,45 @@ impl StunService {
     ///
     /// # Returns
     /// Vector of all discovered public addresses
+=======
+    pub fn new() -> Self {
+        Self {
+            client: StunClient::new(StunConfig::default()),
+        }
+    }
+
+    /// Create with custom configuration
+    pub fn with_config(config: StunConfig) -> Self {
+        Self {
+            client: StunClient::new(config),
+        }
+    }
+
+    /// Get public address via STUN
+    pub async fn get_public_address(&self, socket: &UdpSocket) -> NatResult<SocketAddr> {
+        self.client.get_mapped_address(socket).await
+    }
+
+    /// Detect NAT type and behavior
+    pub async fn detect_nat_type(&self, socket: &UdpSocket) -> NatResult<(NatType, NatBehavior)> {
+        let behavior = self.client.detect_nat_behavior(socket).await?;
+        let nat_type = behavior.to_simple_nat_type();
+        Ok((nat_type, behavior))
+    }
+
+    /// Check if P2P connection is feasible
+    pub async fn check_p2p_feasibility(&self, socket: &UdpSocket) -> NatResult<f64> {
+        let behavior = self.client.detect_nat_behavior(socket).await?;
+        Ok(behavior.p2p_score())
+    }
+
+    /// Get multiple public addresses for redundancy
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
     pub async fn get_all_public_addresses(&self, socket: &UdpSocket) -> NatResult<Vec<SocketAddr>> {
         let behavior = self.client.detect_nat_behavior(socket).await?;
         Ok(behavior.public_addresses)
     }
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
 
     /// Test connectivity to specific STUN server
     ///
@@ -304,6 +374,8 @@ impl StunService {
     pub fn client(&self) -> &StunClient {
         &self.client
     }
+=======
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 }
 
 impl Default for StunService {
@@ -312,6 +384,7 @@ impl Default for StunService {
     }
 }
 
+<<<<<<< Updated upstream:src/nat/stun/mod.rs
 /// Comprehensive service statistics
 #[derive(Debug, Clone)]
 pub struct ServiceStatistics {
@@ -547,4 +620,26 @@ mod tests {
         assert_eq!(metrics.success_rate(), 0.95);
         assert_eq!(metrics.average_p2p_score(), 0.8);
     }
+=======
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_stun_service() {
+        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let service = StunService::new();
+
+        // This test requires network access
+        match service.get_public_address(&socket).await {
+            Ok(addr) => {
+                println!("Public address: {}", addr);
+                assert!(!addr.ip().is_loopback());
+            }
+            Err(e) => {
+                eprintln!("STUN test failed (may be offline): {}", e);
+            }
+        }
+    }
+>>>>>>> Stashed changes:previous NAT/nat/stun/mod.rs
 }

@@ -1,4 +1,5 @@
 // src/nat/turn/mod.rs
+<<<<<<< Updated upstream:src/nat/turn/mod.rs
 //! TURN (Traversal Using Relays around NAT) implementation
 //!
 //! This module provides a complete TURN relay implementation with:
@@ -247,3 +248,9 @@ mod tests {
         assert!(creds.realm.is_some());
     }
 }
+=======
+//! Подмодуль TURN для NAT traversal
+
+pub mod server;
+
+>>>>>>> Stashed changes:previous NAT/nat/turn/mod.rs
