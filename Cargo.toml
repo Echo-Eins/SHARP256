@@ -56,18 +56,11 @@ chrono = { version = "0.4", features = ["serde"] }
 memmap2 = "0.9"
 crc32fast = "1.3"
 hmac = "0.12"
-sha2 = "0.10"
 hex = "0.4.0"
-aes-gcm = "0.10"
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
 x25519-dalek = "2.0"
 ring = "0.17.14"
 
-<<<<<<< Updated upstream
-# NAT traversal
-rand = "0.8"
-=======
+
 # Core connectivity dependencies (always included when connectivity enabled)
 uuid = { version = "1.6", features = ["v4"], optional = true }
 rand = { version = "0.8", optional = true }
@@ -84,7 +77,6 @@ libp2p = { version = "0.53", features = ["autonat", "identify", "ping", "tcp", "
 libp2p-swarm = { version = "0.44", optional = true }
 
 # UPnP support (legacy compatibility)
->>>>>>> Stashed changes
 igd = { version = "0.12", features = ["aio"], optional = true }
 if-addrs = { version = "0.6", optional = true }
 xmltree = { version = "0.10", optional = true }
@@ -113,20 +105,16 @@ toml = { version = "0.8", optional = true }              # For NAT router pools 
 
 # Metrics and monitoring
 parking_lot = "0.12"
-<<<<<<< Updated upstream
 winapi = { version = "0.3.9", features = ["winbase", "winnt", "winuser", "minwinbase", "minwindef", "ntdef", "iphlpapi", "iptypes"] }
-=======
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["winbase", "winnt", "winuser", "minwinbase", "minwindef", "ntdef"] }
 
 [target.'cfg(unix)'.dependencies]
->>>>>>> Stashed changes
 libc = "0.2.0"
 once_cell = "1.21.3"
 hostname = "0.4.1"
-socket2 = "0.5.10"
 regex = "1.11.1"
 num_cpus = "1.17.0"
 
@@ -138,7 +126,6 @@ gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 
 # TLS encryption
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
-<<<<<<< Updated upstream
 nat-traversal = [
     "dep:igd",
     "dep:if-addrs",
@@ -153,7 +140,6 @@ nat-traversal = [
     "dep:reqwest",
     "dep:local-ip-address",
 ]
-=======
 
 # Full connectivity suite (replaces nat-traversal)
 connectivity = [
@@ -207,7 +193,6 @@ dev-tools = ["dep:hickory-resolver"]
 
 # Minimal build (no connectivity)
 minimal = []
->>>>>>> Stashed changes
 
 [[bin]]
 name = "sharp-sender"
