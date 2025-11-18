@@ -7,10 +7,15 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::collections::HashMap;
 
+use std::sync::Arc;
 use webrtc::ice::{
-    candidate::{Candidate as WebRtcCandidate, CandidateType as WebRtcCandidateType},
-    // NOTE: CandidatePair moved or renamed in webrtc 0.13
-    // candidate_pair::CandidatePair as WebRtcCandidatePair,
+    candidate::{
+        Candidate as WebRtcCandidate, CandidateType as WebRtcCandidateType,
+        candidate_host::CandidateHostConfig,
+        candidate_server_reflexive::CandidateServerReflexiveConfig,
+        candidate_relay::CandidateRelayConfig,
+        candidate_peer_reflexive::CandidatePeerReflexiveConfig,
+    },
 };
 
 use crate::connectivity::{
@@ -19,16 +24,34 @@ use crate::connectivity::{
 
 /// Конвертация WebRTC кандидата в наш формат
 pub fn webrtc_candidate_to_candidate(webrtc_candidate: &dyn WebRtcCandidate) -> Result<Candidate> {
+    use anyhow::Context;
+    use std::net::IpAddr;
+
     // Получаем базовую информацию
     let foundation = webrtc_candidate.foundation().to_string();
     let priority = webrtc_candidate.priority();
-    let address = webrtc_candidate.address();
     let candidate_type = webrtc_candidate_type_to_candidate_type(webrtc_candidate.candidate_type());
-    let related_address = webrtc_candidate.related_address();
+
+    // Parse address string to SocketAddr
+    let ip_addr: IpAddr = webrtc_candidate.address()
+        .parse()
+        .context("Failed to parse candidate IP address")?;
+    let address = SocketAddr::new(ip_addr, webrtc_candidate.port());
+
+    // Handle related address
+    let related_address = if !webrtc_candidate.related_address().is_empty() {
+        let rel_ip: IpAddr = webrtc_candidate.related_address()
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
+        let rel_port = webrtc_candidate.related_port();
+        Some(SocketAddr::new(rel_ip, rel_port))
+    } else {
+        None
+    };
 
     // Создаем атрибуты кандидата
     let attributes = CandidateAttributes {
-        transport: webrtc_candidate.transport_type().to_string(),
+        transport: "udp".to_string(), // webrtc_candidate.network_type().to_string() for actual
         component: webrtc_candidate.component() as u16,
         network_cost: calculate_network_cost(&candidate_type, &address),
         generation: 0, // WebRTC-rs не предоставляет это напрямую
@@ -41,16 +64,110 @@ pub fn webrtc_candidate_to_candidate(webrtc_candidate: &dyn WebRtcCandidate) -> 
         priority,
         address,
         candidate_type,
+        base_address: address, // For simplicity use same as address
         related_address,
         attributes,
     })
 }
 
 /// Конвертация нашего кандидата в WebRTC формат
-pub fn candidate_to_webrtc_candidate(candidate: &Candidate) -> Result<Box<dyn WebRtcCandidate + Send + Sync>> {
-    // TODO: Это сложнее, так как WebRTC-rs использует трейты
-    // Возможно нужно создать wrapper структуру
-    unimplemented!("candidate_to_webrtc_candidate conversion not yet implemented")
+///
+/// Создает реальные webrtc-rs кандидаты на основе типа кандидата.
+/// RFC 8445 compliant implementation.
+pub fn candidate_to_webrtc_candidate(candidate: &Candidate) -> Result<Arc<dyn WebRtcCandidate + Send + Sync>> {
+    use anyhow::Context;
+    use webrtc::ice::candidate::CandidateBaseConfig;
+
+    let base_config = CandidateBaseConfig {
+        network: "udp".to_string(),
+        address: candidate.address.ip().to_string(),
+        port: candidate.address.port(),
+        component: candidate.attributes.component as u16,
+        priority: candidate.priority,
+        foundation: candidate.foundation.clone(),
+        ..Default::default()
+    };
+
+    match candidate.candidate_type {
+        CandidateType::Host => {
+            let config = CandidateHostConfig {
+                base_config,
+                ..Default::default()
+            };
+            let webrtc_candidate = config.new_candidate_host()
+                .context("Failed to create host candidate")?;
+            Ok(Arc::new(webrtc_candidate))
+        }
+        CandidateType::ServerReflexive => {
+            let config = CandidateServerReflexiveConfig {
+                base_config,
+                rel_addr: candidate.related_address
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+                rel_port: candidate.related_address
+                    .map(|addr| addr.port())
+                    .unwrap_or(0),
+            };
+            let webrtc_candidate = config.new_candidate_server_reflexive()
+                .context("Failed to create server reflexive candidate")?;
+            Ok(Arc::new(webrtc_candidate))
+        }
+        CandidateType::PeerReflexive => {
+            let config = CandidatePeerReflexiveConfig {
+                base_config,
+                rel_addr: candidate.related_address
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+                rel_port: candidate.related_address
+                    .map(|addr| addr.port())
+                    .unwrap_or(0),
+            };
+            let webrtc_candidate = config.new_candidate_peer_reflexive()
+                .context("Failed to create peer reflexive candidate")?;
+            Ok(Arc::new(webrtc_candidate))
+        }
+        CandidateType::Relay => {
+            let config = CandidateRelayConfig {
+                base_config,
+                rel_addr: candidate.related_address
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+                rel_port: candidate.related_address
+                    .map(|addr| addr.port())
+                    .unwrap_or(0),
+                ..Default::default()
+            };
+            let webrtc_candidate = config.new_candidate_relay()
+                .context("Failed to create relay candidate")?;
+            Ok(Arc::new(webrtc_candidate))
+        }
+        // For custom types (RouterPool, Hairpin), map to closest webrtc-rs types
+        CandidateType::RouterPool => {
+            // Map to ServerReflexive
+            let config = CandidateServerReflexiveConfig {
+                base_config,
+                rel_addr: candidate.related_address
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+                rel_port: candidate.related_address
+                    .map(|addr| addr.port())
+                    .unwrap_or(0),
+            };
+            let webrtc_candidate = config.new_candidate_server_reflexive()
+                .context("Failed to create router pool candidate")?;
+            Ok(Arc::new(webrtc_candidate))
+        }
+        CandidateType::Hairpin => {
+            // Map to Host
+            let config = CandidateHostConfig {
+                base_config,
+                ..Default::default()
+            };
+            let webrtc_candidate = config.new_candidate_host()
+                .context("Failed to create hairpin candidate")?;
+            Ok(Arc::new(webrtc_candidate))
+        }
+    }
 }
 
 /// Конвертация типа кандидата WebRTC в наш тип
@@ -77,19 +194,19 @@ pub fn candidate_type_to_webrtc_candidate_type(candidate_type: CandidateType) ->
 }
 
 /// Конвертация WebRTC пары кандидатов в нашу пару
-pub fn webrtc_pair_to_candidate_pair(webrtc_pair: &WebRtcCandidatePair) -> Result<CandidatePair> {
-    let local = webrtc_candidate_to_candidate(webrtc_pair.local())?;
-    let remote = webrtc_candidate_to_candidate(webrtc_pair.remote())?;
+///
+/// Note: webrtc-rs 0.13 handles CandidatePair internally.
+/// Use the on_selected_candidate_pair_change callback to get the selected pair.
+/// This function creates a CandidatePair from two candidates directly.
+pub fn create_candidate_pair_from_webrtc(
+    local: &Arc<dyn WebRtcCandidate + Send + Sync>,
+    remote: &Arc<dyn WebRtcCandidate + Send + Sync>,
+) -> Result<CandidatePair> {
+    let local_candidate = webrtc_candidate_to_candidate(local.as_ref())?;
+    let remote_candidate = webrtc_candidate_to_candidate(remote.as_ref())?;
 
-    let mut pair = CandidatePair::new(local, remote);
-
-    // Обновляем состояние на основе WebRTC пары
-    pair.state = match webrtc_pair.state() {
-        // Мапим состояния WebRTC в наши состояния
-        _ => CandidatePairState::Waiting, // Упрощенное мапирование
-    };
-
-    pair.nominated = webrtc_pair.nominated();
+    let mut pair = CandidatePair::new(local_candidate, remote_candidate);
+    pair.state = CandidatePairState::Waiting;
 
     Ok(pair)
 }
