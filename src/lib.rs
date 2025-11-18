@@ -80,7 +80,7 @@ pub fn init_logging(level: &str) {
         .add_directive("hyper=warn".parse().unwrap())
         .add_directive("reqwest=warn".parse().unwrap());
 
-=======
+
 
 // Новая connectivity система (заменяет старый nat модуль)
 #[cfg(feature = "connectivity")]
@@ -107,7 +107,7 @@ pub use connectivity::{
 pub fn init_logging(level: &str) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
->>>>>>> Stashed changes
+
     tracing_subscriber::registry()
         .with(
             fmt::layer()
@@ -131,14 +131,12 @@ pub fn system_info() -> String {
     let mut sys = System::new_all();
     sys.refresh_all();
 
-<<<<<<< Updated upstream
+
     let cpu_brand = sys.cpus()
         .first()
         .map(|cpu| cpu.brand())
         .unwrap_or("Unknown");
 
-=======
->>>>>>> Stashed changes
     let mut info = format!(
         "SHARP-256 Protocol v{}\n\
          ════════════════════════════════════════\n\
@@ -150,7 +148,7 @@ pub fn system_info() -> String {
         System::os_version().unwrap_or_else(|| "Unknown".to_string()),
         cpu_brand,
         sys.cpus().len(),
-<<<<<<< Updated upstream
+
         sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0,
         sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0
     );
@@ -285,9 +283,7 @@ pub const fn has_gui() -> bool {
 /// Check if the current build has TLS support
 pub const fn has_tls() -> bool {
     cfg!(feature = "tls")
-=======
-        sys.available_memory() / 1024 / 1024
-    );
+        sys.available_memory() / 1024 / 1024);
 
     // Добавляем информацию о connectivity возможностях
     #[cfg(feature = "connectivity")]
@@ -439,7 +435,7 @@ pub mod nat_compat {
             self.connectivity.shutdown().await
         }
     }
->>>>>>> Stashed changes
+
 }
 
 #[cfg(test)]
@@ -447,7 +443,7 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< Updated upstream
+
     fn test_version() {
         assert!(!VERSION.is_empty());
     }
@@ -466,7 +462,7 @@ mod tests {
         let _ = has_nat_traversal();
         let _ = has_gui();
         let _ = has_tls();
-=======
+
     fn test_system_info() {
         let info = system_info();
         assert!(info.contains("SHARP-256 Protocol"));
@@ -513,6 +509,6 @@ mod tests {
     async fn test_nat_compat_layer() {
         let nat_manager = nat_compat::NatManager::new().await;
         assert!(nat_manager.is_ok());
->>>>>>> Stashed changes
+
     }
 }
