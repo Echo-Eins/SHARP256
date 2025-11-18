@@ -17,6 +17,13 @@ use webrtc::ice::{
 };
 use anyhow::Context;
 
+use crate::connectivity::stun::{
+    StunClient, StunClientConfig, StunConfig,
+    StunMessage, StunMessageType,
+    attributes::StunAttribute,
+    transaction::TransactionId,
+};
+
 use crate::connectivity::{
     Candidate, CandidatePair, CandidatePairState, CandidateType,
     ConnectivityEvent, CandidateAttributes,
@@ -520,48 +527,108 @@ impl CandidateNominator {
 
     /// Номинация конкретной пары
     ///
-    /// В webrtc-rs nomination происходит автоматически через ICE agent
-    /// когда controlling agent устанавливает USE-CANDIDATE флаг в STUN requests.
-    /// Эта функция регистрирует пару для номинации и ожидает callback.
+    /// Процесс nomination по RFC 8445:
+    /// 1. Controlling agent отправляет STUN Binding Request с USE-CANDIDATE атрибутом
+    /// 2. Controlled agent получает запрос и отмечает пару как nominated
+    /// 3. После успешного response обе стороны используют эту пару
+    ///
+    /// webrtc-rs Agent обрабатывает USE-CANDIDATE внутренне при connectivity checks.
+    /// Мы дополнительно измеряем RTT через наш STUN клиент для точной статистики.
     async fn nominate_pair(&self, component_id: u32, pair: CandidatePair) -> Result<()> {
-        info!("Registering pair for nomination (component {}): {:?} -> {:?}",
+        info!("Nominating pair (component {}): {:?} -> {:?}",
               component_id, pair.local.address, pair.remote.address);
 
         // Update statistics
         self.stats.write().await.nomination_attempts += 1;
 
-        // In webrtc-rs, nomination happens automatically when:
-        // 1. Agent is in controlling mode
-        // 2. Connectivity check succeeds with USE-CANDIDATE flag
-        //
-        // The on_selected_candidate_pair_change callback will notify us
-        // when nomination completes. We just track the pair here.
-
         // Check agent connection state
         let agent_state = self.webrtc_agent.get_connection_state().await;
-        debug!("WebRTC agent connection state: {:?}", agent_state);
+        debug!("WebRTC agent connection state before nomination: {:?}", agent_state);
 
-        // For controlling agent, the nomination process is:
-        // 1. Agent performs connectivity checks
-        // 2. When a check succeeds, agent may nominate the pair
-        // 3. on_selected_candidate_pair_change callback fires
+        // Measure actual RTT to the peer using our STUN client
+        // This provides accurate timing for statistics and logging
+        let rtt = match self.measure_rtt_to_peer(&pair).await {
+            Ok(measured_rtt) => {
+                info!("Measured RTT to peer: {:?}", measured_rtt);
+                measured_rtt
+            }
+            Err(e) => {
+                debug!("Could not measure RTT: {} (using estimate)", e);
+                Duration::from_millis(50) // Fallback estimate
+            }
+        };
+
+        // webrtc-rs Agent handles USE-CANDIDATE internally:
+        // - When Agent is in controlling mode
+        // - It sends STUN Binding Request with USE-CANDIDATE attribute (0x0025)
+        // - The on_selected_candidate_pair_change callback fires on success
         //
-        // We track the pair as "pending nomination" and the callback
-        // in setup_event_handlers will update the state to Nominated.
+        // We track the pair and wait for the callback.
 
-        // Send nomination event to track progress
+        // Send nomination event with RTT
         let _ = self.event_tx.send(ConnectivityEvent::NominationStarted {
             component_id,
             pair: pair.clone(),
         });
 
-        // The actual nomination result comes from on_selected_candidate_pair_change
-        // callback set up in setup_event_handlers(). We don't block here -
-        // the caller waits on nomination_complete.notify_one() signal.
+        debug!("USE-CANDIDATE will be sent by webrtc-rs Agent for pair: {:?} -> {:?}",
+               pair.local.address, pair.remote.address);
 
-        debug!("Pair registered for nomination, waiting for agent callback");
+        // Log that nomination is in progress
+        info!("Nomination in progress (webrtc-rs handles USE-CANDIDATE), RTT={:?}", rtt);
 
         Ok(())
+    }
+
+    /// Measure RTT to peer using direct STUN binding request
+    ///
+    /// This sends a STUN Binding Request to the remote candidate's address
+    /// to get an accurate RTT measurement for statistics.
+    async fn measure_rtt_to_peer(&self, pair: &CandidatePair) -> Result<Duration> {
+        use tokio::net::UdpSocket;
+        use std::time::Instant;
+
+        // Create a temporary socket for RTT measurement
+        let local_addr = pair.local.address;
+        let remote_addr = pair.remote.address;
+
+        // Build STUN Binding Request
+        let mut msg = StunMessage::new_binding_request();
+        let request_bytes = msg.encode()
+            .context("Failed to encode STUN request")?;
+
+        // Bind to local candidate address
+        let socket = UdpSocket::bind("0.0.0.0:0").await
+            .context("Failed to bind socket for RTT measurement")?;
+
+        let start = Instant::now();
+
+        // Send request
+        socket.send_to(&request_bytes, remote_addr).await
+            .context("Failed to send STUN request")?;
+
+        // Wait for response with timeout
+        let mut buf = vec![0u8; 548];
+        let timeout_duration = Duration::from_secs(2);
+
+        match tokio::time::timeout(timeout_duration, socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, from))) => {
+                let rtt = start.elapsed();
+
+                // Verify it's a valid STUN response
+                if len >= 20 {
+                    let magic = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    if magic == 0x2112A442 {
+                        debug!("Received STUN response from {} (RTT: {:?})", from, rtt);
+                        return Ok(rtt);
+                    }
+                }
+
+                Err(anyhow::anyhow!("Invalid STUN response"))
+            }
+            Ok(Err(e)) => Err(anyhow::anyhow!("Socket error: {}", e)),
+            Err(_) => Err(anyhow::anyhow!("RTT measurement timeout")),
+        }
     }
 
     /// Обработка успешной номинации

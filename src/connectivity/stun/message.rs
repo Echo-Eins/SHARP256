@@ -18,9 +18,8 @@
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
-use std::collections::HashMap;
 
 use super::constants::*;
 use super::transaction::TransactionId;

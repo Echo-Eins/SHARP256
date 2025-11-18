@@ -9,7 +9,7 @@
 //!
 //! For ICE, we use short-term credentials with the ICE password.
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 

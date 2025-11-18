@@ -6,16 +6,16 @@
 use anyhow::{Result, Context};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{debug, info, warn, error, instrument};
+use tracing::{debug, info, warn, instrument};
 
 use super::{
     StunConfig, StunError, BindingResult,
-    message::{StunMessage, StunMessageType},
-    attributes::{StunAttribute, XorMappedAddress, ChangeRequest},
+    message::StunMessage,
+    attributes::{StunAttribute, ChangeRequest},
     transaction::{TransactionId, TransactionTracker},
     integrity::MessageIntegrity,
     retransmission::{RetransmissionConfig, RetransmissionTimer, RetransmissionAction},
