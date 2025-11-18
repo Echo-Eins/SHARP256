@@ -3,15 +3,14 @@
 //! Конвертация между webrtc-rs типами и нашими типами
 
 use std::hash::{Hash, Hasher};
-
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use webrtc::ice::{
     candidate::{Candidate as WebRtcCandidate, CandidateType as WebRtcCandidateType},
-    candidate_pair::CandidatePair as WebRtcCandidatePair,
+    // NOTE: CandidatePair moved or renamed in webrtc 0.13
+    // candidate_pair::CandidatePair as WebRtcCandidatePair,
 };
 
 use crate::connectivity::{

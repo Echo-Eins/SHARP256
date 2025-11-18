@@ -34,6 +34,39 @@ pub trait Transport: Send + Sync + Debug {
 
     /// Get priority (higher is better)
     fn priority(&self) -> u8;
+
+    /// Send data
+    async fn send(&self, data: &[u8]) -> Result<usize>;
+
+    /// Receive data
+    async fn recv(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr)>;
+
+    /// Get local address
+    fn local_addr(&self) -> Result<SocketAddr>;
+
+    /// Get remote address
+    fn remote_addr(&self) -> Result<SocketAddr>;
+
+    /// Check if connected
+    fn is_connected(&self) -> bool;
+
+    /// Close connection
+    async fn close(&self) -> Result<()>;
+
+    /// Get transport statistics
+    async fn get_stats(&self) -> TransportStats;
+
+    /// Send ping to check connection
+    async fn ping(&self) -> Result<Duration>;
+
+    /// Get maximum packet size
+    fn max_packet_size(&self) -> usize;
+
+    /// Check if transport is reliable (TCP-like)
+    fn is_reliable(&self) -> bool;
+
+    /// Check if encryption is supported
+    fn supports_encryption(&self) -> bool;
 }
 
 /// Transport types
@@ -49,6 +82,8 @@ pub enum TransportType {
     Upnp,
     /// Hairpin NAT loopback
     Hairpin,
+    /// TCP connection
+    Tcp,
 }
 
 /// Established connection
@@ -105,6 +140,32 @@ pub struct ConnectionMetrics {
     pub bandwidth: u64,
     /// Jitter
     pub jitter: Duration,
+}
+
+/// Transport statistics
+#[derive(Debug, Clone, Default)]
+pub struct TransportStats {
+    /// Total bytes sent
+    pub bytes_sent: u64,
+    /// Total bytes received
+    pub bytes_received: u64,
+    /// Total packets sent
+    pub packets_sent: u64,
+    /// Total packets received
+    pub packets_received: u64,
+    /// Connection metrics
+    pub metrics: ConnectionMetrics,
+    /// Transport uptime
+    pub uptime: Duration,
+}
+
+/// Base transport implementation (заглушка для совместимости)
+pub struct BaseTransport;
+
+impl BaseTransport {
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl ConnectionMetrics {
