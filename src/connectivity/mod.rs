@@ -62,6 +62,9 @@ pub mod config;
 #[cfg(feature = "webrtc-ice-stack")]
 pub mod ice;
 
+// STUN module (RFC 8489, RFC 5780)
+pub mod stun;
+
 // Fallback модули
 #[cfg(feature = "libp2p-fallback")]
 pub mod fallback;
@@ -103,6 +106,13 @@ pub use ice::{
     GatheringState, ConnectivityState, NominationState,
     IceComponentFactory, get_ice_capabilities, validate_ice_config,
     create_p2p_ice_config, create_test_ice_config
+};
+
+// STUN module exports (RFC 8489, RFC 5780)
+pub use stun::{
+    StunClient, StunClientConfig, StunConfig,
+    NatDetector, NatDetectionResult, NatMappingBehavior, NatFilteringBehavior, NatType,
+    StunMessage, StunMessageType, TransactionId, BindingResult, StunError,
 };
 
 // === ОСНОВНЫЕ ТИПЫ ===
