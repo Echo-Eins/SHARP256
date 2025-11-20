@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use crate::connectivity::{Candidate, CandidatePair};
 
+pub mod ice_transport;
 pub mod mtu_discovery;
 pub mod socket;
 pub mod stats;
@@ -66,6 +67,8 @@ pub use socket::{
 pub use mtu_discovery::{
     InterfaceMtuDetector, PathMtuDiscovery, PmtudState, PmtudStats, ProbeResult,
 };
+
+pub use ice_transport::{IceTransport, IceTransportConfig};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TRANSPORT TRAIT - RFC 8445 Section 7
