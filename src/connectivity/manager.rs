@@ -2,7 +2,7 @@
 //! ConnectivityManager - центральный координатор всех методов подключения
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -409,6 +409,52 @@ pub struct ConnectivityManager {
 
     /// Notification для ожидания завершения
     connection_complete: Arc<Notify>,
+
+    // === STATISTICS TRACKING FIELDS ===
+    /// Gathering start time for duration tracking
+    gathering_started_at: Arc<RwLock<Option<Instant>>>,
+
+    /// Gathering completion time
+    gathering_completed_at: Arc<RwLock<Option<Instant>>>,
+
+    /// Connection methods attempted (for statistics)
+    methods_attempted: Arc<RwLock<Vec<ConnectionMethod>>>,
+
+    /// Fallback attempt counter
+    fallback_count: Arc<RwLock<u32>>,
+
+    /// Error tracking (last 10 errors)
+    recent_errors: Arc<RwLock<VecDeque<String>>>,
+
+    /// Total error count
+    total_errors: Arc<RwLock<u32>>,
+
+    /// STUN statistics
+    stun_stats: Arc<RwLock<StunStatistics>>,
+
+    /// TURN statistics (optional, only if TURN is used)
+    turn_stats: Arc<RwLock<Option<TurnStatistics>>>,
+
+    /// Transport statistics aggregator
+    transport_stats_aggregator: Arc<RwLock<Option<TransportStats>>>,
+}
+
+/// STUN statistics tracking
+#[derive(Debug, Clone, Default)]
+struct StunStatistics {
+    requests_sent: u32,
+    responses_received: u32,
+    timeouts: u32,
+    last_rtt: Option<Duration>,
+}
+
+/// TURN statistics tracking
+#[derive(Debug, Clone, Default)]
+struct TurnStatistics {
+    allocations: u32,
+    bytes_relayed: u64,
+    active_permissions: u32,
+    refresh_count: u32,
 }
 
 impl ConnectivityManager {
@@ -450,6 +496,17 @@ impl ConnectivityManager {
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
             shutdown: Arc::new(AtomicBool::new(false)),
             connection_complete: Arc::new(Notify::new()),
+
+            // Statistics tracking fields initialization
+            gathering_started_at: Arc::new(RwLock::new(None)),
+            gathering_completed_at: Arc::new(RwLock::new(None)),
+            methods_attempted: Arc::new(RwLock::new(Vec::new())),
+            fallback_count: Arc::new(RwLock::new(0)),
+            recent_errors: Arc::new(RwLock::new(VecDeque::with_capacity(10))),
+            total_errors: Arc::new(RwLock::new(0)),
+            stun_stats: Arc::new(RwLock::new(StunStatistics::default())),
+            turn_stats: Arc::new(RwLock::new(None)),
+            transport_stats_aggregator: Arc::new(RwLock::new(None)),
         };
 
         // Инициализируем компоненты
@@ -592,6 +649,9 @@ impl ConnectivityManager {
 
     /// Сбор локальных кандидатов из всех источников
     async fn gather_candidates(&self, socket: Arc<UdpSocket>) -> Result<Vec<Candidate>> {
+        // Record gathering start time
+        self.record_gathering_start().await;
+
         let mut candidates = Vec::new();
         let local_addr = socket.local_addr()?;
 
@@ -694,6 +754,9 @@ impl ConnectivityManager {
 
         // Сортируем кандидаты по приоритету
         candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
+
+        // Record gathering complete time
+        self.record_gathering_complete().await;
 
         info!("Gathered {} candidates total", candidates.len());
         Ok(candidates)
@@ -802,6 +865,9 @@ impl ConnectivityManager {
     ) -> Result<EstablishedConnection> {
         let start_time = Instant::now();
         debug!("Attempting connection via {:?}", method);
+
+        // Record method attempt for statistics
+        self.record_method_attempt(method).await;
 
         // Записываем попытку
         {
@@ -1183,6 +1249,7 @@ impl ConnectivityManager {
         }
 
         // Get transport stats if connection established
+        let transport_stats_agg = self.transport_stats_aggregator.read().await.clone();
         let (active_transport, transport_stats, current_rtt_ms, packet_loss, jitter_ms) =
             if let Some(conn) = established_connection.as_ref() {
                 let rtt = conn.metrics.rtt.map(|d| d.as_millis() as u32);
@@ -1191,7 +1258,7 @@ impl ConnectivityManager {
 
                 (
                     Some(conn.transport_type),
-                    None, // TODO: Implement transport stats collection
+                    transport_stats_agg, // Now using aggregated transport stats
                     rtt,
                     loss,
                     jitter,
@@ -1227,6 +1294,44 @@ impl ConnectivityManager {
             None
         };
 
+        // Collect all statistics from tracking fields
+        let gathering_duration = if let (Some(started), Some(completed)) = (
+            *self.gathering_started_at.read().await,
+            *self.gathering_completed_at.read().await,
+        ) {
+            Some(completed - started)
+        } else {
+            None
+        };
+
+        let methods_attempted_list = self.methods_attempted.read().await
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect();
+
+        let fallback_count = *self.fallback_count.read().await;
+        let total_error_count = *self.total_errors.read().await;
+        let recent_error_list = self.recent_errors.read().await
+            .iter()
+            .cloned()
+            .collect();
+
+        let stun_statistics = self.stun_stats.read().await.clone();
+        let turn_statistics = self.turn_stats.read().await.clone();
+
+        // Collect performance metrics from transport
+        let (bytes_sent, bytes_received, packets_sent, packets_received) =
+            if let Some(stats) = &transport_stats {
+                (
+                    stats.bytes_sent,
+                    stats.bytes_received,
+                    stats.packets_sent,
+                    stats.packets_received,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
+
         DetailedConnectivityStats {
             state,
             started_at: metrics.started_at,
@@ -1239,7 +1344,7 @@ impl ConnectivityManager {
             local_candidates_count: local_candidates.len() as u32,
             remote_candidates_count: remote_candidates.len() as u32,
             candidate_type_distribution: type_distribution,
-            gathering_duration: None, // TODO: Track gathering duration
+            gathering_duration,
 
             total_checks: metrics.connectivity_checks,
             successful_checks: metrics.successful_checks,
@@ -1259,24 +1364,24 @@ impl ConnectivityManager {
             jitter_ms,
             quality_score,
 
-            methods_attempted: vec![], // TODO: Track attempted methods
+            methods_attempted: methods_attempted_list,
             successful_method: active_transport.map(|t| format!("{:?}", t)),
-            fallback_attempts: 0, // TODO: Track fallback attempts
+            fallback_attempts: fallback_count,
 
-            total_errors: 0, // TODO: Track errors
-            recent_errors: vec![],
+            total_errors: total_error_count,
+            recent_errors: recent_error_list,
 
-            stun_requests_sent: 0, // TODO: Collect from STUN module
-            stun_responses_received: 0,
-            stun_timeouts: 0,
+            stun_requests_sent: stun_statistics.requests_sent,
+            stun_responses_received: stun_statistics.responses_received,
+            stun_timeouts: stun_statistics.timeouts,
 
-            turn_allocations: 0, // TODO: Collect from TURN if used
-            turn_bytes_relayed: 0,
+            turn_allocations: turn_statistics.as_ref().map(|t| t.allocations).unwrap_or(0),
+            turn_bytes_relayed: turn_statistics.as_ref().map(|t| t.bytes_relayed).unwrap_or(0),
 
-            bytes_sent: 0, // TODO: Collect from transport
-            bytes_received: 0,
-            packets_sent: 0,
-            packets_received: 0,
+            bytes_sent,
+            bytes_received,
+            packets_sent,
+            packets_received,
             uptime,
         }
     }
@@ -1335,12 +1440,104 @@ impl ConnectivityManager {
     #[cfg(feature = "webrtc-ice-stack")]
     async fn collect_ice_stats(&self) -> Option<IceStatistics> {
         if let Some(ice_agent) = &*self.ice_agent.read().await {
-            // TODO: Implement ICE stats collection from agent
-            // For now return placeholder
-            None
+            // Extract ICE-specific statistics from agent
+            let ice_stats = ice_agent.get_stats().await;
+            let process_state = ice_agent.get_process_state().await;
+
+            Some(IceStatistics {
+                agent_state: format!("{:?}", process_state),
+                role: if self.config.ice.controlling_role.unwrap_or(false) {
+                    "controlling".to_string()
+                } else {
+                    "controlled".to_string()
+                },
+                local_ufrag: ice_stats.local_ufrag,
+                remote_ufrag: ice_stats.remote_ufrag,
+                trickle_ice_enabled: self.config.ice.trickle_ice,
+                aggressive_nomination: self.config.ice.aggressive_nomination,
+                restart_count: ice_stats.restart_count,
+            })
         } else {
             None
         }
+    }
+
+    // === STATISTICS TRACKING HELPER METHODS ===
+
+    /// Record that gathering started
+    async fn record_gathering_start(&self) {
+        *self.gathering_started_at.write().await = Some(Instant::now());
+    }
+
+    /// Record that gathering completed
+    async fn record_gathering_complete(&self) {
+        *self.gathering_completed_at.write().await = Some(Instant::now());
+    }
+
+    /// Record a connection method attempt
+    async fn record_method_attempt(&self, method: ConnectionMethod) {
+        let mut methods = self.methods_attempted.write().await;
+        if !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+
+    /// Record a fallback attempt
+    async fn record_fallback(&self) {
+        *self.fallback_count.write().await += 1;
+    }
+
+    /// Record an error
+    async fn record_error(&self, error: String) {
+        *self.total_errors.write().await += 1;
+
+        let mut errors = self.recent_errors.write().await;
+        errors.push_back(error);
+
+        // Keep only last 10 errors
+        if errors.len() > 10 {
+            errors.pop_front();
+        }
+    }
+
+    /// Record STUN request sent
+    pub async fn record_stun_request(&self) {
+        self.stun_stats.write().await.requests_sent += 1;
+    }
+
+    /// Record STUN response received
+    pub async fn record_stun_response(&self, rtt: Duration) {
+        let mut stats = self.stun_stats.write().await;
+        stats.responses_received += 1;
+        stats.last_rtt = Some(rtt);
+    }
+
+    /// Record STUN timeout
+    pub async fn record_stun_timeout(&self) {
+        self.stun_stats.write().await.timeouts += 1;
+    }
+
+    /// Record TURN allocation
+    pub async fn record_turn_allocation(&self) {
+        let mut turn_stats = self.turn_stats.write().await;
+        if turn_stats.is_none() {
+            *turn_stats = Some(TurnStatistics::default());
+        }
+        if let Some(stats) = turn_stats.as_mut() {
+            stats.allocations += 1;
+        }
+    }
+
+    /// Record bytes relayed through TURN
+    pub async fn record_turn_bytes(&self, bytes: u64) {
+        if let Some(stats) = self.turn_stats.write().await.as_mut() {
+            stats.bytes_relayed += bytes;
+        }
+    }
+
+    /// Update transport statistics
+    pub async fn update_transport_stats(&self, stats: TransportStats) {
+        *self.transport_stats_aggregator.write().await = Some(stats);
     }
 
     /// Graceful shutdown
@@ -1401,6 +1598,17 @@ impl Clone for ConnectivityManager {
             event_rx: self.event_rx.clone(),
             shutdown: self.shutdown.clone(),
             connection_complete: self.connection_complete.clone(),
+
+            // Clone statistics tracking fields
+            gathering_started_at: self.gathering_started_at.clone(),
+            gathering_completed_at: self.gathering_completed_at.clone(),
+            methods_attempted: self.methods_attempted.clone(),
+            fallback_count: self.fallback_count.clone(),
+            recent_errors: self.recent_errors.clone(),
+            total_errors: self.total_errors.clone(),
+            stun_stats: self.stun_stats.clone(),
+            turn_stats: self.turn_stats.clone(),
+            transport_stats_aggregator: self.transport_stats_aggregator.clone(),
         }
     }
 }
