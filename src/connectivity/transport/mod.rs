@@ -55,8 +55,8 @@ pub mod socket;
 pub mod stats;
 
 pub use stats::{
-    CandidatePairStats, ConsentStats, IceStats, PerformanceMetrics, QualityMetrics, SocketStats,
-    TransportStats,
+    CandidatePairStats, ConsentStats, IceRole, IceStats, PerformanceMetrics, QualityMetrics,
+    SocketStats, TransportStats,
 };
 
 pub use socket::{

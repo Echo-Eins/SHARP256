@@ -383,10 +383,10 @@ pub struct CandidatePair {
     /// Номинирована ли пара
     pub nominated: bool,
     /// Время последней активности
+    #[serde(skip)]
     pub last_activity: Option<Instant>,
     /// Round-Trip Time (RFC 8445 Section 6)
-    /// Measured during connectivity checks
-    #[serde(skip)]
+    /// Measured during connectivity checks during STUN binding requests
     pub rtt: Option<Duration>,
 }
 

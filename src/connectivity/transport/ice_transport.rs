@@ -711,14 +711,71 @@ impl Transport for IceTransport {
 
         // Aggregate ICE statistics from ProductionIceAgent
         let ice_stats_guard = self.ice_agent.stats.read().await;
-        let ice_stats = ice_stats_guard.clone();
+        let agent_ice_stats = ice_stats_guard.clone();
         drop(ice_stats_guard);
 
-        // Update TransportStats with ICE data
-        stats.gathering_duration = ice_stats.gathering_duration;
-        stats.connection_establishment_duration = ice_stats.connection_duration;
-        // Note: ice and consent stats are complex structures - skipped for now
-        // TODO: Properly map IceStatistics -> IceStats and ConsentStats
+        // Update TransportStats with ICE timing data
+        stats.gathering_duration = agent_ice_stats.gathering_duration;
+        stats.connection_establishment_duration = agent_ice_stats.connection_duration;
+
+        // Build comprehensive IceStats structure
+        let config_guard = self.config.read();
+        let ice_stats = crate::connectivity::transport::IceStats {
+            role: if config_guard.controlling {
+                crate::connectivity::transport::IceRole::Controlling
+            } else {
+                crate::connectivity::transport::IceRole::Controlled
+            },
+            local_ufrag: config_guard.local_ufrag.clone(),
+            remote_ufrag: config_guard.remote_ufrag.clone(),
+            pwd_length: config_guard.local_pwd.len(),
+            restart_count: 0, // TODO: Track restart count
+            trickle_ice_enabled: config_guard.trickle_ice,
+            end_of_candidates_received: false, // TODO: Track from signaling
+            stun_servers: vec![], // TODO: Aggregate from ice_config
+            turn_servers: vec![], // TODO: Aggregate from ice_config
+        };
+        drop(config_guard);
+        stats.ice = Some(ice_stats);
+
+        // Build ConsentStats structure from IceTransport's consent tracking
+        let consent_stats = crate::connectivity::transport::ConsentStats {
+            checks_performed: *self.consent_checks_performed.read() as u32,
+            checks_succeeded: (*self.consent_checks_performed.read() - *self.consent_checks_failed.read()) as u32,
+            checks_failed: *self.consent_checks_failed.read() as u32,
+            checks_timeout: 0, // We don't distinguish timeout from failure
+            last_successful_check: if *self.consent_fresh.read() {
+                *self.last_consent_check.read()
+            } else {
+                None
+            },
+            last_failed_check: if !*self.consent_fresh.read() {
+                *self.last_consent_check.read()
+            } else {
+                None
+            },
+            consent_fresh: *self.consent_fresh.read(),
+            check_interval: self.config.read().consent_interval,
+            consent_timeout: self.config.read().consent_timeout,
+            consecutive_failures: if *self.consent_fresh.read() {
+                0
+            } else {
+                *self.consent_checks_failed.read() as u32
+            },
+        };
+        stats.consent = Some(consent_stats);
+
+        // Add MTU/Performance statistics
+        if let Some(pmtud_stats) = self.socket.pmtud_stats() {
+            use crate::connectivity::transport::PerformanceMetrics;
+            let mut perf = PerformanceMetrics::default();
+
+            // MTU info would be in PerformanceMetrics fields
+            // Note: PerformanceMetrics doesn't have path_mtu field in the actual struct
+            // So we skip MTU aggregation for now
+
+            stats.performance = Some(perf);
+        }
 
         stats
     }
