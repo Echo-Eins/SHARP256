@@ -56,7 +56,7 @@ pub mod stats;
 
 pub use stats::{
     CandidatePairStats, ConsentStats, IceRole, IceStats, PerformanceMetrics, QualityMetrics,
-    SocketStats, TransportStats,
+    SocketStats, StunServerStats, TransportStats, TurnServerStats,
 };
 
 pub use socket::{
@@ -705,6 +705,12 @@ pub enum TransportEvent {
     /// ICE restart completed
     RestartCompleted,
 
+    /// End-of-candidates received (RFC 8838 Section 13)
+    ///
+    /// Remote peer has finished gathering candidates.
+    /// No more candidates will be received.
+    EndOfCandidatesReceived,
+
     /// Connection failed
     ///
     /// All connectivity checks failed or timed out.
@@ -749,6 +755,7 @@ impl TransportEvent {
             Self::ConsentExpired => "ConsentExpired",
             Self::RestartInitiated => "RestartInitiated",
             Self::RestartCompleted => "RestartCompleted",
+            Self::EndOfCandidatesReceived => "EndOfCandidatesReceived",
             Self::Failed { .. } => "Failed",
             Self::Closed => "Closed",
             Self::Error { .. } => "Error",

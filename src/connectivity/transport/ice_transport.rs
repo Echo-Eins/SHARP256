@@ -186,6 +186,13 @@ pub struct IceTransport {
     /// Consent checks failed
     consent_checks_failed: Arc<StdRwLock<u64>>,
 
+    // ═══ ICE State Tracking (RFC 8445) ═══
+    /// Number of ICE restarts performed (RFC 8445 Section 9)
+    restart_count: Arc<StdRwLock<u32>>,
+
+    /// Whether end-of-candidates signaling was received (RFC 8838 Section 13)
+    end_of_candidates_received: Arc<StdRwLock<bool>>,
+
     // ═══ Configuration ═══
     config: Arc<StdRwLock<IceTransportConfig>>,
 
@@ -269,6 +276,8 @@ impl IceTransport {
             consent_timeout: config.consent_timeout,
             consent_checks_performed: Arc::new(StdRwLock::new(0)),
             consent_checks_failed: Arc::new(StdRwLock::new(0)),
+            restart_count: Arc::new(StdRwLock::new(0)),
+            end_of_candidates_received: Arc::new(StdRwLock::new(false)),
             config: Arc::new(StdRwLock::new(config)),
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
@@ -300,6 +309,28 @@ impl IceTransport {
     /// Emit transport event
     fn emit_event(&self, event: TransportEvent) {
         let _ = self.event_tx.send(event);
+    }
+
+    /// Signal that end-of-candidates was received (RFC 8838 Section 13)
+    ///
+    /// This should be called by the signaling layer when the remote peer
+    /// has finished gathering all candidates and sent the end-of-candidates
+    /// indication.
+    ///
+    /// ## RFC 8838 Section 13
+    ///
+    /// The end-of-candidates indication signals that no more candidates
+    /// will be sent, allowing the ICE agent to conclude gathering and
+    /// potentially optimize connectivity checks.
+    pub fn set_end_of_candidates_received(&self) {
+        let already_set = *self.end_of_candidates_received.read();
+        if !already_set {
+            *self.end_of_candidates_received.write() = true;
+            info!("End-of-candidates signaling received from remote peer");
+
+            // Emit event for application awareness
+            self.emit_event(TransportEvent::EndOfCandidatesReceived);
+        }
     }
 
     /// Start consent freshness checks (RFC 7675)
@@ -720,6 +751,46 @@ impl Transport for IceTransport {
 
         // Build comprehensive IceStats structure
         let config_guard = self.config.read();
+
+        // Aggregate STUN server statistics from configuration (RFC 8489)
+        let stun_servers: Vec<crate::connectivity::transport::StunServerStats> = config_guard
+            .ice_config
+            .stun_servers
+            .iter()
+            .map(|url| {
+                // Create basic StunServerStats from configuration
+                // Note: Detailed per-server statistics (requests/responses/timeouts/rtt)
+                // would require StunClient integration - for now we provide configuration info
+                crate::connectivity::transport::StunServerStats {
+                    address: url.clone(),
+                    requests_sent: 0,        // Would be tracked by StunClient
+                    responses_received: 0,   // Would be tracked by StunClient
+                    timeouts: 0,             // Would be tracked by StunClient
+                    avg_rtt: None,           // Would be tracked by StunClient
+                }
+            })
+            .collect();
+
+        // Aggregate TURN server statistics from configuration (RFC 8656)
+        let turn_servers: Vec<crate::connectivity::transport::TurnServerStats> = config_guard
+            .ice_config
+            .turn_servers
+            .iter()
+            .map(|turn_server| {
+                // Create basic TurnServerStats from configuration
+                // Note: Detailed per-server statistics (allocations/bytes/permissions/refreshes)
+                // would require TURN client integration - for now we provide configuration info
+                crate::connectivity::transport::TurnServerStats {
+                    address: turn_server.url.clone(),
+                    allocations: 0,          // Would be tracked by TURN client
+                    allocation_failures: 0,  // Would be tracked by TURN client
+                    bytes_relayed: 0,        // Would be tracked by TURN client
+                    active_permissions: 0,   // Would be tracked by TURN client
+                    refreshes: 0,            // Would be tracked by TURN client
+                }
+            })
+            .collect();
+
         let ice_stats = crate::connectivity::transport::IceStats {
             role: if config_guard.controlling {
                 crate::connectivity::transport::IceRole::Controlling
@@ -729,11 +800,11 @@ impl Transport for IceTransport {
             local_ufrag: config_guard.local_ufrag.clone(),
             remote_ufrag: config_guard.remote_ufrag.clone(),
             pwd_length: config_guard.local_pwd.len(),
-            restart_count: 0, // TODO: Track restart count
+            restart_count: *self.restart_count.read(),
             trickle_ice_enabled: config_guard.trickle_ice,
-            end_of_candidates_received: false, // TODO: Track from signaling
-            stun_servers: vec![], // TODO: Aggregate from ice_config
-            turn_servers: vec![], // TODO: Aggregate from ice_config
+            end_of_candidates_received: *self.end_of_candidates_received.read(),
+            stun_servers,
+            turn_servers,
         };
         drop(config_guard);
         stats.ice = Some(ice_stats);
@@ -836,6 +907,11 @@ impl Transport for IceTransport {
     /// - Explicit application request
     async fn restart(&self) -> Result<()> {
         info!("Initiating ICE restart");
+
+        // Increment restart counter (RFC 8445 Section 9)
+        *self.restart_count.write() += 1;
+        let restart_num = *self.restart_count.read();
+        info!("ICE restart #{}", restart_num);
 
         // Emit restart event
         self.emit_event(TransportEvent::RestartInitiated);
