@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::protocol::constants::PROTOCOL_VERSION;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 /// Первичный ACK от отправителя к получателю
@@ -96,7 +96,7 @@ pub struct ControlAck {
     pub batch_range_start: u32,
     pub batch_range_end: u32,
     pub lost_packets: Vec<LostPacket>, // Пустой вектор = все пакеты получены
-    pub lost_hashes: Vec<u32>, // Номера партий с потерянными хешами
+    pub lost_hashes: Vec<u32>,         // Номера партий с потерянными хешами
     pub sao_params: SaoParams,
     pub ping_ms: f64,
     pub timestamp: u64,
@@ -125,7 +125,8 @@ impl ControlAck {
 
     /// Добавление потерянного пакета
     pub fn add_lost_packet(&mut self, batch_number: u32, packet_number: u16) {
-        self.lost_packets.push(LostPacket::new(batch_number, packet_number));
+        self.lost_packets
+            .push(LostPacket::new(batch_number, packet_number));
     }
 
     /// Добавление партии с потерянными хешами
@@ -155,7 +156,7 @@ pub struct ResumeAck {
     pub last_packet_in_batch: u16,
     pub bytes_transferred: u64,
     pub partial_file_hash: String, // Хеш уже переданной части
-    pub resume_token: String, // Уникальный токен для проверки
+    pub resume_token: String,      // Уникальный токен для проверки
 }
 
 /// Ответ на запрос возобновления

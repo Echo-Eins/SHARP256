@@ -19,14 +19,12 @@
 //! 2. Test II: Binding Request to same IP, different port → compare with Test I
 //! 3. Test III: Binding Request to different IP → compare with Test I
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tracing::{info, warn, debug, instrument};
+use tracing::{debug, info, instrument, warn};
 
-use super::{
-    StunClient, StunClientConfig, StunConfig, BindingResult, StunError,
-};
+use super::{BindingResult, StunClient, StunClientConfig, StunConfig, StunError};
 
 /// NAT Mapping Behavior per RFC 5780
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +49,9 @@ impl std::fmt::Display for NatMappingBehavior {
         match self {
             NatMappingBehavior::EndpointIndependent => write!(f, "Endpoint-Independent Mapping"),
             NatMappingBehavior::AddressDependent => write!(f, "Address-Dependent Mapping"),
-            NatMappingBehavior::AddressAndPortDependent => write!(f, "Address and Port-Dependent Mapping"),
+            NatMappingBehavior::AddressAndPortDependent => {
+                write!(f, "Address and Port-Dependent Mapping")
+            }
             NatMappingBehavior::Unknown => write!(f, "Unknown Mapping"),
         }
     }
@@ -78,9 +78,13 @@ pub enum NatFilteringBehavior {
 impl std::fmt::Display for NatFilteringBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NatFilteringBehavior::EndpointIndependent => write!(f, "Endpoint-Independent Filtering"),
+            NatFilteringBehavior::EndpointIndependent => {
+                write!(f, "Endpoint-Independent Filtering")
+            }
             NatFilteringBehavior::AddressDependent => write!(f, "Address-Dependent Filtering"),
-            NatFilteringBehavior::AddressAndPortDependent => write!(f, "Address and Port-Dependent Filtering"),
+            NatFilteringBehavior::AddressAndPortDependent => {
+                write!(f, "Address and Port-Dependent Filtering")
+            }
             NatFilteringBehavior::Unknown => write!(f, "Unknown Filtering"),
         }
     }
@@ -231,12 +235,18 @@ impl NatDetector {
     /// This runs the RFC 5780 test suite and returns comprehensive results.
     #[instrument(skip(self))]
     pub async fn detect_nat_behavior(&self) -> Result<NatDetectionResult> {
-        info!("Starting NAT behavior detection with server {}", self.primary_server);
+        info!(
+            "Starting NAT behavior detection with server {}",
+            self.primary_server
+        );
 
         let mut test_results = NatTestResults::default();
 
         // Test I: Basic binding request to primary server
-        let test_1 = self.client.binding_request_udp(self.primary_server, None).await
+        let test_1 = self
+            .client
+            .binding_request_udp(self.primary_server, None)
+            .await
             .context("Test I (primary binding) failed")?;
 
         info!("Test I: Mapped address = {}", test_1.mapped_address);
@@ -253,16 +263,14 @@ impl NatDetector {
         }
 
         // Determine mapping behavior
-        let mapping_behavior = self.detect_mapping_behavior(
-            &test_1,
-            &mut test_results,
-        ).await;
+        let mapping_behavior = self
+            .detect_mapping_behavior(&test_1, &mut test_results)
+            .await;
 
         // Determine filtering behavior
-        let filtering_behavior = self.detect_filtering_behavior(
-            &test_1,
-            &mut test_results,
-        ).await;
+        let filtering_behavior = self
+            .detect_filtering_behavior(&test_1, &mut test_results)
+            .await;
 
         // Classify NAT type
         let nat_type = classify_nat_type(mapping_behavior, filtering_behavior, &test_1);
@@ -272,7 +280,8 @@ impl NatDetector {
         let average_rtt = stats.average_rtt().unwrap_or(test_1.rtt);
 
         // Generate recommendations
-        let recommendations = generate_recommendations(nat_type, mapping_behavior, filtering_behavior);
+        let recommendations =
+            generate_recommendations(nat_type, mapping_behavior, filtering_behavior);
 
         let result = NatDetectionResult {
             mapping_behavior,
@@ -309,10 +318,7 @@ impl NatDetector {
         };
 
         // Test II: Same IP, different port
-        let alt_port_addr = SocketAddr::new(
-            self.primary_server.ip(),
-            other_addr.port(),
-        );
+        let alt_port_addr = SocketAddr::new(self.primary_server.ip(), other_addr.port());
 
         match self.client.binding_request_udp(alt_port_addr, None).await {
             Ok(test_2) => {
@@ -324,7 +330,8 @@ impl NatDetector {
                     // Test III: Different IP
                     match self.client.binding_request_udp(other_addr, None).await {
                         Ok(test_3) => {
-                            let mapped_3 = test_3.xor_mapped_address.unwrap_or(test_3.mapped_address);
+                            let mapped_3 =
+                                test_3.xor_mapped_address.unwrap_or(test_3.mapped_address);
                             results.test_3 = Some(test_3);
 
                             if mapped_1 == mapped_3 {
@@ -363,11 +370,15 @@ impl NatDetector {
         // to have the server respond from a different address/port
 
         // Test with CHANGE-REQUEST: change both IP and port
-        match self.client.binding_request_with_change(
-            self.primary_server,
-            true,  // change IP
-            true,  // change port
-        ).await {
+        match self
+            .client
+            .binding_request_with_change(
+                self.primary_server,
+                true, // change IP
+                true, // change port
+            )
+            .await
+        {
             Ok(result) => {
                 results.test_1_change_both = Some(result);
                 info!("Filtering: Endpoint-Independent (received response from different IP:port)");
@@ -382,11 +393,15 @@ impl NatDetector {
         }
 
         // Test with CHANGE-REQUEST: change port only
-        match self.client.binding_request_with_change(
-            self.primary_server,
-            false, // same IP
-            true,  // change port
-        ).await {
+        match self
+            .client
+            .binding_request_with_change(
+                self.primary_server,
+                false, // same IP
+                true,  // change port
+            )
+            .await
+        {
             Ok(result) => {
                 results.test_1_change_port = Some(result);
                 info!("Filtering: Address-Dependent (received from same IP, different port)");
@@ -407,7 +422,9 @@ impl NatDetector {
 
     /// Quick NAT check (just Test I)
     pub async fn quick_check(&self) -> Result<BindingResult> {
-        self.client.binding_request_udp(self.primary_server, None).await
+        self.client
+            .binding_request_udp(self.primary_server, None)
+            .await
             .map_err(|e| anyhow::anyhow!("Quick NAT check failed: {}", e))
     }
 
@@ -427,16 +444,15 @@ fn classify_nat_type(
     // This would require knowing local address
 
     match mapping {
-        NatMappingBehavior::EndpointIndependent => {
-            match filtering {
-                NatFilteringBehavior::EndpointIndependent => NatType::FullCone,
-                NatFilteringBehavior::AddressDependent => NatType::RestrictedCone,
-                NatFilteringBehavior::AddressAndPortDependent => NatType::PortRestrictedCone,
-                NatFilteringBehavior::Unknown => NatType::Unknown,
-            }
+        NatMappingBehavior::EndpointIndependent => match filtering {
+            NatFilteringBehavior::EndpointIndependent => NatType::FullCone,
+            NatFilteringBehavior::AddressDependent => NatType::RestrictedCone,
+            NatFilteringBehavior::AddressAndPortDependent => NatType::PortRestrictedCone,
+            NatFilteringBehavior::Unknown => NatType::Unknown,
+        },
+        NatMappingBehavior::AddressDependent | NatMappingBehavior::AddressAndPortDependent => {
+            NatType::Symmetric
         }
-        NatMappingBehavior::AddressDependent |
-        NatMappingBehavior::AddressAndPortDependent => NatType::Symmetric,
         NatMappingBehavior::Unknown => NatType::Unknown,
     }
 }
@@ -476,11 +492,15 @@ fn generate_recommendations(
 
     // Add specific recommendations based on behaviors
     if mapping == NatMappingBehavior::AddressAndPortDependent {
-        recommendations.push("New mapping for each destination - requires TURN for peer behind symmetric NAT".to_string());
+        recommendations.push(
+            "New mapping for each destination - requires TURN for peer behind symmetric NAT"
+                .to_string(),
+        );
     }
 
     if filtering == NatFilteringBehavior::AddressAndPortDependent {
-        recommendations.push("Strict filtering - ensure binding holes are punched correctly".to_string());
+        recommendations
+            .push("Strict filtering - ensure binding holes are punched correctly".to_string());
     }
 
     recommendations

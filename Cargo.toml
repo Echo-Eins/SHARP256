@@ -199,11 +199,11 @@ minimal = []
 name = "sharp-relay"
 path = "src/bin/relay.rs"
 
-# NAT router pool for testing/development
-[[bin]]
-name = "sharp-nat-router"
-path = "src/bin/nat_router.rs"
-required-features = ["connectivity"]
+# NAT router pool for testing/development (PHASE 1: Removed)
+# [[bin]]
+# name = "sharp-nat-router"
+# path = "src/bin/nat_router.rs"
+# required-features = ["connectivity"]
 
 [profile.release]
 opt-level = 3

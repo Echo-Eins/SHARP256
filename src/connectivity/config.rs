@@ -406,21 +406,19 @@ impl Default for RouterPoolsConfig {
         Self {
             enabled: true,
             pools_file: Some(PathBuf::from("src/nat_router_pools.toml")),
-            builtin_pools: vec![
-                RouterPool {
-                    name: "common-home-routers".to_string(),
-                    description: Some("Common home router default gateways".to_string()),
-                    routers: vec![
-                        "192.168.1.1:53".parse().unwrap(),
-                        "192.168.0.1:53".parse().unwrap(),
-                        "10.0.0.1:53".parse().unwrap(),
-                        "172.16.0.1:53".parse().unwrap(),
-                    ],
-                    region: Some("global".to_string()),
-                    priority: 50,
-                    metadata: HashMap::new(),
-                },
-            ],
+            builtin_pools: vec![RouterPool {
+                name: "common-home-routers".to_string(),
+                description: Some("Common home router default gateways".to_string()),
+                routers: vec![
+                    "192.168.1.1:53".parse().unwrap(),
+                    "192.168.0.1:53".parse().unwrap(),
+                    "10.0.0.1:53".parse().unwrap(),
+                    "172.16.0.1:53".parse().unwrap(),
+                ],
+                region: Some("global".to_string()),
+                priority: 50,
+                metadata: HashMap::new(),
+            }],
             max_routers_to_try: 5,
             router_check_timeout: Duration::from_secs(2),
             priority: 90,
@@ -543,12 +541,16 @@ impl ConnectivityConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         // Проверяем STUN серверы
         if self.ice.stun_servers.is_empty() {
-            return Err(anyhow::anyhow!("At least one STUN server must be configured"));
+            return Err(anyhow::anyhow!(
+                "At least one STUN server must be configured"
+            ));
         }
 
         // Проверяем таймауты
         if self.general.connection_timeout < Duration::from_secs(10) {
-            return Err(anyhow::anyhow!("Connection timeout too small (minimum 10 seconds)"));
+            return Err(anyhow::anyhow!(
+                "Connection timeout too small (minimum 10 seconds)"
+            ));
         }
 
         // Проверяем приоритеты
@@ -575,7 +577,10 @@ mod tests {
         let mut config = ConnectivityConfig::default();
         config.optimize_for_symmetric_nat();
 
-        assert_eq!(config.general.connection_methods_order[0], ConnectionMethod::RouterPools);
+        assert_eq!(
+            config.general.connection_methods_order[0],
+            ConnectionMethod::RouterPools
+        );
         assert!(config.ice.candidate_priorities.relay > 0);
     }
 
@@ -583,7 +588,10 @@ mod tests {
     fn test_testing_config() {
         let config = ConnectivityConfig::for_testing();
         assert!(config.ice.gathering_timeout < Duration::from_secs(5));
-        assert_eq!(config.general.nomination_strategy, NominationStrategy::Aggressive);
+        assert_eq!(
+            config.general.nomination_strategy,
+            NominationStrategy::Aggressive
+        );
     }
 
     #[cfg(feature = "nat-router-pools")]

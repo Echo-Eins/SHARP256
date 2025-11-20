@@ -42,21 +42,17 @@
 //! let (size, addr) = connection.recv(&mut buffer).await?;
 //! ```
 
-use anyhow::Result;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
 use serde::{Deserialize, Serialize};
-use parking_lot::Mutex;
-use tracing::{info, warn, debug, error};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 // === МОДУЛИ ===
 
-// PHASE 2: Manager and Transport will be rebuilt from scratch
+// PHASE 2: Manager will be rebuilt from scratch
 // pub mod manager;
-// pub mod transport;
+
+// PHASE 2 - STAGE 1: Transport layer (RFC 8445 compliant)
+pub mod transport;
 
 pub mod config;
 
@@ -88,29 +84,32 @@ pub mod upnp;
 
 // === RE-EXPORTS ===
 
-// PHASE 2: Manager and Transport types will be defined here
-// pub use manager::{ConnectivityManager, ConnectivityEvent, DetailedConnectivityStats};
-// pub use transport::{Transport, TransportType, TransportStats, EstablishedConnection};
+// PHASE 2: Manager types will be defined here
+// pub use manager::{ConnectivityManager, DetailedConnectivityStats};
+
+// PHASE 2 - STAGE 1: Transport layer exports (RFC 8445 compliant)
+pub use transport::{
+    CandidatePairStats, ConnectionInfo, ConnectionState, ConsentStats, IceStats,
+    PerformanceMetrics, QualityMetrics, SocketStats, Transport, TransportCapabilities,
+    TransportEvent, TransportStats, TransportType,
+};
 
 pub use config::{
-    ConnectivityConfig, IceConfig, LibP2pConfig, RelayConfig,
-    ConnectionMethod, GeneralConfig
+    ConnectionMethod, ConnectivityConfig, GeneralConfig, IceConfig, LibP2pConfig, RelayConfig,
 };
 
 // ICE specific exports
 #[cfg(feature = "webrtc-ice-stack")]
 pub use ice::{
-    IceAgent, IceEvent, IceAgentState, IceConnection,
-    CandidateGatherer, ConnectivityChecker, CandidateNominator,
-    GatheringState, ConnectivityState, NominationState,
-    ProductionIceAgent
+    CandidateGatherer, CandidateNominator, ConnectivityChecker, ConnectivityState, GatheringState,
+    IceAgent, IceAgentState, IceConnection, IceEvent, NominationState, ProductionIceAgent,
 };
 
 // STUN module exports (RFC 8489, RFC 5780)
 pub use stun::{
-    StunClient, StunClientConfig, StunConfig,
-    NatDetector, NatDetectionResult, NatMappingBehavior, NatFilteringBehavior, NatType,
-    StunMessage, StunMessageType, TransactionId, BindingResult, StunError,
+    BindingResult, NatDetectionResult, NatDetector, NatFilteringBehavior, NatMappingBehavior,
+    NatType, StunClient, StunClientConfig, StunConfig, StunError, StunMessage, StunMessageType,
+    TransactionId,
 };
 
 // === ОСНОВНЫЕ ТИПЫ ===
@@ -155,9 +154,13 @@ impl Candidate {
             foundation: ice::utils::generate_foundation(
                 CandidateType::ServerReflexive,
                 local_address,
-                Some(stun_server)
+                Some(stun_server),
             ),
-            priority: ice::utils::calculate_candidate_priority(CandidateType::ServerReflexive, 65534, 1),
+            priority: ice::utils::calculate_candidate_priority(
+                CandidateType::ServerReflexive,
+                65534,
+                1,
+            ),
             address: public_address,
             candidate_type: CandidateType::ServerReflexive,
             related_address: Some(local_address),
@@ -166,15 +169,15 @@ impl Candidate {
     }
 
     /// Создание relay кандидата
-    pub fn relay(
-        relay_address: SocketAddr,
-        local_address: SocketAddr,
-        secure: bool,
-    ) -> Self {
+    pub fn relay(relay_address: SocketAddr, local_address: SocketAddr, secure: bool) -> Self {
         let priority_offset = if secure { 0 } else { 10 };
         Self {
             foundation: ice::utils::generate_foundation(CandidateType::Relay, local_address, None),
-            priority: ice::utils::calculate_candidate_priority(CandidateType::Relay, 65533 - priority_offset, 1),
+            priority: ice::utils::calculate_candidate_priority(
+                CandidateType::Relay,
+                65533 - priority_offset,
+                1,
+            ),
             address: relay_address,
             candidate_type: CandidateType::Relay,
             related_address: Some(local_address),
@@ -246,8 +249,8 @@ impl TransportProtocol {
     /// These are IANA registered ports for ICE/STUN
     pub fn default_port(&self) -> u16 {
         match self {
-            Self::Udp => 3478,  // STUN default UDP port (RFC 8489)
-            Self::Tcp => 3478,  // STUN default TCP port (RFC 8489)
+            Self::Udp => 3478, // STUN default UDP port (RFC 8489)
+            Self::Tcp => 3478, // STUN default TCP port (RFC 8489)
         }
     }
 }
@@ -414,7 +417,11 @@ impl CandidatePair {
         }
 
         // Транспорт и компонент должны совпадать (RFC 8445 Section 6.1.2.2)
-        if !self.local.attributes.is_compatible_with(&self.remote.attributes) {
+        if !self
+            .local
+            .attributes
+            .is_compatible_with(&self.remote.attributes)
+        {
             return false;
         }
 
@@ -450,25 +457,6 @@ pub struct ConnectivityCheckResult {
     pub error: Option<String>,
     /// Время проверки
     pub timestamp: Instant,
-}
-
-/// Состояние connectivity процесса
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    /// Новое соединение
-    New,
-    /// Подключение в процессе
-    Connecting,
-    /// Соединение установлено
-    Connected,
-    /// Соединение завершено
-    Completed,
-    /// Соединение неудачно
-    Failed,
-    /// Соединение отключено
-    Disconnected,
-    /// Соединение закрыто
-    Closed,
 }
 
 /// Метрики connectivity
@@ -728,11 +716,21 @@ impl SupportedFeatures {
     /// Получение списка активных features
     pub fn active_features(&self) -> Vec<&'static str> {
         let mut features = Vec::new();
-        if self.webrtc_ice { features.push("webrtc-ice-stack"); }
-        if self.libp2p_fallback { features.push("libp2p-fallback"); }
-        if self.relay_encryption { features.push("relay-encryption"); }
-        if self.nat_router_pools { features.push("nat-router-pools"); }
-        if self.upnp_support { features.push("upnp-support"); }
+        if self.webrtc_ice {
+            features.push("webrtc-ice-stack");
+        }
+        if self.libp2p_fallback {
+            features.push("libp2p-fallback");
+        }
+        if self.relay_encryption {
+            features.push("relay-encryption");
+        }
+        if self.nat_router_pools {
+            features.push("nat-router-pools");
+        }
+        if self.upnp_support {
+            features.push("upnp-support");
+        }
         features
     }
 
@@ -951,6 +949,7 @@ mod tests {
         assert!(info.contains("v2.0.0"));
     }
 
+    /* PHASE 2: Tests will be rewritten when Connectivity is rebuilt
     #[tokio::test]
     async fn test_auto_connectivity_creation() {
         let connectivity = create_auto_connectivity().await;
@@ -964,4 +963,5 @@ mod tests {
         let nat_manager = nat_compat::NatManager::new().await;
         assert!(nat_manager.is_ok());
     }
+    */
 }

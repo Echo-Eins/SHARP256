@@ -2,28 +2,28 @@
 //! Signaling система для обмена ICE кандидатами через SHARP протокол
 
 use anyhow::Result;
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock, Notify};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::time::timeout;
-use tracing::{debug, info, warn, trace, error};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
-use bytes::BytesMut;
 
 use crate::connectivity::{Candidate, CandidatePair};
-use crate::protocol::{packet::*, constants::*};
+use crate::protocol::{constants::*, packet::*};
 
 // Submodules
-pub mod sharp_signaling;
 pub mod production_signaling;
+pub mod sharp_signaling;
 
 // Re-exports
-pub use sharp_signaling::SharpSignaling;
 pub use production_signaling::ProductionSignaling;
+pub use sharp_signaling::SharpSignaling;
 
 /// Состояние signaling сессии
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,16 +164,10 @@ pub enum SignalingMessage {
     },
 
     /// Завершение сессии
-    SessionTerminate {
-        session_id: String,
-        reason: String,
-    },
+    SessionTerminate { session_id: String, reason: String },
 
     /// Heartbeat для поддержания сессии
-    Heartbeat {
-        session_id: String,
-        timestamp: u64,
-    },
+    Heartbeat { session_id: String, timestamp: u64 },
 
     /// Ошибка signaling
     Error {
@@ -255,7 +249,12 @@ impl TryFrom<SerializedCandidate> for Candidate {
             "PeerReflexive" => crate::connectivity::CandidateType::PeerReflexive,
             "Relay" => crate::connectivity::CandidateType::Relay,
             "RouterPool" => crate::connectivity::CandidateType::RouterPool,
-            _ => return Err(anyhow::anyhow!("Unknown candidate type: {}", serialized.candidate_type)),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Unknown candidate type: {}",
+                    serialized.candidate_type
+                ))
+            }
         };
 
         Ok(Candidate {
@@ -367,7 +366,7 @@ pub enum SignalingEvent {
     /// Получены новые кандидаты
     CandidatesReceived {
         session_id: String,
-        candidates: Vec<Candidate>
+        candidates: Vec<Candidate>,
     },
     /// Результат connectivity check
     ConnectivityCheckResult {
@@ -387,10 +386,7 @@ pub enum SignalingEvent {
         connection_info: ConnectionInfo,
     },
     /// Сессия завершена
-    SessionTerminated {
-        session_id: String,
-        reason: String,
-    },
+    SessionTerminated { session_id: String, reason: String },
     /// Ошибка signaling
     Error {
         session_id: Option<String>,
@@ -460,11 +456,7 @@ impl SignalingManager {
     }
 
     /// Создание новой signaling сессии
-    pub async fn create_session(
-        &self,
-        peer_addr: SocketAddr,
-        controlling: bool,
-    ) -> Result<String> {
+    pub async fn create_session(&self, peer_addr: SocketAddr, controlling: bool) -> Result<String> {
         let session_id = Uuid::new_v4().to_string();
         let session = Arc::new(SignalingSession::new(
             session_id.clone(),
@@ -473,7 +465,10 @@ impl SignalingManager {
             self.event_tx.clone(),
         ));
 
-        self.sessions.write().await.insert(session_id.clone(), session.clone());
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session.clone());
 
         // Отправляем инициацию сессии
         let init_message = SignalingMessage::SessionInit {
@@ -487,7 +482,10 @@ impl SignalingManager {
         self.stats.write().await.record_message_sent();
 
         info!("Created signaling session: {}", session_id);
-        self.emit_event(SignalingEvent::SessionInitiated { session_id: session_id.clone() }).await;
+        self.emit_event(SignalingEvent::SessionInitiated {
+            session_id: session_id.clone(),
+        })
+        .await;
 
         Ok(session_id)
     }
@@ -503,18 +501,25 @@ impl SignalingManager {
         session_id: &str,
         candidates: Vec<Candidate>,
     ) -> Result<Vec<Candidate>> {
-        let session = self.get_session(session_id).await
+        let session = self
+            .get_session(session_id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
         // Отправляем наши кандидаты
         let exchange_message = SignalingMessage::CandidateExchange {
             session_id: session_id.to_string(),
-            candidates: candidates.into_iter().map(SerializedCandidate::from).collect(),
+            candidates: candidates
+                .into_iter()
+                .map(SerializedCandidate::from)
+                .collect(),
             gathering_complete: true,
             sequence: session.next_sequence().await,
         };
 
-        self.transport.send_message(exchange_message, session.peer_addr()).await?;
+        self.transport
+            .send_message(exchange_message, session.peer_addr())
+            .await?;
         self.stats.write().await.record_message_sent();
         self.stats.write().await.record_candidate_exchange();
 
@@ -534,7 +539,9 @@ impl SignalingManager {
         remote_candidate: &Candidate,
         use_candidate: bool,
     ) -> Result<()> {
-        let session = self.get_session(session_id).await
+        let session = self
+            .get_session(session_id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
         let check_id = Uuid::new_v4().to_string();
@@ -547,13 +554,16 @@ impl SignalingManager {
             to_candidate: SerializedCandidate::from(remote_candidate.clone()),
             priority: crate::connectivity::CandidatePair::new(
                 local_candidate.clone(),
-                remote_candidate.clone()
-            ).priority,
+                remote_candidate.clone(),
+            )
+            .priority,
             use_candidate,
             transaction_id,
         };
 
-        self.transport.send_message(check_message, session.peer_addr()).await?;
+        self.transport
+            .send_message(check_message, session.peer_addr())
+            .await?;
         self.stats.write().await.record_message_sent();
         self.stats.write().await.record_connectivity_check();
 
@@ -567,7 +577,9 @@ impl SignalingManager {
         pair: &CandidatePair,
         controlling: bool,
     ) -> Result<()> {
-        let session = self.get_session(session_id).await
+        let session = self
+            .get_session(session_id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
         let nomination_message = SignalingMessage::NominationRequest {
@@ -579,7 +591,9 @@ impl SignalingManager {
             controlling,
         };
 
-        self.transport.send_message(nomination_message, session.peer_addr()).await?;
+        self.transport
+            .send_message(nomination_message, session.peer_addr())
+            .await?;
         self.stats.write().await.record_message_sent();
 
         Ok(())
@@ -593,7 +607,9 @@ impl SignalingManager {
                 reason: reason.to_string(),
             };
 
-            self.transport.send_message(terminate_message, session.peer_addr()).await?;
+            self.transport
+                .send_message(terminate_message, session.peer_addr())
+                .await?;
             self.stats.write().await.record_message_sent();
         }
 
@@ -602,7 +618,8 @@ impl SignalingManager {
         self.emit_event(SignalingEvent::SessionTerminated {
             session_id: session_id.to_string(),
             reason: reason.to_string(),
-        }).await;
+        })
+        .await;
 
         info!("Terminated signaling session: {}", session_id);
         Ok(())
@@ -620,7 +637,9 @@ impl SignalingManager {
         // Завершаем все сессии
         let sessions: Vec<String> = self.sessions.read().await.keys().cloned().collect();
         for session_id in sessions {
-            let _ = self.terminate_session(&session_id, "Manager shutdown").await;
+            let _ = self
+                .terminate_session(&session_id, "Manager shutdown")
+                .await;
         }
 
         // Закрываем транспорт
@@ -675,23 +694,46 @@ impl SignalingManager {
         message: SignalingMessage,
         from_addr: SocketAddr,
     ) -> Result<()> {
-        trace!("Received signaling message from {}: {:?}", from_addr, message);
+        trace!(
+            "Received signaling message from {}: {:?}",
+            from_addr,
+            message
+        );
 
         match message {
-            SignalingMessage::SessionInit { session_id, controlling, capabilities, .. } => {
-                self.handle_session_init(session_id, from_addr, controlling, capabilities).await
+            SignalingMessage::SessionInit {
+                session_id,
+                controlling,
+                capabilities,
+                ..
+            } => {
+                self.handle_session_init(session_id, from_addr, controlling, capabilities)
+                    .await
             }
 
-            SignalingMessage::CandidateExchange { session_id, candidates, .. } => {
-                self.handle_candidate_exchange(session_id, candidates).await
+            SignalingMessage::CandidateExchange {
+                session_id,
+                candidates,
+                ..
+            } => self.handle_candidate_exchange(session_id, candidates).await,
+
+            SignalingMessage::ConnectivityCheck {
+                session_id,
+                check_id,
+                transaction_id,
+                ..
+            } => {
+                self.handle_connectivity_check(session_id, check_id, transaction_id, from_addr)
+                    .await
             }
 
-            SignalingMessage::ConnectivityCheck { session_id, check_id, transaction_id, .. } => {
-                self.handle_connectivity_check(session_id, check_id, transaction_id, from_addr).await
-            }
-
-            SignalingMessage::NominationRequest { session_id, nominated_pair, .. } => {
-                self.handle_nomination_request(session_id, nominated_pair).await
+            SignalingMessage::NominationRequest {
+                session_id,
+                nominated_pair,
+                ..
+            } => {
+                self.handle_nomination_request(session_id, nominated_pair)
+                    .await
             }
 
             SignalingMessage::SessionTerminate { session_id, reason } => {
@@ -721,7 +763,10 @@ impl SignalingManager {
             self.event_tx.clone(),
         ));
 
-        self.sessions.write().await.insert(session_id.clone(), session);
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
 
         // Отправляем ответ
         let response = SignalingMessage::SessionInitResponse {
@@ -734,7 +779,8 @@ impl SignalingManager {
         self.transport.send_message(response, from_addr).await?;
         self.stats.write().await.record_message_sent();
 
-        self.emit_event(SignalingEvent::SessionInitiated { session_id }).await;
+        self.emit_event(SignalingEvent::SessionInitiated { session_id })
+            .await;
 
         Ok(())
     }
@@ -758,7 +804,8 @@ impl SignalingManager {
             self.emit_event(SignalingEvent::CandidatesReceived {
                 session_id,
                 candidates,
-            }).await;
+            })
+            .await;
         }
 
         Ok(())
@@ -798,10 +845,8 @@ impl SignalingManager {
         let remote_candidate = nominated_pair.1.try_into()?;
         let pair = CandidatePair::new(local_candidate, remote_candidate);
 
-        self.emit_event(SignalingEvent::CandidatePairNominated {
-            session_id,
-            pair,
-        }).await;
+        self.emit_event(SignalingEvent::CandidatePairNominated { session_id, pair })
+            .await;
 
         self.stats.write().await.record_nomination();
 
@@ -812,10 +857,8 @@ impl SignalingManager {
     async fn handle_session_terminate(&self, session_id: String, reason: String) -> Result<()> {
         self.sessions.write().await.remove(&session_id);
 
-        self.emit_event(SignalingEvent::SessionTerminated {
-            session_id,
-            reason,
-        }).await;
+        self.emit_event(SignalingEvent::SessionTerminated { session_id, reason })
+            .await;
 
         Ok(())
     }
@@ -875,7 +918,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SignalingTransport for MockSignalingTransport {
-        async fn send_message(&self, _message: SignalingMessage, _target: SocketAddr) -> Result<()> {
+        async fn send_message(
+            &self,
+            _message: SignalingMessage,
+            _target: SocketAddr,
+        ) -> Result<()> {
             Ok(())
         }
 

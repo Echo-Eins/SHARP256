@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
-use tokio::time::{timeout, sleep, interval};
-use tracing::{debug, info, warn, error};
+use tokio::time::{interval, sleep, timeout};
+use tracing::{debug, error, info, warn};
 
 use webrtc::ice::{
-    agent::{Agent as WebRtcAgent},
+    agent::Agent as WebRtcAgent,
     candidate::Candidate as WebRtcCandidate,
     state::{ConnectionState as WebRtcConnectionState, GatheringState as WebRtcGatheringState},
     url::Url,
@@ -22,13 +22,13 @@ use webrtc::ice::{
 // Import directly from webrtc_ice as it's not re-exported
 use webrtc_ice::agent::agent_config::AgentConfig as WebRtcAgentConfig;
 
-use crate::connectivity::{
-    Candidate, CandidatePair, CandidatePairState, ConnectivityCheckResult,
-    ConnectivityEvent, CandidateType, TransportProtocol,
-};
+use super::webrtc_integration::{EnhancedWebRtcAgent, WebRtcConnection};
 use crate::connectivity::config::IceConfig;
 use crate::connectivity::signaling::ProductionSignaling;
-use super::webrtc_integration::{WebRtcConnection, EnhancedWebRtcAgent};
+use crate::connectivity::{
+    Candidate, CandidatePair, CandidatePairState, CandidateType, ConnectivityCheckResult,
+    ConnectivityEvent, TransportProtocol,
+};
 
 /// Production ICE Agent Configuration
 #[derive(Debug, Clone)]
@@ -171,15 +171,16 @@ pub enum IceEvent {
 impl ProductionIceAgent {
     /// Create new production ICE agent
     pub async fn new(config: ProductionIceConfig) -> Result<Self> {
-        info!("Creating production ICE agent (controlling: {})", config.controlling);
+        info!(
+            "Creating production ICE agent (controlling: {})",
+            config.controlling
+        );
 
         // Create WebRTC agent configuration
         let webrtc_config = Self::create_webrtc_config(&config)?;
 
         // Create enhanced WebRTC agent
-        let webrtc_agent = Arc::new(
-            EnhancedWebRtcAgent::new(webrtc_config).await?
-        );
+        let webrtc_agent = Arc::new(EnhancedWebRtcAgent::new(webrtc_config).await?);
 
         // Create event channel
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -207,11 +208,7 @@ impl ProductionIceAgent {
     }
 
     /// Start ICE process
-    pub async fn start(
-        &self,
-        socket: Arc<UdpSocket>,
-        peer_addr: Option<SocketAddr>,
-    ) -> Result<()> {
+    pub async fn start(&self, socket: Arc<UdpSocket>, peer_addr: Option<SocketAddr>) -> Result<()> {
         info!("Starting ICE process");
 
         // Update state
@@ -219,11 +216,9 @@ impl ProductionIceAgent {
 
         // Initialize signaling if peer address provided
         if let Some(addr) = peer_addr {
-            let signaling = ProductionSignaling::new(
-                socket.clone(),
-                addr,
-                self.config.read().controlling,
-            ).await?;
+            let signaling =
+                ProductionSignaling::new(socket.clone(), addr, self.config.read().controlling)
+                    .await?;
 
             // Initialize session
             signaling.initialize_session().await?;
@@ -284,7 +279,8 @@ impl ProductionIceAgent {
 
         // Emit events
         for candidate in &candidates {
-            self.emit_event(IceEvent::CandidateGathered(candidate.clone())).await;
+            self.emit_event(IceEvent::CandidateGathered(candidate.clone()))
+                .await;
         }
 
         // Update statistics
@@ -308,10 +304,8 @@ impl ProductionIceAgent {
             for remote_candidate in remote.iter() {
                 // Check compatibility
                 if Self::are_candidates_compatible(local_candidate, remote_candidate) {
-                    let pair = CandidatePair::new(
-                        local_candidate.clone(),
-                        remote_candidate.clone(),
-                    );
+                    let pair =
+                        CandidatePair::new(local_candidate.clone(), remote_candidate.clone());
 
                     pairs.push(pair.clone());
                     self.emit_event(IceEvent::CandidatePairFormed(pair)).await;
@@ -360,9 +354,7 @@ impl ProductionIceAgent {
 
         for pair in pairs {
             let self_clone = self.clone();
-            let task = tokio::spawn(async move {
-                self_clone.check_candidate_pair(pair).await
-            });
+            let task = tokio::spawn(async move { self_clone.check_candidate_pair(pair).await });
             check_tasks.push(task);
         }
 
@@ -384,18 +376,22 @@ impl ProductionIceAgent {
 
     /// Check a single candidate pair
     async fn check_candidate_pair(&self, mut pair: CandidatePair) -> Result<()> {
-        self.emit_event(IceEvent::ConnectivityCheckStarted(pair.clone())).await;
+        self.emit_event(IceEvent::ConnectivityCheckStarted(pair.clone()))
+            .await;
         self.stats.write().pairs_checked += 1;
 
         // Perform STUN check through signaling
         if let Some(signaling) = &*self.signaling.read().await {
             let start = Instant::now();
 
-            match signaling.send_connectivity_check(
-                &pair.local,
-                &pair.remote,
-                false, // use_candidate
-            ).await {
+            match signaling
+                .send_connectivity_check(
+                    &pair.local,
+                    &pair.remote,
+                    false, // use_candidate
+                )
+                .await
+            {
                 Ok(rtt) => {
                     pair.state = CandidatePairState::Succeeded;
                     pair.rtt = Some(rtt);
@@ -406,9 +402,8 @@ impl ProductionIceAgent {
                     // Update current RTT
                     self.stats.write().current_rtt_ms = Some(rtt.as_millis() as u32);
 
-                    self.emit_event(
-                        IceEvent::ConnectivityCheckSucceeded(pair, rtt)
-                    ).await;
+                    self.emit_event(IceEvent::ConnectivityCheckSucceeded(pair, rtt))
+                        .await;
 
                     // If aggressive nomination, nominate immediately
                     if self.config.read().aggressive_nomination {
@@ -421,9 +416,8 @@ impl ProductionIceAgent {
                     pair.state = CandidatePairState::Failed;
                     self.stats.write().pairs_failed += 1;
 
-                    self.emit_event(
-                        IceEvent::ConnectivityCheckFailed(pair, e.to_string())
-                    ).await;
+                    self.emit_event(IceEvent::ConnectivityCheckFailed(pair, e.to_string()))
+                        .await;
 
                     Err(e)
                 }
@@ -454,9 +448,9 @@ impl ProductionIceAgent {
             match best_pairs.get(&component) {
                 Some(existing) => {
                     // Compare priorities and RTT
-                    if pair.priority > existing.priority ||
-                        (pair.priority == existing.priority &&
-                            pair.rtt < existing.rtt) {
+                    if pair.priority > existing.priority
+                        || (pair.priority == existing.priority && pair.rtt < existing.rtt)
+                    {
                         best_pairs.insert(component, pair.clone());
                     }
                 }
@@ -485,7 +479,8 @@ impl ProductionIceAgent {
         self.nominated_pairs.write().await.push(pair.clone());
         self.stats.write().pairs_nominated += 1;
 
-        self.emit_event(IceEvent::CandidatePairNominated(pair)).await;
+        self.emit_event(IceEvent::CandidatePairNominated(pair))
+            .await;
 
         Ok(())
     }
@@ -497,23 +492,21 @@ impl ProductionIceAgent {
         let nominated = self.nominated_pairs.read().await.clone();
 
         for pair in nominated {
-            let connection = self.webrtc_agent.establish_connection(
-                &pair.local,
-                &pair.remote,
-            ).await?;
+            let connection = self
+                .webrtc_agent
+                .establish_connection(&pair.local, &pair.remote)
+                .await?;
 
             // Store connection
-            let connection_id = format!("{}-{}",
-                                        pair.local.foundation,
-                                        pair.remote.foundation
-            );
+            let connection_id = format!("{}-{}", pair.local.foundation, pair.remote.foundation);
 
-            self.connections.write().await.insert(
-                connection_id.clone(),
-                connection.clone()
-            );
+            self.connections
+                .write()
+                .await
+                .insert(connection_id.clone(), connection.clone());
 
-            self.emit_event(IceEvent::ConnectionEstablished(connection)).await;
+            self.emit_event(IceEvent::ConnectionEstablished(connection))
+                .await;
 
             // For now, establish only the first connection
             // In production, might want multiple connections for redundancy
@@ -709,11 +702,17 @@ mod tests {
             },
         };
 
-        assert!(ProductionIceAgent::are_candidates_compatible(&local, &compatible_remote));
+        assert!(ProductionIceAgent::are_candidates_compatible(
+            &local,
+            &compatible_remote
+        ));
 
         // Test incompatible transport
         let mut incompatible = compatible_remote.clone();
         incompatible.attributes.transport = TransportProtocol::Tcp;
-        assert!(!ProductionIceAgent::are_candidates_compatible(&local, &incompatible));
+        assert!(!ProductionIceAgent::are_candidates_compatible(
+            &local,
+            &incompatible
+        ));
     }
 }

@@ -1,15 +1,17 @@
-use crate::protocol::constants::{MAX_PAYLOAD_SIZE_GSO, MAX_PAYLOAD_SIZE_MTU};
-use anyhow::{Context, Result};
-use std::net::SocketAddr;
-use rand::Rng;
 use crate::protocol::constants::*;
+use anyhow::{Context, Result};
+use rand::Rng;
+use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
+use tokio::time::sleep;
 use tokio::time::{timeout, Duration};
-use tokio::time::{sleep};
 
 #[cfg(unix)]
-use libc::{IPPROTO_IP, IPPROTO_IPV6, IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_PMTUDISC_DONT, IP_MTU, IPV6_MTU_DISCOVER, IPV6_PMTUDISC_DO, IPV6_PMTUDISC_DONT, IPV6_MTU};
+use libc::{
+    IPPROTO_IP, IPPROTO_IPV6, IPV6_MTU, IPV6_MTU_DISCOVER, IPV6_PMTUDISC_DO, IPV6_PMTUDISC_DONT,
+    IP_MTU, IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_PMTUDISC_DONT,
+};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
@@ -34,10 +36,18 @@ fn set_df(socket: &UdpSocket, v6: bool, enable: bool) -> std::io::Result<()> {
     let fd = socket.as_raw_fd();
     unsafe {
         let (level, optname, val) = if v6 {
-            let val = if enable { IPV6_PMTUDISC_DO } else { IPV6_PMTUDISC_DONT };
+            let val = if enable {
+                IPV6_PMTUDISC_DO
+            } else {
+                IPV6_PMTUDISC_DONT
+            };
             (IPPROTO_IPV6, IPV6_MTU_DISCOVER, val)
         } else {
-            let val = if enable { IP_PMTUDISC_DO } else { IP_PMTUDISC_DONT };
+            let val = if enable {
+                IP_PMTUDISC_DO
+            } else {
+                IP_PMTUDISC_DONT
+            };
             (IPPROTO_IP, IP_MTU_DISCOVER, val)
         };
         let val: libc::c_int = val;
@@ -71,14 +81,7 @@ fn get_pmtu(socket: &UdpSocket, v6: bool) -> Option<usize> {
         };
         let mut mtu: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        if libc::getsockopt(
-            fd,
-            level,
-            opt,
-            &mut mtu as *mut _ as *mut _,
-            &mut len,
-        ) == -1
-        {
+        if libc::getsockopt(fd, level, opt, &mut mtu as *mut _ as *mut _, &mut len) == -1 {
             None
         } else {
             Some(mtu as usize)
@@ -104,7 +107,7 @@ pub async fn check_fragmentation(socket: &UdpSocket, peer: SocketAddr) -> Result
             .await
             .with_context(|| "failed to send fragmentation request")?;
 
-    // Wait for response
+        // Wait for response
         let mut buffer = vec![0u8; 1024];
         match timeout(Duration::from_secs(2), socket.recv_from(&mut buffer)).await {
             Ok(Ok((size, addr))) if addr == peer && size >= 12 && &buffer[..8] == b"SHARP_FR" => {
@@ -113,7 +116,10 @@ pub async fn check_fragmentation(socket: &UdpSocket, peer: SocketAddr) -> Result
                 return Ok(max_size);
             }
             _ => {
-                tracing::debug!("No response to fragmentation request attempt {}", attempt + 1);
+                tracing::debug!(
+                    "No response to fragmentation request attempt {}",
+                    attempt + 1
+                );
                 sleep(Duration::from_millis(200)).await;
             }
         }
@@ -131,13 +137,13 @@ pub async fn detect_max_payload(socket: &UdpSocket, peer: SocketAddr) -> Result<
     // Test sizes to try (in order)
     let test_sizes = vec![
         // Start with common sizes
-        1200,   // Safe for most networks
-        1400,   // Close to typical MTU
-        1472,   // Maximum for 1500 MTU (1500 - 20 IP - 8 UDP)
-        8192,   // Jumbo frame boundary
-        16384,  // Common GSO size
-        32768,  // Half of max GSO
-        65507,  // Maximum UDP payload (65535 - 20 IP - 8 UDP)
+        1200,  // Safe for most networks
+        1400,  // Close to typical MTU
+        1472,  // Maximum for 1500 MTU (1500 - 20 IP - 8 UDP)
+        8192,  // Jumbo frame boundary
+        16384, // Common GSO size
+        32768, // Half of max GSO
+        65507, // Maximum UDP payload (65535 - 20 IP - 8 UDP)
     ];
 
     let mut max_working = 0;
@@ -187,7 +193,8 @@ pub async fn detect_max_payload(socket: &UdpSocket, peer: SocketAddr) -> Result<
         tested_successfully,
     };
 
-    tracing::info!("Fragmentation detection complete: max_payload={}, GSO={}, path_mtu={}",
+    tracing::info!(
+        "Fragmentation detection complete: max_payload={}, GSO={}, path_mtu={}",
         info.max_payload_size,
         info.supports_gso,
         info.path_mtu
@@ -253,7 +260,7 @@ async fn binary_search_mtu(
     socket: &UdpSocket,
     peer: SocketAddr,
     min: usize,
-    max: usize
+    max: usize,
 ) -> Result<usize> {
     let mut low = min;
     let mut high = max;
@@ -277,7 +284,7 @@ async fn binary_search_mtu(
 pub async fn handle_fragmentation_packet(
     socket: &UdpSocket,
     data: &[u8],
-    addr: SocketAddr
+    addr: SocketAddr,
 ) -> Result<bool> {
     if data.len() < 8 {
         return Ok(false);

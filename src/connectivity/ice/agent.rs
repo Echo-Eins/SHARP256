@@ -11,35 +11,35 @@
 //! let connection = agent.perform_ice_process().await?;
 //! ```
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, Notify, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::time::timeout;
-use tracing::{debug, info, warn, error, trace, instrument};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use webrtc::ice::{
-    agent::{Agent as WebRtcAgent},
+    agent::Agent as WebRtcAgent,
     candidate::{Candidate as WebRtcCandidate, CandidateType as WebRtcCandidateType},
+    network_type::NetworkType,
     state::{ConnectionState as WebRtcConnectionState, GatheringState as WebRtcGatheringState},
     url::Url,
-    network_type::NetworkType,
 };
 // Import directly from webrtc_ice as they're not re-exported
 use webrtc_ice::agent::agent_config::AgentConfig as WebRtcAgentConfig;
 use webrtc_ice::candidate::candidate_base::CandidateBaseConfig;
 
-use crate::connectivity::{
-    Candidate, CandidatePair, CandidatePairState, ConnectivityCheckResult, ConnectivityEvent
+use super::{
+    connectivity::{ConnectivityChecker, ConnectivityState, ConnectivityStats},
+    gathering::{CandidateGatherer, GatheringState, GatheringStats},
+    nomination::{CandidateNominator, NominationState, NominationStats},
+    IceAgentState, IceConnection, IceEvent,
 };
 use crate::connectivity::config::IceConfig;
-use super::{
-    IceConnection, IceAgentState, IceEvent,
-    gathering::{CandidateGatherer, GatheringState, GatheringStats},
-    connectivity::{ConnectivityChecker, ConnectivityState, ConnectivityStats},
-    nomination::{CandidateNominator, NominationState, NominationStats},
+use crate::connectivity::{
+    Candidate, CandidatePair, CandidatePairState, ConnectivityCheckResult, ConnectivityEvent,
 };
 
 /// ICE Agent configuration
@@ -205,14 +205,14 @@ impl IceAgent {
     #[instrument(skip(config))]
     pub async fn with_config(config: IceAgentConfig) -> Result<Self> {
         // Create WebRTC Agent configuration
-        let webrtc_config = Self::create_webrtc_config(&config)
-            .context("Failed to create WebRTC config")?;
+        let webrtc_config =
+            Self::create_webrtc_config(&config).context("Failed to create WebRTC config")?;
 
         // Create WebRTC Agent
         let webrtc_agent = Arc::new(
             WebRtcAgent::new(webrtc_config)
                 .await
-                .context("Failed to create WebRTC Agent")?
+                .context("Failed to create WebRTC Agent")?,
         );
 
         // Create event channels
@@ -249,10 +249,7 @@ impl IceAgent {
         // Start event processing
         agent.start_event_processing().await?;
 
-        info!(
-            controlling = agent.config.controlling,
-            "ICE Agent created"
-        );
+        info!(controlling = agent.config.controlling, "ICE Agent created");
 
         Ok(agent)
     }
@@ -270,8 +267,9 @@ impl IceAgent {
 
         // Add TURN servers
         for turn_server in &config.ice_config.turn_servers {
-            let url = Url::parse_url(&turn_server.url)
-                .map_err(|e| anyhow::anyhow!("Invalid TURN server URL {}: {}", turn_server.url, e))?;
+            let url = Url::parse_url(&turn_server.url).map_err(|e| {
+                anyhow::anyhow!("Invalid TURN server URL {}: {}", turn_server.url, e)
+            })?;
             urls.push(url);
         }
 
@@ -336,7 +334,11 @@ impl IceAgent {
 
     /// Start event processing
     async fn start_event_processing(&self) -> Result<()> {
-        let event_rx = self.internal_event_rx.lock().await.take()
+        let event_rx = self
+            .internal_event_rx
+            .lock()
+            .await
+            .take()
             .ok_or_else(|| anyhow::anyhow!("Event receiver already taken"))?;
 
         let processor = IceEventProcessor {
@@ -407,7 +409,10 @@ impl IceAgent {
                 self.get_connection().await
             }
             Err(_) => {
-                error!(timeout_secs = timeout_duration.as_secs(), "ICE process timed out");
+                error!(
+                    timeout_secs = timeout_duration.as_secs(),
+                    "ICE process timed out"
+                );
 
                 // Update state
                 {
@@ -417,8 +422,13 @@ impl IceAgent {
                 }
 
                 self.stats.write().await.connection_failures += 1;
-                let _ = self.event_tx.send(IceEvent::Error("ICE process timeout".to_string()));
-                Err(anyhow::anyhow!("ICE process timeout after {:?}", timeout_duration))
+                let _ = self
+                    .event_tx
+                    .send(IceEvent::Error("ICE process timeout".to_string()));
+                Err(anyhow::anyhow!(
+                    "ICE process timeout after {:?}",
+                    timeout_duration
+                ))
             }
         }
     }
@@ -429,7 +439,8 @@ impl IceAgent {
         info!("Starting candidate gathering");
 
         let gatherer = self.candidate_gatherer.lock().await;
-        let gatherer = gatherer.as_ref()
+        let gatherer = gatherer
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("CandidateGatherer not initialized"))?;
 
         // Start gathering
@@ -470,10 +481,13 @@ impl IceAgent {
     }
 
     /// Convert our Candidate to webrtc-rs format
-    fn candidate_to_webrtc(&self, candidate: &Candidate) -> Result<Arc<dyn WebRtcCandidate + Send + Sync>> {
+    fn candidate_to_webrtc(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<Arc<dyn WebRtcCandidate + Send + Sync>> {
         use webrtc::ice::candidate::candidate_host::CandidateHostConfig;
-        use webrtc::ice::candidate::candidate_server_reflexive::CandidateServerReflexiveConfig;
         use webrtc::ice::candidate::candidate_relay::CandidateRelayConfig;
+        use webrtc::ice::candidate::candidate_server_reflexive::CandidateServerReflexiveConfig;
 
         let network_type = if candidate.address.is_ipv4() {
             NetworkType::Udp4
@@ -584,7 +598,10 @@ impl IceAgent {
         // Update pairs
         *self.candidate_pairs.write().await = new_pairs;
 
-        debug!(count = self.candidate_pairs.read().await.len(), "Updated candidate pairs");
+        debug!(
+            count = self.candidate_pairs.read().await.len(),
+            "Updated candidate pairs"
+        );
         Ok(())
     }
 
@@ -621,7 +638,8 @@ impl IceAgent {
         }
 
         let checker = self.connectivity_checker.lock().await;
-        let checker = checker.as_ref()
+        let checker = checker
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("ConnectivityChecker not initialized"))?;
 
         // Form check list from candidate pairs
@@ -680,12 +698,14 @@ impl IceAgent {
         }
 
         let nominator = self.candidate_nominator.lock().await;
-        let nominator = nominator.as_ref()
+        let nominator = nominator
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("CandidateNominator not initialized"))?;
 
         // Get valid pairs from connectivity checker
         let checker = self.connectivity_checker.lock().await;
-        let checker = checker.as_ref()
+        let checker = checker
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("ConnectivityChecker not initialized"))?;
 
         let valid_pairs = checker.get_valid_pairs().await;
@@ -730,7 +750,9 @@ impl IceAgent {
                 *self.ice_connection.write().await = Some(connection.clone());
                 Ok(connection)
             } else {
-                Err(anyhow::anyhow!("No connection available - ICE process not completed"))
+                Err(anyhow::anyhow!(
+                    "No connection available - ICE process not completed"
+                ))
             }
         }
     }
@@ -828,7 +850,10 @@ impl IceAgent {
     /// Check if connected
     pub async fn is_connected(&self) -> bool {
         let state = self.process_state.read().await;
-        matches!(state.agent_state, IceAgentState::Connected | IceAgentState::Completed)
+        matches!(
+            state.agent_state,
+            IceAgentState::Connected | IceAgentState::Completed
+        )
     }
 
     /// Shutdown ICE Agent
@@ -918,8 +943,13 @@ impl IceEventProcessor {
             }
 
             ConnectivityEvent::ConnectivityCheckResult(result) => {
-                trace!(success = result.success, "Processing connectivity check result");
-                let _ = self.event_tx.send(IceEvent::ConnectivityCheckCompleted(result));
+                trace!(
+                    success = result.success,
+                    "Processing connectivity check result"
+                );
+                let _ = self
+                    .event_tx
+                    .send(IceEvent::ConnectivityCheckCompleted(result));
             }
 
             ConnectivityEvent::CandidatePairNominated(pair) => {
@@ -932,12 +962,14 @@ impl IceEventProcessor {
                 *self.ice_connection.write().await = Some(connection.clone());
 
                 let _ = self.event_tx.send(IceEvent::CandidatePairNominated(pair));
-                let _ = self.event_tx.send(IceEvent::ConnectionEstablished(connection));
+                let _ = self
+                    .event_tx
+                    .send(IceEvent::ConnectionEstablished(connection));
                 self.nomination_complete.notify_one();
                 self.connection_established.notify_one();
             }
 
-            ConnectivityEvent::ConnectionEstablished(established) => {
+            ConnectivityEvent::ConnectionEstablished => {
                 info!("Processing connection established");
                 self.process_state.write().await.agent_state = IceAgentState::Connected;
                 self.connection_established.notify_one();

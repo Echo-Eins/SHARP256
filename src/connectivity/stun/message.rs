@@ -21,9 +21,9 @@
 use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
 
+use super::attributes::StunAttribute;
 use super::constants::*;
 use super::transaction::TransactionId;
-use super::attributes::StunAttribute;
 
 /// STUN message class (2 bits)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,7 +297,10 @@ impl StunMessage {
 
         // Verify length
         if msg_length % 4 != 0 {
-            return Err(anyhow::anyhow!("Message length not multiple of 4: {}", msg_length));
+            return Err(anyhow::anyhow!(
+                "Message length not multiple of 4: {}",
+                msg_length
+            ));
         }
 
         if data.len() < HEADER_SIZE + msg_length {

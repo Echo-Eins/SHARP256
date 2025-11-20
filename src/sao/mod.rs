@@ -1,8 +1,8 @@
+use crate::protocol::ack::SaoParams;
+use crate::protocol::constants::*;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
-use crate::protocol::ack::SaoParams;
-use crate::protocol::constants::*;
 
 /// Метрики для одной партии
 #[derive(Debug, Clone)]
@@ -33,9 +33,8 @@ impl BatchMetrics {
     }
 
     pub fn rtt_ms(&self) -> Option<f64> {
-        self.ack_time.map(|ack| {
-            (ack - self.send_time).as_secs_f64() * 1000.0
-        })
+        self.ack_time
+            .map(|ack| (ack - self.send_time).as_secs_f64() * 1000.0)
     }
 
     pub fn loss_rate(&self) -> f64 {
@@ -59,7 +58,9 @@ impl SaoSystem {
     pub fn new() -> Self {
         Self {
             params: Arc::new(RwLock::new(SaoParams::default())),
-            metrics_history: Arc::new(RwLock::new(Vec::with_capacity(SAO_RECALC_INTERVAL as usize))),
+            metrics_history: Arc::new(RwLock::new(Vec::with_capacity(
+                SAO_RECALC_INTERVAL as usize,
+            ))),
             last_update_batch: Arc::new(RwLock::new(0)),
             start_time: Instant::now(),
         }
@@ -85,9 +86,11 @@ impl SaoSystem {
         let mut history = self.metrics_history.write();
         for metric in history.iter_mut() {
             if metric.batch_number >= control_ack.batch_range_start
-                && metric.batch_number <= control_ack.batch_range_end {
-
-                let lost_in_batch = control_ack.lost_packets.iter()
+                && metric.batch_number <= control_ack.batch_range_end
+            {
+                let lost_in_batch = control_ack
+                    .lost_packets
+                    .iter()
                     .filter(|p| p.batch_number == metric.batch_number)
                     .count() as u16;
 
@@ -114,14 +117,31 @@ impl SaoSystem {
         }
 
         // Рассчитываем средние метрики
-        let (total_rtt, rtt_count, total_loss, total_packets) = history.iter()
-            .fold((0.0, 0usize, 0u16, 0u16), |(rtt_sum, rtt_cnt, loss, packets), metric| {
-                let new_rtt = metric.rtt_ms().map_or((rtt_sum, rtt_cnt), |rtt| (rtt_sum + rtt, rtt_cnt + 1));
-                (new_rtt.0, new_rtt.1, loss + metric.packets_lost, packets + metric.packets_sent)
-            });
+        let (total_rtt, rtt_count, total_loss, total_packets) = history.iter().fold(
+            (0.0, 0usize, 0u16, 0u16),
+            |(rtt_sum, rtt_cnt, loss, packets), metric| {
+                let new_rtt = metric
+                    .rtt_ms()
+                    .map_or((rtt_sum, rtt_cnt), |rtt| (rtt_sum + rtt, rtt_cnt + 1));
+                (
+                    new_rtt.0,
+                    new_rtt.1,
+                    loss + metric.packets_lost,
+                    packets + metric.packets_sent,
+                )
+            },
+        );
 
-        let avg_rtt = if rtt_count > 0 { total_rtt / rtt_count as f64 } else { 0.0 };
-        let loss_rate = if total_packets > 0 { total_loss as f64 / total_packets as f64 } else { 0.0 };
+        let avg_rtt = if rtt_count > 0 {
+            total_rtt / rtt_count as f64
+        } else {
+            0.0
+        };
+        let loss_rate = if total_packets > 0 {
+            total_loss as f64 / total_packets as f64
+        } else {
+            0.0
+        };
 
         // Рассчитываем пропускную способность
         let elapsed_secs = self.start_time.elapsed().as_secs_f64();
@@ -149,7 +169,8 @@ impl SaoSystem {
             params.batch_size = (params.batch_size + SAO_BATCH_SIZE_STEP).min(MAX_BATCH_SIZE);
             params.optimized_mode = true;
         } else if score < SAO_SCORE_DECREASE_THRESHOLD && params.batch_size > MIN_BATCH_SIZE {
-            params.batch_size = (params.batch_size.saturating_sub(SAO_BATCH_SIZE_STEP)).max(MIN_BATCH_SIZE);
+            params.batch_size =
+                (params.batch_size.saturating_sub(SAO_BATCH_SIZE_STEP)).max(MIN_BATCH_SIZE);
             params.optimized_mode = params.batch_size > INITIAL_BATCH_SIZE;
         }
 

@@ -3,29 +3,29 @@
 //! Production implementation based on webrtc-rs library
 //! RFC 8445 compliant
 
+use crate::connectivity::{Candidate, CandidatePair, ConnectivityCheckResult};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use crate::connectivity::{Candidate, CandidatePair, ConnectivityCheckResult};
 
 // Core ICE modules
 pub mod agent;
 pub mod connectivity;
 pub mod gathering;
 pub mod nomination;
+pub mod production_ice_agent;
 pub mod utils;
 pub mod webrtc_integration;
-pub mod production_ice_agent;
 
 // Re-export main types for convenience
 pub use agent::IceAgent;
 pub use connectivity::{ConnectivityChecker, ConnectivityState};
 pub use gathering::{CandidateGatherer, GatheringState};
 pub use nomination::{CandidateNominator, NominationState};
+pub use production_ice_agent::ProductionIceAgent;
 pub use utils::*;
 pub use webrtc_integration::*;
-pub use production_ice_agent::ProductionIceAgent;
 
 // Type alias for production use
 pub type ProductionAgent = ProductionIceAgent;

@@ -1,10 +1,10 @@
-use eframe::egui;
-use std::path::PathBuf;
-use std::net::SocketAddr;
-use std::sync::mpsc::{self, Sender, Receiver};
-use std::sync::Arc;
-use parking_lot::RwLock;
 use crate::sender::Sender as SharpSender;
+use eframe::egui;
+use parking_lot::RwLock;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
 pub struct SenderApp {
     // Настройки передачи
@@ -12,14 +12,14 @@ pub struct SenderApp {
     receiver_addr: String,
     bind_addr: String,
     use_encryption: bool,
-    
+
     // Состояние передачи
     state: Arc<RwLock<TransferState>>,
-    
+
     // Каналы для общения с потоком передачи
     command_tx: Option<Sender<Command>>,
     update_rx: Receiver<Update>,
-    
+
     // UI состояние
     show_file_picker: bool,
     error_message: Option<String>,
@@ -61,7 +61,7 @@ struct Update {
 impl SenderApp {
     pub fn new() -> Self {
         let (update_tx, update_rx) = mpsc::channel();
-        
+
         Self {
             file_path: None,
             receiver_addr: "192.168.1.100:5555".to_string(),
@@ -75,7 +75,7 @@ impl SenderApp {
             frag_size: Arc::new(RwLock::new(None)),
         }
     }
-    
+
     fn start_transfer(&mut self, ctx: &egui::Context) {
         if let Some(file_path) = &self.file_path {
             // Парсим адреса
@@ -86,7 +86,7 @@ impl SenderApp {
                     return;
                 }
             };
-            
+
             let bind_addr = match self.bind_addr.parse::<SocketAddr>() {
                 Ok(addr) => addr,
                 Err(e) => {
@@ -94,11 +94,11 @@ impl SenderApp {
                     return;
                 }
             };
-            
+
             // Создаем каналы
             let (command_tx, command_rx) = mpsc::channel();
             self.command_tx = Some(command_tx);
-            
+
             // Запускаем передачу в отдельном потоке
             let file = file_path.clone();
             let encrypt = self.use_encryption;
@@ -106,7 +106,7 @@ impl SenderApp {
             let ctx_clone = ctx.clone();
 
             let frag_info = self.frag_size.clone();
-            
+
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
@@ -119,16 +119,17 @@ impl SenderApp {
                         state,
                         command_rx,
                         ctx_clone,
-                    ).await;
+                    )
+                    .await;
                 });
             });
-            
+
             *self.state.write() = TransferState::Connecting;
         } else {
             self.error_message = Some("Please select a file".to_string());
         }
     }
-    
+
     fn cancel_transfer(&mut self) {
         if let Some(tx) = &self.command_tx {
             let _ = tx.send(Command::Cancel);
@@ -142,27 +143,27 @@ impl eframe::App for SenderApp {
         while let Ok(update) = self.update_rx.try_recv() {
             *self.state.write() = update.state;
         }
-        
+
         // File picker dialog
         if self.show_file_picker {
             if let Some(path) = rfd::FileDialog::new()
                 .set_title("Select file to send")
-                .pick_file() 
+                .pick_file()
             {
                 self.file_path = Some(path);
             }
             self.show_file_picker = false;
         }
-        
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("SHARP-256 File Sender");
             ui.separator();
-            
+
             // Настройки передачи
             ui.group(|ui| {
                 ui.label("Transfer Settings");
                 ui.separator();
-                
+
                 ui.horizontal(|ui| {
                     ui.label("File:");
                     if let Some(path) = &self.file_path {
@@ -176,27 +177,27 @@ impl eframe::App for SenderApp {
                     } else {
                         ui.label("No file selected");
                     }
-                    
+
                     if ui.button("Browse...").clicked() {
                         self.show_file_picker = true;
                     }
                 });
-                
+
                 ui.horizontal(|ui| {
                     ui.label("Receiver address:");
                     ui.text_edit_singleline(&mut self.receiver_addr);
                 });
-                
+
                 ui.horizontal(|ui| {
                     ui.label("Local bind address:");
                     ui.text_edit_singleline(&mut self.bind_addr);
                 });
-                
+
                 ui.checkbox(&mut self.use_encryption, "Use encryption (TLS 1.3)");
             });
-            
+
             ui.add_space(20.0);
-            
+
             // Состояние передачи
             match &*self.state.read() {
                 TransferState::Idle => {
@@ -217,16 +218,16 @@ impl eframe::App for SenderApp {
                         "Transferring: {}/{} bytes",
                         bytes_sent, total_bytes
                     ));
-                    
+
                     let progress_bar = egui::ProgressBar::new(*progress)
                         .text(format!("{:.1}%", progress * 100.0))
                         .animate(true);
                     ui.add(progress_bar);
-                    
+
                     ui.horizontal(|ui| {
                         ui.label(format!("Speed: {:.2} MB/s", speed_mbps));
                         ui.separator();
-                        
+
                         let eta_str = if *eta_seconds < 60 {
                             format!("{}s", eta_seconds)
                         } else if *eta_seconds < 3600 {
@@ -259,14 +260,16 @@ impl eframe::App for SenderApp {
                 ui.add_space(10.0);
                 ui.colored_label(egui::Color32::RED, error);
             }
-            
+
             ui.add_space(20.0);
-            
+
             // Кнопки управления
             ui.horizontal(|ui| {
                 let current = self.state.read().clone();
                 match current {
-                    TransferState::Idle | TransferState::Completed { .. } | TransferState::Failed(_) => {
+                    TransferState::Idle
+                    | TransferState::Completed { .. }
+                    | TransferState::Failed(_) => {
                         if ui.button("Start Transfer").clicked() {
                             self.error_message = None;
                             self.start_transfer(ctx);
@@ -280,7 +283,7 @@ impl eframe::App for SenderApp {
                 }
             });
         });
-        
+
         // Обновляем UI во время передачи
         if matches!(*self.state.read(), TransferState::Transferring { .. }) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -304,9 +307,9 @@ async fn transfer_task(
         *state.write() = new_state;
         ctx.request_repaint();
     };
-    
+
     update_state(TransferState::Connecting);
-    
+
     // Создаем sender
     match SharpSender::new(bind_addr, receiver_addr, &file_path, use_encryption).await {
         Ok(sender) => {
@@ -329,12 +332,12 @@ async fn transfer_task(
                     return;
                 }
             };
-            
+
             // Запускаем передачу с эмуляцией прогресса
             // TODO: Интегрировать реальные callbacks из sender
             let start_time = std::time::Instant::now();
             let mut transferred = 0u64;
-            
+
             // Эмулируем прогресс для демонстрации
             loop {
                 // Проверяем отмену
@@ -342,7 +345,7 @@ async fn transfer_task(
                     update_state(TransferState::Failed("Cancelled by user".to_string()));
                     return;
                 }
-                
+
                 // Обновляем прогресс (временная эмуляция)
                 transferred = (transferred + file_size / 100).min(file_size);
                 let progress = transferred as f32 / file_size as f32;
@@ -357,7 +360,7 @@ async fn transfer_task(
                 } else {
                     0
                 };
-                
+
                 update_state(TransferState::Transferring {
                     progress,
                     speed_mbps,
@@ -365,7 +368,7 @@ async fn transfer_task(
                     bytes_sent: transferred,
                     total_bytes: file_size,
                 });
-                
+
                 if transferred >= file_size {
                     update_state(TransferState::Completed {
                         total_time_s: elapsed,
@@ -373,7 +376,7 @@ async fn transfer_task(
                     });
                     break;
                 }
-                
+
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }

@@ -3,14 +3,14 @@
 //! Comprehensive RFC 8445 compliant candidate gathering with webrtc-rs integration
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, Notify};
-use tokio::time::{timeout, sleep, interval};
-use tracing::{debug, info, warn, error, trace};
-use parking_lot::Mutex;
+use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::time::{interval, sleep, timeout};
+use tracing::{debug, error, info, trace, warn};
 
 use webrtc::ice::{
     agent::Agent as WebRtcAgent,
@@ -18,11 +18,9 @@ use webrtc::ice::{
     state::GatheringState as WebRtcGatheringState,
 };
 
-use crate::connectivity::{
-    Candidate, CandidateType, CandidateAttributes, ConnectivityEvent,
-};
 use crate::connectivity::config::IceConfig;
 use crate::connectivity::ice::utils::webrtc_candidate_to_candidate;
+use crate::connectivity::{Candidate, CandidateAttributes, CandidateType, ConnectivityEvent};
 
 /// Прогресс сбора кандидатов
 #[derive(Debug, Clone)]
@@ -142,9 +140,9 @@ impl GatheringStats {
     }
 
     pub fn total_candidates(&self) -> u64 {
-        self.host_candidates_gathered +
-            self.srflx_candidates_gathered +
-            self.relay_candidates_gathered
+        self.host_candidates_gathered
+            + self.srflx_candidates_gathered
+            + self.relay_candidates_gathered
     }
 }
 
@@ -283,54 +281,64 @@ impl CandidateGatherer {
         let progress_clone = Arc::clone(&progress);
         let stats_clone = Arc::clone(&stats);
 
-        self.webrtc_agent.on_candidate(Box::new(move |webrtc_candidate| {
-            let gathered_candidates = Arc::clone(&gathered_candidates_clone);
-            let progress = Arc::clone(&progress_clone);
-            let stats = Arc::clone(&stats_clone);
-            let event_tx = event_tx_candidates.clone();
+        self.webrtc_agent
+            .on_candidate(Box::new(move |webrtc_candidate| {
+                let gathered_candidates = Arc::clone(&gathered_candidates_clone);
+                let progress = Arc::clone(&progress_clone);
+                let stats = Arc::clone(&stats_clone);
+                let event_tx = event_tx_candidates.clone();
 
-            Box::pin(async move {
-                if let Some(webrtc_candidate) = webrtc_candidate {
-                    // Конвертируем webrtc кандидат в наш формат
-                    match webrtc_candidate_to_candidate(webrtc_candidate.as_ref()) {
-                        Ok(candidate) => {
-                            trace!("Gathered candidate: {:?}", candidate);
+                Box::pin(async move {
+                    if let Some(webrtc_candidate) = webrtc_candidate {
+                        // Конвертируем webrtc кандидат в наш формат
+                        match webrtc_candidate_to_candidate(webrtc_candidate.as_ref()) {
+                            Ok(candidate) => {
+                                trace!("Gathered candidate: {:?}", candidate);
 
-                            // Добавляем к собранным кандидатам
-                            gathered_candidates.write().await.push(candidate.clone());
+                                // Добавляем к собранным кандидатам
+                                gathered_candidates.write().await.push(candidate.clone());
 
-                            // Обновляем прогресс
-                            {
-                                let mut progress = progress.write().await;
-                                *progress.candidates_count.entry(candidate.candidate_type).or_insert(0) += 1;
-                                progress.total_candidates += 1;
-                            }
-
-                            // Обновляем статистику
-                            {
-                                let mut stats = stats.write().await;
-                                match candidate.candidate_type {
-                                    CandidateType::Host => stats.host_candidates_gathered += 1,
-                                    CandidateType::ServerReflexive => stats.srflx_candidates_gathered += 1,
-                                    CandidateType::Relay => stats.relay_candidates_gathered += 1,
-                                    _ => {}
+                                // Обновляем прогресс
+                                {
+                                    let mut progress = progress.write().await;
+                                    *progress
+                                        .candidates_count
+                                        .entry(candidate.candidate_type)
+                                        .or_insert(0) += 1;
+                                    progress.total_candidates += 1;
                                 }
-                            }
 
-                            // Отправляем событие о новом кандидате
-                            let _ = event_tx.send(ConnectivityEvent::CandidateGathered(candidate));
+                                // Обновляем статистику
+                                {
+                                    let mut stats = stats.write().await;
+                                    match candidate.candidate_type {
+                                        CandidateType::Host => stats.host_candidates_gathered += 1,
+                                        CandidateType::ServerReflexive => {
+                                            stats.srflx_candidates_gathered += 1
+                                        }
+                                        CandidateType::Relay => {
+                                            stats.relay_candidates_gathered += 1
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                // Отправляем событие о новом кандидате
+                                let _ =
+                                    event_tx.send(ConnectivityEvent::CandidateGathered(candidate));
+                            }
+                            Err(e) => {
+                                warn!("Failed to convert WebRTC candidate: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to convert WebRTC candidate: {}", e);
-                        }
+                    } else {
+                        // null candidate означает завершение gathering
+                        debug!("Gathering completed (null candidate received)");
+                        gathering_complete.notify_one();
                     }
-                } else {
-                    // null candidate означает завершение gathering
-                    debug!("Gathering completed (null candidate received)");
-                    gathering_complete.notify_one();
-                }
-            })
-        })).await;
+                })
+            }))
+            .await;
 
         // Обработчик изменения состояния gathering
         let state_clone = Arc::clone(&state);
@@ -339,43 +347,45 @@ impl CandidateGatherer {
         let gathering_complete_clone = Arc::clone(&gathering_complete);
         let event_tx_state = event_tx.clone();
 
-        self.webrtc_agent.on_gathering_state_change(Box::new(move |webrtc_state| {
-            let state = Arc::clone(&state_clone);
-            let progress = Arc::clone(&progress_clone);
-            let stats = Arc::clone(&stats_clone);
-            let gathering_complete = Arc::clone(&gathering_complete_clone);
-            let event_tx = event_tx_state.clone();
+        self.webrtc_agent
+            .on_gathering_state_change(Box::new(move |webrtc_state| {
+                let state = Arc::clone(&state_clone);
+                let progress = Arc::clone(&progress_clone);
+                let stats = Arc::clone(&stats_clone);
+                let gathering_complete = Arc::clone(&gathering_complete_clone);
+                let event_tx = event_tx_state.clone();
 
-            Box::pin(async move {
-                let new_state = GatheringState::from(webrtc_state);
-                debug!("Gathering state changed to: {:?}", new_state);
+                Box::pin(async move {
+                    let new_state = GatheringState::from(webrtc_state);
+                    debug!("Gathering state changed to: {:?}", new_state);
 
-                // Обновляем состояние
-                *state.write().await = new_state;
+                    // Обновляем состояние
+                    *state.write().await = new_state;
 
-                // Обновляем прогресс
-                {
-                    let mut progress = progress.write().await;
-                    progress.state = new_state;
+                    // Обновляем прогресс
+                    {
+                        let mut progress = progress.write().await;
+                        progress.state = new_state;
 
-                    if new_state == GatheringState::Complete {
-                        progress.completed_at = Some(Instant::now());
+                        if new_state == GatheringState::Complete {
+                            progress.completed_at = Some(Instant::now());
+                        }
                     }
-                }
 
-                // Обновляем статистику
-                if new_state == GatheringState::Complete {
-                    stats.write().await.completed_at = Some(Instant::now());
-                }
+                    // Обновляем статистику
+                    if new_state == GatheringState::Complete {
+                        stats.write().await.completed_at = Some(Instant::now());
+                    }
 
-                // Если сбор завершен, уведомляем
-                if new_state == GatheringState::Complete {
-                    let candidates = gathered_candidates.read().await.clone();
-                    let _ = event_tx.send(ConnectivityEvent::GatheringComplete(candidates));
-                    gathering_complete.notify_one();
-                }
-            })
-        })).await;
+                    // Если сбор завершен, уведомляем
+                    if new_state == GatheringState::Complete {
+                        let candidates = gathered_candidates.read().await.clone();
+                        let _ = event_tx.send(ConnectivityEvent::GatheringComplete(candidates));
+                        gathering_complete.notify_one();
+                    }
+                })
+            }))
+            .await;
 
         Ok(())
     }
@@ -393,11 +403,17 @@ impl CandidateGatherer {
                     info!("Gathered {} candidates", candidates.len());
                     Ok(())
                 } else {
-                    Err(anyhow::anyhow!("Gathering completed with state: {:?}", state))
+                    Err(anyhow::anyhow!(
+                        "Gathering completed with state: {:?}",
+                        state
+                    ))
                 }
             }
             Err(_) => {
-                warn!("ICE candidate gathering timed out after {:?}", timeout_duration);
+                warn!(
+                    "ICE candidate gathering timed out after {:?}",
+                    timeout_duration
+                );
                 self.handle_gathering_error("Gathering timeout").await;
                 Err(anyhow::anyhow!("Gathering timeout"))
             }
@@ -419,10 +435,16 @@ impl CandidateGatherer {
         }
 
         // Обновляем статистику
-        self.stats.write().await.gathering_errors.push(error.to_string());
+        self.stats
+            .write()
+            .await
+            .gathering_errors
+            .push(error.to_string());
 
         // Отправляем событие об ошибке
-        let _ = self.event_tx.send(ConnectivityEvent::Error(error.to_string()));
+        let _ = self
+            .event_tx
+            .send(ConnectivityEvent::Error(error.to_string()));
     }
 
     /// Получение собранных кандидатов
@@ -542,12 +564,7 @@ impl GathererFactory {
             ..Default::default()
         };
 
-        CandidateGatherer::with_config(
-            webrtc_agent,
-            ice_config,
-            gathering_config,
-            event_tx,
-        )
+        CandidateGatherer::with_config(webrtc_agent, ice_config, gathering_config, event_tx)
     }
 }
 
@@ -564,7 +581,11 @@ mod tests {
             ..Default::default()
         };
 
-        Arc::new(WebRtcAgent::new(config).await.expect("Failed to create test agent"))
+        Arc::new(
+            WebRtcAgent::new(config)
+                .await
+                .expect("Failed to create test agent"),
+        )
     }
 
     #[tokio::test]

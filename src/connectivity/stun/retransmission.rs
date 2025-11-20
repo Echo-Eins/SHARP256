@@ -256,10 +256,7 @@ pub enum RetransmissionAction {
     Wait { duration: Duration },
 
     /// Retransmit the message
-    Retransmit {
-        attempt: u32,
-        rto: Duration,
-    },
+    Retransmit { attempt: u32, rto: Duration },
 
     /// Wait for final timeout
     WaitFinal { duration: Duration },

@@ -1,20 +1,20 @@
+use crate::protocol::constants::*;
 use bytes::{Buf, BufMut, BytesMut};
 use std::io::{self, Error, ErrorKind};
-use crate::protocol::constants::*;
 
 /// Заголовок пакета SHARP-256 (30 байт)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketHeader {
-    pub magic_number: u16,          // 2 bytes - идентификатор протокола
-    pub version: u8,                // 1 byte - версия протокола
-    pub packet_type: PacketType,    // 1 byte - тип пакета
-    pub batch_number: u32,          // 4 bytes - номер партии
-    pub packet_in_batch: u16,       // 2 bytes - номер пакета в партии
-    pub total_packets: u16,         // 2 bytes - всего пакетов в партии
-    pub payload_length: u32,        // 4 bytes - размер полезной нагрузки
-    pub flags: u8,                  // 1 byte - флаги
-    pub sequence: u32,              // 4 bytes - глобальный номер (для отладки)
-    pub reserved: [u8; 9],          // 9 bytes - резерв
+    pub magic_number: u16,       // 2 bytes - идентификатор протокола
+    pub version: u8,             // 1 byte - версия протокола
+    pub packet_type: PacketType, // 1 byte - тип пакета
+    pub batch_number: u32,       // 4 bytes - номер партии
+    pub packet_in_batch: u16,    // 2 bytes - номер пакета в партии
+    pub total_packets: u16,      // 2 bytes - всего пакетов в партии
+    pub payload_length: u32,     // 4 bytes - размер полезной нагрузки
+    pub flags: u8,               // 1 byte - флаги
+    pub sequence: u32,           // 4 bytes - глобальный номер (для отладки)
+    pub reserved: [u8; 9],       // 9 bytes - резерв
 }
 
 impl PacketHeader {
@@ -36,7 +36,7 @@ impl PacketHeader {
     /// Сериализация заголовка в байты
     pub fn to_bytes(&self) -> BytesMut {
         let mut buf = BytesMut::with_capacity(SHARP_HEADER_SIZE);
-        
+
         buf.put_u16(self.magic_number);
         buf.put_u8(self.version);
         buf.put_u8(self.packet_type as u8);
@@ -47,7 +47,7 @@ impl PacketHeader {
         buf.put_u8(self.flags);
         buf.put_u32(self.sequence);
         buf.put_slice(&self.reserved);
-        
+
         buf
     }
 
@@ -56,23 +56,20 @@ impl PacketHeader {
         if buf.len() < SHARP_HEADER_SIZE {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "Buffer too small for packet header"
+                "Buffer too small for packet header",
             ));
         }
 
         let magic_number = buf.get_u16();
         if magic_number != MAGIC_NUMBER {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "Invalid magic number"
-            ));
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid magic number"));
         }
 
         let version = buf.get_u8();
         if version != PROTOCOL_VERSION {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "Unsupported protocol version"
+                "Unsupported protocol version",
             ));
         }
 
@@ -91,7 +88,7 @@ impl PacketHeader {
         let payload_length = buf.get_u32();
         let flags = buf.get_u8();
         let sequence = buf.get_u32();
-        
+
         let mut reserved = [0u8; 9];
         buf.copy_to_slice(&mut reserved);
 
@@ -128,7 +125,8 @@ impl PacketHeader {
             BLOCK_SIZE as u64
         };
 
-        let packets_before = self.batch_number as u64 * batch_size as u64 + self.packet_in_batch as u64;
+        let packets_before =
+            self.batch_number as u64 * batch_size as u64 + self.packet_in_batch as u64;
         packets_before * block_size
     }
 }
@@ -155,11 +153,11 @@ impl Packet {
     /// Десериализация пакета из байтов
     pub fn from_bytes(buf: &mut BytesMut) -> io::Result<Self> {
         let header = PacketHeader::from_bytes(buf)?;
-        
+
         if buf.len() < header.payload_length as usize {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "Buffer too small for payload"
+                "Buffer too small for payload",
             ));
         }
 
@@ -168,10 +166,10 @@ impl Packet {
         if !buf.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "Trailing data after packet"
+                "Trailing data after packet",
             ));
         }
-        
+
         Ok(Self { header, payload })
     }
 }

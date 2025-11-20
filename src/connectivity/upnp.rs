@@ -8,7 +8,9 @@ use anyhow::Result;
 pub struct UpnpManager;
 
 impl UpnpManager {
-    pub fn new(_config: impl Into<Option<crate::connectivity::config::ConnectivityConfig>>) -> Result<Self> {
+    pub fn new(
+        _config: impl Into<Option<crate::connectivity::config::ConnectivityConfig>>,
+    ) -> Result<Self> {
         Ok(Self)
     }
 }

@@ -7,30 +7,27 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, Notify};
-use tokio::time::{timeout, sleep};
-use tracing::{debug, info, warn, error};
+use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, info, warn};
 
-use webrtc::ice::{
-    agent::Agent as WebRtcAgent,
-    candidate::Candidate as WebRtcCandidate,
-};
 use anyhow::Context;
+use webrtc::ice::{agent::Agent as WebRtcAgent, candidate::Candidate as WebRtcCandidate};
 
 use crate::connectivity::stun::{
-    StunClient, StunClientConfig, StunConfig,
-    StunMessage, StunMessageType,
-    attributes::StunAttribute,
-    transaction::TransactionId,
+    attributes::StunAttribute, transaction::TransactionId, StunClient, StunClientConfig,
+    StunConfig, StunMessage, StunMessageType,
 };
 
 use crate::connectivity::{
-    Candidate, CandidatePair, CandidatePairState, CandidateType,
-    ConnectivityEvent, CandidateAttributes,
+    Candidate, CandidateAttributes, CandidatePair, CandidatePairState, CandidateType,
+    ConnectivityEvent,
 };
 
 /// Convert webrtc-rs candidate to our Candidate format
-fn webrtc_candidate_to_candidate(webrtc_candidate: &Arc<dyn WebRtcCandidate + Send + Sync>) -> Candidate {
+fn webrtc_candidate_to_candidate(
+    webrtc_candidate: &Arc<dyn WebRtcCandidate + Send + Sync>,
+) -> Candidate {
     use std::net::SocketAddr;
 
     let candidate_type = match webrtc_candidate.candidate_type() {
@@ -42,7 +39,10 @@ fn webrtc_candidate_to_candidate(webrtc_candidate: &Arc<dyn WebRtcCandidate + Se
     };
 
     let address = SocketAddr::new(
-        webrtc_candidate.address().parse().unwrap_or_else(|_| "0.0.0.0".parse().unwrap()),
+        webrtc_candidate
+            .address()
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0".parse().unwrap()),
         webrtc_candidate.port(),
     );
 
@@ -268,25 +268,32 @@ impl CandidateNominator {
         let mut pairs_by_component: HashMap<u32, Vec<CandidatePair>> = HashMap::new();
         for pair in pairs {
             let component_id = pair.local.attributes.component;
-            pairs_by_component.entry(component_id).or_insert_with(Vec::new).push(pair);
+            pairs_by_component
+                .entry(component_id)
+                .or_insert_with(Vec::new)
+                .push(pair);
         }
 
         // Добавляем entries для каждого компонента
         {
             let mut entries = self.nomination_entries.write().await;
             for (component_id, component_pairs) in pairs_by_component {
-                let entry = entries.entry(component_id).or_insert_with(|| NominationEntry {
-                    component_id,
-                    state: NominationState::NotStarted,
-                    candidate_pairs: Vec::new(),
-                    nominated_pair: None,
-                    nominated_at: None,
-                    attempts: 0,
-                });
+                let entry = entries
+                    .entry(component_id)
+                    .or_insert_with(|| NominationEntry {
+                        component_id,
+                        state: NominationState::NotStarted,
+                        candidate_pairs: Vec::new(),
+                        nominated_pair: None,
+                        nominated_at: None,
+                        attempts: 0,
+                    });
 
                 // Добавляем новые пары и сортируем по приоритету
                 entry.candidate_pairs.extend(component_pairs);
-                entry.candidate_pairs.sort_by(|a, b| b.priority.cmp(&a.priority));
+                entry
+                    .candidate_pairs
+                    .sort_by(|a, b| b.priority.cmp(&a.priority));
 
                 // Применяем дополнительные предпочтения
                 if self.config.prefer_relay_candidates {
@@ -312,7 +319,9 @@ impl CandidateNominator {
     /// Запуск nomination процесса
     pub async fn start_nomination(&self) -> Result<()> {
         if !self.controlling {
-            return Err(anyhow::anyhow!("Only controlling agent can start nomination"));
+            return Err(anyhow::anyhow!(
+                "Only controlling agent can start nomination"
+            ));
         }
 
         if *self.shutdown.read().await {
@@ -360,68 +369,74 @@ impl CandidateNominator {
         let nomination_complete_clone = Arc::clone(&nomination_complete);
         let state_clone = Arc::clone(&state);
 
-        self.webrtc_agent.on_selected_candidate_pair_change(Box::new(move |webrtc_pair| {
-            let stats = Arc::clone(&stats_clone);
-            let entries = Arc::clone(&entries_clone);
-            let event_tx = event_tx_clone.clone();
-            let nomination_complete = Arc::clone(&nomination_complete_clone);
-            let state = Arc::clone(&state_clone);
+        self.webrtc_agent
+            .on_selected_candidate_pair_change(Box::new(move |webrtc_pair| {
+                let stats = Arc::clone(&stats_clone);
+                let entries = Arc::clone(&entries_clone);
+                let event_tx = event_tx_clone.clone();
+                let nomination_complete = Arc::clone(&nomination_complete_clone);
+                let state = Arc::clone(&state_clone);
 
-            Box::pin(async move {
-                if let Some(webrtc_pair) = webrtc_pair {
-                    debug!("Selected candidate pair changed - nomination successful");
+                Box::pin(async move {
+                    if let Some(webrtc_pair) = webrtc_pair {
+                        debug!("Selected candidate pair changed - nomination successful");
 
-                    // Convert webrtc-rs candidate pair to our format
-                    let local_candidate = webrtc_candidate_to_candidate(&webrtc_pair.local);
-                    let remote_candidate = webrtc_candidate_to_candidate(&webrtc_pair.remote);
-                    let component_id = webrtc_pair.local.component() as u32;
+                        // Convert webrtc-rs candidate pair to our format
+                        let local_candidate = webrtc_candidate_to_candidate(&webrtc_pair.local);
+                        let remote_candidate = webrtc_candidate_to_candidate(&webrtc_pair.remote);
+                        let component_id = webrtc_pair.local.component() as u32;
 
-                    let nominated_pair = CandidatePair {
-                        local: local_candidate,
-                        remote: remote_candidate,
-                        priority: (webrtc_pair.local.priority() as u64) << 32 |
-                                  (webrtc_pair.remote.priority() as u64),
-                        state: CandidatePairState::Succeeded,
-                        nominated: true,
-                        valid: true,
-                        last_check: Some(Instant::now()),
-                    };
+                        let nominated_pair = CandidatePair {
+                            local: local_candidate,
+                            remote: remote_candidate,
+                            priority: (webrtc_pair.local.priority() as u64) << 32
+                                | (webrtc_pair.remote.priority() as u64),
+                            state: CandidatePairState::Succeeded,
+                            nominated: true,
+                            valid: true,
+                            last_check: Some(Instant::now()),
+                        };
 
-                    // Update nomination entry for this component
-                    {
-                        let mut entries_guard = entries.write().await;
-                        if let Some(entry) = entries_guard.get_mut(&component_id) {
-                            entry.state = NominationState::Nominated;
-                            entry.nominated_pair = Some(nominated_pair.clone());
-                            entry.nominated_at = Some(Instant::now());
+                        // Update nomination entry for this component
+                        {
+                            let mut entries_guard = entries.write().await;
+                            if let Some(entry) = entries_guard.get_mut(&component_id) {
+                                entry.state = NominationState::Nominated;
+                                entry.nominated_pair = Some(nominated_pair.clone());
+                                entry.nominated_at = Some(Instant::now());
+                            }
+                        }
+
+                        // Update statistics
+                        {
+                            let mut stats_guard = stats.write().await;
+                            stats_guard.successful_nominations += 1;
+                            stats_guard
+                                .nominated_pairs_by_component
+                                .insert(component_id, nominated_pair);
+                            if let Some(started_at) = stats_guard.started_at {
+                                stats_guard.time_to_nominate = Some(Instant::now() - started_at);
+                            }
+                        }
+
+                        // Check if nomination completed for all components
+                        let all_completed = {
+                            let entries_guard = entries.read().await;
+                            !entries_guard.is_empty()
+                                && entries_guard
+                                    .values()
+                                    .all(|entry| entry.state == NominationState::Nominated)
+                        };
+
+                        if all_completed {
+                            *state.write().await = NominationState::Completed;
+                            stats.write().await.completed_at = Some(Instant::now());
+                            nomination_complete.notify_one();
                         }
                     }
-
-                    // Update statistics
-                    {
-                        let mut stats_guard = stats.write().await;
-                        stats_guard.successful_nominations += 1;
-                        stats_guard.nominated_pairs_by_component.insert(component_id, nominated_pair);
-                        if let Some(started_at) = stats_guard.started_at {
-                            stats_guard.time_to_nominate = Some(Instant::now() - started_at);
-                        }
-                    }
-
-                    // Check if nomination completed for all components
-                    let all_completed = {
-                        let entries_guard = entries.read().await;
-                        !entries_guard.is_empty() &&
-                            entries_guard.values().all(|entry| entry.state == NominationState::Nominated)
-                    };
-
-                    if all_completed {
-                        *state.write().await = NominationState::Completed;
-                        stats.write().await.completed_at = Some(Instant::now());
-                        nomination_complete.notify_one();
-                    }
-                }
-            })
-        })).await;
+                })
+            }))
+            .await;
 
         Ok(())
     }
@@ -459,7 +474,10 @@ impl CandidateNominator {
                 Ok(())
             }
             Err(_) => {
-                warn!("Aggressive nomination timed out after {:?}", timeout_duration);
+                warn!(
+                    "Aggressive nomination timed out after {:?}",
+                    timeout_duration
+                );
                 self.handle_nomination_timeout().await;
                 Err(anyhow::anyhow!("Nomination timeout"))
             }
@@ -478,9 +496,9 @@ impl CandidateNominator {
         // Проверяем, достаточно ли успешных пар
         let ready_for_nomination = {
             let entries = self.nomination_entries.read().await;
-            entries.values().all(|entry| {
-                entry.candidate_pairs.len() >= self.config.min_successful_pairs
-            })
+            entries
+                .values()
+                .all(|entry| entry.candidate_pairs.len() >= self.config.min_successful_pairs)
         };
 
         if !ready_for_nomination {
@@ -535,15 +553,20 @@ impl CandidateNominator {
     /// webrtc-rs Agent обрабатывает USE-CANDIDATE внутренне при connectivity checks.
     /// Мы дополнительно измеряем RTT через наш STUN клиент для точной статистики.
     async fn nominate_pair(&self, component_id: u32, pair: CandidatePair) -> Result<()> {
-        info!("Nominating pair (component {}): {:?} -> {:?}",
-              component_id, pair.local.address, pair.remote.address);
+        info!(
+            "Nominating pair (component {}): {:?} -> {:?}",
+            component_id, pair.local.address, pair.remote.address
+        );
 
         // Update statistics
         self.stats.write().await.nomination_attempts += 1;
 
         // Check agent connection state
         let agent_state = self.webrtc_agent.get_connection_state().await;
-        debug!("WebRTC agent connection state before nomination: {:?}", agent_state);
+        debug!(
+            "WebRTC agent connection state before nomination: {:?}",
+            agent_state
+        );
 
         // Measure actual RTT to the peer using our STUN client
         // This provides accurate timing for statistics and logging
@@ -571,11 +594,16 @@ impl CandidateNominator {
             pair: pair.clone(),
         });
 
-        debug!("USE-CANDIDATE will be sent by webrtc-rs Agent for pair: {:?} -> {:?}",
-               pair.local.address, pair.remote.address);
+        debug!(
+            "USE-CANDIDATE will be sent by webrtc-rs Agent for pair: {:?} -> {:?}",
+            pair.local.address, pair.remote.address
+        );
 
         // Log that nomination is in progress
-        info!("Nomination in progress (webrtc-rs handles USE-CANDIDATE), RTT={:?}", rtt);
+        info!(
+            "Nomination in progress (webrtc-rs handles USE-CANDIDATE), RTT={:?}",
+            rtt
+        );
 
         Ok(())
     }
@@ -585,8 +613,8 @@ impl CandidateNominator {
     /// This sends a STUN Binding Request to the remote candidate's address
     /// to get an accurate RTT measurement for statistics.
     async fn measure_rtt_to_peer(&self, pair: &CandidatePair) -> Result<Duration> {
-        use tokio::net::UdpSocket;
         use std::time::Instant;
+        use tokio::net::UdpSocket;
 
         // Create a temporary socket for RTT measurement
         let local_addr = pair.local.address;
@@ -594,17 +622,19 @@ impl CandidateNominator {
 
         // Build STUN Binding Request
         let mut msg = StunMessage::new_binding_request();
-        let request_bytes = msg.encode()
-            .context("Failed to encode STUN request")?;
+        let request_bytes = msg.encode().context("Failed to encode STUN request")?;
 
         // Bind to local candidate address
-        let socket = UdpSocket::bind("0.0.0.0:0").await
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
             .context("Failed to bind socket for RTT measurement")?;
 
         let start = Instant::now();
 
         // Send request
-        socket.send_to(&request_bytes, remote_addr).await
+        socket
+            .send_to(&request_bytes, remote_addr)
+            .await
             .context("Failed to send STUN request")?;
 
         // Wait for response with timeout
@@ -632,7 +662,11 @@ impl CandidateNominator {
     }
 
     /// Обработка успешной номинации
-    async fn handle_nomination_success(&self, component_id: u32, pair: CandidatePair) -> Result<()> {
+    async fn handle_nomination_success(
+        &self,
+        component_id: u32,
+        pair: CandidatePair,
+    ) -> Result<()> {
         info!("Nomination successful for component {}", component_id);
 
         // Обновляем entry
@@ -649,7 +683,9 @@ impl CandidateNominator {
         {
             let mut stats = self.stats.write().await;
             stats.successful_nominations += 1;
-            stats.nominated_pairs_by_component.insert(component_id, pair.clone());
+            stats
+                .nominated_pairs_by_component
+                .insert(component_id, pair.clone());
         }
 
         // Создаем результат номинации
@@ -663,7 +699,9 @@ impl CandidateNominator {
         };
 
         // Отправляем событие номинации
-        let _ = self.event_tx.send(ConnectivityEvent::CandidatePairNominated(pair));
+        let _ = self
+            .event_tx
+            .send(ConnectivityEvent::CandidatePairNominated(pair));
 
         // Проверяем, завершена ли nomination для всех компонентов
         self.check_nomination_completion().await;
@@ -676,15 +714,19 @@ impl CandidateNominator {
         &self,
         component_id: u32,
         pair: CandidatePair,
-        reason: &str
+        reason: &str,
     ) -> Result<()> {
-        warn!("Nomination failed for component {}: {}", component_id, reason);
+        warn!(
+            "Nomination failed for component {}: {}",
+            component_id, reason
+        );
 
         // Обновляем entry
         {
             let mut entries = self.nomination_entries.write().await;
             if let Some(entry) = entries.get_mut(&component_id) {
-                if entry.attempts < 3 { // Максимум 3 попытки
+                if entry.attempts < 3 {
+                    // Максимум 3 попытки
                     entry.state = NominationState::NotStarted; // Попробуем другую пару
                 } else {
                     entry.state = NominationState::Failed;
@@ -721,7 +763,10 @@ impl CandidateNominator {
         };
 
         if let Some(pair) = next_pair {
-            debug!("Retrying nomination with next pair for component {}", component_id);
+            debug!(
+                "Retrying nomination with next pair for component {}",
+                component_id
+            );
             self.nominate_pair(component_id, pair).await?;
         }
 
@@ -732,9 +777,13 @@ impl CandidateNominator {
     async fn check_nomination_completion(&self) {
         let (all_nominated, any_failed) = {
             let entries = self.nomination_entries.read().await;
-            let all_nominated = !entries.is_empty() &&
-                entries.values().all(|entry| entry.state == NominationState::Nominated);
-            let any_failed = entries.values().any(|entry| entry.state == NominationState::Failed);
+            let all_nominated = !entries.is_empty()
+                && entries
+                    .values()
+                    .all(|entry| entry.state == NominationState::Nominated);
+            let any_failed = entries
+                .values()
+                .any(|entry| entry.state == NominationState::Failed);
             (all_nominated, any_failed)
         };
 
@@ -757,7 +806,8 @@ impl CandidateNominator {
         // 1. Сортируем по приоритету
         // 2. Применяем предпочтения конфигурации
 
-        let mut scored_pairs: Vec<(CandidatePair, f64)> = pairs.iter()
+        let mut scored_pairs: Vec<(CandidatePair, f64)> = pairs
+            .iter()
             .map(|pair| (pair.clone(), self.calculate_pair_score(pair)))
             .collect();
 
@@ -796,11 +846,10 @@ impl CandidateNominator {
         *self.state.write().await = NominationState::Failed;
         self.stats.write().await.completed_at = Some(Instant::now());
 
-        let _ = self.event_tx.send(ConnectivityEvent::Error(
-            "Nomination timeout".to_string()
-        ));
+        let _ = self
+            .event_tx
+            .send(ConnectivityEvent::Error("Nomination timeout".to_string()));
     }
-
 
     // Публичные методы для получения состояния
 
@@ -812,13 +861,17 @@ impl CandidateNominator {
     /// Получение номинированных пар
     pub async fn get_nominated_pairs(&self) -> Vec<CandidatePair> {
         let entries = self.nomination_entries.read().await;
-        entries.values()
+        entries
+            .values()
             .filter_map(|entry| entry.nominated_pair.clone())
             .collect()
     }
 
     /// Получение номинированной пары для компонента
-    pub async fn get_nominated_pair_for_component(&self, component_id: u32) -> Option<CandidatePair> {
+    pub async fn get_nominated_pair_for_component(
+        &self,
+        component_id: u32,
+    ) -> Option<CandidatePair> {
         let entries = self.nomination_entries.read().await;
         entries.get(&component_id)?.nominated_pair.clone()
     }
@@ -945,7 +998,11 @@ mod tests {
             ..Default::default()
         };
 
-        Arc::new(WebRtcAgent::new(config).await.expect("Failed to create test agent"))
+        Arc::new(
+            WebRtcAgent::new(config)
+                .await
+                .expect("Failed to create test agent"),
+        )
     }
 
     #[tokio::test]
@@ -953,9 +1010,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let webrtc_agent = create_test_webrtc_agent().await;
 
-        let nominator = NominatorFactory::create_for_testing(
-            webrtc_agent, true, event_tx
-        );
+        let nominator = NominatorFactory::create_for_testing(webrtc_agent, true, event_tx);
 
         assert_eq!(nominator.get_state().await, NominationState::NotStarted);
         assert_eq!(nominator.get_nominated_pairs().await.len(), 0);
@@ -967,15 +1022,13 @@ mod tests {
         let webrtc_agent = create_test_webrtc_agent().await;
 
         // Test aggressive nominator
-        let aggressive = NominatorFactory::create_aggressive(
-            Arc::clone(&webrtc_agent), true, event_tx.clone()
-        );
+        let aggressive =
+            NominatorFactory::create_aggressive(Arc::clone(&webrtc_agent), true, event_tx.clone());
         assert_eq!(aggressive.config.method, NominationMethod::Aggressive);
 
         // Test standard nominator
-        let standard = NominatorFactory::create_standard(
-            Arc::clone(&webrtc_agent), true, event_tx.clone()
-        );
+        let standard =
+            NominatorFactory::create_standard(Arc::clone(&webrtc_agent), true, event_tx.clone());
         assert_eq!(standard.config.method, NominationMethod::Regular);
     }
 
@@ -987,10 +1040,7 @@ mod tests {
         let nominator = CandidateNominator::new(webrtc_agent, true, event_tx);
 
         // Add pairs for component 1
-        let pairs = vec![
-            create_test_pair(1, 100),
-            create_test_pair(1, 200),
-        ];
+        let pairs = vec![create_test_pair(1, 100), create_test_pair(1, 200)];
 
         let result = nominator.add_valid_pairs(pairs).await;
         assert!(result.is_ok());
@@ -1026,9 +1076,7 @@ mod tests {
         let mut config = NominationConfig::default();
         config.prefer_relay_candidates = true;
 
-        let nominator = CandidateNominator::with_config(
-            webrtc_agent, true, config, event_tx
-        );
+        let nominator = CandidateNominator::with_config(webrtc_agent, true, config, event_tx);
 
         // Create host pair
         let host_pair = create_test_pair(1, 1000);

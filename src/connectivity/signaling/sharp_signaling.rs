@@ -1,7 +1,7 @@
 // src/connectivity/signaling/sharp_signaling.rs
 //! SHARP-256 signaling implementation через UDP пакеты
 
-use super::{SignalingMessage, SignalingTransport, SignalingStats};
+use super::{SignalingMessage, SignalingStats, SignalingTransport};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
-use tokio::time::{timeout, sleep};
-use tracing::{debug, info, warn, trace, error};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::connectivity::Candidate;
-use crate::protocol::{packet::*, constants::*};
+use crate::protocol::{constants::*, packet::*};
 
 /// SHARP signaling transport через UDP
 pub struct SharpSignaling {
@@ -41,10 +41,7 @@ impl SharpSignaling {
     pub fn new(socket: Arc<UdpSocket>, peer_addr: SocketAddr) -> Self {
         info!("Creating SHARP signaling transport to {}", peer_addr);
 
-        let reliable_sender = Arc::new(ReliableMessageSender::new(
-            socket.clone(),
-            peer_addr,
-        ));
+        let reliable_sender = Arc::new(ReliableMessageSender::new(socket.clone(), peer_addr));
 
         Self {
             socket,
@@ -58,8 +55,14 @@ impl SharpSignaling {
     }
 
     /// Обмен кандидатами с peer
-    pub async fn exchange_candidates(&self, local_candidates: Vec<Candidate>) -> Result<Vec<Candidate>> {
-        info!("Starting candidate exchange with {} candidates", local_candidates.len());
+    pub async fn exchange_candidates(
+        &self,
+        local_candidates: Vec<Candidate>,
+    ) -> Result<Vec<Candidate>> {
+        info!(
+            "Starting candidate exchange with {} candidates",
+            local_candidates.len()
+        );
 
         // Создаем сообщение с кандидатами
         let exchange_message = SignalingMessage::CandidateExchange {
@@ -82,10 +85,8 @@ impl SharpSignaling {
         while start_time.elapsed() < timeout_duration {
             if let Some((message, _)) = self.try_receive_message().await {
                 if let SignalingMessage::CandidateExchange { candidates, .. } = message {
-                    let received_candidates: Result<Vec<Candidate>> = candidates
-                        .into_iter()
-                        .map(|sc| sc.try_into())
-                        .collect();
+                    let received_candidates: Result<Vec<Candidate>> =
+                        candidates.into_iter().map(|sc| sc.try_into()).collect();
 
                     match received_candidates {
                         Ok(candidates) => {
@@ -109,16 +110,16 @@ impl SharpSignaling {
     /// Обработка входящего SHARP пакета
     pub async fn handle_sharp_packet(&self, packet: Packet) -> Result<()> {
         match packet.header.packet_type {
-            PacketType::IceCandidate |
-            PacketType::IceConnCheck |
-            PacketType::IceNomination => {
+            PacketType::IceCandidate | PacketType::IceConnCheck | PacketType::IceNomination => {
                 // Десериализуем signaling сообщение
                 match bincode::deserialize::<SignalingMessage>(&packet.payload) {
                     Ok(message) => {
                         trace!("Received signaling message: {:?}", message);
 
                         // Добавляем в очередь входящих сообщений
-                        self.incoming_messages.write().push_back((message, self.peer_addr));
+                        self.incoming_messages
+                            .write()
+                            .push_back((message, self.peer_addr));
                         self.message_notify.notify_one();
                         self.stats.write().record_message_received();
 
@@ -147,14 +148,15 @@ impl SharpSignaling {
         let serialized = bincode::serialize(message)?;
 
         let packet_type = match message {
-            SignalingMessage::CandidateExchange { .. } |
-            SignalingMessage::CandidateAck { .. } => PacketType::IceCandidate,
+            SignalingMessage::CandidateExchange { .. } | SignalingMessage::CandidateAck { .. } => {
+                PacketType::IceCandidate
+            }
 
-            SignalingMessage::ConnectivityCheck { .. } |
-            SignalingMessage::ConnectivityResponse { .. } => PacketType::IceConnCheck,
+            SignalingMessage::ConnectivityCheck { .. }
+            | SignalingMessage::ConnectivityResponse { .. } => PacketType::IceConnCheck,
 
-            SignalingMessage::NominationRequest { .. } |
-            SignalingMessage::NominationResponse { .. } => PacketType::IceNomination,
+            SignalingMessage::NominationRequest { .. }
+            | SignalingMessage::NominationResponse { .. } => PacketType::IceNomination,
 
             _ => PacketType::IceCandidate, // Default
         };
@@ -171,26 +173,43 @@ impl SharpSignaling {
 impl SignalingTransport for SharpSignaling {
     async fn send_message(&self, message: SignalingMessage, target: SocketAddr) -> Result<()> {
         if target != self.peer_addr {
-            warn!("Attempting to send message to {}, but configured peer is {}", target, self.peer_addr);
+            warn!(
+                "Attempting to send message to {}, but configured peer is {}",
+                target, self.peer_addr
+            );
         }
 
         let packet = self.create_signaling_packet(&message)?;
         let packet_bytes = packet.to_bytes();
 
-        trace!("Sending signaling packet: {} bytes to {}", packet_bytes.len(), self.peer_addr);
+        trace!(
+            "Sending signaling packet: {} bytes to {}",
+            packet_bytes.len(),
+            self.peer_addr
+        );
 
         match self.socket.send_to(&packet_bytes, self.peer_addr).await {
             Ok(bytes_sent) => {
                 if bytes_sent != packet_bytes.len() {
-                    warn!("Partial signaling packet sent: {}/{} bytes", bytes_sent, packet_bytes.len());
+                    warn!(
+                        "Partial signaling packet sent: {}/{} bytes",
+                        bytes_sent,
+                        packet_bytes.len()
+                    );
                 }
 
                 self.stats.write().record_message_sent();
-                debug!("Sent signaling message to {}: {:?}", self.peer_addr, message);
+                debug!(
+                    "Sent signaling message to {}: {:?}",
+                    self.peer_addr, message
+                );
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to send signaling message to {}: {}", self.peer_addr, e);
+                error!(
+                    "Failed to send signaling message to {}: {}",
+                    self.peer_addr, e
+                );
                 self.stats.write().record_error();
                 Err(e.into())
             }
@@ -208,7 +227,10 @@ impl SignalingTransport for SharpSignaling {
             }
 
             // Ждем уведомления с таймаутом
-            if timeout(timeout_duration, self.message_notify.notified()).await.is_ok() {
+            if timeout(timeout_duration, self.message_notify.notified())
+                .await
+                .is_ok()
+            {
                 continue;
             }
 
@@ -292,7 +314,9 @@ impl ReliableMessageSender {
         };
 
         // Отправляем первый раз
-        self.socket.send_to(&packet.to_bytes(), self.peer_addr).await?;
+        self.socket
+            .send_to(&packet.to_bytes(), self.peer_addr)
+            .await?;
 
         // Добавляем в список ожидающих подтверждения
         self.pending_messages.write().push(pending);
@@ -347,7 +371,11 @@ impl ReliableMessageSender {
 
             // Повторно отправляем сообщения
             for msg in to_retry {
-                if let Err(e) = self.socket.send_to(&msg.packet.to_bytes(), self.peer_addr).await {
+                if let Err(e) = self
+                    .socket
+                    .send_to(&msg.packet.to_bytes(), self.peer_addr)
+                    .await
+                {
                     warn!("Failed to retry message {}: {}", msg.id, e);
                 }
             }
@@ -385,7 +413,9 @@ impl SharpSignalingManager {
     pub async fn create_transport(&self, peer_addr: SocketAddr) -> Arc<SharpSignaling> {
         let transport = Arc::new(SharpSignaling::new(self.socket.clone(), peer_addr));
 
-        self.active_transports.write().insert(peer_addr, transport.clone());
+        self.active_transports
+            .write()
+            .insert(peer_addr, transport.clone());
 
         info!("Created SHARP signaling transport for {}", peer_addr);
         transport
@@ -397,13 +427,14 @@ impl SharpSignalingManager {
     }
 
     /// Обработка входящего пакета от основного SHARP протокола
-    pub async fn handle_incoming_packet(&self, packet: Packet, from_addr: SocketAddr) -> Result<bool> {
+    pub async fn handle_incoming_packet(
+        &self,
+        packet: Packet,
+        from_addr: SocketAddr,
+    ) -> Result<bool> {
         // Проверяем, является ли это signaling пакетом
         match packet.header.packet_type {
-            PacketType::IceCandidate |
-            PacketType::IceConnCheck |
-            PacketType::IceNomination => {
-
+            PacketType::IceCandidate | PacketType::IceConnCheck | PacketType::IceNomination => {
                 // Находим или создаем транспорт для этого peer
                 let transport = if let Some(transport) = self.get_transport(from_addr).await {
                     transport

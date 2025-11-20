@@ -7,13 +7,13 @@
 #![warn(clippy::all)]
 
 // Core protocol modules
-pub mod protocol;
 pub mod buffer;
 pub mod file;
+pub mod fragmentation;
+pub mod progress;
+pub mod protocol;
 pub mod sao;
 pub mod state;
-pub mod progress;
-pub mod fragmentation;
 
 // Security module
 pub mod security;
@@ -27,16 +27,16 @@ pub mod connectivity;
 pub mod gui;
 
 // Re-export main types
-pub use protocol::constants::*;
 pub use fragmentation::*;
-pub use progress::{ProgressInfo, TransferEvent, ProgressCallback, EventCallback};
+pub use progress::{EventCallback, ProgressCallback, ProgressInfo, TransferEvent};
+pub use protocol::constants::*;
 
 // Re-export connectivity types
+// PHASE 2: Connectivity, ConnectivityManager, EstablishedConnection will be added back
 #[cfg(feature = "connectivity")]
 pub use connectivity::{
-    Connectivity, ConnectivityManager, ConnectivityEvent,
-    Candidate, CandidatePair, ConnectionState,
-    EstablishedConnection, Transport, TransportType
+    Candidate, CandidatePair, ConnectionState, ConnectivityEvent, Transport, TransportStats,
+    TransportType,
 };
 
 /// Protocol version
@@ -71,7 +71,7 @@ pub fn init_logging(level: &str) {
                 .with_thread_ids(true)
                 .with_file(true)
                 .with_line_number(true)
-                .with_ansi(true)
+                .with_ansi(true),
         )
         .with(filter)
         .init();
@@ -87,7 +87,8 @@ pub fn system_info() -> String {
     let mut sys = System::new_all();
     sys.refresh_all();
 
-    let cpu_brand = sys.cpus()
+    let cpu_brand = sys
+        .cpus()
         .first()
         .map(|cpu| cpu.brand())
         .unwrap_or("Unknown");
@@ -176,6 +177,7 @@ pub fn symmetric_nat_connectivity_config() -> connectivity::config::Connectivity
 }
 
 /// Connectivity utilities
+/* PHASE 2: connectivity_utils will be rebuilt when Connectivity is available
 #[cfg(feature = "connectivity")]
 pub mod connectivity_utils {
     use super::connectivity::*;
@@ -220,6 +222,7 @@ pub mod connectivity_utils {
         connectivity.get_connectable_address().await
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {
