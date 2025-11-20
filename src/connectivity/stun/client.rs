@@ -442,6 +442,13 @@ impl StunClient {
         self.tracker.get_latest_rtt().await
     }
 
+    /// Get number of pending transactions
+    ///
+    /// Useful for monitoring active STUN requests and detecting potential issues.
+    pub async fn pending_count(&self) -> usize {
+        self.tracker.pending_count().await
+    }
+
     /// Get local address
     pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.socket.local_addr()
