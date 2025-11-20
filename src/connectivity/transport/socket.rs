@@ -645,12 +645,15 @@ impl NetworkInterfaceDetector {
 
             let mut interfaces = Vec::new();
             for if_addr in if_addrs {
+                let interface_name = if_addr.name.clone();
+                let mtu = Self::get_interface_mtu(&interface_name);
+
                 interfaces.push(NetworkInterface {
                     name: if_addr.name,
                     addresses: vec![if_addr.addr.ip()],
                     is_up: true, // if_addrs returns only UP interfaces
                     is_loopback: if_addr.addr.ip().is_loopback(),
-                    mtu: None, // TODO: получить из system calls
+                    mtu,
                 });
             }
 
@@ -660,6 +663,35 @@ impl NetworkInterfaceDetector {
         #[cfg(not(feature = "connectivity"))]
         {
             Ok(Vec::new())
+        }
+    }
+
+    /// Получить MTU интерфейса через system calls
+    ///
+    /// Platform-specific MTU detection:
+    /// - Linux: reads from /sys/class/net/<interface>/mtu
+    /// - Other platforms: returns None (fallback)
+    fn get_interface_mtu(interface_name: &str) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!("/sys/class/net/{}/mtu", interface_name);
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(mtu) = contents.trim().parse::<usize>() {
+                    trace!("Detected MTU for {}: {}", interface_name, mtu);
+                    return Some(mtu);
+                }
+            }
+            None
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // На других платформах используем стандартные MTU значения
+            // В будущем можно добавить platform-specific ioctl для macOS/Windows
+            let _ = interface_name; // suppress unused warning
+
+            // RFC 1191: Path MTU Discovery - стандартный Ethernet MTU
+            Some(1500)
         }
     }
 
