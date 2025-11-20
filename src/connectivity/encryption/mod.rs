@@ -9,21 +9,47 @@ use serde::{Deserialize, Serialize};
 // Submodules
 #[cfg(feature = "relay-encryption")]
 pub mod header_crypto;
-#[cfg(feature = "relay-encryption")]
-pub mod key_exchange;
-#[cfg(feature = "relay-encryption")]
-pub mod obfuscation;
 
 // Re-exports
 #[cfg(feature = "relay-encryption")]
 pub use header_crypto::HeaderCrypto;
-#[cfg(feature = "relay-encryption")]
-pub use key_exchange::{KeyExchanger, SharedSecret};
-#[cfg(feature = "relay-encryption")]
-pub use obfuscation::{PacketObfuscator, ObfuscationLevel};
 
 #[cfg(feature = "relay-encryption")]
 use crate::connectivity::config::HeaderEncryptionAlgorithm;
+
+/// Уровень обфускации пакетов
+#[cfg(feature = "relay-encryption")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ObfuscationLevel {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+/// Key exchanger для обмена ключами (заглушка)
+#[cfg(feature = "relay-encryption")]
+pub struct KeyExchanger {
+    private_key: [u8; 32],
+}
+
+#[cfg(feature = "relay-encryption")]
+impl KeyExchanger {
+    pub fn new(private_key: Option<[u8; 32]>) -> Result<Self> {
+        Ok(Self {
+            private_key: private_key.unwrap_or_else(|| {
+                use rand::Rng;
+                rand::thread_rng().gen()
+            }),
+        })
+    }
+}
+
+/// Shared secret (заглушка)
+#[cfg(feature = "relay-encryption")]
+pub struct SharedSecret {
+    secret: [u8; 32],
+}
 
 /// Алгоритмы шифрования заголовков
 #[cfg(feature = "relay-encryption")]
@@ -371,10 +397,7 @@ pub mod mock {
     }
 }
 
-// Условные re-exports
-#[cfg(feature = "relay-encryption")]
-pub use header_crypto::HeaderCrypto;
-
+// Условные re-exports только для non-relay-encryption
 #[cfg(not(feature = "relay-encryption"))]
 pub use mock::MockHeaderCrypto as HeaderCrypto;
 

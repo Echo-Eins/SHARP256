@@ -554,34 +554,81 @@ impl GathererFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
+    use webrtc::ice::agent::agent_config::AgentConfig;
+    use webrtc::ice::network_type::NetworkType;
+
+    /// Helper to create webrtc-rs agent for testing
+    async fn create_test_webrtc_agent() -> Arc<WebRtcAgent> {
+        let config = AgentConfig {
+            network_types: vec![NetworkType::Udp4],
+            ..Default::default()
+        };
+
+        Arc::new(WebRtcAgent::new(config).await.expect("Failed to create test agent"))
+    }
 
     #[tokio::test]
     async fn test_gatherer_creation() {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
 
-        // Для теста создаем mock webrtc agent
-        // В реальности это должен быть настоящий WebRTC Agent
-        // let webrtc_agent = Arc::new(create_test_agent().await);
-        // let gatherer = GathererFactory::create_for_testing(webrtc_agent, event_tx);
+        let ice_config = IceConfig::default();
+        let gatherer = GathererFactory::create_for_testing(webrtc_agent, ice_config, event_tx);
 
-        // assert_eq!(gatherer.get_state().await, GatheringState::New);
-        // assert_eq!(gatherer.get_candidates().await.len(), 0);
+        assert_eq!(gatherer.get_state().await, GatheringState::New);
+        assert_eq!(gatherer.get_candidates().await.len(), 0);
     }
 
     #[tokio::test]
-    async fn test_state_transitions() {
-        // Тест переходов состояний
-        // New -> Gathering -> Complete
+    async fn test_gathering_config() {
+        let config = GatheringConfig::default();
+
+        assert_eq!(config.gathering_timeout, Duration::from_secs(30));
+        assert_eq!(config.max_retries, 3);
+        assert!(!config.ipv4_only);
+        assert!(!config.ipv6_only);
     }
 
     #[tokio::test]
-    async fn test_gathering_timeout() {
-        // Тест таймаута gathering
+    async fn test_gathering_progress() {
+        let progress = GatheringProgress {
+            state: GatheringState::New,
+            candidates_count: HashMap::new(),
+            total_candidates: 0,
+            started_at: None,
+            completed_at: None,
+            errors: Vec::new(),
+        };
+
+        assert_eq!(progress.state, GatheringState::New);
+        assert_eq!(progress.total_candidates, 0);
     }
 
     #[tokio::test]
-    async fn test_candidate_filtering() {
-        // Тест фильтрации кандидатов по типу
+    async fn test_state_conversion() {
+        // Test conversion from WebRTC gathering state
+        let webrtc_new = WebRtcGatheringState::New;
+        let our_new: GatheringState = webrtc_new.into();
+        assert_eq!(our_new, GatheringState::New);
+
+        let webrtc_gathering = WebRtcGatheringState::Gathering;
+        let our_gathering: GatheringState = webrtc_gathering.into();
+        assert_eq!(our_gathering, GatheringState::Gathering);
+
+        let webrtc_complete = WebRtcGatheringState::Complete;
+        let our_complete: GatheringState = webrtc_complete.into();
+        assert_eq!(our_complete, GatheringState::Complete);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
+
+        let ice_config = IceConfig::default();
+        let gatherer = CandidateGatherer::new(webrtc_agent, ice_config, event_tx);
+
+        let result = gatherer.shutdown().await;
+        assert!(result.is_ok());
     }
 }

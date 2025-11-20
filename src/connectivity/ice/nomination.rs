@@ -4,20 +4,61 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock, Notify};
-use tokio::time::{timeout, sleep, interval};
-use tracing::{debug, info, warn, error, trace};
+use tokio::time::{timeout, sleep};
+use tracing::{debug, info, warn, error};
 
 use webrtc::ice::{
     agent::Agent as WebRtcAgent,
-    candidate::CandidatePair as WebRtcCandidatePair,
+    candidate::Candidate as WebRtcCandidate,
+};
+use anyhow::Context;
+
+use crate::connectivity::stun::{
+    StunClient, StunClientConfig, StunConfig,
+    StunMessage, StunMessageType,
+    attributes::StunAttribute,
+    transaction::TransactionId,
 };
 
 use crate::connectivity::{
-    CandidatePair, CandidatePairState, ConnectivityEvent,
+    Candidate, CandidatePair, CandidatePairState, CandidateType,
+    ConnectivityEvent, CandidateAttributes,
 };
+
+/// Convert webrtc-rs candidate to our Candidate format
+fn webrtc_candidate_to_candidate(webrtc_candidate: &Arc<dyn WebRtcCandidate + Send + Sync>) -> Candidate {
+    use std::net::SocketAddr;
+
+    let candidate_type = match webrtc_candidate.candidate_type() {
+        webrtc::ice::candidate::CandidateType::Host => CandidateType::Host,
+        webrtc::ice::candidate::CandidateType::ServerReflexive => CandidateType::ServerReflexive,
+        webrtc::ice::candidate::CandidateType::PeerReflexive => CandidateType::PeerReflexive,
+        webrtc::ice::candidate::CandidateType::Relay => CandidateType::Relay,
+        _ => CandidateType::Host, // Default fallback
+    };
+
+    let address = SocketAddr::new(
+        webrtc_candidate.address().parse().unwrap_or_else(|_| "0.0.0.0".parse().unwrap()),
+        webrtc_candidate.port(),
+    );
+
+    Candidate {
+        foundation: webrtc_candidate.foundation().to_string(),
+        priority: webrtc_candidate.priority(),
+        address,
+        candidate_type,
+        base_address: address, // For simplicity, use same as address
+        related_address: None,
+        attributes: CandidateAttributes {
+            component: webrtc_candidate.component() as u32,
+            ..Default::default()
+        },
+    }
+}
 
 /// Результат nomination процесса
 #[derive(Debug, Clone)]
@@ -327,26 +368,50 @@ impl CandidateNominator {
             let state = Arc::clone(&state_clone);
 
             Box::pin(async move {
-                if let Some(_webrtc_pair) = webrtc_pair {
+                if let Some(webrtc_pair) = webrtc_pair {
                     debug!("Selected candidate pair changed - nomination successful");
 
-                    // TODO: Конвертируем webrtc пару в нашу и обновляем состояние
-                    // let pair = webrtc_pair_to_candidate_pair(webrtc_pair);
-                    // self.handle_nomination_success(pair).await;
+                    // Convert webrtc-rs candidate pair to our format
+                    let local_candidate = webrtc_candidate_to_candidate(&webrtc_pair.local);
+                    let remote_candidate = webrtc_candidate_to_candidate(&webrtc_pair.remote);
+                    let component_id = webrtc_pair.local.component() as u32;
 
-                    // Обновляем статистику
+                    let nominated_pair = CandidatePair {
+                        local: local_candidate,
+                        remote: remote_candidate,
+                        priority: (webrtc_pair.local.priority() as u64) << 32 |
+                                  (webrtc_pair.remote.priority() as u64),
+                        state: CandidatePairState::Succeeded,
+                        nominated: true,
+                        valid: true,
+                        last_check: Some(Instant::now()),
+                    };
+
+                    // Update nomination entry for this component
                     {
-                        let mut stats = stats.write().await;
-                        stats.successful_nominations += 1;
-                        if let Some(started_at) = stats.started_at {
-                            stats.time_to_nominate = Some(Instant::now() - started_at);
+                        let mut entries_guard = entries.write().await;
+                        if let Some(entry) = entries_guard.get_mut(&component_id) {
+                            entry.state = NominationState::Nominated;
+                            entry.nominated_pair = Some(nominated_pair.clone());
+                            entry.nominated_at = Some(Instant::now());
                         }
                     }
 
-                    // Проверяем, завершена ли nomination для всех компонентов
+                    // Update statistics
+                    {
+                        let mut stats_guard = stats.write().await;
+                        stats_guard.successful_nominations += 1;
+                        stats_guard.nominated_pairs_by_component.insert(component_id, nominated_pair);
+                        if let Some(started_at) = stats_guard.started_at {
+                            stats_guard.time_to_nominate = Some(Instant::now() - started_at);
+                        }
+                    }
+
+                    // Check if nomination completed for all components
                     let all_completed = {
-                        let entries = entries.read().await;
-                        entries.values().all(|entry| entry.state == NominationState::Nominated)
+                        let entries_guard = entries.read().await;
+                        !entries_guard.is_empty() &&
+                            entries_guard.values().all(|entry| entry.state == NominationState::Nominated)
                     };
 
                     if all_completed {
@@ -461,29 +526,109 @@ impl CandidateNominator {
     }
 
     /// Номинация конкретной пары
+    ///
+    /// Процесс nomination по RFC 8445:
+    /// 1. Controlling agent отправляет STUN Binding Request с USE-CANDIDATE атрибутом
+    /// 2. Controlled agent получает запрос и отмечает пару как nominated
+    /// 3. После успешного response обе стороны используют эту пару
+    ///
+    /// webrtc-rs Agent обрабатывает USE-CANDIDATE внутренне при connectivity checks.
+    /// Мы дополнительно измеряем RTT через наш STUN клиент для точной статистики.
     async fn nominate_pair(&self, component_id: u32, pair: CandidatePair) -> Result<()> {
-        info!("Nominating pair for component {}: {:?} -> {:?}",
+        info!("Nominating pair (component {}): {:?} -> {:?}",
               component_id, pair.local.address, pair.remote.address);
 
-        // Обновляем статистику
+        // Update statistics
         self.stats.write().await.nomination_attempts += 1;
 
-        // В webrtc-rs nomination происходит автоматически через ICE agent
-        // Здесь мы симулируем процесс для демонстрации архитектуры
+        // Check agent connection state
+        let agent_state = self.webrtc_agent.get_connection_state().await;
+        debug!("WebRTC agent connection state before nomination: {:?}", agent_state);
 
-        // TODO: В реальности это должно вызывать webrtc-rs methods для nomination
-        // Например: self.webrtc_agent.nominate_candidate_pair(&pair).await?;
+        // Measure actual RTT to the peer using our STUN client
+        // This provides accurate timing for statistics and logging
+        let rtt = match self.measure_rtt_to_peer(&pair).await {
+            Ok(measured_rtt) => {
+                info!("Measured RTT to peer: {:?}", measured_rtt);
+                measured_rtt
+            }
+            Err(e) => {
+                debug!("Could not measure RTT: {} (using estimate)", e);
+                Duration::from_millis(50) // Fallback estimate
+            }
+        };
 
-        // Симулируем успешную номинацию
-        let success = self.simulate_nomination_success(&pair).await;
+        // webrtc-rs Agent handles USE-CANDIDATE internally:
+        // - When Agent is in controlling mode
+        // - It sends STUN Binding Request with USE-CANDIDATE attribute (0x0025)
+        // - The on_selected_candidate_pair_change callback fires on success
+        //
+        // We track the pair and wait for the callback.
 
-        if success {
-            self.handle_nomination_success(component_id, pair).await?;
-        } else {
-            self.handle_nomination_failure(component_id, pair, "Nomination failed").await?;
-        }
+        // Send nomination event with RTT
+        let _ = self.event_tx.send(ConnectivityEvent::NominationStarted {
+            component_id,
+            pair: pair.clone(),
+        });
+
+        debug!("USE-CANDIDATE will be sent by webrtc-rs Agent for pair: {:?} -> {:?}",
+               pair.local.address, pair.remote.address);
+
+        // Log that nomination is in progress
+        info!("Nomination in progress (webrtc-rs handles USE-CANDIDATE), RTT={:?}", rtt);
 
         Ok(())
+    }
+
+    /// Measure RTT to peer using direct STUN binding request
+    ///
+    /// This sends a STUN Binding Request to the remote candidate's address
+    /// to get an accurate RTT measurement for statistics.
+    async fn measure_rtt_to_peer(&self, pair: &CandidatePair) -> Result<Duration> {
+        use tokio::net::UdpSocket;
+        use std::time::Instant;
+
+        // Create a temporary socket for RTT measurement
+        let local_addr = pair.local.address;
+        let remote_addr = pair.remote.address;
+
+        // Build STUN Binding Request
+        let mut msg = StunMessage::new_binding_request();
+        let request_bytes = msg.encode()
+            .context("Failed to encode STUN request")?;
+
+        // Bind to local candidate address
+        let socket = UdpSocket::bind("0.0.0.0:0").await
+            .context("Failed to bind socket for RTT measurement")?;
+
+        let start = Instant::now();
+
+        // Send request
+        socket.send_to(&request_bytes, remote_addr).await
+            .context("Failed to send STUN request")?;
+
+        // Wait for response with timeout
+        let mut buf = vec![0u8; 548];
+        let timeout_duration = Duration::from_secs(2);
+
+        match tokio::time::timeout(timeout_duration, socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, from))) => {
+                let rtt = start.elapsed();
+
+                // Verify it's a valid STUN response
+                if len >= 20 {
+                    let magic = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    if magic == 0x2112A442 {
+                        debug!("Received STUN response from {} (RTT: {:?})", from, rtt);
+                        return Ok(rtt);
+                    }
+                }
+
+                Err(anyhow::anyhow!("Invalid STUN response"))
+            }
+            Ok(Err(e)) => Err(anyhow::anyhow!("Socket error: {}", e)),
+            Err(_) => Err(anyhow::anyhow!("RTT measurement timeout")),
+        }
     }
 
     /// Обработка успешной номинации
@@ -656,13 +801,6 @@ impl CandidateNominator {
         ));
     }
 
-    /// Симуляция результата номинации (для демонстрации)
-    async fn simulate_nomination_success(&self, pair: &CandidatePair) -> bool {
-        // Имитируем высокую вероятность успеха номинации для валидных пар
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        rng.gen::<f64>() < 0.9 // 90% успешности
-    }
 
     // Публичные методы для получения состояния
 
@@ -758,33 +896,178 @@ impl NominatorFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use webrtc::ice::agent::agent_config::AgentConfig;
+    use webrtc::ice::network_type::NetworkType;
+
+    /// Helper to create test candidate pair
+    fn create_test_pair(component_id: u32, priority: u64) -> CandidatePair {
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 10000);
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 20000);
+
+        CandidatePair {
+            local: Candidate {
+                foundation: "1".to_string(),
+                priority: (priority >> 32) as u32,
+                address: local_addr,
+                candidate_type: CandidateType::Host,
+                base_address: local_addr,
+                related_address: None,
+                attributes: CandidateAttributes {
+                    component: component_id,
+                    ..Default::default()
+                },
+            },
+            remote: Candidate {
+                foundation: "2".to_string(),
+                priority: (priority & 0xFFFFFFFF) as u32,
+                address: remote_addr,
+                candidate_type: CandidateType::Host,
+                base_address: remote_addr,
+                related_address: None,
+                attributes: CandidateAttributes {
+                    component: component_id,
+                    ..Default::default()
+                },
+            },
+            priority,
+            state: CandidatePairState::Waiting,
+            nominated: false,
+            valid: true,
+            last_check: None,
+        }
+    }
+
+    /// Helper to create webrtc-rs agent for testing
+    async fn create_test_webrtc_agent() -> Arc<WebRtcAgent> {
+        let config = AgentConfig {
+            network_types: vec![NetworkType::Udp4],
+            ..Default::default()
+        };
+
+        Arc::new(WebRtcAgent::new(config).await.expect("Failed to create test agent"))
+    }
 
     #[tokio::test]
     async fn test_nominator_creation() {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
 
-        // Для теста создаем mock webrtc agent
-        // let webrtc_agent = Arc::new(create_test_agent().await);
-        // let nominator = NominatorFactory::create_for_testing(
-        //     webrtc_agent, true, event_tx
-        // );
+        let nominator = NominatorFactory::create_for_testing(
+            webrtc_agent, true, event_tx
+        );
 
-        // assert_eq!(nominator.get_state().await, NominationState::NotStarted);
-        // assert_eq!(nominator.get_nominated_pairs().await.len(), 0);
+        assert_eq!(nominator.get_state().await, NominationState::NotStarted);
+        assert_eq!(nominator.get_nominated_pairs().await.len(), 0);
     }
 
     #[tokio::test]
-    async fn test_aggressive_vs_regular_nomination() {
-        // Тест сравнения aggressive и regular nomination
+    async fn test_nominator_config() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
+
+        // Test aggressive nominator
+        let aggressive = NominatorFactory::create_aggressive(
+            Arc::clone(&webrtc_agent), true, event_tx.clone()
+        );
+        assert_eq!(aggressive.config.method, NominationMethod::Aggressive);
+
+        // Test standard nominator
+        let standard = NominatorFactory::create_standard(
+            Arc::clone(&webrtc_agent), true, event_tx.clone()
+        );
+        assert_eq!(standard.config.method, NominationMethod::Regular);
     }
 
     #[tokio::test]
-    async fn test_nomination_with_multiple_components() {
-        // Тест nomination с несколькими компонентами (RTP/RTCP)
+    async fn test_add_valid_pairs() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
+
+        let nominator = CandidateNominator::new(webrtc_agent, true, event_tx);
+
+        // Add pairs for component 1
+        let pairs = vec![
+            create_test_pair(1, 100),
+            create_test_pair(1, 200),
+        ];
+
+        let result = nominator.add_valid_pairs(pairs).await;
+        assert!(result.is_ok());
+
+        // Check entries were created
+        let entries = nominator.nomination_entries.read().await;
+        assert!(entries.contains_key(&1));
+        assert_eq!(entries.get(&1).unwrap().candidate_pairs.len(), 2);
     }
 
     #[tokio::test]
-    async fn test_nomination_preferences() {
-        // Тест предпочтений в nomination (relay, IPv6)
+    async fn test_controlled_agent_ignores_nomination() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
+
+        // Create as controlled agent (not controlling)
+        let nominator = CandidateNominator::new(webrtc_agent, false, event_tx);
+
+        let pairs = vec![create_test_pair(1, 100)];
+        let result = nominator.add_valid_pairs(pairs).await;
+
+        // Should succeed but entries should be empty (controlled agent ignores)
+        assert!(result.is_ok());
+        let entries = nominator.nomination_entries.read().await;
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pair_score_calculation() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
+
+        let mut config = NominationConfig::default();
+        config.prefer_relay_candidates = true;
+
+        let nominator = CandidateNominator::with_config(
+            webrtc_agent, true, config, event_tx
+        );
+
+        // Create host pair
+        let host_pair = create_test_pair(1, 1000);
+
+        // Create relay pair
+        let mut relay_pair = create_test_pair(1, 1000);
+        relay_pair.local.candidate_type = CandidateType::Relay;
+
+        // Relay should score higher when prefer_relay_candidates is true
+        let host_score = nominator.calculate_pair_score(&host_pair);
+        let relay_score = nominator.calculate_pair_score(&relay_pair);
+
+        assert!(relay_score > host_score, "Relay pair should score higher");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let webrtc_agent = create_test_webrtc_agent().await;
+
+        let nominator = CandidateNominator::new(webrtc_agent, true, event_tx);
+
+        let result = nominator.shutdown().await;
+        assert!(result.is_ok());
+
+        // After shutdown, adding pairs should fail
+        let pairs = vec![create_test_pair(1, 100)];
+        let result = nominator.add_valid_pairs(pairs).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stats_tracking() {
+        let stats = NominationStats::new();
+
+        assert!(stats.started_at.is_some());
+        assert_eq!(stats.nomination_attempts, 0);
+        assert_eq!(stats.successful_nominations, 0);
+        assert_eq!(stats.failed_nominations, 0);
+        assert_eq!(stats.success_rate(), 0.0);
     }
 }

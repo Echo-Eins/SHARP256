@@ -13,7 +13,8 @@ use tracing::{debug, info, warn, error};
 use webrtc::ice::{
     agent::{Agent as WebRtcAgent, AgentConfig},
     candidate::{Candidate as WebRtcCandidate, CandidateType},
-    conn::Conn as WebRtcConn,
+    // NOTE: Conn moved or renamed in webrtc 0.13
+    // conn::Conn as WebRtcConn,
     network_type::NetworkType,
     state::{ConnectionState, GatheringState},
     url::Url,

@@ -8,6 +8,7 @@ version = "0.4.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
+ "async-trait",
  "base64 0.21.7",
  "bincode",
  "blake3",
@@ -69,6 +70,7 @@ dependencies = [
  "winapi 0.3.9",
  "x25519-dalek",
  "xmltree",
+ "zeroize",
 ]
 
 [[package]]

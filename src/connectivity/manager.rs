@@ -50,6 +50,11 @@ pub enum ConnectivityEvent {
     ConnectivityChecksStarted,
     /// Результат connectivity check
     ConnectivityCheckResult(ConnectivityCheckResult),
+    /// Nomination начата для пары
+    NominationStarted {
+        component_id: u32,
+        pair: CandidatePair,
+    },
     /// Пара кандидатов номинирована
     CandidatePairNominated(CandidatePair),
     /// Соединение установлено

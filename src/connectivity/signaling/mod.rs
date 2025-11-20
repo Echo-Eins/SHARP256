@@ -19,11 +19,71 @@ use crate::protocol::{packet::*, constants::*};
 
 // Submodules
 pub mod sharp_signaling;
-pub mod session;
 
 // Re-exports
 pub use sharp_signaling::SharpSignaling;
-pub use session::{SignalingSession, SessionState};
+
+/// Состояние signaling сессии
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    New,
+    Initiating,
+    Connected,
+    Failed,
+    Terminated,
+}
+
+/// Signaling сессия
+pub struct SignalingSession {
+    session_id: String,
+    peer_addr: SocketAddr,
+    controlling: bool,
+    state: Arc<RwLock<SessionState>>,
+    sequence: Arc<RwLock<u32>>,
+    remote_candidates: Arc<RwLock<Vec<Candidate>>>,
+    candidates_notify: Arc<Notify>,
+    event_tx: mpsc::UnboundedSender<SignalingEvent>,
+}
+
+impl SignalingSession {
+    pub fn new(
+        session_id: String,
+        peer_addr: SocketAddr,
+        controlling: bool,
+        event_tx: mpsc::UnboundedSender<SignalingEvent>,
+    ) -> Self {
+        Self {
+            session_id,
+            peer_addr,
+            controlling,
+            state: Arc::new(RwLock::new(SessionState::New)),
+            sequence: Arc::new(RwLock::new(0)),
+            remote_candidates: Arc::new(RwLock::new(Vec::new())),
+            candidates_notify: Arc::new(Notify::new()),
+            event_tx,
+        }
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    pub async fn next_sequence(&self) -> u32 {
+        let mut seq = self.sequence.write().await;
+        *seq += 1;
+        *seq
+    }
+
+    pub async fn add_remote_candidates(&self, candidates: Vec<Candidate>) {
+        self.remote_candidates.write().await.extend(candidates);
+        self.candidates_notify.notify_waiters();
+    }
+
+    pub async fn wait_for_candidates(&self) -> Vec<Candidate> {
+        self.candidates_notify.notified().await;
+        self.remote_candidates.read().await.clone()
+    }
+}
 
 /// Сообщения signaling протокола
 #[derive(Debug, Clone, Serialize, Deserialize)]
