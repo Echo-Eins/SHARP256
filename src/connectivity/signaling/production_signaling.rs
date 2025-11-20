@@ -9,12 +9,12 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use crate::connectivity::transport::UdpSocketWrapper;
 use crate::connectivity::{Candidate, CandidatePair};
 use crate::protocol::{constants::*, packet::*};
 
@@ -158,7 +158,7 @@ impl From<&Candidate> for SerializedCandidate {
 /// Production signaling transport
 pub struct ProductionSignaling {
     /// UDP socket for signaling
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpSocketWrapper>,
     /// Peer address
     peer_addr: SocketAddr,
     /// Session information
@@ -213,7 +213,7 @@ struct RetransmissionManager {
     /// Pending acknowledgments
     pending: Arc<RwLock<HashMap<String, PendingMessage>>>,
     /// Socket for retransmissions
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpSocketWrapper>,
     /// Target address
     peer_addr: SocketAddr,
 }
@@ -241,7 +241,7 @@ pub struct SignalingStats {
 impl ProductionSignaling {
     /// Create new production signaling transport
     pub async fn new(
-        socket: Arc<UdpSocket>,
+        socket: Arc<UdpSocketWrapper>,
         peer_addr: SocketAddr,
         controlling: bool,
     ) -> Result<Self> {
@@ -670,7 +670,7 @@ async fn retransmission_loop(
 }
 
 /// Background receive loop
-async fn receive_loop(socket: Arc<UdpSocket>, signaling: ProductionSignaling) {
+async fn receive_loop(socket: Arc<UdpSocketWrapper>, signaling: ProductionSignaling) {
     let mut buf = vec![0u8; 65536];
 
     loop {

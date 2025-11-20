@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
+
+use crate::connectivity::transport::UdpSocketWrapper;
 
 use webrtc::ice::{
     agent::Agent as WebRtcAgent,
@@ -208,7 +209,11 @@ impl ProductionIceAgent {
     }
 
     /// Start ICE process
-    pub async fn start(&self, socket: Arc<UdpSocket>, peer_addr: Option<SocketAddr>) -> Result<()> {
+    pub async fn start(
+        &self,
+        socket: Arc<UdpSocketWrapper>,
+        peer_addr: Option<SocketAddr>,
+    ) -> Result<()> {
         info!("Starting ICE process");
 
         // Update state
