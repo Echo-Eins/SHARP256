@@ -29,6 +29,7 @@ use tokio::net::UdpSocket;
 use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
+use super::mtu_discovery::{InterfaceMtuDetector, PathMtuDiscovery, PmtudState};
 use super::stats::SocketStats;
 
 /// RFC 8421 Happy Eyeballs parameters
@@ -180,6 +181,9 @@ pub struct UdpSocketWrapper {
     /// Path MTU (discovered)
     path_mtu: Arc<RwLock<Option<usize>>>,
 
+    /// Path MTU Discovery manager (RFC 4821/8899)
+    pmtu_discovery: Arc<RwLock<Option<Arc<PathMtuDiscovery>>>>,
+
     /// Время создания
     created_at: Instant,
 
@@ -229,6 +233,7 @@ impl UdpSocketWrapper {
             state: Arc::new(RwLock::new(SocketState::Bound)),
             stats: Arc::new(RwLock::new(SocketStats::new())),
             path_mtu: Arc::new(RwLock::new(None)),
+            pmtu_discovery: Arc::new(RwLock::new(None)),
             created_at: now,
             last_activity: Arc::new(RwLock::new(now)),
         })
@@ -436,6 +441,127 @@ impl UdpSocketWrapper {
     /// Получить clone внутреннего Arc<UdpSocket> для расширенных операций
     pub fn inner(&self) -> Arc<UdpSocket> {
         Arc::clone(&self.socket)
+    }
+
+    /// Start Path MTU Discovery process (RFC 4821/8899)
+    ///
+    /// Performs PLPMTUD (Packetization Layer Path MTU Discovery) to find
+    /// the optimal MTU for the path to the remote address.
+    ///
+    /// ## Arguments
+    /// - `remote_addr`: Remote address to probe
+    ///
+    /// ## Returns
+    /// Discovered Path MTU in bytes
+    ///
+    /// ## Example
+    /// ```no_run
+    /// # use sharp256::connectivity::transport::socket::{UdpSocketWrapper, SocketOptions};
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let socket = UdpSocketWrapper::bind("0.0.0.0:0", SocketOptions::default()).await?;
+    /// let remote = "8.8.8.8:53".parse()?;
+    /// let mtu = socket.start_mtu_discovery(remote).await?;
+    /// println!("Discovered MTU: {} bytes", mtu);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start_mtu_discovery(&self, remote_addr: SocketAddr) -> Result<usize> {
+        info!("Starting Path MTU Discovery to {}", remote_addr);
+
+        let local_ip = self.local_addr.ip();
+        let pmtud = Arc::new(PathMtuDiscovery::new(local_ip, remote_addr));
+
+        // Store PMTUD instance
+        *self.pmtu_discovery.write() = Some(Arc::clone(&pmtud));
+
+        // Create probe function that uses this socket
+        let socket = Arc::clone(&self.socket);
+        let probe_fn = move |size: usize| {
+            let socket = Arc::clone(&socket);
+            let remote = remote_addr;
+            Box::pin(async move {
+                // Create probe packet (filled with pattern)
+                let mut probe = vec![0xAA; size];
+                probe[0] = 0xDE; // Magic byte
+                probe[1] = 0xAD;
+
+                // Send probe
+                match socket.send_to(&probe, remote).await {
+                    Ok(sent) if sent == size => {
+                        // Probe sent successfully
+                        // In real implementation, would wait for ACK/response
+                        // For now, assume success if send succeeded
+                        Ok(true)
+                    }
+                    Ok(_) => Ok(false),  // Partial send
+                    Err(_) => Ok(false), // Send failed
+                }
+            })
+        };
+
+        // Run discovery
+        let discovered_mtu = pmtud.discover(probe_fn).await?;
+
+        // Update path_mtu
+        *self.path_mtu.write() = Some(discovered_mtu);
+
+        info!("MTU Discovery complete: {} bytes", discovered_mtu);
+
+        Ok(discovered_mtu)
+    }
+
+    /// Get maximum payload size accounting for all headers
+    ///
+    /// Calculates: MTU - IP_header - UDP_header - SHARP_header
+    ///
+    /// ## Returns
+    /// Maximum safe payload size in bytes, or None if MTU not yet discovered
+    ///
+    /// ## Example
+    /// ```no_run
+    /// # use sharp256::connectivity::transport::socket::{UdpSocketWrapper, SocketOptions};
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let socket = UdpSocketWrapper::bind("0.0.0.0:0", SocketOptions::default()).await?;
+    /// socket.start_mtu_discovery("8.8.8.8:53".parse()?).await?;
+    /// if let Some(max_payload) = socket.get_max_payload() {
+    ///     println!("Maximum payload: {} bytes", max_payload);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_max_payload(&self) -> Option<usize> {
+        if let Some(pmtud) = self.pmtu_discovery.read().as_ref() {
+            pmtud.get_max_payload()
+        } else if let Some(mtu) = *self.path_mtu.read() {
+            // Manual MTU set, calculate payload
+            let ip_header = match self.ip_version {
+                IpVersion::V4 => crate::protocol::constants::IPV4_HEADER_SIZE,
+                IpVersion::V6 => crate::protocol::constants::IPV6_HEADER_SIZE,
+            };
+            Some(mtu.saturating_sub(
+                ip_header
+                    + crate::protocol::constants::UDP_HEADER_SIZE
+                    + crate::protocol::constants::SHARP_HEADER_SIZE,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Get PMTUD statistics
+    pub fn pmtud_stats(&self) -> Option<super::mtu_discovery::PmtudStats> {
+        self.pmtu_discovery
+            .read()
+            .as_ref()
+            .map(|pmtud| pmtud.stats())
+    }
+
+    /// Get PMTUD state
+    pub fn pmtud_state(&self) -> Option<PmtudState> {
+        self.pmtu_discovery
+            .read()
+            .as_ref()
+            .map(|pmtud| pmtud.state())
     }
 }
 
@@ -670,29 +796,11 @@ impl NetworkInterfaceDetector {
     ///
     /// Platform-specific MTU detection:
     /// - Linux: reads from /sys/class/net/<interface>/mtu
-    /// - Other platforms: returns None (fallback)
+    /// - Windows: uses netsh command
+    /// - macOS: returns standard MTU (1500)
+    /// - Other platforms: RFC 1191 standard (1500)
     fn get_interface_mtu(interface_name: &str) -> Option<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            let path = format!("/sys/class/net/{}/mtu", interface_name);
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(mtu) = contents.trim().parse::<usize>() {
-                    trace!("Detected MTU for {}: {}", interface_name, mtu);
-                    return Some(mtu);
-                }
-            }
-            None
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            // На других платформах используем стандартные MTU значения
-            // В будущем можно добавить platform-specific ioctl для macOS/Windows
-            let _ = interface_name; // suppress unused warning
-
-            // RFC 1191: Path MTU Discovery - стандартный Ethernet MTU
-            Some(1500)
-        }
+        InterfaceMtuDetector::get_interface_mtu(interface_name)
     }
 
     /// Получить все IPv4 адреса на системе

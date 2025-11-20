@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use crate::connectivity::{Candidate, CandidatePair};
 
+pub mod mtu_discovery;
 pub mod socket;
 pub mod stats;
 
@@ -60,6 +61,10 @@ pub use stats::{
 pub use socket::{
     HappyEyeballsConnector, IpVersion, NetworkInterface, NetworkInterfaceDetector, SocketOptions,
     SocketState, UdpSocketWrapper,
+};
+
+pub use mtu_discovery::{
+    InterfaceMtuDetector, PathMtuDiscovery, PmtudState, PmtudStats, ProbeResult,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
