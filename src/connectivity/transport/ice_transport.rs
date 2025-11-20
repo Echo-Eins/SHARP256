@@ -1069,24 +1069,92 @@ impl Transport for IceTransport {
         // Build comprehensive IceStats structure
         let config_guard = self.config.read();
 
-        // Aggregate STUN server statistics from configuration (RFC 8489)
-        let stun_servers: Vec<crate::connectivity::transport::StunServerStats> = config_guard
-            .ice_config
-            .stun_servers
-            .iter()
-            .map(|url| {
-                // Create basic StunServerStats from configuration
-                // Note: Detailed per-server statistics (requests/responses/timeouts/rtt)
-                // would require StunClient integration - for now we provide configuration info
-                crate::connectivity::transport::StunServerStats {
-                    address: url.clone(),
-                    requests_sent: 0,        // Would be tracked by StunClient
-                    responses_received: 0,   // Would be tracked by StunClient
-                    timeouts: 0,             // Would be tracked by StunClient
-                    avg_rtt: None,           // Would be tracked by StunClient
+        // Aggregate STUN server statistics from LIVE StunClient instances (RFC 8489)
+        //
+        // RFC 8445 Section 14: ICE implementations MUST collect statistics about STUN usage.
+        // RFC 8489 Section 7.2: Multiple STUN servers may be used simultaneously.
+        //
+        // This aggregation provides REAL-TIME statistics from:
+        // - StunServerRuntimeStats (updated by consent freshness checks)
+        // - StunClient's TransactionTracker (all STUN transactions)
+        //
+        // NO HARDCODED VALUES - all data is live from actual STUN operations.
+        let stun_servers: Vec<crate::connectivity::transport::StunServerStats> = {
+            let stun_stats_guard = self.stun_stats.read();
+            let stun_clients_guard = self.stun_clients.read();
+
+            let mut servers = Vec::new();
+
+            // Iterate over all STUN servers that have runtime statistics
+            for (server_addr, runtime_stats) in stun_stats_guard.iter() {
+                // Get StunClient for this server to fetch latest TransactionTracker data
+                if let Some(client) = stun_clients_guard.get(server_addr) {
+                    // Update runtime stats with latest data from TransactionTracker
+                    // This ensures we capture ALL STUN transactions, not just consent checks
+                    let mut updated_stats = runtime_stats.clone();
+
+                    match client.get_stats().await {
+                        Ok(tracker_stats) => {
+                            // Sync with TransactionTracker (authoritative source)
+                            // TransactionTracker counts all transactions, runtime_stats
+                            // might only count consent checks, so we take the max
+                            let tracker_total = tracker_stats.count + tracker_stats.failures;
+                            if tracker_total > updated_stats.requests_sent {
+                                updated_stats.requests_sent = tracker_total;
+                            }
+
+                            updated_stats.responses_received = tracker_stats.count;
+                            updated_stats.avg_rtt = tracker_stats.average_rtt();
+                            updated_stats.min_rtt = tracker_stats.min_rtt;
+                            updated_stats.max_rtt = tracker_stats.max_rtt;
+                            updated_stats.total_retransmissions = tracker_stats.total_retransmissions;
+
+                            // Timeouts from TransactionTracker (failures)
+                            if tracker_stats.failures > updated_stats.timeouts {
+                                updated_stats.timeouts = tracker_stats.failures;
+                            }
+                        }
+                        Err(e) => {
+                            // Failed to get TransactionTracker stats, use runtime_stats as-is
+                            debug!(
+                                "Failed to get TransactionTracker stats for {}: {}. Using runtime stats.",
+                                server_addr, e
+                            );
+                        }
+                    }
+
+                    // Convert to exportable format using to_export_stats()
+                    servers.push(updated_stats.to_export_stats());
+                } else {
+                    // StunClient not found for this server (shouldn't happen)
+                    // Use runtime stats as fallback
+                    warn!(
+                        "StunClient not found for {} during stats aggregation. Using runtime stats only.",
+                        server_addr
+                    );
+                    servers.push(runtime_stats.to_export_stats());
                 }
-            })
-            .collect();
+            }
+
+            drop(stun_stats_guard);
+            drop(stun_clients_guard);
+
+            if servers.is_empty() {
+                // No STUN servers configured or initialized
+                debug!("No STUN server statistics available (no servers configured)");
+            } else {
+                // Log aggregated statistics for monitoring
+                debug!(
+                    "Aggregated statistics for {} STUN server(s): total_requests={}, total_responses={}, total_timeouts={}",
+                    servers.len(),
+                    servers.iter().map(|s| s.requests_sent).sum::<u32>(),
+                    servers.iter().map(|s| s.responses_received).sum::<u32>(),
+                    servers.iter().map(|s| s.timeouts).sum::<u32>()
+                );
+            }
+
+            servers
+        };
 
         // Aggregate TURN server statistics from configuration (RFC 8656)
         let turn_servers: Vec<crate::connectivity::transport::TurnServerStats> = config_guard
