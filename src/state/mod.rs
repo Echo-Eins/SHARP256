@@ -32,7 +32,7 @@ impl TransferState {
         is_sender: bool,
         peer_address: String,
     ) -> Self {
-        #[cfg(feature = "nat-traversal")]
+        #[cfg(feature = "connectivity")]
         let resume_token: String = {
             use rand::Rng;
             rand::thread_rng()
@@ -41,8 +41,8 @@ impl TransferState {
                 .map(char::from)
                 .collect()
         };
-        
-        #[cfg(not(feature = "nat-traversal"))]
+
+        #[cfg(not(feature = "connectivity"))]
         let resume_token = format!("token_{}", chrono::Utc::now().timestamp());
         
         Self {

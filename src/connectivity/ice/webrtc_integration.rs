@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn, error};
 
 use webrtc::ice::{
-    agent::{Agent as WebRtcAgent, AgentConfig},
+    agent::{Agent as WebRtcAgent},
     candidate::{Candidate as WebRtcCandidate, CandidateType},
     network_type::NetworkType,
     state::{ConnectionState, GatheringState},
@@ -19,6 +19,8 @@ use webrtc::ice::{
     mdns::MulticastDnsMode,
     tcp_type::TcpType,
 };
+// Import directly from webrtc_ice as it's not re-exported
+use webrtc_ice::agent::agent_config::AgentConfig;
 
 use webrtc::stun::message::Message as StunMessage;
 use webrtc::turn::client::Client as TurnClient;

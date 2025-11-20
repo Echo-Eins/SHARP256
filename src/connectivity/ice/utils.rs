@@ -76,7 +76,8 @@ pub fn webrtc_candidate_to_candidate(webrtc_candidate: &dyn WebRtcCandidate) -> 
 /// RFC 8445 compliant implementation.
 pub fn candidate_to_webrtc_candidate(candidate: &Candidate) -> Result<Arc<dyn WebRtcCandidate + Send + Sync>> {
     use anyhow::Context;
-    use webrtc::ice::candidate::CandidateBaseConfig;
+    // Import directly from webrtc_ice as it's not re-exported
+    use webrtc_ice::candidate::candidate_base::CandidateBaseConfig;
 
     let base_config = CandidateBaseConfig {
         network: "udp".to_string(),

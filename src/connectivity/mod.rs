@@ -101,11 +101,10 @@ pub use transport::{
 // ICE specific exports
 #[cfg(feature = "webrtc-ice-stack")]
 pub use ice::{
-    IceStack, IceAgent, IceEvent, IceAgentState, IceConnection,
+    IceAgent, IceEvent, IceAgentState, IceConnection,
     CandidateGatherer, ConnectivityChecker, CandidateNominator,
     GatheringState, ConnectivityState, NominationState,
-    IceComponentFactory, get_ice_capabilities, validate_ice_config,
-    create_p2p_ice_config, create_test_ice_config
+    ProductionIceAgent
 };
 
 // STUN module exports (RFC 8489, RFC 5780)

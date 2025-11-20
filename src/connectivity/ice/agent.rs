@@ -21,12 +21,15 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn, error, trace, instrument};
 
 use webrtc::ice::{
-    agent::{Agent as WebRtcAgent, AgentConfig as WebRtcAgentConfig},
+    agent::{Agent as WebRtcAgent},
     candidate::{Candidate as WebRtcCandidate, CandidateType as WebRtcCandidateType},
     state::{ConnectionState as WebRtcConnectionState, GatheringState as WebRtcGatheringState},
     url::Url,
     network_type::NetworkType,
 };
+// Import directly from webrtc_ice as they're not re-exported
+use webrtc_ice::agent::agent_config::AgentConfig as WebRtcAgentConfig;
+use webrtc_ice::candidate::candidate_base::CandidateBaseConfig;
 
 use crate::connectivity::{
     Candidate, CandidatePair, CandidatePairState, ConnectivityCheckResult, ConnectivityEvent
@@ -481,7 +484,7 @@ impl IceAgent {
         match candidate.candidate_type {
             crate::connectivity::CandidateType::Host => {
                 let config = CandidateHostConfig {
-                    base_config: webrtc::ice::candidate::CandidateBaseConfig {
+                    base_config: CandidateBaseConfig {
                         network: "udp".to_string(),
                         address: candidate.address.ip().to_string(),
                         port: candidate.address.port(),
@@ -497,7 +500,7 @@ impl IceAgent {
             crate::connectivity::CandidateType::ServerReflexive => {
                 let related = candidate.related_address.unwrap_or(candidate.address);
                 let config = CandidateServerReflexiveConfig {
-                    base_config: webrtc::ice::candidate::CandidateBaseConfig {
+                    base_config: CandidateBaseConfig {
                         network: "udp".to_string(),
                         address: candidate.address.ip().to_string(),
                         port: candidate.address.port(),
@@ -514,7 +517,7 @@ impl IceAgent {
             crate::connectivity::CandidateType::Relay => {
                 let related = candidate.related_address.unwrap_or(candidate.address);
                 let config = CandidateRelayConfig {
-                    base_config: webrtc::ice::candidate::CandidateBaseConfig {
+                    base_config: CandidateBaseConfig {
                         network: "udp".to_string(),
                         address: candidate.address.ip().to_string(),
                         port: candidate.address.port(),
@@ -532,7 +535,7 @@ impl IceAgent {
             _ => {
                 // Default to host candidate
                 let config = CandidateHostConfig {
-                    base_config: webrtc::ice::candidate::CandidateBaseConfig {
+                    base_config: CandidateBaseConfig {
                         network: "udp".to_string(),
                         address: candidate.address.ip().to_string(),
                         port: candidate.address.port(),

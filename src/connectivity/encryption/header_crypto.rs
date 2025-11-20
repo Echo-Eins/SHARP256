@@ -24,8 +24,8 @@ use chacha20poly1305::{
 
 #[cfg(feature = "relay-encryption")]
 use aes_gcm::{
-    Aes128Gcm, Aes256Gcm, KeyInit as AesKeyInit, Aead as AesAead,
-    Nonce as AesNonce
+    aead::{Aead as AesAead, KeyInit as AesKeyInit},
+    Aes128Gcm, Aes256Gcm, Nonce as AesNonce
 };
 
 #[cfg(feature = "relay-encryption")]

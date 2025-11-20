@@ -18,7 +18,7 @@ use crate::connectivity::{
     ConnectivityMetrics, ConnectivityCheckResult,
 };
 use crate::connectivity::config::{ConnectivityConfig, ConnectionMethod};
-use crate::connectivity::transport::{Transport, EstablishedConnection, TransportType};
+use crate::connectivity::transport::{Transport, EstablishedConnection, TransportType, TransportStats};
 use crate::connectivity::signaling::SharpSignaling;
 
 // Conditional imports based on features
@@ -887,36 +887,18 @@ impl ConnectivityManager {
             }
 
             ConnectionMethod::Ice => {
-                #[cfg(feature = "webrtc-ice-stack")]
-                {
-                    self.attempt_ice_connection(socket).await
-                }
-                #[cfg(not(feature = "webrtc-ice-stack"))]
-                {
-                    Err(anyhow::anyhow!("ICE not available"))
-                }
+                // PHASE 2: ICE transport implementation with IceTransport struct
+                Err(anyhow::anyhow!("ICE transport layer not yet implemented - Phase 2 rebuild required"))
             }
 
             ConnectionMethod::Upnp => {
-                #[cfg(feature = "upnp-support")]
-                {
-                    self.attempt_upnp_connection(socket).await
-                }
-                #[cfg(not(feature = "upnp-support"))]
-                {
-                    Err(anyhow::anyhow!("UPnP not available"))
-                }
+                // PHASE 2: UPnP transport implementation with UpnpTransport struct
+                Err(anyhow::anyhow!("UPnP transport layer not yet implemented - Phase 2 rebuild required"))
             }
 
             ConnectionMethod::RouterPools => {
-                #[cfg(feature = "nat-router-pools")]
-                {
-                    self.attempt_router_pools_connection(socket).await
-                }
-                #[cfg(not(feature = "nat-router-pools"))]
-                {
-                    Err(anyhow::anyhow!("Router pools not available"))
-                }
+                // PHASE 2: Router pools transport implementation with RouterPoolTransport struct
+                Err(anyhow::anyhow!("Router pools transport layer not yet implemented - Phase 2 rebuild required"))
             }
 
             ConnectionMethod::LibP2p => {
@@ -986,6 +968,7 @@ impl ConnectivityManager {
         Err(anyhow::anyhow!("Direct connection failed"))
     }
 
+    /* COMMENTED OUT FOR PHASE 1 CLEANUP - REQUIRES IceTransport IMPLEMENTATION IN PHASE 2
     /// Попытка ICE соединения
     #[cfg(feature = "webrtc-ice-stack")]
     async fn attempt_ice_connection(&self, socket: Arc<UdpSocket>) -> Result<EstablishedConnection> {
@@ -1023,7 +1006,9 @@ impl ConnectivityManager {
 
         Err(anyhow::anyhow!("ICE connection failed"))
     }
+    */
 
+    /* COMMENTED OUT FOR PHASE 1 CLEANUP - REQUIRES UpnpTransport IMPLEMENTATION IN PHASE 2
     /// Попытка UPnP соединения
     #[cfg(feature = "upnp-support")]
     async fn attempt_upnp_connection(&self, socket: Arc<UdpSocket>) -> Result<EstablishedConnection> {
@@ -1052,7 +1037,9 @@ impl ConnectivityManager {
 
         Err(anyhow::anyhow!("UPnP connection failed"))
     }
+    */
 
+    /* COMMENTED OUT FOR PHASE 1 CLEANUP - REQUIRES RouterPoolTransport IMPLEMENTATION IN PHASE 2
     /// Попытка соединения через router pools
     #[cfg(feature = "nat-router-pools")]
     async fn attempt_router_pools_connection(&self, socket: Arc<UdpSocket>) -> Result<EstablishedConnection> {
@@ -1078,6 +1065,7 @@ impl ConnectivityManager {
 
         Err(anyhow::anyhow!("Router pools connection failed"))
     }
+    */
 
     /// Попытка libp2p соединения
     #[cfg(feature = "libp2p-fallback")]

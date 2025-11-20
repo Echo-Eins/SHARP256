@@ -14,19 +14,21 @@ use tokio::time::{timeout, sleep, interval};
 use tracing::{debug, info, warn, error};
 
 use webrtc::ice::{
-    agent::{Agent as WebRtcAgent, AgentConfig as WebRtcAgentConfig},
+    agent::{Agent as WebRtcAgent},
     candidate::Candidate as WebRtcCandidate,
     state::{ConnectionState as WebRtcConnectionState, GatheringState as WebRtcGatheringState},
     url::Url,
 };
+// Import directly from webrtc_ice as it's not re-exported
+use webrtc_ice::agent::agent_config::AgentConfig as WebRtcAgentConfig;
 
 use crate::connectivity::{
     Candidate, CandidatePair, CandidatePairState, ConnectivityCheckResult,
     ConnectivityEvent, CandidateType, TransportProtocol,
 };
 use crate::connectivity::config::IceConfig;
+use crate::connectivity::signaling::ProductionSignaling;
 use super::webrtc_integration::{WebRtcConnection, EnhancedWebRtcAgent};
-use super::production_signaling::ProductionSignaling;
 
 /// Production ICE Agent Configuration
 #[derive(Debug, Clone)]
