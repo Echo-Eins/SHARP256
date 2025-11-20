@@ -36,19 +36,19 @@ use parking_lot::RwLock as StdRwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     ConnectionInfo, ConnectionState, QualityMetrics, SocketOptions, Transport, TransportEvent,
     TransportStats, TransportType, UdpSocketWrapper,
 };
 use crate::connectivity::config::IceConfig;
-use crate::connectivity::ice::production_ice_agent::{
-    IceState, ProductionIceAgent, ProductionIceConfig,
-};
-use crate::connectivity::{Candidate, CandidatePair};
+use crate::connectivity::ice::production_ice_agent::{ProductionIceAgent, ProductionIceConfig};
+use crate::connectivity::stun::message::{StunClass, StunMessage, StunMessageType, StunMethod};
+use crate::connectivity::stun::transaction::TransactionId;
+use crate::connectivity::CandidatePair;
 
 /// RFC 7675: Default consent freshness interval (15 seconds)
 const DEFAULT_CONSENT_INTERVAL: Duration = Duration::from_secs(15);
@@ -103,6 +103,11 @@ pub struct IceTransportConfig {
 
     /// Keep-alive interval
     pub keepalive_interval: Duration,
+
+    /// Strict source validation (RFC 8445 Section 11.1)
+    /// When enabled, packets from unexpected sources are dropped
+    /// When disabled, packets are logged but accepted
+    pub strict_source_validation: bool,
 }
 
 impl Default for IceTransportConfig {
@@ -121,6 +126,7 @@ impl Default for IceTransportConfig {
             trickle_ice: true,
             aggressive_nomination: false,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+            strict_source_validation: true, // RFC 8445 Section 11.1: Drop unexpected packets
         }
     }
 }
@@ -328,13 +334,16 @@ impl IceTransport {
                         if let Some(ref pair) = *nominated_pair.read() {
                             let start = Instant::now();
 
-                            // RFC 7675: Send STUN binding indication
-                            // In production, use proper STUN message
-                            // For now, simplified implementation
-                            let check_result = socket.send_to(
-                                b"CONSENT_CHECK",
-                                &pair.remote.address
-                            ).await;
+                            // RFC 7675 Section 5.1: Send STUN Binding Indication
+                            // Binding Indication is used (not Request) to avoid requiring a response
+                            let stun_msg = create_consent_check_message();
+                            let check_result = match stun_msg.encode() {
+                                Ok(bytes) => socket.send_to(&bytes, &pair.remote.address).await,
+                                Err(e) => {
+                                    warn!("Failed to encode STUN consent check: {}", e);
+                                    continue;
+                                }
+                            };
 
                             *checks_performed.write() += 1;
 
@@ -635,16 +644,27 @@ impl Transport for IceTransport {
             .await
             .context("Socket recv_from failed")?;
 
-        // Verify source (should be from nominated peer)
+        // RFC 8445 Section 11.1: Verify source address
         let pair_guard = self.nominated_pair.read();
         if let Some(ref pair) = *pair_guard {
             if from != pair.remote.address {
-                warn!(
-                    "Received data from unexpected source: {} (expected: {})",
-                    from, pair.remote.address
-                );
-                // In production, might want to drop packets from wrong source
-                // For now, log and continue
+                let strict_validation = self.config.read().strict_source_validation;
+
+                if strict_validation {
+                    // Strict mode: Drop packets from unexpected sources (RFC 8445 Section 11.1)
+                    drop(pair_guard);
+                    return Err(anyhow!(
+                        "Packet from unexpected source {} (expected {}), dropped",
+                        from,
+                        pair.remote.address
+                    ));
+                } else {
+                    // Permissive mode: Log warning but accept packet
+                    warn!(
+                        "Received data from unexpected source: {} (expected: {})",
+                        from, pair.remote.address
+                    );
+                }
             }
         }
         drop(pair_guard);
@@ -794,6 +814,13 @@ impl Transport for IceTransport {
 
         info!("Generated new ICE credentials for restart");
 
+        // RFC 8445 Section 9: Shutdown existing ICE agent gracefully
+        info!("Shutting down existing ICE agent for restart");
+        self.ice_agent
+            .shutdown()
+            .await
+            .context("Failed to shutdown ICE agent during restart")?;
+
         // Create new ICE agent with new credentials
         let ice_config = {
             let config = self.config.read();
@@ -811,11 +838,12 @@ impl Transport for IceTransport {
             }
         };
 
-        // Note: In full implementation, would update existing agent
-        // For now, simplified by creating new agent
-        warn!("ICE restart: creating new agent (simplified implementation)");
+        // Note: Ideally would update credentials in existing agent via restart() method
+        // Currently ProductionIceAgent doesn't expose restart() API, so we create new agent
+        // This is RFC-compliant but less optimal than in-place credential update
+        info!("Creating new ICE agent with updated credentials");
 
-        // Re-run connection process
+        // Re-run full connection process with new credentials
         self.connect().await.context("ICE restart connect failed")?;
 
         // Emit completion
@@ -830,14 +858,57 @@ impl Transport for IceTransport {
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Create STUN Binding Indication for consent freshness checks
+///
+/// RFC 7675 Section 5.1: Consent Freshness
+/// - Uses STUN Binding Indication (not Request)
+/// - No response expected (Indication vs Request)
+/// - Sent periodically to verify peer consent
+fn create_consent_check_message() -> StunMessage {
+    let msg_type = StunMessageType::new(StunClass::Indication, StunMethod::Binding);
+    let transaction_id = TransactionId::generate();
+
+    StunMessage::with_transaction_id(msg_type, transaction_id)
+}
+
 /// Generate ICE credential string (ufrag/pwd)
 ///
 /// RFC 8445 Section 5.4: ICE credentials
-/// - ufrag: 4-256 characters (typically 8)
-/// - pwd: 22-256 characters (typically 24)
+/// - ice-char = ALPHA / DIGIT / "+" / "/"
+/// - ice-ufrag: 4*256ice-char (minimum 4, maximum 256)
+/// - ice-pwd: 22*256ice-char (minimum 22, maximum 256)
+///
+/// ## Arguments
+/// - `length`: Desired length (must meet RFC minimums)
+///
+/// ## Panics
+/// Panics if length violates RFC constraints
 fn generate_ice_credential(length: usize) -> String {
     use rand::Rng;
+
+    // RFC 8445 Section 5.4: Allowed character set
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    // RFC 8445 Section 5.4: Validate length constraints
+    const MIN_UFRAG_LENGTH: usize = 4;
+    const MIN_PWD_LENGTH: usize = 22;
+    const MAX_LENGTH: usize = 256;
+
+    // Validate length constraints
+    if length < MIN_UFRAG_LENGTH {
+        panic!(
+            "ICE credential length {} violates RFC 8445: minimum is {}",
+            length, MIN_UFRAG_LENGTH
+        );
+    }
+
+    if length > MAX_LENGTH {
+        panic!(
+            "ICE credential length {} violates RFC 8445: maximum is {}",
+            length, MAX_LENGTH
+        );
+    }
+
     let mut rng = rand::thread_rng();
 
     (0..length)
