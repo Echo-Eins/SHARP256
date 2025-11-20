@@ -54,23 +54,18 @@ use tracing::{info, warn, debug, error};
 
 // === МОДУЛИ ===
 
-// Основной менеджер connectivity
-pub mod manager;
+// PHASE 2: Manager and Transport will be rebuilt from scratch
+// pub mod manager;
+// pub mod transport;
+
 pub mod config;
 
-// ICE модули (primary)
+// ICE modules (primary) - RFC 8445 compliant
 #[cfg(feature = "webrtc-ice-stack")]
 pub mod ice;
 
 // STUN module (RFC 8489, RFC 5780)
 pub mod stun;
-
-// Fallback модули
-#[cfg(feature = "libp2p-fallback")]
-pub mod fallback;
-
-// Transport абстракция
-pub mod transport;
 
 // Signaling система
 pub mod signaling;
@@ -78,6 +73,10 @@ pub mod signaling;
 // Encryption для relay
 #[cfg(feature = "relay-encryption")]
 pub mod encryption;
+
+// Fallback модули
+#[cfg(feature = "libp2p-fallback")]
+pub mod fallback;
 
 // NAT router pools
 #[cfg(feature = "nat-router-pools")]
@@ -89,13 +88,13 @@ pub mod upnp;
 
 // === RE-EXPORTS ===
 
-pub use manager::{ConnectivityManager, ConnectivityEvent, DetailedConnectivityStats};
+// PHASE 2: Manager and Transport types will be defined here
+// pub use manager::{ConnectivityManager, ConnectivityEvent, DetailedConnectivityStats};
+// pub use transport::{Transport, TransportType, TransportStats, EstablishedConnection};
+
 pub use config::{
     ConnectivityConfig, IceConfig, LibP2pConfig, RelayConfig,
     ConnectionMethod, GeneralConfig
-};
-pub use transport::{
-    Transport, TransportType, TransportStats, EstablishedConnection
 };
 
 // ICE specific exports
@@ -313,6 +312,12 @@ pub struct CandidateAttributes {
     /// Дополнительные расширения (RFC 8445 Section 5.1)
     /// Allows for future extensibility without breaking compatibility
     pub extensions: std::collections::HashMap<String, String>,
+
+    /// SHARP-256 extension: hairpin detection capability
+    pub hairpin_capable: bool,
+
+    /// SHARP-256 extension: encryption capability
+    pub encryption_capable: bool,
 }
 
 impl Default for CandidateAttributes {
@@ -330,6 +335,9 @@ impl Default for CandidateAttributes {
             network_id: 1,
             // No extensions by default
             extensions: std::collections::HashMap::new(),
+            // SHARP-256 extensions default to false
+            hairpin_capable: false,
+            encryption_capable: false,
         }
     }
 }
@@ -507,8 +515,39 @@ impl ConnectivityMetrics {
     }
 }
 
+/// События connectivity системы
+#[derive(Debug, Clone)]
+pub enum ConnectivityEvent {
+    /// Начался сбор кандидатов
+    GatheringStarted,
+    /// Новый кандидат найден
+    CandidateGathered(Candidate),
+    /// Сбор кандидатов завершен
+    GatheringComplete(Vec<Candidate>),
+    /// Начались connectivity checks
+    ConnectivityChecksStarted,
+    /// Результат connectivity check
+    ConnectivityCheckResult(ConnectivityCheckResult),
+    /// Nomination начата для пары
+    NominationStarted {
+        component_id: u32,
+        pair: CandidatePair,
+    },
+    /// Пара кандидатов номинирована
+    CandidatePairNominated(CandidatePair),
+    /// Соединение установлено (PHASE 2: will include connection info)
+    ConnectionEstablished,
+    /// Соединение закрыто
+    ConnectionClosed,
+    /// Ошибка в процессе подключения
+    Error(String),
+    /// Метрики обновлены
+    MetricsUpdated(ConnectivityMetrics),
+}
+
 /// === ГЛАВНАЯ СТРУКТУРА CONNECTIVITY ===
 
+/* PHASE 2: Connectivity wrapper will be rebuilt from scratch
 /// Главная структура для управления connectivity
 pub struct Connectivity {
     /// Менеджер connectivity
@@ -673,6 +712,7 @@ impl Connectivity {
         self.manager.shutdown().await
     }
 }
+*/
 
 /// Поддерживаемые возможности
 #[derive(Debug, Clone)]
@@ -703,6 +743,7 @@ impl SupportedFeatures {
     }
 }
 
+/* PHASE 2: Utility functions will be rebuilt
 /// === UTILITY ФУНКЦИИ ===
 
 /// Создание стандартной connectivity системы
@@ -755,7 +796,9 @@ pub async fn create_auto_connectivity() -> Result<Connectivity> {
         Connectivity::with_config(config).await
     }
 }
+*/
 
+/* PHASE 2: Compatibility layer will be removed
 /// === COMPATIBILITY LAYER ===
 
 /// Compatibility layer для старого NAT API
@@ -812,6 +855,7 @@ pub mod nat_compat {
         }
     }
 }
+*/
 
 /// === КОНСТАНТЫ И ВЕРСИИ ===
 
@@ -852,6 +896,7 @@ mod tests {
     use super::*;
     use tokio::time::sleep;
 
+    /* PHASE 2: Connectivity tests will be rewritten
     #[tokio::test]
     async fn test_connectivity_creation() {
         let connectivity = create_test_connectivity().await;
@@ -869,6 +914,7 @@ mod tests {
         // В тестах должен быть доступен хотя бы один метод
         assert!(features.meets_minimum_requirements());
     }
+    */
 
     #[tokio::test]
     async fn test_candidate_creation() {
