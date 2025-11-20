@@ -799,7 +799,8 @@ pub enum QualityRating {
 /// Socket-level statistics
 ///
 /// Low-level socket metrics for debugging and optimization.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// RFC 768 (UDP) and system-level monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocketStats {
     /// Socket buffer sizes
     pub send_buffer_size: usize,
@@ -807,6 +808,18 @@ pub struct SocketStats {
 
     /// Socket errors encountered
     pub socket_errors: u32,
+
+    /// Total packets sent (IPv4 + IPv6)
+    pub packets_sent: u64,
+
+    /// Total packets received (IPv4 + IPv6)
+    pub packets_received: u64,
+
+    /// Total bytes sent
+    pub bytes_sent: u64,
+
+    /// Total bytes received
+    pub bytes_received: u64,
 
     /// IPv4 packets sent
     pub ipv4_packets_sent: u64,
@@ -819,6 +832,186 @@ pub struct SocketStats {
 
     /// IPv6 packets received
     pub ipv6_packets_received: u64,
+
+    /// IPv4 bytes sent
+    pub ipv4_bytes_sent: u64,
+
+    /// IPv6 bytes sent
+    pub ipv6_bytes_sent: u64,
+
+    /// IPv4 bytes received
+    pub ipv4_bytes_received: u64,
+
+    /// IPv6 bytes received
+    pub ipv6_bytes_received: u64,
+
+    /// Send syscalls
+    pub send_syscalls: u64,
+
+    /// Recv syscalls
+    pub recv_syscalls: u64,
+
+    /// Blocked sends (EWOULDBLOCK)
+    pub send_would_block: u32,
+
+    /// Blocked receives (EWOULDBLOCK)
+    pub recv_would_block: u32,
+
+    /// Timestamp of creation
+    pub created_at: Instant,
+
+    /// Last send time
+    pub last_send: Option<Instant>,
+
+    /// Last recv time
+    pub last_recv: Option<Instant>,
+}
+
+impl Default for SocketStats {
+    fn default() -> Self {
+        Self {
+            send_buffer_size: 0,
+            recv_buffer_size: 0,
+            socket_errors: 0,
+            packets_sent: 0,
+            packets_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            ipv4_packets_sent: 0,
+            ipv6_packets_sent: 0,
+            ipv4_packets_received: 0,
+            ipv6_packets_received: 0,
+            ipv4_bytes_sent: 0,
+            ipv6_bytes_sent: 0,
+            ipv4_bytes_received: 0,
+            ipv6_bytes_received: 0,
+            send_syscalls: 0,
+            recv_syscalls: 0,
+            send_would_block: 0,
+            recv_would_block: 0,
+            created_at: Instant::now(),
+            last_send: None,
+            last_recv: None,
+        }
+    }
+}
+
+impl SocketStats {
+    /// Create new socket statistics
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a send operation
+    pub fn record_send(&mut self, bytes: usize) {
+        self.packets_sent += 1;
+        self.bytes_sent += bytes as u64;
+        self.send_syscalls += 1;
+        self.last_send = Some(Instant::now());
+    }
+
+    /// Record a receive operation
+    pub fn record_recv(&mut self, bytes: usize) {
+        self.packets_received += 1;
+        self.bytes_received += bytes as u64;
+        self.recv_syscalls += 1;
+        self.last_recv = Some(Instant::now());
+    }
+
+    /// Record an IPv4 send
+    pub fn record_ipv4_send(&mut self, bytes: usize) {
+        self.ipv4_packets_sent += 1;
+        self.ipv4_bytes_sent += bytes as u64;
+        self.record_send(bytes);
+    }
+
+    /// Record an IPv6 send
+    pub fn record_ipv6_send(&mut self, bytes: usize) {
+        self.ipv6_packets_sent += 1;
+        self.ipv6_bytes_sent += bytes as u64;
+        self.record_send(bytes);
+    }
+
+    /// Record an IPv4 receive
+    pub fn record_ipv4_recv(&mut self, bytes: usize) {
+        self.ipv4_packets_received += 1;
+        self.ipv4_bytes_received += bytes as u64;
+        self.record_recv(bytes);
+    }
+
+    /// Record an IPv6 receive
+    pub fn record_ipv6_recv(&mut self, bytes: usize) {
+        self.ipv6_packets_received += 1;
+        self.ipv6_bytes_received += bytes as u64;
+        self.record_recv(bytes);
+    }
+
+    /// Record a socket error
+    pub fn record_error(&mut self) {
+        self.socket_errors += 1;
+    }
+
+    /// Record EWOULDBLOCK on send
+    pub fn record_send_would_block(&mut self) {
+        self.send_would_block += 1;
+    }
+
+    /// Record EWOULDBLOCK on recv
+    pub fn record_recv_would_block(&mut self) {
+        self.recv_would_block += 1;
+    }
+
+    /// Get uptime
+    pub fn uptime(&self) -> Duration {
+        self.created_at.elapsed()
+    }
+
+    /// Get average packet size sent
+    pub fn avg_send_packet_size(&self) -> usize {
+        if self.packets_sent > 0 {
+            (self.bytes_sent / self.packets_sent) as usize
+        } else {
+            0
+        }
+    }
+
+    /// Get average packet size received
+    pub fn avg_recv_packet_size(&self) -> usize {
+        if self.packets_received > 0 {
+            (self.bytes_received / self.packets_received) as usize
+        } else {
+            0
+        }
+    }
+
+    /// Get send throughput (bytes per second)
+    pub fn send_throughput_bps(&self) -> f64 {
+        let uptime = self.uptime().as_secs_f64();
+        if uptime > 0.0 {
+            (self.bytes_sent as f64 * 8.0) / uptime
+        } else {
+            0.0
+        }
+    }
+
+    /// Get receive throughput (bytes per second)
+    pub fn recv_throughput_bps(&self) -> f64 {
+        let uptime = self.uptime().as_secs_f64();
+        if uptime > 0.0 {
+            (self.bytes_received as f64 * 8.0) / uptime
+        } else {
+            0.0
+        }
+    }
+
+    /// Get IPv6 usage percentage
+    pub fn ipv6_usage_percentage(&self) -> f64 {
+        if self.packets_sent > 0 {
+            (self.ipv6_packets_sent as f64 / self.packets_sent as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
