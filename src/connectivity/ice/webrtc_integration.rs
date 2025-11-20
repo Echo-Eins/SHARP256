@@ -193,6 +193,17 @@ impl WebRtcConnection {
     }
 }
 
+impl std::fmt::Debug for WebRtcConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebRtcConnection")
+            .field("conn", &"<dyn WebRtcConn>")
+            .field("stats", &"<RwLock<ConnectionStats>>")
+            .field("candidate_pair", &self.candidate_pair)
+            .field("state", &"<RwLock<ConnectionState>>")
+            .finish()
+    }
+}
+
 /// Enhanced WebRTC Agent wrapper with full feature support
 pub struct EnhancedWebRtcAgent {
     /// Underlying WebRTC agent

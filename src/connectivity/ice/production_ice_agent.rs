@@ -3,33 +3,24 @@
 //! Full RFC 8445 compliant implementation with WebRTC-rs integration
 
 use anyhow::Result;
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, Notify};
-use tokio::time::{interval, sleep, timeout};
-use tracing::{debug, error, info, warn};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::time::interval;
+use tracing::info;
 
 use crate::connectivity::transport::UdpSocketWrapper;
 
-use webrtc::ice::{
-    agent::Agent as WebRtcAgent,
-    candidate::Candidate as WebRtcCandidate,
-    state::{ConnectionState as WebRtcConnectionState, GatheringState as WebRtcGatheringState},
-    url::Url,
-};
+use webrtc::ice::{candidate::Candidate as WebRtcCandidate, url::Url};
 // Import directly from webrtc_ice as it's not re-exported
 use webrtc_ice::agent::agent_config::AgentConfig as WebRtcAgentConfig;
 
 use super::webrtc_integration::{EnhancedWebRtcAgent, WebRtcConnection};
 use crate::connectivity::config::IceConfig;
 use crate::connectivity::signaling::ProductionSignaling;
-use crate::connectivity::{
-    Candidate, CandidatePair, CandidatePairState, CandidateType, ConnectivityCheckResult,
-    ConnectivityEvent, TransportProtocol,
-};
+use crate::connectivity::{Candidate, CandidatePair, CandidatePairState, CandidateType, TransportProtocol};
 
 /// Production ICE Agent Configuration
 #[derive(Debug, Clone)]
@@ -91,6 +82,8 @@ pub enum IceState {
 }
 
 /// Production ICE Agent with full functionality
+///
+/// Note: Some fields are public to allow access from IceTransport
 pub struct ProductionIceAgent {
     /// Configuration
     config: Arc<RwLock<ProductionIceConfig>>,
@@ -116,14 +109,14 @@ pub struct ProductionIceAgent {
     /// Valid pairs (connectivity check succeeded)
     valid_pairs: Arc<RwLock<Vec<CandidatePair>>>,
 
-    /// Nominated pairs
-    nominated_pairs: Arc<RwLock<Vec<CandidatePair>>>,
+    /// Nominated pairs (PUBLIC: accessed by IceTransport)
+    pub nominated_pairs: Arc<RwLock<Vec<CandidatePair>>>,
 
     /// Established connections
     connections: Arc<RwLock<HashMap<String, Arc<WebRtcConnection>>>>,
 
-    /// Statistics
-    stats: Arc<RwLock<IceStatistics>>,
+    /// Statistics (PUBLIC: accessed by IceTransport)
+    pub stats: Arc<RwLock<IceStatistics>>,
 
     /// Event channel
     event_tx: mpsc::UnboundedSender<IceEvent>,
@@ -131,7 +124,9 @@ pub struct ProductionIceAgent {
 
     /// Notifications
     gathering_complete: Arc<Notify>,
-    connection_established: Arc<Notify>,
+
+    /// Connection established notification (PUBLIC: accessed by IceTransport)
+    pub connection_established: Arc<Notify>,
 
     /// Shutdown signal
     shutdown: Arc<Notify>,
@@ -221,9 +216,8 @@ impl ProductionIceAgent {
 
         // Initialize signaling if peer address provided
         if let Some(addr) = peer_addr {
-            let signaling =
-                ProductionSignaling::new(socket.clone(), addr, self.config.read().controlling)
-                    .await?;
+            let controlling = self.config.read().await.controlling;
+            let signaling = ProductionSignaling::new(socket.clone(), addr, controlling).await?;
 
             // Initialize session
             signaling.initialize_session().await?;
@@ -236,7 +230,7 @@ impl ProductionIceAgent {
         self.gather_candidates().await?;
 
         // Update statistics
-        self.stats.write().gathering_duration = Some(gathering_start.elapsed());
+        self.stats.write().await.gathering_duration = Some(gathering_start.elapsed());
 
         // Exchange candidates if signaling available
         if let Some(signaling) = &*self.signaling.read().await {
@@ -261,7 +255,7 @@ impl ProductionIceAgent {
         self.establish_connections().await?;
 
         // Update statistics
-        self.stats.write().connection_duration = Some(connection_start.elapsed());
+        self.stats.write().await.connection_duration = Some(connection_start.elapsed());
 
         // Update state
         self.set_state(IceState::Completed).await;
@@ -289,7 +283,7 @@ impl ProductionIceAgent {
         }
 
         // Update statistics
-        self.stats.write().candidates_gathered = candidates.len();
+        self.stats.write().await.candidates_gathered = candidates.len();
 
         self.emit_event(IceEvent::GatheringComplete).await;
         self.gathering_complete.notify_waiters();
@@ -322,7 +316,7 @@ impl ProductionIceAgent {
         pairs.sort_by_key(|p| std::cmp::Reverse(p.priority));
 
         *self.candidate_pairs.write().await = pairs.clone();
-        self.stats.write().pairs_created = pairs.len();
+        self.stats.write().await.pairs_created = pairs.len();
 
         info!("Formed {} candidate pairs", pairs.len());
     }
@@ -383,7 +377,7 @@ impl ProductionIceAgent {
     async fn check_candidate_pair(&self, mut pair: CandidatePair) -> Result<()> {
         self.emit_event(IceEvent::ConnectivityCheckStarted(pair.clone()))
             .await;
-        self.stats.write().pairs_checked += 1;
+        self.stats.write().await.pairs_checked += 1;
 
         // Perform STUN check through signaling
         if let Some(signaling) = &*self.signaling.read().await {
@@ -402,16 +396,16 @@ impl ProductionIceAgent {
                     pair.rtt = Some(rtt);
 
                     self.valid_pairs.write().await.push(pair.clone());
-                    self.stats.write().pairs_succeeded += 1;
+                    self.stats.write().await.pairs_succeeded += 1;
 
                     // Update current RTT
-                    self.stats.write().current_rtt_ms = Some(rtt.as_millis() as u32);
+                    self.stats.write().await.current_rtt_ms = Some(rtt.as_millis() as u32);
 
-                    self.emit_event(IceEvent::ConnectivityCheckSucceeded(pair, rtt))
+                    self.emit_event(IceEvent::ConnectivityCheckSucceeded(pair.clone(), rtt))
                         .await;
 
                     // If aggressive nomination, nominate immediately
-                    if self.config.read().aggressive_nomination {
+                    if self.config.read().await.aggressive_nomination {
                         self.nominate_pair(pair).await?;
                     }
 
@@ -419,7 +413,7 @@ impl ProductionIceAgent {
                 }
                 Err(e) => {
                     pair.state = CandidatePairState::Failed;
-                    self.stats.write().pairs_failed += 1;
+                    self.stats.write().await.pairs_failed += 1;
 
                     self.emit_event(IceEvent::ConnectivityCheckFailed(pair, e.to_string()))
                         .await;
@@ -436,7 +430,7 @@ impl ProductionIceAgent {
 
     /// Nominate pairs
     async fn nominate_pairs(&self) -> Result<()> {
-        if self.config.read().aggressive_nomination {
+        if self.config.read().await.aggressive_nomination {
             // Already nominated during checks
             return Ok(());
         }
@@ -445,7 +439,7 @@ impl ProductionIceAgent {
 
         // Get best valid pair per component
         let valid_pairs = self.valid_pairs.read().await;
-        let mut best_pairs: HashMap<u32, CandidatePair> = HashMap::new();
+        let mut best_pairs: HashMap<u16, CandidatePair> = HashMap::new();
 
         for pair in valid_pairs.iter() {
             let component = pair.local.attributes.component;
@@ -482,7 +476,7 @@ impl ProductionIceAgent {
 
         pair.nominated = true;
         self.nominated_pairs.write().await.push(pair.clone());
-        self.stats.write().pairs_nominated += 1;
+        self.stats.write().await.pairs_nominated += 1;
 
         self.emit_event(IceEvent::CandidatePairNominated(pair))
             .await;
@@ -534,7 +528,7 @@ impl ProductionIceAgent {
     /// Start keepalive mechanism
     async fn start_keepalive(&self) {
         let connections = self.connections.clone();
-        let interval_duration = self.config.read().keepalive_interval;
+        let interval_duration = self.config.read().await.keepalive_interval;
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -561,9 +555,9 @@ impl ProductionIceAgent {
 
     /// Set agent state
     async fn set_state(&self, new_state: IceState) {
-        let old_state = *self.state.read();
+        let old_state = *self.state.read().await;
         if old_state != new_state {
-            *self.state.write() = new_state;
+            *self.state.write().await = new_state;
             self.emit_event(IceEvent::StateChanged(new_state)).await;
             info!("ICE state changed: {:?} -> {:?}", old_state, new_state);
         }
@@ -609,12 +603,8 @@ impl ProductionIceAgent {
         // Add TURN servers
         for turn_server in &config.ice_config.turn_servers {
             let mut url = Url::parse_url(&turn_server.url)?;
-            if let Some(username) = &turn_server.username {
-                url.username = username.clone();
-            }
-            if let Some(password) = &turn_server.password {
-                url.password = password.clone();
-            }
+            url.username = turn_server.username.clone();
+            url.password = turn_server.credential.clone();
             urls.push(url);
         }
 
@@ -648,10 +638,62 @@ impl Clone for ProductionIceAgent {
     }
 }
 
-/// Generate ICE credential string
+impl std::fmt::Debug for ProductionIceAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProductionIceAgent")
+            .field("config", &"<RwLock<ProductionIceConfig>>")
+            .field("state", &"<RwLock<IceState>>")
+            .field("webrtc_agent", &"<EnhancedWebRtcAgent>")
+            .field("signaling", &"<RwLock<Option<ProductionSignaling>>>")
+            .field("local_candidates", &"<RwLock<Vec<Candidate>>>")
+            .field("remote_candidates", &"<RwLock<Vec<Candidate>>>")
+            .field("candidate_pairs", &"<RwLock<Vec<CandidatePair>>>")
+            .field("valid_pairs", &"<RwLock<Vec<CandidatePair>>>")
+            .field("nominated_pairs", &"<RwLock<Vec<CandidatePair>>>")
+            .field("connections", &"<RwLock<HashMap>>")
+            .field("stats", &"<RwLock<IceStatistics>>")
+            .finish()
+    }
+}
+
+/// Generate ICE credential string (ufrag/pwd)
+///
+/// RFC 8445 Section 5.4: ICE credentials
+/// - ice-char = ALPHA / DIGIT / "+" / "/"
+/// - ice-ufrag: 4*256ice-char (minimum 4, maximum 256)
+/// - ice-pwd: 22*256ice-char (minimum 22, maximum 256)
+///
+/// ## Arguments
+/// - `length`: Desired length (must meet RFC minimums)
+///
+/// ## Panics
+/// Panics if length violates RFC constraints
 fn generate_ice_credential(length: usize) -> String {
     use rand::Rng;
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    // RFC 8445 Section 5.4: Allowed character set
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    // RFC 8445 Section 5.4: Validate length constraints
+    const MIN_UFRAG_LENGTH: usize = 4;
+    const MIN_PWD_LENGTH: usize = 22;
+    const MAX_LENGTH: usize = 256;
+
+    // Validate length constraints
+    if length < MIN_UFRAG_LENGTH {
+        panic!(
+            "ICE credential length {} violates RFC 8445: minimum is {}",
+            length, MIN_UFRAG_LENGTH
+        );
+    }
+
+    if length > MAX_LENGTH {
+        panic!(
+            "ICE credential length {} violates RFC 8445: maximum is {}",
+            length, MAX_LENGTH
+        );
+    }
+
     let mut rng = rand::thread_rng();
 
     (0..length)
@@ -671,7 +713,7 @@ mod tests {
         let config = ProductionIceConfig::default();
         let agent = ProductionIceAgent::new(config).await.unwrap();
 
-        assert_eq!(*agent.state.read(), IceState::New);
+        assert_eq!(*agent.state.read().await, IceState::New);
         assert!(agent.local_candidates.read().await.is_empty());
     }
 

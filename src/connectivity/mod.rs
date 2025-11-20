@@ -370,7 +370,7 @@ impl CandidateAttributes {
 }
 
 /// Пара кандидатов для connectivity checks
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidatePair {
     /// Локальный кандидат
     pub local: Candidate,
@@ -384,6 +384,10 @@ pub struct CandidatePair {
     pub nominated: bool,
     /// Время последней активности
     pub last_activity: Option<Instant>,
+    /// Round-Trip Time (RFC 8445 Section 6)
+    /// Measured during connectivity checks
+    #[serde(skip)]
+    pub rtt: Option<Duration>,
 }
 
 impl CandidatePair {
@@ -397,6 +401,7 @@ impl CandidatePair {
             state: CandidatePairState::Waiting,
             nominated: false,
             last_activity: None,
+            rtt: None,
         }
     }
 
