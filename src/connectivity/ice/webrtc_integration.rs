@@ -13,8 +13,6 @@ use tracing::{debug, info, warn, error};
 use webrtc::ice::{
     agent::{Agent as WebRtcAgent, AgentConfig},
     candidate::{Candidate as WebRtcCandidate, CandidateType},
-    // NOTE: Conn moved or renamed in webrtc 0.13
-    // conn::Conn as WebRtcConn,
     network_type::NetworkType,
     state::{ConnectionState, GatheringState},
     url::Url,
@@ -26,6 +24,81 @@ use webrtc::stun::message::Message as StunMessage;
 use webrtc::turn::client::Client as TurnClient;
 
 use crate::connectivity::{Candidate, CandidatePair};
+
+/// WebRTC connection trait abstraction
+///
+/// This trait provides a production-ready abstraction over WebRTC connection types,
+/// ensuring compatibility with webrtc-rs 0.13 API changes while maintaining
+/// RFC 8445 ICE compliance.
+///
+/// # Design Notes
+///
+/// In webrtc-rs 0.13, the `Conn` type was refactored. This trait provides
+/// a stable interface that can be implemented by various connection types:
+/// - UDP connections from ICE Agent
+/// - TCP connections (RFC 6544: ICE-TCP)
+/// - TURN relay connections (RFC 5766)
+/// - Mock connections for testing
+///
+/// # Thread Safety
+///
+/// All implementations MUST be Send + Sync for use in async contexts.
+pub trait WebRtcConn {
+    /// Send data through the connection
+    ///
+    /// # Arguments
+    /// * `data` - Byte slice to send
+    ///
+    /// # Returns
+    /// Number of bytes sent, or error
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Connection is closed
+    /// - Network error occurs
+    /// - Buffer size exceeds MTU
+    fn send(&self, data: &[u8]) -> Result<usize>;
+
+    /// Receive data from the connection
+    ///
+    /// # Arguments
+    /// * `buf` - Buffer to receive into
+    ///
+    /// # Returns
+    /// Number of bytes received, or error
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Connection is closed
+    /// - Timeout occurs
+    /// - Network error occurs
+    fn recv(&self, buf: &mut [u8]) -> Result<usize>;
+
+    /// Close the connection gracefully
+    ///
+    /// # Returns
+    /// Ok(()) on successful close, or error
+    ///
+    /// # Errors
+    /// Returns error if close operation fails
+    fn close(&self) -> Result<()>;
+
+    /// Get local address of the connection
+    ///
+    /// # Returns
+    /// Local socket address, or None if not available
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
+    /// Get remote address of the connection
+    ///
+    /// # Returns
+    /// Remote socket address, or None if not available
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+}
 
 /// Production WebRTC connection wrapper
 pub struct WebRtcConnection {

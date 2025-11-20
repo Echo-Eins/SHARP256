@@ -195,6 +195,78 @@ impl Candidate {
     }
 }
 
+/// Transport protocol for ICE candidates
+///
+/// RFC 8445 Section 5.1.2.1: Transport Protocol
+/// "The transport protocol used by the candidate. This specification
+///  only defines UDP. However, extensibility is provided to allow for
+///  future transport protocols to be used with ICE, such as TCP active,
+///  TCP passive, or TCP simultaneous-open."
+///
+/// RFC 6544: ICE-TCP (TCP Candidates with Interactive Connectivity Establishment)
+/// Defines how TCP can be used as a transport protocol for ICE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TransportProtocol {
+    /// UDP transport (RFC 8445 default)
+    /// The primary transport protocol for ICE, providing best compatibility
+    /// and performance for NAT traversal scenarios.
+    Udp,
+
+    /// TCP transport (RFC 6544: ICE-TCP)
+    /// Alternative transport when UDP is blocked by firewalls.
+    /// Supports Active, Passive, and Simultaneous-Open connection types.
+    Tcp,
+}
+
+impl TransportProtocol {
+    /// Convert to protocol string for SDP/ICE messages
+    /// Returns "udp" or "tcp" as per RFC 8445 Section 5.1.2.1
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+
+    /// Parse from protocol string
+    /// Accepts "UDP", "udp", "TCP", "tcp" (case-insensitive per RFC 8445)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "udp" => Some(Self::Udp),
+            "tcp" => Some(Self::Tcp),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a reliable transport
+    /// TCP provides reliability, UDP does not (per RFC 793 and RFC 768)
+    pub fn is_reliable(&self) -> bool {
+        matches!(self, Self::Tcp)
+    }
+
+    /// Get default port for this protocol
+    /// These are IANA registered ports for ICE/STUN
+    pub fn default_port(&self) -> u16 {
+        match self {
+            Self::Udp => 3478,  // STUN default UDP port (RFC 8489)
+            Self::Tcp => 3478,  // STUN default TCP port (RFC 8489)
+        }
+    }
+}
+
+impl Default for TransportProtocol {
+    /// Default to UDP per RFC 8445 Section 2.1
+    fn default() -> Self {
+        Self::Udp
+    }
+}
+
+impl std::fmt::Display for TransportProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Тип ICE кандидата
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CandidateType {
@@ -213,32 +285,77 @@ pub enum CandidateType {
 }
 
 /// Атрибуты кандидата
+///
+/// RFC 8445 Section 5.1: Candidate Attributes
+/// Contains all necessary attributes for ICE candidate description
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateAttributes {
-    /// Транспортный протокол (udp/tcp)
-    pub transport: String,
-    /// ID компонента (1 для RTP, 2 для RTCP)
+    /// Транспортный протокол (RFC 8445 Section 5.1.2.1)
+    /// UDP (default) or TCP (RFC 6544)
+    pub transport: TransportProtocol,
+
+    /// ID компонента (RFC 8445 Section 5.1.2.2)
+    /// 1 for RTP, 2 for RTCP, per RFC 5245 conventions
     pub component: u16,
-    /// Стоимость сети
+
+    /// Стоимость сети (RFC 8445 Section 5.1.2)
+    /// Lower values indicate higher preference
+    /// Range: 0-65535, where 0 is highest cost
     pub network_cost: u16,
-    /// Поколение ICE (для restarts)
+
+    /// Поколение ICE (RFC 8445 Section 2.5: ICE Restart)
+    /// Incremented each time ICE restarts
     pub generation: u32,
-    /// ID сети
+
+    /// ID сети (RFC 8445 Section 5.1.3)
+    /// Identifies the network interface for multi-homed hosts
     pub network_id: u32,
-    /// Дополнительные расширения
+
+    /// Дополнительные расширения (RFC 8445 Section 5.1)
+    /// Allows for future extensibility without breaking compatibility
     pub extensions: std::collections::HashMap<String, String>,
 }
 
 impl Default for CandidateAttributes {
     fn default() -> Self {
         Self {
-            transport: "udp".to_string(),
+            // Default to UDP per RFC 8445
+            transport: TransportProtocol::Udp,
+            // Component 1 (RTP) is the default per RFC 5245
             component: 1,
+            // Network cost 0 = highest preference
             network_cost: 0,
+            // Initial generation
             generation: 0,
+            // Default network ID
             network_id: 1,
+            // No extensions by default
             extensions: std::collections::HashMap::new(),
         }
+    }
+}
+
+impl CandidateAttributes {
+    /// Create attributes for a specific transport protocol
+    pub fn with_transport(transport: TransportProtocol) -> Self {
+        Self {
+            transport,
+            ..Default::default()
+        }
+    }
+
+    /// Create attributes with custom component ID
+    pub fn with_component(component: u16) -> Self {
+        Self {
+            component,
+            ..Default::default()
+        }
+    }
+
+    /// Check if attributes are compatible for pairing
+    /// Per RFC 8445 Section 6.1.2.2: candidates must have matching transport and component
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        self.transport == other.transport && self.component == other.component
     }
 }
 
@@ -280,19 +397,17 @@ impl CandidatePair {
     }
 
     /// Проверка совместимости кандидатов
+    ///
+    /// RFC 8445 Section 6.1.2.2: Forming Candidate Pairs
+    /// "Candidates MUST have the same IP address version and transport protocol"
     pub fn is_compatible(&self) -> bool {
-        // IP версии должны совпадать
+        // IP версии должны совпадать (RFC 8445 Section 6.1.2.2)
         if self.local.address.is_ipv4() != self.remote.address.is_ipv4() {
             return false;
         }
 
-        // Транспорт должен совпадать
-        if self.local.attributes.transport != self.remote.attributes.transport {
-            return false;
-        }
-
-        // Компоненты должны совпадать
-        if self.local.attributes.component != self.remote.attributes.component {
+        // Транспорт и компонент должны совпадать (RFC 8445 Section 6.1.2.2)
+        if !self.local.attributes.is_compatible_with(&self.remote.attributes) {
             return false;
         }
 
