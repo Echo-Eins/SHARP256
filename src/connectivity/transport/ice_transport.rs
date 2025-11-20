@@ -41,14 +41,17 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use super::{
-    ConnectionInfo, ConnectionState, QualityMetrics, SocketOptions, Transport, TransportEvent,
-    TransportStats, TransportType, UdpSocketWrapper,
+    stats::StunServerRuntimeStats, ConnectionInfo, ConnectionState, QualityMetrics,
+    SocketOptions, Transport, TransportEvent, TransportStats, TransportType, UdpSocketWrapper,
 };
 use crate::connectivity::config::IceConfig;
 use crate::connectivity::ice::production_ice_agent::{ProductionIceAgent, ProductionIceConfig};
+use crate::connectivity::stun::client::{StunClient, StunClientConfig};
 use crate::connectivity::stun::message::{StunClass, StunMessage, StunMessageType, StunMethod};
 use crate::connectivity::stun::transaction::TransactionId;
+use crate::connectivity::stun::{parse_stun_url, StunConfig};
 use crate::connectivity::CandidatePair;
+use std::collections::HashMap;
 
 /// RFC 7675: Default consent freshness interval (15 seconds)
 const DEFAULT_CONSENT_INTERVAL: Duration = Duration::from_secs(15);
@@ -193,6 +196,46 @@ pub struct IceTransport {
     /// Whether end-of-candidates signaling was received (RFC 8838 Section 13)
     end_of_candidates_received: Arc<StdRwLock<bool>>,
 
+    // ═══ STUN Client Layer (RFC 8489) ═══
+    /// STUN clients for each configured server
+    ///
+    /// RFC 8489 Section 7.2: Multiple STUN servers can be used simultaneously.
+    /// Each server gets its own StunClient instance for transaction isolation
+    /// and independent statistics tracking.
+    ///
+    /// Key: Server SocketAddr
+    /// Value: StunClient instance with dedicated TransactionTracker
+    ///
+    /// ## Usage
+    ///
+    /// - Consent freshness checks (RFC 7675): Select healthy server for checks
+    /// - NAT detection: Parallel requests to multiple servers
+    /// - Server redundancy: Failover to healthy servers on timeout
+    ///
+    /// ## Thread Safety
+    ///
+    /// HashMap is wrapped in Arc<StdRwLock> for concurrent access from:
+    /// - Consent freshness check task
+    /// - stats() aggregation
+    /// - Server health monitoring
+    stun_clients: Arc<StdRwLock<HashMap<SocketAddr, Arc<StunClient>>>>,
+
+    /// Runtime statistics for each STUN server
+    ///
+    /// RFC 8445 Section 14: ICE implementations MUST collect statistics.
+    ///
+    /// Tracks live statistics aggregated from StunClient's TransactionTracker:
+    /// - Requests sent / responses received
+    /// - Timeouts and retransmissions
+    /// - RTT measurements (min/avg/max)
+    /// - Quality score for server selection
+    ///
+    /// Updated in real-time as STUN transactions complete.
+    ///
+    /// Key: Server SocketAddr
+    /// Value: StunServerRuntimeStats with live metrics
+    stun_stats: Arc<StdRwLock<HashMap<SocketAddr, StunServerRuntimeStats>>>,
+
     // ═══ Configuration ═══
     config: Arc<StdRwLock<IceTransportConfig>>,
 
@@ -260,6 +303,99 @@ impl IceTransport {
                 .context("Failed to create ICE agent")?,
         );
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // STUN Client Initialization (RFC 8489 Section 7.2)
+        // ═══════════════════════════════════════════════════════════════════════
+        //
+        // Create dedicated StunClient instance for each configured STUN server.
+        // Each client has its own TransactionTracker for independent statistics
+        // and transaction management.
+        //
+        // RFC 8489 Section 7.2: Multiple STUN servers MAY be used simultaneously
+        // to provide redundancy and improve reliability.
+
+        info!(
+            "Initializing STUN clients for {} configured servers",
+            config.ice_config.stun_servers.len()
+        );
+
+        let mut stun_clients_map = HashMap::new();
+        let mut stun_stats_map = HashMap::new();
+        let socket_local_addr = socket.local_addr();
+
+        for stun_url in &config.ice_config.stun_servers {
+            // Parse STUN URL to extract server address and protocol
+            let (server_addr, use_dtls) = match parse_stun_url(stun_url) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    warn!(
+                        "Failed to parse STUN URL '{}': {}. Skipping this server.",
+                        stun_url, e
+                    );
+                    continue;
+                }
+            };
+
+            if use_dtls {
+                // DTLS not yet implemented (will be done in HIGH-5)
+                warn!(
+                    "STUN server '{}' requires DTLS which is not yet implemented. Skipping.",
+                    stun_url
+                );
+                continue;
+            }
+
+            // Create StunClientConfig with ICE credentials
+            let stun_config = StunClientConfig {
+                config: StunConfig {
+                    servers: vec![stun_url.clone()], // Single server for this client
+                    use_dtls: false,                 // DTLS handled separately above
+                    timeout: Duration::from_secs(5), // RFC 8489: 5 second timeout
+                    max_retransmissions: 7, // RFC 8489 Section 7.2.1: Up to 7 retransmissions
+                    initial_rto_ms: 500,    // RFC 8489 Section 7.2.1: 500ms initial RTO
+                    ice_ufrag: Some(config.local_ufrag.clone()),
+                    ice_pwd: Some(config.local_pwd.clone()),
+                    integrity_failure_threshold: 3, // Allow 3 integrity failures before fallback
+                    fallback_on_integrity_failure: true, // Fallback to non-integrity mode
+                },
+                local_addr: Some(socket_local_addr),
+                verbose: false,
+            };
+
+            // Create StunClient instance for this server
+            match StunClient::new(stun_config).await {
+                Ok(stun_client) => {
+                    info!(
+                        "Created STUN client for server {} (local: {})",
+                        server_addr, socket_local_addr
+                    );
+
+                    stun_clients_map.insert(server_addr, Arc::new(stun_client));
+
+                    // Initialize runtime statistics for this server
+                    stun_stats_map.insert(server_addr, StunServerRuntimeStats::new(server_addr));
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to create STUN client for '{}': {}. Skipping this server.",
+                        stun_url, e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if stun_clients_map.is_empty() {
+            warn!(
+                "No STUN clients were successfully created! STUN functionality will be limited."
+            );
+        } else {
+            info!(
+                "Successfully initialized {} STUN client(s)",
+                stun_clients_map.len()
+            );
+        }
+
         // Create event channel
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -278,6 +414,8 @@ impl IceTransport {
             consent_checks_failed: Arc::new(StdRwLock::new(0)),
             restart_count: Arc::new(StdRwLock::new(0)),
             end_of_candidates_received: Arc::new(StdRwLock::new(false)),
+            stun_clients: Arc::new(StdRwLock::new(stun_clients_map)),
+            stun_stats: Arc::new(StdRwLock::new(stun_stats_map)),
             config: Arc::new(StdRwLock::new(config)),
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),

@@ -67,6 +67,17 @@ pub struct StunClient {
     skip_integrity: Arc<RwLock<bool>>,
 }
 
+impl std::fmt::Debug for StunClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StunClient")
+            .field("config", &self.config)
+            .field("socket", &"<UdpSocket>")
+            .field("tracker", &"<TransactionTracker>")
+            .field("integrity", &self.integrity.is_some())
+            .finish()
+    }
+}
+
 impl StunClient {
     /// Create a new STUN client
     #[instrument(skip(config))]

@@ -479,7 +479,10 @@ pub enum IceRole {
     Controlled,
 }
 
-/// STUN server statistics
+/// STUN server statistics (for external reporting)
+///
+/// This structure is used for exporting statistics via the Transport::stats() API.
+/// For internal runtime tracking, see StunServerRuntimeStats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StunServerStats {
     /// Server address
@@ -496,6 +499,144 @@ pub struct StunServerStats {
 
     /// Average RTT to this server
     pub avg_rtt: Option<Duration>,
+}
+
+/// STUN server runtime statistics (internal tracking)
+///
+/// RFC 8445 Section 14: ICE implementations MUST collect statistics about STUN usage.
+/// RFC 8489 Section 7.2: Multiple STUN servers may be used simultaneously.
+///
+/// This structure tracks detailed runtime statistics for each STUN server,
+/// aggregated from StunClient's TransactionTracker. Used internally by IceTransport
+/// to maintain live statistics and implement server quality scoring.
+///
+/// ## Usage
+///
+/// Each STUN server configured in IceConfig gets its own StunServerRuntimeStats
+/// instance, which is updated in real-time as STUN transactions complete.
+///
+/// ## Quality Score
+///
+/// The quality_score field (0.0-1.0) is used for intelligent server selection:
+/// - 1.0: Perfect server (no failures, low RTT)
+/// - 0.8-1.0: Good server
+/// - 0.5-0.8: Degraded server
+/// - <0.5: Poor server (should avoid)
+///
+/// Score decreases on failures/timeouts and increases on successful responses.
+#[derive(Debug, Clone)]
+pub struct StunServerRuntimeStats {
+    /// Server socket address
+    pub address: std::net::SocketAddr,
+
+    /// Total requests sent to this server (from TransactionTracker)
+    pub requests_sent: u64,
+
+    /// Total successful responses received (from TransactionTracker)
+    pub responses_received: u64,
+
+    /// Total timeouts for this server (from TransactionTracker)
+    pub timeouts: u64,
+
+    /// Current average RTT (from TransactionTracker.average_rtt())
+    pub avg_rtt: Option<Duration>,
+
+    /// Minimum RTT observed (from TransactionTracker)
+    pub min_rtt: Option<Duration>,
+
+    /// Maximum RTT observed (from TransactionTracker)
+    pub max_rtt: Option<Duration>,
+
+    /// Total retransmissions to this server (from TransactionTracker)
+    pub total_retransmissions: u64,
+
+    /// Last successful request timestamp
+    #[allow(dead_code)] // Used for quality tracking
+    pub last_success: Option<std::time::Instant>,
+
+    /// Last failure timestamp
+    #[allow(dead_code)] // Used for quality tracking
+    pub last_failure: Option<std::time::Instant>,
+
+    /// Server quality score (0.0-1.0)
+    ///
+    /// Updated based on success/failure rates:
+    /// - Success: quality_score = min(1.0, quality_score * 1.1)
+    /// - Failure: quality_score *= 0.9
+    /// - Timeout: quality_score *= 0.8 (larger penalty)
+    pub quality_score: f64,
+}
+
+impl StunServerRuntimeStats {
+    /// Create new runtime statistics for a STUN server
+    pub fn new(address: std::net::SocketAddr) -> Self {
+        Self {
+            address,
+            requests_sent: 0,
+            responses_received: 0,
+            timeouts: 0,
+            avg_rtt: None,
+            min_rtt: None,
+            max_rtt: None,
+            total_retransmissions: 0,
+            last_success: None,
+            last_failure: None,
+            quality_score: 1.0, // Start optimistic
+        }
+    }
+
+    /// Calculate success rate (0.0-1.0)
+    pub fn success_rate(&self) -> f64 {
+        if self.requests_sent == 0 {
+            return 1.0; // No data yet, optimistic
+        }
+        self.responses_received as f64 / self.requests_sent as f64
+    }
+
+    /// Check if server is healthy (quality >= 0.5)
+    pub fn is_healthy(&self) -> bool {
+        self.quality_score >= 0.5
+    }
+
+    /// Update quality score on successful response
+    pub fn record_success(&mut self) {
+        self.responses_received += 1;
+        self.last_success = Some(std::time::Instant::now());
+        // Increase quality score, cap at 1.0
+        self.quality_score = (self.quality_score * 1.1).min(1.0);
+    }
+
+    /// Update quality score on failure
+    pub fn record_failure(&mut self) {
+        self.last_failure = Some(std::time::Instant::now());
+        // Decrease quality score (failure penalty)
+        self.quality_score *= 0.9;
+    }
+
+    /// Update quality score on timeout (larger penalty)
+    pub fn record_timeout(&mut self) {
+        self.timeouts += 1;
+        self.last_failure = Some(std::time::Instant::now());
+        // Larger penalty for timeouts
+        self.quality_score *= 0.8;
+    }
+
+    /// Convert to exportable StunServerStats
+    pub fn to_export_stats(&self) -> StunServerStats {
+        StunServerStats {
+            address: self.address.to_string(),
+            requests_sent: self.requests_sent as u32,
+            responses_received: self.responses_received as u32,
+            timeouts: self.timeouts as u32,
+            avg_rtt: self.avg_rtt,
+        }
+    }
+}
+
+impl Default for StunServerRuntimeStats {
+    fn default() -> Self {
+        Self::new("0.0.0.0:0".parse().unwrap())
+    }
 }
 
 /// TURN server statistics
