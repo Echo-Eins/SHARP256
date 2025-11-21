@@ -25,7 +25,7 @@
 //! ## Использование
 //!
 //! ```rust
-//! use sharp256::connectivity::Connectivity;
+//  use sharp256::connectivity::Connectivity;
 //!
 //! // Создание с конфигурацией по умолчанию
 //! let connectivity = Connectivity::new().await?;

@@ -135,7 +135,7 @@ impl StunClient {
     }
 
     /// Send UDP Binding Request with optional CHANGE-REQUEST
-    async fn binding_request_udp(
+    pub async fn binding_request_udp(
         &self,
         server_addr: SocketAddr,
         change_request: Option<ChangeRequest>,
