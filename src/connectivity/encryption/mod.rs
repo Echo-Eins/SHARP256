@@ -368,7 +368,9 @@ pub mod benchmark {
 
         // Сортируем по производительности
         all_results.sort_by(|a, b| {
-            b.throughput_mbps.partial_cmp(&a.throughput_mbps).unwrap_or(std::cmp::Ordering::Equal)
+            b.throughput_mbps
+                .partial_cmp(&a.throughput_mbps)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         Ok(all_results)
@@ -383,16 +385,23 @@ pub mod mock {
     pub struct MockHeaderCrypto;
 
     impl MockHeaderCrypto {
-        pub fn new(_key: [u8; 32], _algorithm: crate::connectivity::config::HeaderEncryptionAlgorithm) -> anyhow::Result<Self> {
+        pub fn new(
+            _key: [u8; 32],
+            _algorithm: crate::connectivity::config::HeaderEncryptionAlgorithm,
+        ) -> anyhow::Result<Self> {
             Ok(Self)
         }
 
         pub fn encrypt_header_bytes(&self, _data: &[u8]) -> anyhow::Result<Vec<u8>> {
-            Err(anyhow::anyhow!("Relay encryption not available (feature disabled)"))
+            Err(anyhow::anyhow!(
+                "Relay encryption not available (feature disabled)"
+            ))
         }
 
         pub fn decrypt_header_bytes(&self, _data: &[u8]) -> anyhow::Result<Vec<u8>> {
-            Err(anyhow::anyhow!("Relay encryption not available (feature disabled)"))
+            Err(anyhow::anyhow!(
+                "Relay encryption not available (feature disabled)"
+            ))
         }
     }
 }
@@ -476,7 +485,11 @@ mod tests {
     #[cfg(not(feature = "relay-encryption"))]
     #[test]
     fn test_mock_header_crypto() {
-        let mock_crypto = mock::MockHeaderCrypto::new([0u8; 32], crate::connectivity::config::HeaderEncryptionAlgorithm::ChaCha20Poly1305).unwrap();
+        let mock_crypto = mock::MockHeaderCrypto::new(
+            [0u8; 32],
+            crate::connectivity::config::HeaderEncryptionAlgorithm::ChaCha20Poly1305,
+        )
+        .unwrap();
 
         // Mock должен возвращать ошибки
         assert!(mock_crypto.encrypt_header_bytes(b"test").is_err());

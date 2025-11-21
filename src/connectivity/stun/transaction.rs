@@ -4,11 +4,11 @@
 //! RFC 8489 Section 6: Transaction ID is a 96-bit identifier
 //! used to uniquely identify STUN transactions.
 
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use rand::Rng;
 
 /// Transaction ID (96 bits / 12 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -232,11 +232,14 @@ impl TransactionTracker {
     }
 
     /// Get pending transaction info
-    pub async fn get_pending(&self, transaction_id: &TransactionId) -> Option<(Vec<u8>, std::net::SocketAddr, u32)> {
+    pub async fn get_pending(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Option<(Vec<u8>, std::net::SocketAddr, u32)> {
         let pending = self.pending.read().await;
-        pending.get(transaction_id).map(|tx| {
-            (tx.request.clone(), tx.destination, tx.retransmissions)
-        })
+        pending
+            .get(transaction_id)
+            .map(|tx| (tx.request.clone(), tx.destination, tx.retransmissions))
     }
 
     /// Get all pending transaction IDs
@@ -290,7 +293,9 @@ mod tests {
 
     #[test]
     fn test_transaction_id_hex() {
-        let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67];
+        let bytes = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+        ];
         let id = TransactionId::from_bytes(bytes);
         assert_eq!(id.to_hex(), "0123456789abcdef01234567");
     }

@@ -3,29 +3,104 @@
 //! This replaces all mock implementations with real WebRTC connections
 
 use anyhow::Result;
-use std::sync::Arc;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 use webrtc::ice::{
-    agent::{Agent as WebRtcAgent, AgentConfig},
+    agent::Agent as WebRtcAgent,
     candidate::{Candidate as WebRtcCandidate, CandidateType},
-    // NOTE: Conn moved or renamed in webrtc 0.13
-    // conn::Conn as WebRtcConn,
+    mdns::MulticastDnsMode,
     network_type::NetworkType,
     state::{ConnectionState, GatheringState},
-    url::Url,
-    mdns::MulticastDnsMode,
     tcp_type::TcpType,
+    url::Url,
 };
+// Import directly from webrtc_ice as it's not re-exported
+use webrtc_ice::agent::agent_config::AgentConfig;
 
 use webrtc::stun::message::Message as StunMessage;
 use webrtc::turn::client::Client as TurnClient;
 
 use crate::connectivity::{Candidate, CandidatePair};
+
+/// WebRTC connection trait abstraction
+///
+/// This trait provides a production-ready abstraction over WebRTC connection types,
+/// ensuring compatibility with webrtc-rs 0.13 API changes while maintaining
+/// RFC 8445 ICE compliance.
+///
+/// # Design Notes
+///
+/// In webrtc-rs 0.13, the `Conn` type was refactored. This trait provides
+/// a stable interface that can be implemented by various connection types:
+/// - UDP connections from ICE Agent
+/// - TCP connections (RFC 6544: ICE-TCP)
+/// - TURN relay connections (RFC 5766)
+/// - Mock connections for testing
+///
+/// # Thread Safety
+///
+/// All implementations MUST be Send + Sync for use in async contexts.
+pub trait WebRtcConn {
+    /// Send data through the connection
+    ///
+    /// # Arguments
+    /// * `data` - Byte slice to send
+    ///
+    /// # Returns
+    /// Number of bytes sent, or error
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Connection is closed
+    /// - Network error occurs
+    /// - Buffer size exceeds MTU
+    fn send(&self, data: &[u8]) -> Result<usize>;
+
+    /// Receive data from the connection
+    ///
+    /// # Arguments
+    /// * `buf` - Buffer to receive into
+    ///
+    /// # Returns
+    /// Number of bytes received, or error
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Connection is closed
+    /// - Timeout occurs
+    /// - Network error occurs
+    fn recv(&self, buf: &mut [u8]) -> Result<usize>;
+
+    /// Close the connection gracefully
+    ///
+    /// # Returns
+    /// Ok(()) on successful close, or error
+    ///
+    /// # Errors
+    /// Returns error if close operation fails
+    fn close(&self) -> Result<()>;
+
+    /// Get local address of the connection
+    ///
+    /// # Returns
+    /// Local socket address, or None if not available
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
+    /// Get remote address of the connection
+    ///
+    /// # Returns
+    /// Remote socket address, or None if not available
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+}
 
 /// Production WebRTC connection wrapper
 pub struct WebRtcConnection {
@@ -53,10 +128,7 @@ pub struct ConnectionStats {
 
 impl WebRtcConnection {
     /// Create a new WebRTC connection from an established ICE connection
-    pub fn new(
-        conn: Arc<dyn WebRtcConn + Send + Sync>,
-        candidate_pair: CandidatePair,
-    ) -> Self {
+    pub fn new(conn: Arc<dyn WebRtcConn + Send + Sync>, candidate_pair: CandidatePair) -> Self {
         Self {
             conn,
             stats: Arc::new(RwLock::new(ConnectionStats::default())),
@@ -67,7 +139,9 @@ impl WebRtcConnection {
 
     /// Send data through the connection
     pub async fn send(&self, data: &[u8]) -> Result<usize> {
-        let sent = self.conn.send(data)
+        let sent = self
+            .conn
+            .send(data)
             .map_err(|e| anyhow::anyhow!("WebRTC send failed: {}", e))?;
 
         // Update statistics
@@ -82,7 +156,9 @@ impl WebRtcConnection {
 
     /// Receive data from the connection
     pub async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        let received = self.conn.recv(buf)
+        let received = self
+            .conn
+            .recv(buf)
             .map_err(|e| anyhow::anyhow!("WebRTC recv failed: {}", e))?;
 
         // Update statistics
@@ -103,7 +179,8 @@ impl WebRtcConnection {
     /// Close the connection
     pub async fn close(&self) -> Result<()> {
         *self.state.write().await = ConnectionState::Closed;
-        self.conn.close()
+        self.conn
+            .close()
             .map_err(|e| anyhow::anyhow!("Failed to close WebRTC connection: {}", e))
     }
 
@@ -113,6 +190,17 @@ impl WebRtcConnection {
             *self.state.read().await,
             ConnectionState::Connected | ConnectionState::Completed
         )
+    }
+}
+
+impl std::fmt::Debug for WebRtcConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebRtcConnection")
+            .field("conn", &"<dyn WebRtcConn>")
+            .field("stats", &"<RwLock<ConnectionStats>>")
+            .field("candidate_pair", &self.candidate_pair)
+            .field("state", &"<RwLock<ConnectionState>>")
+            .finish()
     }
 }
 
@@ -155,7 +243,9 @@ impl EnhancedWebRtcAgent {
         let mut candidates = Vec::new();
 
         // Start gathering
-        self.agent.gather_candidates().await
+        self.agent
+            .gather_candidates()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to start gathering: {}", e))?;
 
         // Wait for gathering to complete with timeout
@@ -163,7 +253,10 @@ impl EnhancedWebRtcAgent {
         let start = std::time::Instant::now();
 
         loop {
-            let state = self.agent.get_gathering_state().await
+            let state = self
+                .agent
+                .get_gathering_state()
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to get gathering state: {}", e))?;
 
             if state == GatheringState::Complete {
@@ -179,7 +272,10 @@ impl EnhancedWebRtcAgent {
         }
 
         // Get all local candidates
-        let local_candidates = self.agent.get_local_candidates().await
+        let local_candidates = self
+            .agent
+            .get_local_candidates()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get local candidates: {}", e))?;
 
         for webrtc_candidate in local_candidates {
@@ -199,7 +295,10 @@ impl EnhancedWebRtcAgent {
     }
 
     /// Convert WebRTC candidate to our format with full attribute support
-    async fn convert_webrtc_candidate(&self, webrtc_candidate: WebRtcCandidate) -> Result<Candidate> {
+    async fn convert_webrtc_candidate(
+        &self,
+        webrtc_candidate: WebRtcCandidate,
+    ) -> Result<Candidate> {
         let candidate_type = match webrtc_candidate.candidate_type() {
             CandidateType::Host => crate::connectivity::CandidateType::Host,
             CandidateType::ServerReflexive => crate::connectivity::CandidateType::ServerReflexive,
@@ -215,16 +314,18 @@ impl EnhancedWebRtcAgent {
             foundation: webrtc_candidate.foundation(),
             priority: webrtc_candidate.priority(),
             address: SocketAddr::new(
-                address.parse()
+                address
+                    .parse()
                     .map_err(|e| anyhow::anyhow!("Invalid candidate address: {}", e))?,
-                webrtc_candidate.port()
+                webrtc_candidate.port(),
             ),
             candidate_type,
             related_address: if !related_address.is_empty() {
                 Some(SocketAddr::new(
-                    related_address.parse()
+                    related_address
+                        .parse()
                         .map_err(|e| anyhow::anyhow!("Invalid related address: {}", e))?,
-                    webrtc_candidate.related_port()
+                    webrtc_candidate.related_port(),
                 ))
             } else {
                 None
@@ -249,27 +350,26 @@ impl EnhancedWebRtcAgent {
         local_candidate: &Candidate,
         remote_candidate: &Candidate,
     ) -> Result<Arc<WebRtcConnection>> {
-        info!("Establishing WebRTC connection: {} -> {}",
-              local_candidate.address, remote_candidate.address);
+        info!(
+            "Establishing WebRTC connection: {} -> {}",
+            local_candidate.address, remote_candidate.address
+        );
 
         // Create connection through WebRTC agent
-        let conn = self.agent.dial(
-            remote_candidate.address.to_string(),
-            local_candidate.address.to_string()
-        ).await
+        let conn = self
+            .agent
+            .dial(
+                remote_candidate.address.to_string(),
+                local_candidate.address.to_string(),
+            )
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to dial: {}", e))?;
 
         // Create candidate pair
-        let candidate_pair = CandidatePair::new(
-            local_candidate.clone(),
-            remote_candidate.clone()
-        );
+        let candidate_pair = CandidatePair::new(local_candidate.clone(), remote_candidate.clone());
 
         // Wrap in our connection type
-        let connection = Arc::new(WebRtcConnection::new(
-            Arc::new(conn),
-            candidate_pair
-        ));
+        let connection = Arc::new(WebRtcConnection::new(Arc::new(conn), candidate_pair));
 
         // Store connection
         self.connections.write().await.push(connection.clone());
@@ -318,7 +418,7 @@ impl MdnsResolver {
                 foundation: format!("mdns-{}", uuid::Uuid::new_v4()),
                 priority: calculate_candidate_priority(
                     crate::connectivity::CandidateType::Host,
-                    addr
+                    addr,
                 ),
                 address: *addr,
                 candidate_type: crate::connectivity::CandidateType::Host,
@@ -376,7 +476,7 @@ fn calculate_network_cost(network_type: NetworkType) -> u32 {
 /// Calculate candidate priority according to RFC 8445
 fn calculate_candidate_priority(
     candidate_type: crate::connectivity::CandidateType,
-    addr: &SocketAddr
+    addr: &SocketAddr,
 ) -> u32 {
     let type_preference = match candidate_type {
         crate::connectivity::CandidateType::Host => 126,
@@ -411,10 +511,8 @@ mod tests {
     #[tokio::test]
     async fn test_candidate_priority_calculation() {
         let addr = "192.168.1.100:5000".parse().unwrap();
-        let priority = calculate_candidate_priority(
-            crate::connectivity::CandidateType::Host,
-            &addr
-        );
+        let priority =
+            calculate_candidate_priority(crate::connectivity::CandidateType::Host, &addr);
 
         // Host candidate should have high priority
         assert!(priority > (100 << 24));

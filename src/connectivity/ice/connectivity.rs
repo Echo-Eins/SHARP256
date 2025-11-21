@@ -20,26 +20,24 @@
 //! let valid_pairs = checker.get_valid_pairs().await;
 //! ```
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, Notify, Mutex, oneshot};
-use tokio::time::{timeout, sleep, interval};
-use tracing::{debug, info, warn, error, trace, instrument};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
+use tokio::time::{interval, sleep, timeout};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use webrtc::ice::{
-    agent::Agent as WebRtcAgent,
-    candidate::Candidate as WebRtcCandidate,
+    agent::Agent as WebRtcAgent, candidate::Candidate as WebRtcCandidate,
     state::ConnectionState as WebRtcConnectionState,
 };
 
-use crate::connectivity::{
-    Candidate, CandidatePair, CandidatePairState, CandidateType,
-    ConnectivityCheckResult,
-};
 use crate::connectivity::config::IceConfig;
+use crate::connectivity::{
+    Candidate, CandidatePair, CandidatePairState, CandidateType, ConnectivityCheckResult,
+};
 
 /// Events emitted by ConnectivityChecker
 #[derive(Debug, Clone)]
@@ -59,10 +57,7 @@ pub enum ConnectivityEvent {
         rtt: Duration,
     },
     /// Connectivity checks completed
-    ConnectivityChecksCompleted {
-        success: bool,
-        duration: Duration,
-    },
+    ConnectivityChecksCompleted { success: bool, duration: Duration },
     /// Error occurred
     Error(String),
 }
@@ -169,7 +164,7 @@ impl Default for ConnectivityConfig {
             connectivity_timeout: Duration::from_secs(30),
             check_interval: Duration::from_millis(50), // Ta timer per RFC 8445
             max_concurrent_checks: 5,
-            max_retries: 7, // Rc per RFC 8489
+            max_retries: 7,                           // Rc per RFC 8489
             stun_timeout: Duration::from_millis(500), // RTO per RFC 8489
             retransmission_interval: Duration::from_millis(500),
             max_candidate_pairs: 100,
@@ -243,7 +238,7 @@ impl ConnectivityStats {
                 let count = self.successful_checks;
                 if count > 0 {
                     Duration::from_nanos(
-                        ((avg.as_nanos() * (count - 1) as u128) + rtt.as_nanos()) / count as u128
+                        ((avg.as_nanos() * (count - 1) as u128) + rtt.as_nanos()) / count as u128,
                     )
                 } else {
                     rtt
@@ -464,8 +459,12 @@ impl ConnectivityChecker {
 
         // Update state
         *self.state.write().await = ConnectivityState::Checking;
-        let _ = self.event_tx.send(ConnectivityEvent::ConnectivityChecksStarted);
-        let _ = self.event_tx.send(ConnectivityEvent::StateChanged(ConnectivityState::Checking));
+        let _ = self
+            .event_tx
+            .send(ConnectivityEvent::ConnectivityChecksStarted);
+        let _ = self
+            .event_tx
+            .send(ConnectivityEvent::StateChanged(ConnectivityState::Checking));
 
         // Setup webrtc-rs event handlers
         self.setup_webrtc_handlers().await?;
@@ -479,18 +478,25 @@ impl ConnectivityChecker {
 
         match &connection_result {
             Ok(()) => {
-                info!(duration_ms = duration.as_millis(), "Connectivity checks completed successfully");
-                let _ = self.event_tx.send(ConnectivityEvent::ConnectivityChecksCompleted {
-                    success: true,
-                    duration,
-                });
+                info!(
+                    duration_ms = duration.as_millis(),
+                    "Connectivity checks completed successfully"
+                );
+                let _ = self
+                    .event_tx
+                    .send(ConnectivityEvent::ConnectivityChecksCompleted {
+                        success: true,
+                        duration,
+                    });
             }
             Err(e) => {
                 error!(error = %e, duration_ms = duration.as_millis(), "Connectivity checks failed");
-                let _ = self.event_tx.send(ConnectivityEvent::ConnectivityChecksCompleted {
-                    success: false,
-                    duration,
-                });
+                let _ = self
+                    .event_tx
+                    .send(ConnectivityEvent::ConnectivityChecksCompleted {
+                        success: false,
+                        duration,
+                    });
                 let _ = self.event_tx.send(ConnectivityEvent::Error(e.to_string()));
             }
         }
@@ -540,7 +546,8 @@ impl ConnectivityChecker {
                                 }
                                 first_connection.notify_one();
                                 info!(
-                                    time_to_connect_ms = stats.time_to_connect.map(|d| d.as_millis()),
+                                    time_to_connect_ms =
+                                        stats.time_to_connect.map(|d| d.as_millis()),
                                     "First connection established"
                                 );
                             }
@@ -660,7 +667,10 @@ impl ConnectivityChecker {
                 Ok(())
             }
             Err(_) => {
-                warn!(timeout_secs = timeout_duration.as_secs(), "Connectivity checks timed out");
+                warn!(
+                    timeout_secs = timeout_duration.as_secs(),
+                    "Connectivity checks timed out"
+                );
                 *self.state.write().await = ConnectivityState::Failed;
                 self.stats.write().await.completed_at = Some(Instant::now());
                 Err(anyhow::anyhow!(

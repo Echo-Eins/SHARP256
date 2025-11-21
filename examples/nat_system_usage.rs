@@ -9,28 +9,38 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 use SHARP3::nat::{
-    // Основные типы системы
-    NatSystem, NatSystemConfig, NatSessionConfig,
+    create_controlled_session_config,
+    create_controlling_session_config,
+    create_ice_session_with_sharp,
 
-    // Менеджеры
-    create_stun_turn_manager, create_ice_session_with_sharp,
-
-    // Конфигурации
-    TurnServerInfo, TurnTransport, IceRole,
-
-    // Утилиты
-    default_stun_servers, parse_turn_server_url,
-    create_controlling_session_config, create_controlled_session_config,
     create_p2p_nat_system,
 
-    // События
-    NatSystemEvent, NatSessionEvent, IceIntegrationEvent,
+    // Менеджеры
+    create_stun_turn_manager,
+    // Утилиты
+    default_stun_servers,
+    parse_turn_server_url,
+    IceIntegrationEvent,
 
+    IceRole,
+
+    NatError,
     // Ошибки
-    NatResult, NatError,
+    NatResult,
+    NatSessionConfig,
+
+    NatSessionEvent,
+    // Основные типы системы
+    NatSystem,
+    NatSystemConfig,
+    // События
+    NatSystemEvent,
+    // Конфигурации
+    TurnServerInfo,
+    TurnTransport,
 };
 
 #[tokio::main]
@@ -59,13 +69,11 @@ async fn demo_basic_nat_system() -> NatResult<()> {
     config.stun_config.servers = default_stun_servers();
 
     // Добавить TURN серверы (пример)
-    config.turn_servers = vec![
-        parse_turn_server_url(
-            "turn:turn.example.com:3478",
-            "username",
-            "password"
-        )?,
-    ];
+    config.turn_servers = vec![parse_turn_server_url(
+        "turn:turn.example.com:3478",
+        "username",
+        "password",
+    )?];
 
     // Создать NAT систему
     let nat_system = Arc::new(NatSystem::new(config).await?);
@@ -154,9 +162,24 @@ async fn demo_basic_nat_system() -> NatResult<()> {
     // Получить статистику
     let stats = nat_system.get_stats();
     info!("📊 Статистика NAT системы:");
-    info!("  - Общие сессии: {}", stats.total_sessions.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Активные сессии: {}", stats.active_sessions.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Успешные соединения: {}", stats.successful_connections.load(std::sync::atomic::Ordering::Relaxed));
+    info!(
+        "  - Общие сессии: {}",
+        stats
+            .total_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Активные сессии: {}",
+        stats
+            .active_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Успешные соединения: {}",
+        stats
+            .successful_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Завершить систему
     nat_system.shutdown().await?;
@@ -173,9 +196,7 @@ async fn demo_stun_turn_manager() -> NatResult<()> {
     let stun_servers = default_stun_servers();
     let turn_servers = vec![]; // Пустой список для демонстрации
 
-    let manager = Arc::new(
-        create_stun_turn_manager(stun_servers, turn_servers, false).await?
-    );
+    let manager = Arc::new(create_stun_turn_manager(stun_servers, turn_servers, false).await?);
 
     // Подписаться на события
     let mut events = manager.subscribe();
@@ -187,10 +208,15 @@ async fn demo_stun_turn_manager() -> NatResult<()> {
     info!("Тестирование сбора кандидатов...");
 
     // Попробовать получить server reflexive кандидат
-    match manager.get_server_reflexive_candidate(socket.clone(), component_id).await {
+    match manager
+        .get_server_reflexive_candidate(socket.clone(), component_id)
+        .await
+    {
         Ok(Some(candidate)) => {
-            info!("🎯 Получен server reflexive кандидат: {}:{} ({})",
-                  candidate.address.ip, candidate.address.port, candidate.foundation);
+            info!(
+                "🎯 Получен server reflexive кандидат: {}:{} ({})",
+                candidate.address.ip, candidate.address.port, candidate.foundation
+            );
         }
         Ok(None) => {
             info!("ℹ️ Server reflexive кандидат не получен");
@@ -203,8 +229,10 @@ async fn demo_stun_turn_manager() -> NatResult<()> {
     // Попробовать получить relay кандидат (ожидается неудача без TURN серверов)
     match manager.get_relay_candidate(socket, component_id).await {
         Ok(Some(candidate)) => {
-            info!("🎯 Получен relay кандидат: {}:{} ({})",
-                  candidate.address.ip, candidate.address.port, candidate.foundation);
+            info!(
+                "🎯 Получен relay кандидат: {}:{} ({})",
+                candidate.address.ip, candidate.address.port, candidate.foundation
+            );
         }
         Ok(None) => {
             info!("ℹ️ Relay кандидат не получен (ожидается без TURN серверов)");
@@ -229,9 +257,24 @@ async fn demo_stun_turn_manager() -> NatResult<()> {
     // Получить статистику
     let stats = manager.get_stats();
     info!("📊 Статистика STUN/TURN:");
-    info!("  - STUN запросы: {}", stats.stun_requests.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - STUN успехи: {}", stats.stun_successes.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - TURN запросы: {}", stats.turn_allocation_requests.load(std::sync::atomic::Ordering::Relaxed));
+    info!(
+        "  - STUN запросы: {}",
+        stats
+            .stun_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - STUN успехи: {}",
+        stats
+            .stun_successes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - TURN запросы: {}",
+        stats
+            .turn_allocation_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Завершить менеджер
     manager.shutdown().await?;
@@ -249,9 +292,8 @@ async fn demo_ice_integration() -> NatResult<()> {
     let stun_servers = default_stun_servers();
     let turn_servers = vec![];
 
-    let ice_session = Arc::new(
-        create_ice_session_with_sharp(ice_config, stun_servers, turn_servers).await?
-    );
+    let ice_session =
+        Arc::new(create_ice_session_with_sharp(ice_config, stun_servers, turn_servers).await?);
 
     // Подписаться на события ICE
     let mut ice_events = ice_session.subscribe_ice_events();
@@ -345,19 +387,49 @@ async fn demo_ice_integration() -> NatResult<()> {
     // Получить статистику
     let ice_stats = ice_session.get_integration_stats();
     info!("📊 Статистика ICE интеграции:");
-    info!("  - Общие сессии: {}", ice_stats.total_sessions.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Общие кандидаты: {}", ice_stats.total_candidates.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Host кандидаты: {}", ice_stats.host_candidates.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Server reflexive: {}", ice_stats.server_reflexive_candidates.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Relay кандидаты: {}", ice_stats.relay_candidates.load(std::sync::atomic::Ordering::Relaxed));
+    info!(
+        "  - Общие сессии: {}",
+        ice_stats
+            .total_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Общие кандидаты: {}",
+        ice_stats
+            .total_candidates
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Host кандидаты: {}",
+        ice_stats
+            .host_candidates
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Server reflexive: {}",
+        ice_stats
+            .server_reflexive_candidates
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Relay кандидаты: {}",
+        ice_stats
+            .relay_candidates
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Получить кандидаты
     let candidates = ice_session.get_candidates(1).await;
     info!("📋 Собранные кандидаты для компонента 1:");
     for (i, candidate) in candidates.iter().enumerate() {
-        info!("  {}. {:?} - {}:{} (приоритет: {})",
-              i + 1, candidate.candidate_type,
-              candidate.address.ip, candidate.address.port, candidate.priority);
+        info!(
+            "  {}. {:?} - {}:{} (приоритет: {})",
+            i + 1,
+            candidate.candidate_type,
+            candidate.address.ip,
+            candidate.address.port,
+            candidate.priority
+        );
     }
 
     // Завершить сессию
@@ -376,12 +448,9 @@ async fn demo_full_p2p_connection() -> NatResult<()> {
     let turn_servers = vec![]; // Для демонстрации без TURN
 
     // Создать две NAT системы (имитация двух узлов)
-    let nat_system_a = Arc::new(
-        create_p2p_nat_system(stun_servers.clone(), turn_servers.clone()).await?
-    );
-    let nat_system_b = Arc::new(
-        create_p2p_nat_system(stun_servers, turn_servers).await?
-    );
+    let nat_system_a =
+        Arc::new(create_p2p_nat_system(stun_servers.clone(), turn_servers.clone()).await?);
+    let nat_system_b = Arc::new(create_p2p_nat_system(stun_servers, turn_servers).await?);
 
     info!("Созданы две NAT системы для имитации P2P соединения");
 
@@ -392,21 +461,32 @@ async fn demo_full_p2p_connection() -> NatResult<()> {
     let session_a = nat_system_a.create_session(session_config_a).await?;
     let session_b = nat_system_b.create_session(session_config_b).await?;
 
-    info!("Созданы сессии: A={}, B={}", session_a.session_id, session_b.session_id);
+    info!(
+        "Созданы сессии: A={}, B={}",
+        session_a.session_id, session_b.session_id
+    );
 
     // Создать сокеты
     let socket_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let socket_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
-    info!("Созданы сокеты: A={}, B={}", socket_a.local_addr()?, socket_b.local_addr()?);
+    info!(
+        "Созданы сокеты: A={}, B={}",
+        socket_a.local_addr()?,
+        socket_b.local_addr()?
+    );
 
     // Подписаться на события
     let mut events_a = session_a.subscribe();
     let mut events_b = session_b.subscribe();
 
     // Запустить соединения
-    nat_system_a.start_connection(session_a.clone(), socket_a).await?;
-    nat_system_b.start_connection(session_b.clone(), socket_b).await?;
+    nat_system_a
+        .start_connection(session_a.clone(), socket_a)
+        .await?;
+    nat_system_b
+        .start_connection(session_b.clone(), socket_b)
+        .await?;
 
     info!("Запущены процессы соединения для обеих сессий");
 
@@ -488,20 +568,46 @@ async fn demo_full_p2p_connection() -> NatResult<()> {
     let state_b = session_b.get_state().await;
 
     info!("📊 Результаты P2P соединения:");
-    info!("  - Сессия A: состояние={:?}, соединена={}", state_a, connected_a);
-    info!("  - Сессия B: состояние={:?}, соединена={}", state_b, connected_b);
+    info!(
+        "  - Сессия A: состояние={:?}, соединена={}",
+        state_a, connected_a
+    );
+    info!(
+        "  - Сессия B: состояние={:?}, соединена={}",
+        state_b, connected_b
+    );
 
     // Получить статистику обеих систем
     let stats_a = nat_system_a.get_stats();
     let stats_b = nat_system_b.get_stats();
 
     info!("📊 Статистика системы A:");
-    info!("  - Успешные соединения: {}", stats_a.successful_connections.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Неудачные соединения: {}", stats_a.failed_connections.load(std::sync::atomic::Ordering::Relaxed));
+    info!(
+        "  - Успешные соединения: {}",
+        stats_a
+            .successful_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Неудачные соединения: {}",
+        stats_a
+            .failed_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     info!("📊 Статистика системы B:");
-    info!("  - Успешные соединения: {}", stats_b.successful_connections.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  - Неудачные соединения: {}", stats_b.failed_connections.load(std::sync::atomic::Ordering::Relaxed));
+    info!(
+        "  - Успешные соединения: {}",
+        stats_b
+            .successful_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    info!(
+        "  - Неудачные соединения: {}",
+        stats_b
+            .failed_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Завершить системы
     nat_system_a.shutdown().await?;

@@ -1,46 +1,42 @@
 //! SHARP-256 Protocol Library (lib.rs)
 //!
 //! High-performance file transfer protocol with BLAKE3 integrity verification
-//! and comprehensive NAT traversal support.
+//! and comprehensive connectivity/NAT traversal support via ICE.
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
 // Core protocol modules
-pub mod protocol;
 pub mod buffer;
 pub mod file;
+pub mod fragmentation;
+pub mod progress;
+pub mod protocol;
 pub mod sao;
 pub mod state;
-pub mod progress;
-pub mod sender;
-pub mod receiver;
-pub mod fragmentation;
 
 // Security module
 pub mod security;
 
-// Connectivity system (replaces old NAT module)
+// Connectivity system (ICE/STUN/TURN - RFC 8445 compliant)
 #[cfg(feature = "connectivity")]
 pub mod connectivity;
 
-// GUI module (feature-gated)
+// GUI module (feature-gated) - DEPRECATED: Will be replaced with TUI
 #[cfg(feature = "gui")]
 pub mod gui;
 
 // Re-export main types
-pub use sender::Sender;
-pub use receiver::Receiver;
-pub use protocol::constants::*;
 pub use fragmentation::*;
-pub use progress::{ProgressInfo, TransferEvent, ProgressCallback, EventCallback};
+pub use progress::{EventCallback, ProgressCallback, ProgressInfo, TransferEvent};
+pub use protocol::constants::*;
 
 // Re-export connectivity types
+// PHASE 2: Connectivity, ConnectivityManager, EstablishedConnection will be added back
 #[cfg(feature = "connectivity")]
 pub use connectivity::{
-    Connectivity, ConnectivityManager, ConnectivityEvent,
-    Candidate, CandidatePair, ConnectionState,
-    EstablishedConnection, Transport, TransportType
+    Candidate, CandidatePair, ConnectionState, ConnectivityEvent, Transport, TransportStats,
+    TransportType,
 };
 
 /// Protocol version
@@ -75,7 +71,7 @@ pub fn init_logging(level: &str) {
                 .with_thread_ids(true)
                 .with_file(true)
                 .with_line_number(true)
-                .with_ansi(true)
+                .with_ansi(true),
         )
         .with(filter)
         .init();
@@ -91,7 +87,8 @@ pub fn system_info() -> String {
     let mut sys = System::new_all();
     sys.refresh_all();
 
-    let cpu_brand = sys.cpus()
+    let cpu_brand = sys
+        .cpus()
         .first()
         .map(|cpu| cpu.brand())
         .unwrap_or("Unknown");
@@ -141,69 +138,8 @@ pub fn system_info() -> String {
     info
 }
 
-/// Builder for creating a Sender with custom configuration
-pub struct SenderBuilder {
-    local_addr: std::net::SocketAddr,
-    peer_addr: std::net::SocketAddr,
-    file_path: std::path::PathBuf,
-    use_encryption: bool,
-}
-
-impl SenderBuilder {
-    /// Create a new sender builder
-    pub fn new(
-        local_addr: impl Into<std::net::SocketAddr>,
-        peer_addr: impl Into<std::net::SocketAddr>,
-        file_path: impl Into<std::path::PathBuf>,
-    ) -> Self {
-        Self {
-            local_addr: local_addr.into(),
-            peer_addr: peer_addr.into(),
-            file_path: file_path.into(),
-            use_encryption: false,
-        }
-    }
-
-    /// Enable encryption
-    pub fn with_encryption(mut self, enabled: bool) -> Self {
-        self.use_encryption = enabled;
-        self
-    }
-
-    /// Build the sender
-    pub async fn build(self) -> anyhow::Result<Sender> {
-        Sender::new(
-            self.local_addr,
-            self.peer_addr,
-            &self.file_path,
-            self.use_encryption,
-        ).await
-    }
-}
-
-/// Builder for creating a Receiver with custom configuration
-pub struct ReceiverBuilder {
-    local_addr: std::net::SocketAddr,
-    output_dir: std::path::PathBuf,
-}
-
-impl ReceiverBuilder {
-    /// Create a new receiver builder
-    pub fn new(
-        local_addr: impl Into<std::net::SocketAddr>,
-        output_dir: impl Into<std::path::PathBuf>,
-    ) -> Self {
-        Self {
-            local_addr: local_addr.into(),
-            output_dir: output_dir.into(),
-        }
-    }
-
-    /// Build the receiver
-    pub async fn build(self) -> anyhow::Result<Receiver> {
-        Receiver::new(self.local_addr, self.output_dir).await
-    }
-}
+// OLD SENDER/RECEIVER BUILDERS REMOVED
+// These will be replaced with new transport layer API after Phase 1 cleanup
 
 /// Check if the current build has connectivity support
 pub const fn has_connectivity() -> bool {
@@ -241,6 +177,7 @@ pub fn symmetric_nat_connectivity_config() -> connectivity::config::Connectivity
 }
 
 /// Connectivity utilities
+/* PHASE 2: connectivity_utils will be rebuilt when Connectivity is available
 #[cfg(feature = "connectivity")]
 pub mod connectivity_utils {
     use super::connectivity::*;
@@ -285,6 +222,7 @@ pub mod connectivity_utils {
         connectivity.get_connectable_address().await
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {

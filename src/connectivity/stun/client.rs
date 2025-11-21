@@ -3,24 +3,24 @@
 //!
 //! RFC 8489 compliant STUN client with DTLS support.
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{debug, info, warn, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use super::{
-    StunConfig, StunError, BindingResult,
-    message::StunMessage,
-    attributes::{StunAttribute, ChangeRequest},
-    transaction::{TransactionId, TransactionTracker},
-    integrity::MessageIntegrity,
-    retransmission::{RetransmissionConfig, RetransmissionTimer, RetransmissionAction},
+    attributes::{ChangeRequest, StunAttribute},
     constants::*,
+    integrity::MessageIntegrity,
+    message::StunMessage,
     parse_stun_url,
+    retransmission::{RetransmissionAction, RetransmissionConfig, RetransmissionTimer},
+    transaction::{TransactionId, TransactionTracker},
+    BindingResult, StunConfig, StunError,
 };
 
 /// STUN client configuration
@@ -67,12 +67,24 @@ pub struct StunClient {
     skip_integrity: Arc<RwLock<bool>>,
 }
 
+impl std::fmt::Debug for StunClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StunClient")
+            .field("config", &self.config)
+            .field("socket", &"<UdpSocket>")
+            .field("tracker", &"<TransactionTracker>")
+            .field("integrity", &self.integrity.is_some())
+            .finish()
+    }
+}
+
 impl StunClient {
     /// Create a new STUN client
     #[instrument(skip(config))]
     pub async fn new(config: StunClientConfig) -> Result<Self> {
         // Bind UDP socket
-        let local_addr = config.local_addr
+        let local_addr = config
+            .local_addr
             .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
 
         let socket = UdpSocket::bind(local_addr)
@@ -123,7 +135,7 @@ impl StunClient {
     }
 
     /// Send UDP Binding Request with optional CHANGE-REQUEST
-    async fn binding_request_udp(
+    pub async fn binding_request_udp(
         &self,
         server_addr: SocketAddr,
         change_request: Option<ChangeRequest>,
@@ -137,12 +149,15 @@ impl StunClient {
         }
 
         // Add USERNAME if we have credentials
-        if let (Some(ref ufrag), Some(ref _pwd)) = (&self.config.config.ice_ufrag, &self.config.config.ice_pwd) {
+        if let (Some(ref ufrag), Some(ref _pwd)) =
+            (&self.config.config.ice_ufrag, &self.config.config.ice_pwd)
+        {
             msg.add_attribute(StunAttribute::Username(ufrag.clone()));
         }
 
         // Encode message
-        let mut request_bytes = msg.encode()
+        let mut request_bytes = msg
+            .encode()
             .map_err(|e| StunError::InvalidMessage(e.to_string()))?;
 
         // Add MESSAGE-INTEGRITY if we have credentials and not in fallback mode
@@ -150,14 +165,17 @@ impl StunClient {
         if use_integrity {
             if let Some(ref integrity) = self.integrity {
                 // Calculate HMAC over message with adjusted length
-                let hmac_bytes = msg.encode_for_integrity(&[])
+                let hmac_bytes = msg
+                    .encode_for_integrity(&[])
                     .map_err(|e| StunError::InvalidMessage(e.to_string()))?;
 
-                let hmac = integrity.calculate(&hmac_bytes)
+                let hmac = integrity
+                    .calculate(&hmac_bytes)
                     .map_err(|_| StunError::IntegrityFailed)?;
 
                 msg.add_attribute(StunAttribute::MessageIntegrity(hmac));
-                request_bytes = msg.encode()
+                request_bytes = msg
+                    .encode()
                     .map_err(|e| StunError::InvalidMessage(e.to_string()))?;
             }
         }
@@ -165,14 +183,14 @@ impl StunClient {
         let transaction_id = msg.transaction_id;
 
         // Register transaction
-        self.tracker.register(transaction_id, request_bytes.clone(), server_addr).await;
+        self.tracker
+            .register(transaction_id, request_bytes.clone(), server_addr)
+            .await;
 
         // Send with retransmission
-        let result = self.send_with_retransmission(
-            transaction_id,
-            &request_bytes,
-            server_addr,
-        ).await;
+        let result = self
+            .send_with_retransmission(transaction_id, &request_bytes, server_addr)
+            .await;
 
         // Handle integrity failures
         if let Err(StunError::IntegrityFailed) = &result {
@@ -181,8 +199,10 @@ impl StunClient {
 
             if *failures >= self.config.config.integrity_failure_threshold {
                 if self.config.config.fallback_on_integrity_failure {
-                    warn!("MESSAGE-INTEGRITY failed {} times, falling back to plain requests",
-                          *failures);
+                    warn!(
+                        "MESSAGE-INTEGRITY failed {} times, falling back to plain requests",
+                        *failures
+                    );
                     *self.skip_integrity.write().await = true;
 
                     // Retry without integrity
@@ -212,7 +232,10 @@ impl StunClient {
 
         // Send initial request
         self.socket.send_to(request, server_addr).await?;
-        debug!("Sent STUN Binding Request to {} (tid: {})", server_addr, transaction_id);
+        debug!(
+            "Sent STUN Binding Request to {} (tid: {})",
+            server_addr, transaction_id
+        );
 
         let mut recv_buf = vec![0u8; MAX_MESSAGE_SIZE];
 
@@ -224,7 +247,10 @@ impl StunClient {
                     // Send retransmission
                     self.socket.send_to(request, server_addr).await?;
                     self.tracker.record_retransmission(&transaction_id).await;
-                    debug!("Retransmission {} to {} (RTO: {:?})", attempt, server_addr, rto);
+                    debug!(
+                        "Retransmission {} to {} (RTO: {:?})",
+                        attempt, server_addr, rto
+                    );
                     rto
                 }
                 RetransmissionAction::Timeout => {
@@ -241,7 +267,10 @@ impl StunClient {
                     // Check if it's from our server
                     if from_addr != server_addr {
                         // Could be from alternate address for RFC 5780
-                        debug!("Response from different address: {} (expected {})", from_addr, server_addr);
+                        debug!(
+                            "Response from different address: {} (expected {})",
+                            from_addr, server_addr
+                        );
                     }
 
                     // Parse response
@@ -254,10 +283,10 @@ impl StunClient {
                             }
 
                             // Complete transaction and get RTT
-                            let tx_result = self.tracker.complete(
-                                transaction_id,
-                                recv_buf[..len].to_vec(),
-                            ).await;
+                            let tx_result = self
+                                .tracker
+                                .complete(transaction_id, recv_buf[..len].to_vec())
+                                .await;
 
                             let rtt = tx_result.map(|r| r.rtt).unwrap_or(Duration::ZERO);
 
@@ -329,7 +358,8 @@ impl StunClient {
         };
 
         // Extract XOR-MAPPED-ADDRESS (preferred) or MAPPED-ADDRESS
-        let xor_mapped_address = response.get_attribute(ATTR_XOR_MAPPED_ADDRESS)
+        let xor_mapped_address = response
+            .get_attribute(ATTR_XOR_MAPPED_ADDRESS)
             .and_then(|attr| {
                 if let StunAttribute::XorMappedAddress(xma) = attr {
                     Some(xma.address)
@@ -338,7 +368,8 @@ impl StunClient {
                 }
             });
 
-        let mapped_address = response.get_attribute(ATTR_MAPPED_ADDRESS)
+        let mapped_address = response
+            .get_attribute(ATTR_MAPPED_ADDRESS)
             .and_then(|attr| {
                 if let StunAttribute::MappedAddress(ma) = attr {
                     Some(ma.address)
@@ -347,10 +378,13 @@ impl StunClient {
                 }
             })
             .or(xor_mapped_address)
-            .ok_or_else(|| StunError::InvalidMessage("No mapped address in response".to_string()))?;
+            .ok_or_else(|| {
+                StunError::InvalidMessage("No mapped address in response".to_string())
+            })?;
 
         // Extract RFC 5780 attributes
-        let response_origin = response.get_attribute(ATTR_RESPONSE_ORIGIN)
+        let response_origin = response
+            .get_attribute(ATTR_RESPONSE_ORIGIN)
             .and_then(|attr| {
                 if let StunAttribute::ResponseOrigin(ro) = attr {
                     Some(ro.address)
@@ -359,16 +393,18 @@ impl StunClient {
                 }
             });
 
-        let other_address = response.get_attribute(ATTR_OTHER_ADDRESS)
-            .and_then(|attr| {
-                if let StunAttribute::OtherAddress(oa) = attr {
-                    Some(oa.address)
-                } else {
-                    None
-                }
-            });
+        let other_address = response.get_attribute(ATTR_OTHER_ADDRESS).and_then(|attr| {
+            if let StunAttribute::OtherAddress(oa) = attr {
+                Some(oa.address)
+            } else {
+                None
+            }
+        });
 
-        info!("STUN Binding Success: mapped={}, RTT={:?}", mapped_address, rtt);
+        info!(
+            "STUN Binding Success: mapped={}, RTT={:?}",
+            mapped_address, rtt
+        );
 
         Ok(BindingResult {
             server_addr,
@@ -383,10 +419,16 @@ impl StunClient {
     }
 
     /// Send Binding Request over DTLS
-    async fn binding_request_dtls(&self, server_addr: SocketAddr) -> Result<BindingResult, StunError> {
+    async fn binding_request_dtls(
+        &self,
+        server_addr: SocketAddr,
+    ) -> Result<BindingResult, StunError> {
         // TODO: Implement DTLS using webrtc_dtls crate
         // For now, fall back to UDP with warning
-        warn!("DTLS not yet implemented, falling back to UDP for {}", server_addr);
+        warn!(
+            "DTLS not yet implemented, falling back to UDP for {}",
+            server_addr
+        );
         self.binding_request_udp(server_addr, None).await
     }
 
@@ -398,6 +440,13 @@ impl StunClient {
     /// Get latest RTT measurement
     pub async fn get_latest_rtt(&self) -> Option<Duration> {
         self.tracker.get_latest_rtt().await
+    }
+
+    /// Get number of pending transactions
+    ///
+    /// Useful for monitoring active STUN requests and detecting potential issues.
+    pub async fn pending_count(&self) -> usize {
+        self.tracker.pending_count().await
     }
 
     /// Get local address

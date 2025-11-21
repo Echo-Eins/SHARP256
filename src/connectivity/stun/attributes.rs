@@ -4,7 +4,7 @@
 //! RFC 8489 Section 14: STUN Attributes
 //! RFC 5780: NAT Behavior Discovery attributes
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use bytes::{Buf, BufMut, BytesMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -92,7 +92,8 @@ impl StunAttribute {
                 buf.put_u16(0); // Placeholder for length
                 addr.encode(buf);
                 let value_len = buf.len() - value_start - 2;
-                buf[value_start..value_start + 2].copy_from_slice(&(value_len as u16).to_be_bytes());
+                buf[value_start..value_start + 2]
+                    .copy_from_slice(&(value_len as u16).to_be_bytes());
             }
 
             StunAttribute::XorMappedAddress(addr) => {
@@ -101,7 +102,8 @@ impl StunAttribute {
                 buf.put_u16(0); // Placeholder for length
                 addr.encode(buf);
                 let value_len = buf.len() - value_start - 2;
-                buf[value_start..value_start + 2].copy_from_slice(&(value_len as u16).to_be_bytes());
+                buf[value_start..value_start + 2]
+                    .copy_from_slice(&(value_len as u16).to_be_bytes());
             }
 
             StunAttribute::ChangeRequest(req) => {
@@ -173,7 +175,8 @@ impl StunAttribute {
                 buf.put_u16(0);
                 origin.encode(buf);
                 let value_len = buf.len() - value_start - 2;
-                buf[value_start..value_start + 2].copy_from_slice(&(value_len as u16).to_be_bytes());
+                buf[value_start..value_start + 2]
+                    .copy_from_slice(&(value_len as u16).to_be_bytes());
             }
 
             StunAttribute::OtherAddress(addr) => {
@@ -182,7 +185,8 @@ impl StunAttribute {
                 buf.put_u16(0);
                 addr.encode(buf);
                 let value_len = buf.len() - value_start - 2;
-                buf[value_start..value_start + 2].copy_from_slice(&(value_len as u16).to_be_bytes());
+                buf[value_start..value_start + 2]
+                    .copy_from_slice(&(value_len as u16).to_be_bytes());
             }
 
             StunAttribute::UnknownAttributes(attrs) => {
@@ -225,9 +229,7 @@ impl StunAttribute {
         let padded_length = (length + 3) & !3;
 
         let attr = match attr_type {
-            ATTR_MAPPED_ADDRESS => {
-                StunAttribute::MappedAddress(MappedAddress::decode(value)?)
-            }
+            ATTR_MAPPED_ADDRESS => StunAttribute::MappedAddress(MappedAddress::decode(value)?),
 
             ATTR_XOR_MAPPED_ADDRESS => {
                 StunAttribute::XorMappedAddress(XorMappedAddress::decode(value)?)
@@ -242,8 +244,8 @@ impl StunAttribute {
             }
 
             ATTR_USERNAME => {
-                let username = String::from_utf8(value.to_vec())
-                    .context("Invalid USERNAME UTF-8")?;
+                let username =
+                    String::from_utf8(value.to_vec()).context("Invalid USERNAME UTF-8")?;
                 StunAttribute::Username(username)
             }
 
@@ -275,9 +277,7 @@ impl StunAttribute {
                 StunAttribute::Priority(priority)
             }
 
-            ATTR_USE_CANDIDATE => {
-                StunAttribute::UseCandidate
-            }
+            ATTR_USE_CANDIDATE => StunAttribute::UseCandidate,
 
             ATTR_FINGERPRINT => {
                 if length < 4 {
@@ -292,8 +292,7 @@ impl StunAttribute {
                     return Err(anyhow::anyhow!("ICE-CONTROLLED too short"));
                 }
                 let tiebreaker = u64::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                    value[4], value[5], value[6], value[7],
+                    value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
                 ]);
                 StunAttribute::IceControlled(tiebreaker)
             }
@@ -303,26 +302,19 @@ impl StunAttribute {
                     return Err(anyhow::anyhow!("ICE-CONTROLLING too short"));
                 }
                 let tiebreaker = u64::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                    value[4], value[5], value[6], value[7],
+                    value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
                 ]);
                 StunAttribute::IceControlling(tiebreaker)
             }
 
-            ATTR_RESPONSE_ORIGIN => {
-                StunAttribute::ResponseOrigin(ResponseOrigin::decode(value)?)
-            }
+            ATTR_RESPONSE_ORIGIN => StunAttribute::ResponseOrigin(ResponseOrigin::decode(value)?),
 
-            ATTR_OTHER_ADDRESS => {
-                StunAttribute::OtherAddress(OtherAddress::decode(value)?)
-            }
+            ATTR_OTHER_ADDRESS => StunAttribute::OtherAddress(OtherAddress::decode(value)?),
 
-            _ => {
-                StunAttribute::Unknown {
-                    attr_type,
-                    value: value.to_vec(),
-                }
-            }
+            _ => StunAttribute::Unknown {
+                attr_type,
+                value: value.to_vec(),
+            },
         };
 
         *buf = &buf[padded_length.min(buf.len())..];
@@ -405,7 +397,7 @@ impl XorMappedAddress {
         match self.address {
             SocketAddr::V4(addr) => {
                 buf.put_u8(0x01); // IPv4
-                // XOR port with high 16 bits of magic cookie
+                                  // XOR port with high 16 bits of magic cookie
                 let xport = addr.port() ^ ((MAGIC_COOKIE >> 16) as u16);
                 buf.put_u16(xport);
                 // XOR address with magic cookie
@@ -486,7 +478,10 @@ pub struct ChangeRequest {
 
 impl ChangeRequest {
     pub fn new(change_ip: bool, change_port: bool) -> Self {
-        Self { change_ip, change_port }
+        Self {
+            change_ip,
+            change_port,
+        }
     }
 
     pub fn encode(&self) -> u32 {
@@ -525,7 +520,9 @@ impl ResponseOrigin {
 
     pub fn decode(value: &[u8]) -> Result<Self> {
         let mapped = MappedAddress::decode(value)?;
-        Ok(Self { address: mapped.address })
+        Ok(Self {
+            address: mapped.address,
+        })
     }
 }
 
@@ -546,7 +543,9 @@ impl OtherAddress {
 
     pub fn decode(value: &[u8]) -> Result<Self> {
         let mapped = MappedAddress::decode(value)?;
-        Ok(Self { address: mapped.address })
+        Ok(Self {
+            address: mapped.address,
+        })
     }
 }
 

@@ -1,8 +1,8 @@
-pub mod sender_gui;
 pub mod receiver_gui;
+pub mod sender_gui;
 
-pub use sender_gui::SenderApp;
 pub use receiver_gui::ReceiverApp;
+pub use sender_gui::SenderApp;
 
 #[cfg(feature = "gui")]
 use anyhow::Result;
@@ -30,7 +30,7 @@ pub fn run_sender_gui() -> Result<()> {
         options,
         Box::new(|_cc| Box::new(SenderApp::new())),
     )
-        .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
+    .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }
 
 #[cfg(feature = "gui")]
@@ -47,5 +47,5 @@ pub fn run_receiver_gui(_output: PathBuf, _bind: SocketAddr) -> Result<()> {
         options,
         Box::new(|_cc| Box::new(ReceiverApp::new())),
     )
-        .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
+    .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }

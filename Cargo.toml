@@ -120,28 +120,17 @@ regex = "1.11.1"
 num_cpus = "1.17.0"
 
 [features]
-default = ["gui", "connectivity"]
+# Default: connectivity only (GUI removed, will be replaced with TUI later)
+default = ["connectivity"]
 
-# GUI support
+# GUI support - DEPRECATED: Will be replaced with TUI
+# Disabled by default to avoid GTK compilation issues
 gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 
 # TLS encryption
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
-nat-traversal = [
-    "dep:igd",
-    "dep:if-addrs",
-    "dep:xmltree",
-    "dep:url",
-    "dep:futures",
-    "dep:hyper",
-    "dep:md5",
-    "dep:subtle",
-    "dep:crc",
-    "dep:reqwest",
-    "dep:local-ip-address",
-]
 
-# Full connectivity suite (replaces nat-traversal)
+# Full connectivity suite (RFC 8445 ICE compliant)
 connectivity = [
     "dep:uuid",
     "dep:rand",
@@ -196,24 +185,25 @@ dev-tools = ["dep:hickory-resolver"]
 # Minimal build (no connectivity)
 minimal = []
 
-[[bin]]
-name = "sharp-sender"
-path = "src/bin/sender.rs"
-
-[[bin]]
-name = "sharp-receiver"
-path = "src/bin/receiver.rs"
+# OLD BINARIES - REMOVED (will be rewritten with new connectivity stack)
+# [[bin]]
+# name = "sharp-sender"
+# path = "src/bin/sender.rs"
+#
+# [[bin]]
+# name = "sharp-receiver"
+# path = "src/bin/receiver.rs"
 
 # Relay server with encryption support
 [[bin]]
 name = "sharp-relay"
 path = "src/bin/relay.rs"
 
-# NAT router pool for testing/development
-[[bin]]
-name = "sharp-nat-router"
-path = "src/bin/nat_router.rs"
-required-features = ["connectivity"]
+# NAT router pool for testing/development (PHASE 1: Removed)
+# [[bin]]
+# name = "sharp-nat-router"
+# path = "src/bin/nat_router.rs"
+# required-features = ["connectivity"]
 
 [profile.release]
 opt-level = 3

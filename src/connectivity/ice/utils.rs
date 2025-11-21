@@ -2,24 +2,21 @@
 //! ICE Utility Functions and Type Conversions
 //! Конвертация между webrtc-rs типами и нашими типами
 
-use std::hash::{Hash, Hasher};
 use anyhow::Result;
-use std::net::SocketAddr;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 
 use std::sync::Arc;
-use webrtc::ice::{
-    candidate::{
-        Candidate as WebRtcCandidate, CandidateType as WebRtcCandidateType,
-        candidate_host::CandidateHostConfig,
-        candidate_server_reflexive::CandidateServerReflexiveConfig,
-        candidate_relay::CandidateRelayConfig,
-        candidate_peer_reflexive::CandidatePeerReflexiveConfig,
-    },
+use webrtc::ice::candidate::{
+    candidate_host::CandidateHostConfig, candidate_peer_reflexive::CandidatePeerReflexiveConfig,
+    candidate_relay::CandidateRelayConfig,
+    candidate_server_reflexive::CandidateServerReflexiveConfig, Candidate as WebRtcCandidate,
+    CandidateType as WebRtcCandidateType,
 };
 
 use crate::connectivity::{
-    Candidate, CandidateType, CandidateAttributes, CandidatePair, CandidatePairState,
+    Candidate, CandidateAttributes, CandidatePair, CandidatePairState, CandidateType,
 };
 
 /// Конвертация WebRTC кандидата в наш формат
@@ -33,14 +30,16 @@ pub fn webrtc_candidate_to_candidate(webrtc_candidate: &dyn WebRtcCandidate) -> 
     let candidate_type = webrtc_candidate_type_to_candidate_type(webrtc_candidate.candidate_type());
 
     // Parse address string to SocketAddr
-    let ip_addr: IpAddr = webrtc_candidate.address()
+    let ip_addr: IpAddr = webrtc_candidate
+        .address()
         .parse()
         .context("Failed to parse candidate IP address")?;
     let address = SocketAddr::new(ip_addr, webrtc_candidate.port());
 
     // Handle related address
     let related_address = if !webrtc_candidate.related_address().is_empty() {
-        let rel_ip: IpAddr = webrtc_candidate.related_address()
+        let rel_ip: IpAddr = webrtc_candidate
+            .related_address()
             .parse()
             .unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
         let rel_port = webrtc_candidate.related_port();
@@ -55,7 +54,7 @@ pub fn webrtc_candidate_to_candidate(webrtc_candidate: &dyn WebRtcCandidate) -> 
         component: webrtc_candidate.component() as u16,
         network_cost: calculate_network_cost(&candidate_type, &address),
         generation: 0, // WebRTC-rs не предоставляет это напрямую
-        network_id: 1,  // По умолчанию
+        network_id: 1, // По умолчанию
         extensions: extract_candidate_extensions(webrtc_candidate),
     };
 
@@ -74,9 +73,12 @@ pub fn webrtc_candidate_to_candidate(webrtc_candidate: &dyn WebRtcCandidate) -> 
 ///
 /// Создает реальные webrtc-rs кандидаты на основе типа кандидата.
 /// RFC 8445 compliant implementation.
-pub fn candidate_to_webrtc_candidate(candidate: &Candidate) -> Result<Arc<dyn WebRtcCandidate + Send + Sync>> {
+pub fn candidate_to_webrtc_candidate(
+    candidate: &Candidate,
+) -> Result<Arc<dyn WebRtcCandidate + Send + Sync>> {
     use anyhow::Context;
-    use webrtc::ice::candidate::CandidateBaseConfig;
+    // Import directly from webrtc_ice as it's not re-exported
+    use webrtc_ice::candidate::candidate_base::CandidateBaseConfig;
 
     let base_config = CandidateBaseConfig {
         network: "udp".to_string(),
@@ -94,50 +96,60 @@ pub fn candidate_to_webrtc_candidate(candidate: &Candidate) -> Result<Arc<dyn We
                 base_config,
                 ..Default::default()
             };
-            let webrtc_candidate = config.new_candidate_host()
+            let webrtc_candidate = config
+                .new_candidate_host()
                 .context("Failed to create host candidate")?;
             Ok(Arc::new(webrtc_candidate))
         }
         CandidateType::ServerReflexive => {
             let config = CandidateServerReflexiveConfig {
                 base_config,
-                rel_addr: candidate.related_address
+                rel_addr: candidate
+                    .related_address
                     .map(|addr| addr.ip().to_string())
                     .unwrap_or_default(),
-                rel_port: candidate.related_address
+                rel_port: candidate
+                    .related_address
                     .map(|addr| addr.port())
                     .unwrap_or(0),
             };
-            let webrtc_candidate = config.new_candidate_server_reflexive()
+            let webrtc_candidate = config
+                .new_candidate_server_reflexive()
                 .context("Failed to create server reflexive candidate")?;
             Ok(Arc::new(webrtc_candidate))
         }
         CandidateType::PeerReflexive => {
             let config = CandidatePeerReflexiveConfig {
                 base_config,
-                rel_addr: candidate.related_address
+                rel_addr: candidate
+                    .related_address
                     .map(|addr| addr.ip().to_string())
                     .unwrap_or_default(),
-                rel_port: candidate.related_address
+                rel_port: candidate
+                    .related_address
                     .map(|addr| addr.port())
                     .unwrap_or(0),
             };
-            let webrtc_candidate = config.new_candidate_peer_reflexive()
+            let webrtc_candidate = config
+                .new_candidate_peer_reflexive()
                 .context("Failed to create peer reflexive candidate")?;
             Ok(Arc::new(webrtc_candidate))
         }
         CandidateType::Relay => {
             let config = CandidateRelayConfig {
                 base_config,
-                rel_addr: candidate.related_address
+                rel_addr: candidate
+                    .related_address
                     .map(|addr| addr.ip().to_string())
                     .unwrap_or_default(),
-                rel_port: candidate.related_address
+                rel_port: candidate
+                    .related_address
                     .map(|addr| addr.port())
                     .unwrap_or(0),
                 ..Default::default()
             };
-            let webrtc_candidate = config.new_candidate_relay()
+            let webrtc_candidate = config
+                .new_candidate_relay()
                 .context("Failed to create relay candidate")?;
             Ok(Arc::new(webrtc_candidate))
         }
@@ -146,14 +158,17 @@ pub fn candidate_to_webrtc_candidate(candidate: &Candidate) -> Result<Arc<dyn We
             // Map to ServerReflexive
             let config = CandidateServerReflexiveConfig {
                 base_config,
-                rel_addr: candidate.related_address
+                rel_addr: candidate
+                    .related_address
                     .map(|addr| addr.ip().to_string())
                     .unwrap_or_default(),
-                rel_port: candidate.related_address
+                rel_port: candidate
+                    .related_address
                     .map(|addr| addr.port())
                     .unwrap_or(0),
             };
-            let webrtc_candidate = config.new_candidate_server_reflexive()
+            let webrtc_candidate = config
+                .new_candidate_server_reflexive()
                 .context("Failed to create router pool candidate")?;
             Ok(Arc::new(webrtc_candidate))
         }
@@ -163,7 +178,8 @@ pub fn candidate_to_webrtc_candidate(candidate: &Candidate) -> Result<Arc<dyn We
                 base_config,
                 ..Default::default()
             };
-            let webrtc_candidate = config.new_candidate_host()
+            let webrtc_candidate = config
+                .new_candidate_host()
                 .context("Failed to create hairpin candidate")?;
             Ok(Arc::new(webrtc_candidate))
         }
@@ -181,7 +197,9 @@ pub fn webrtc_candidate_type_to_candidate_type(webrtc_type: WebRtcCandidateType)
 }
 
 /// Конвертация нашего типа кандидата в WebRTC тип
-pub fn candidate_type_to_webrtc_candidate_type(candidate_type: CandidateType) -> WebRtcCandidateType {
+pub fn candidate_type_to_webrtc_candidate_type(
+    candidate_type: CandidateType,
+) -> WebRtcCandidateType {
     match candidate_type {
         CandidateType::Host => WebRtcCandidateType::Host,
         CandidateType::ServerReflexive => WebRtcCandidateType::ServerReflexive,
@@ -214,11 +232,11 @@ pub fn create_candidate_pair_from_webrtc(
 /// Расчет стоимости сети для кандидата
 fn calculate_network_cost(candidate_type: &CandidateType, address: &SocketAddr) -> u16 {
     let base_cost = match candidate_type {
-        CandidateType::Host => 0,           // Наименьшая стоимость
+        CandidateType::Host => 0, // Наименьшая стоимость
         CandidateType::PeerReflexive => 10,
         CandidateType::ServerReflexive => 20,
         CandidateType::RouterPool => 30,
-        CandidateType::Relay => 50,         // Наибольшая стоимость
+        CandidateType::Relay => 50, // Наибольшая стоимость
         CandidateType::Hairpin => 5,
     };
 
@@ -233,8 +251,14 @@ fn extract_candidate_extensions(webrtc_candidate: &dyn WebRtcCandidate) -> HashM
     let mut extensions = HashMap::new();
 
     // Добавляем дополнительную информацию из WebRTC кандидата
-    extensions.insert("webrtc_type".to_string(), format!("{:?}", webrtc_candidate.candidate_type()));
-    extensions.insert("webrtc_protocol".to_string(), webrtc_candidate.transport_type().to_string());
+    extensions.insert(
+        "webrtc_type".to_string(),
+        format!("{:?}", webrtc_candidate.candidate_type()),
+    );
+    extensions.insert(
+        "webrtc_protocol".to_string(),
+        webrtc_candidate.transport_type().to_string(),
+    );
 
     // TCP тип (если применимо)
     if let Some(tcp_type) = webrtc_candidate.tcp_type() {
@@ -245,7 +269,11 @@ fn extract_candidate_extensions(webrtc_candidate: &dyn WebRtcCandidate) -> HashM
 }
 
 /// Генерация foundation для кандидата
-pub fn generate_foundation(candidate_type: CandidateType, base_address: SocketAddr, server_address: Option<SocketAddr>) -> String {
+pub fn generate_foundation(
+    candidate_type: CandidateType,
+    base_address: SocketAddr,
+    server_address: Option<SocketAddr>,
+) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -275,17 +303,29 @@ pub fn calculate_candidate_priority(
     };
 
     // Priority = (2^24) * type_preference + (2^8) * local_preference + (2^0) * (256 - component_id)
-    (1 << 24) * type_preference as u32 +
-        (1 << 8) * local_preference as u32 +
-        (256 - component_id as u32)
+    (1 << 24) * type_preference as u32
+        + (1 << 8) * local_preference as u32
+        + (256 - component_id as u32)
 }
 
 /// Расчет приоритета пары кандидатов по RFC 8445
-pub fn calculate_pair_priority(controlling: bool, local_priority: u32, remote_priority: u32) -> u64 {
+pub fn calculate_pair_priority(
+    controlling: bool,
+    local_priority: u32,
+    remote_priority: u32,
+) -> u64 {
     let (g, d) = if controlling {
-        if local_priority > remote_priority { (1, local_priority as u64) } else { (0, remote_priority as u64) }
+        if local_priority > remote_priority {
+            (1, local_priority as u64)
+        } else {
+            (0, remote_priority as u64)
+        }
     } else {
-        if local_priority > remote_priority { (0, remote_priority as u64) } else { (1, local_priority as u64) }
+        if local_priority > remote_priority {
+            (0, remote_priority as u64)
+        } else {
+            (1, local_priority as u64)
+        }
     };
 
     let min_priority = std::cmp::min(local_priority, remote_priority) as u64;
@@ -317,9 +357,15 @@ pub fn is_valid_candidate_address(address: &SocketAddr) -> bool {
 }
 
 /// Определение типа NAT на основе кандидатов
-pub fn determine_nat_type(host_candidates: &[Candidate], srflx_candidates: &[Candidate]) -> NatType {
+pub fn determine_nat_type(
+    host_candidates: &[Candidate],
+    srflx_candidates: &[Candidate],
+) -> NatType {
     if srflx_candidates.is_empty() {
-        if host_candidates.iter().any(|c| is_public_address(&c.address)) {
+        if host_candidates
+            .iter()
+            .any(|c| is_public_address(&c.address))
+        {
             return NatType::OpenInternet;
         } else {
             return NatType::SymmetricUdpFirewall;
@@ -411,10 +457,7 @@ pub fn is_public_address(address: &SocketAddr) -> bool {
 }
 
 /// Фильтрация кандидатов по критериям
-pub fn filter_candidates(
-    candidates: &[Candidate],
-    filter: &CandidateFilter,
-) -> Vec<Candidate> {
+pub fn filter_candidates(candidates: &[Candidate], filter: &CandidateFilter) -> Vec<Candidate> {
     candidates
         .iter()
         .filter(|candidate| {
@@ -592,13 +635,17 @@ mod tests {
 
     #[test]
     fn test_nat_type_determination() {
-        let host_candidates = vec![
-            create_test_candidate(CandidateType::Host, "192.168.1.100:5000".parse().unwrap(), 1)
-        ];
+        let host_candidates = vec![create_test_candidate(
+            CandidateType::Host,
+            "192.168.1.100:5000".parse().unwrap(),
+            1,
+        )];
 
-        let srflx_candidates = vec![
-            create_test_candidate(CandidateType::ServerReflexive, "203.0.113.1:6000".parse().unwrap(), 1)
-        ];
+        let srflx_candidates = vec![create_test_candidate(
+            CandidateType::ServerReflexive,
+            "203.0.113.1:6000".parse().unwrap(),
+            1,
+        )];
 
         let nat_type = determine_nat_type(&host_candidates, &srflx_candidates);
         assert_eq!(nat_type, NatType::FullCone);

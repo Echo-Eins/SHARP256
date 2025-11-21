@@ -86,8 +86,8 @@ impl MessageIntegrity {
     /// * `expected_hmac` - The MESSAGE-INTEGRITY value from the message
     pub fn verify(&self, message: &[u8], expected_hmac: &[u8; 20]) -> Result<(), IntegrityError> {
         // Find MESSAGE-INTEGRITY position
-        let mi_pos = find_message_integrity_position(message)
-            .ok_or(IntegrityError::MissingAttribute)?;
+        let mi_pos =
+            find_message_integrity_position(message).ok_or(IntegrityError::MissingAttribute)?;
 
         // Create a copy with adjusted length for verification
         let mut verify_msg = message[..mi_pos].to_vec();

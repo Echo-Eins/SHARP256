@@ -9,14 +9,14 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock, Mutex, Notify};
-use tokio::time::{timeout, interval, sleep};
-use tracing::{debug, info, warn, error, trace};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::time::{interval, sleep, timeout};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use crate::connectivity::transport::UdpSocketWrapper;
 use crate::connectivity::{Candidate, CandidatePair};
-use crate::protocol::{packet::*, constants::*};
+use crate::protocol::{constants::*, packet::*};
 
 /// Production signaling protocol version
 const SIGNALING_VERSION: &str = "SHARP-ICE/2.0";
@@ -158,7 +158,7 @@ impl From<&Candidate> for SerializedCandidate {
 /// Production signaling transport
 pub struct ProductionSignaling {
     /// UDP socket for signaling
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpSocketWrapper>,
     /// Peer address
     peer_addr: SocketAddr,
     /// Session information
@@ -213,7 +213,7 @@ struct RetransmissionManager {
     /// Pending acknowledgments
     pending: Arc<RwLock<HashMap<String, PendingMessage>>>,
     /// Socket for retransmissions
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpSocketWrapper>,
     /// Target address
     peer_addr: SocketAddr,
 }
@@ -241,7 +241,7 @@ pub struct SignalingStats {
 impl ProductionSignaling {
     /// Create new production signaling transport
     pub async fn new(
-        socket: Arc<UdpSocket>,
+        socket: Arc<UdpSocketWrapper>,
         peer_addr: SocketAddr,
         controlling: bool,
     ) -> Result<Self> {
@@ -399,8 +399,10 @@ impl ProductionSignaling {
         let timeout_duration = Duration::from_secs(5);
         match timeout(
             timeout_duration,
-            self.wait_for_check_response(transaction_id)
-        ).await {
+            self.wait_for_check_response(transaction_id),
+        )
+        .await
+        {
             Ok(Ok(_)) => Ok(start.elapsed()),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow::anyhow!("Connectivity check timeout")),
@@ -449,7 +451,10 @@ impl ProductionSignaling {
             rto: Duration::from_millis(BASE_RTO),
         };
 
-        self.retransmit_manager.pending.write().await
+        self.retransmit_manager
+            .pending
+            .write()
+            .await
             .insert(message.id.clone(), pending);
 
         // Update stats
@@ -547,7 +552,10 @@ impl ProductionSignaling {
 
     /// Handle session acknowledgment
     async fn handle_session_ack(&self, message: SignalingMessage) -> Result<()> {
-        if let MessagePayload::SessionInitAck { ice_ufrag, ice_pwd, .. } = message.payload {
+        if let MessagePayload::SessionInitAck {
+            ice_ufrag, ice_pwd, ..
+        } = message.payload
+        {
             let mut session = self.session.write().await;
             session.remote_ufrag = Some(ice_ufrag);
             session.remote_pwd = Some(ice_pwd);
@@ -569,9 +577,17 @@ impl ProductionSignaling {
 
     /// Handle check response
     async fn handle_check_response(&self, message: SignalingMessage) -> Result<()> {
-        if let MessagePayload::CheckResponse { success, mapped_address, .. } = message.payload {
+        if let MessagePayload::CheckResponse {
+            success,
+            mapped_address,
+            ..
+        } = message.payload
+        {
             if success {
-                debug!("Connectivity check successful, mapped: {:?}", mapped_address);
+                debug!(
+                    "Connectivity check successful, mapped: {:?}",
+                    mapped_address
+                );
             }
         }
         Ok(())
@@ -654,7 +670,7 @@ async fn retransmission_loop(
 }
 
 /// Background receive loop
-async fn receive_loop(socket: Arc<UdpSocket>, signaling: ProductionSignaling) {
+async fn receive_loop(socket: Arc<UdpSocketWrapper>, signaling: ProductionSignaling) {
     let mut buf = vec![0u8; 65536];
 
     loop {

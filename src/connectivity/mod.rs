@@ -25,7 +25,7 @@
 //! ## Использование
 //!
 //! ```rust
-//! use sharp256::connectivity::Connectivity;
+//  use sharp256::connectivity::Connectivity;
 //!
 //! // Создание с конфигурацией по умолчанию
 //! let connectivity = Connectivity::new().await?;
@@ -42,35 +42,26 @@
 //! let (size, addr) = connection.recv(&mut buffer).await?;
 //! ```
 
-use anyhow::Result;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
 use serde::{Deserialize, Serialize};
-use parking_lot::Mutex;
-use tracing::{info, warn, debug, error};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 // === МОДУЛИ ===
 
-// Основной менеджер connectivity
-pub mod manager;
+// PHASE 2: Manager will be rebuilt from scratch
+// pub mod manager;
+
+// PHASE 2 - STAGE 1: Transport layer (RFC 8445 compliant)
+pub mod transport;
+
 pub mod config;
 
-// ICE модули (primary)
+// ICE modules (primary) - RFC 8445 compliant
 #[cfg(feature = "webrtc-ice-stack")]
 pub mod ice;
 
 // STUN module (RFC 8489, RFC 5780)
 pub mod stun;
-
-// Fallback модули
-#[cfg(feature = "libp2p-fallback")]
-pub mod fallback;
-
-// Transport абстракция
-pub mod transport;
 
 // Signaling система
 pub mod signaling;
@@ -78,6 +69,10 @@ pub mod signaling;
 // Encryption для relay
 #[cfg(feature = "relay-encryption")]
 pub mod encryption;
+
+// Fallback модули
+#[cfg(feature = "libp2p-fallback")]
+pub mod fallback;
 
 // NAT router pools
 #[cfg(feature = "nat-router-pools")]
@@ -89,30 +84,32 @@ pub mod upnp;
 
 // === RE-EXPORTS ===
 
-pub use manager::{ConnectivityManager, ConnectivityEvent, DetailedConnectivityStats};
-pub use config::{
-    ConnectivityConfig, IceConfig, LibP2pConfig, RelayConfig,
-    ConnectionMethod, GeneralConfig
-};
+// PHASE 2: Manager types will be defined here
+// pub use manager::{ConnectivityManager, DetailedConnectivityStats};
+
+// PHASE 2 - STAGE 1: Transport layer exports (RFC 8445 compliant)
 pub use transport::{
-    Transport, TransportType, TransportStats, EstablishedConnection
+    CandidatePairStats, ConnectionInfo, ConnectionState, ConsentStats, IceStats,
+    PerformanceMetrics, QualityMetrics, SocketStats, Transport, TransportCapabilities,
+    TransportEvent, TransportStats, TransportType,
+};
+
+pub use config::{
+    ConnectionMethod, ConnectivityConfig, GeneralConfig, IceConfig, LibP2pConfig, RelayConfig,
 };
 
 // ICE specific exports
 #[cfg(feature = "webrtc-ice-stack")]
 pub use ice::{
-    IceStack, IceAgent, IceEvent, IceAgentState, IceConnection,
-    CandidateGatherer, ConnectivityChecker, CandidateNominator,
-    GatheringState, ConnectivityState, NominationState,
-    IceComponentFactory, get_ice_capabilities, validate_ice_config,
-    create_p2p_ice_config, create_test_ice_config
+    CandidateGatherer, CandidateNominator, ConnectivityChecker, ConnectivityState, GatheringState,
+    IceAgent, IceAgentState, IceConnection, IceEvent, NominationState, ProductionIceAgent,
 };
 
 // STUN module exports (RFC 8489, RFC 5780)
 pub use stun::{
-    StunClient, StunClientConfig, StunConfig,
-    NatDetector, NatDetectionResult, NatMappingBehavior, NatFilteringBehavior, NatType,
-    StunMessage, StunMessageType, TransactionId, BindingResult, StunError,
+    BindingResult, NatDetectionResult, NatDetector, NatFilteringBehavior, NatMappingBehavior,
+    NatType, StunClient, StunClientConfig, StunConfig, StunError, StunMessage, StunMessageType,
+    TransactionId,
 };
 
 // === ОСНОВНЫЕ ТИПЫ ===
@@ -157,9 +154,13 @@ impl Candidate {
             foundation: ice::utils::generate_foundation(
                 CandidateType::ServerReflexive,
                 local_address,
-                Some(stun_server)
+                Some(stun_server),
             ),
-            priority: ice::utils::calculate_candidate_priority(CandidateType::ServerReflexive, 65534, 1),
+            priority: ice::utils::calculate_candidate_priority(
+                CandidateType::ServerReflexive,
+                65534,
+                1,
+            ),
             address: public_address,
             candidate_type: CandidateType::ServerReflexive,
             related_address: Some(local_address),
@@ -168,15 +169,15 @@ impl Candidate {
     }
 
     /// Создание relay кандидата
-    pub fn relay(
-        relay_address: SocketAddr,
-        local_address: SocketAddr,
-        secure: bool,
-    ) -> Self {
+    pub fn relay(relay_address: SocketAddr, local_address: SocketAddr, secure: bool) -> Self {
         let priority_offset = if secure { 0 } else { 10 };
         Self {
             foundation: ice::utils::generate_foundation(CandidateType::Relay, local_address, None),
-            priority: ice::utils::calculate_candidate_priority(CandidateType::Relay, 65533 - priority_offset, 1),
+            priority: ice::utils::calculate_candidate_priority(
+                CandidateType::Relay,
+                65533 - priority_offset,
+                1,
+            ),
             address: relay_address,
             candidate_type: CandidateType::Relay,
             related_address: Some(local_address),
@@ -192,6 +193,78 @@ impl Candidate {
     /// Получение стоимости сети
     pub fn network_cost(&self) -> u16 {
         self.attributes.network_cost
+    }
+}
+
+/// Transport protocol for ICE candidates
+///
+/// RFC 8445 Section 5.1.2.1: Transport Protocol
+/// "The transport protocol used by the candidate. This specification
+///  only defines UDP. However, extensibility is provided to allow for
+///  future transport protocols to be used with ICE, such as TCP active,
+///  TCP passive, or TCP simultaneous-open."
+///
+/// RFC 6544: ICE-TCP (TCP Candidates with Interactive Connectivity Establishment)
+/// Defines how TCP can be used as a transport protocol for ICE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TransportProtocol {
+    /// UDP transport (RFC 8445 default)
+    /// The primary transport protocol for ICE, providing best compatibility
+    /// and performance for NAT traversal scenarios.
+    Udp,
+
+    /// TCP transport (RFC 6544: ICE-TCP)
+    /// Alternative transport when UDP is blocked by firewalls.
+    /// Supports Active, Passive, and Simultaneous-Open connection types.
+    Tcp,
+}
+
+impl TransportProtocol {
+    /// Convert to protocol string for SDP/ICE messages
+    /// Returns "udp" or "tcp" as per RFC 8445 Section 5.1.2.1
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+
+    /// Parse from protocol string
+    /// Accepts "UDP", "udp", "TCP", "tcp" (case-insensitive per RFC 8445)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "udp" => Some(Self::Udp),
+            "tcp" => Some(Self::Tcp),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a reliable transport
+    /// TCP provides reliability, UDP does not (per RFC 793 and RFC 768)
+    pub fn is_reliable(&self) -> bool {
+        matches!(self, Self::Tcp)
+    }
+
+    /// Get default port for this protocol
+    /// These are IANA registered ports for ICE/STUN
+    pub fn default_port(&self) -> u16 {
+        match self {
+            Self::Udp => 3478, // STUN default UDP port (RFC 8489)
+            Self::Tcp => 3478, // STUN default TCP port (RFC 8489)
+        }
+    }
+}
+
+impl Default for TransportProtocol {
+    /// Default to UDP per RFC 8445 Section 2.1
+    fn default() -> Self {
+        Self::Udp
+    }
+}
+
+impl std::fmt::Display for TransportProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -213,37 +286,91 @@ pub enum CandidateType {
 }
 
 /// Атрибуты кандидата
+///
+/// RFC 8445 Section 5.1: Candidate Attributes
+/// Contains all necessary attributes for ICE candidate description
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateAttributes {
-    /// Транспортный протокол (udp/tcp)
-    pub transport: String,
-    /// ID компонента (1 для RTP, 2 для RTCP)
+    /// Транспортный протокол (RFC 8445 Section 5.1.2.1)
+    /// UDP (default) or TCP (RFC 6544)
+    pub transport: TransportProtocol,
+
+    /// ID компонента (RFC 8445 Section 5.1.2.2)
+    /// 1 for RTP, 2 for RTCP, per RFC 5245 conventions
     pub component: u16,
-    /// Стоимость сети
+
+    /// Стоимость сети (RFC 8445 Section 5.1.2)
+    /// Lower values indicate higher preference
+    /// Range: 0-65535, where 0 is highest cost
     pub network_cost: u16,
-    /// Поколение ICE (для restarts)
+
+    /// Поколение ICE (RFC 8445 Section 2.5: ICE Restart)
+    /// Incremented each time ICE restarts
     pub generation: u32,
-    /// ID сети
+
+    /// ID сети (RFC 8445 Section 5.1.3)
+    /// Identifies the network interface for multi-homed hosts
     pub network_id: u32,
-    /// Дополнительные расширения
+
+    /// Дополнительные расширения (RFC 8445 Section 5.1)
+    /// Allows for future extensibility without breaking compatibility
     pub extensions: std::collections::HashMap<String, String>,
+
+    /// SHARP-256 extension: hairpin detection capability
+    pub hairpin_capable: bool,
+
+    /// SHARP-256 extension: encryption capability
+    pub encryption_capable: bool,
 }
 
 impl Default for CandidateAttributes {
     fn default() -> Self {
         Self {
-            transport: "udp".to_string(),
+            // Default to UDP per RFC 8445
+            transport: TransportProtocol::Udp,
+            // Component 1 (RTP) is the default per RFC 5245
             component: 1,
+            // Network cost 0 = highest preference
             network_cost: 0,
+            // Initial generation
             generation: 0,
+            // Default network ID
             network_id: 1,
+            // No extensions by default
             extensions: std::collections::HashMap::new(),
+            // SHARP-256 extensions default to false
+            hairpin_capable: false,
+            encryption_capable: false,
         }
     }
 }
 
+impl CandidateAttributes {
+    /// Create attributes for a specific transport protocol
+    pub fn with_transport(transport: TransportProtocol) -> Self {
+        Self {
+            transport,
+            ..Default::default()
+        }
+    }
+
+    /// Create attributes with custom component ID
+    pub fn with_component(component: u16) -> Self {
+        Self {
+            component,
+            ..Default::default()
+        }
+    }
+
+    /// Check if attributes are compatible for pairing
+    /// Per RFC 8445 Section 6.1.2.2: candidates must have matching transport and component
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        self.transport == other.transport && self.component == other.component
+    }
+}
+
 /// Пара кандидатов для connectivity checks
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidatePair {
     /// Локальный кандидат
     pub local: Candidate,
@@ -256,7 +383,11 @@ pub struct CandidatePair {
     /// Номинирована ли пара
     pub nominated: bool,
     /// Время последней активности
+    #[serde(skip)]
     pub last_activity: Option<Instant>,
+    /// Round-Trip Time (RFC 8445 Section 6)
+    /// Measured during connectivity checks during STUN binding requests
+    pub rtt: Option<Duration>,
 }
 
 impl CandidatePair {
@@ -270,6 +401,7 @@ impl CandidatePair {
             state: CandidatePairState::Waiting,
             nominated: false,
             last_activity: None,
+            rtt: None,
         }
     }
 
@@ -280,19 +412,21 @@ impl CandidatePair {
     }
 
     /// Проверка совместимости кандидатов
+    ///
+    /// RFC 8445 Section 6.1.2.2: Forming Candidate Pairs
+    /// "Candidates MUST have the same IP address version and transport protocol"
     pub fn is_compatible(&self) -> bool {
-        // IP версии должны совпадать
+        // IP версии должны совпадать (RFC 8445 Section 6.1.2.2)
         if self.local.address.is_ipv4() != self.remote.address.is_ipv4() {
             return false;
         }
 
-        // Транспорт должен совпадать
-        if self.local.attributes.transport != self.remote.attributes.transport {
-            return false;
-        }
-
-        // Компоненты должны совпадать
-        if self.local.attributes.component != self.remote.attributes.component {
+        // Транспорт и компонент должны совпадать (RFC 8445 Section 6.1.2.2)
+        if !self
+            .local
+            .attributes
+            .is_compatible_with(&self.remote.attributes)
+        {
             return false;
         }
 
@@ -328,25 +462,6 @@ pub struct ConnectivityCheckResult {
     pub error: Option<String>,
     /// Время проверки
     pub timestamp: Instant,
-}
-
-/// Состояние connectivity процесса
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    /// Новое соединение
-    New,
-    /// Подключение в процессе
-    Connecting,
-    /// Соединение установлено
-    Connected,
-    /// Соединение завершено
-    Completed,
-    /// Соединение неудачно
-    Failed,
-    /// Соединение отключено
-    Disconnected,
-    /// Соединение закрыто
-    Closed,
 }
 
 /// Метрики connectivity
@@ -393,8 +508,39 @@ impl ConnectivityMetrics {
     }
 }
 
+/// События connectivity системы
+#[derive(Debug, Clone)]
+pub enum ConnectivityEvent {
+    /// Начался сбор кандидатов
+    GatheringStarted,
+    /// Новый кандидат найден
+    CandidateGathered(Candidate),
+    /// Сбор кандидатов завершен
+    GatheringComplete(Vec<Candidate>),
+    /// Начались connectivity checks
+    ConnectivityChecksStarted,
+    /// Результат connectivity check
+    ConnectivityCheckResult(ConnectivityCheckResult),
+    /// Nomination начата для пары
+    NominationStarted {
+        component_id: u32,
+        pair: CandidatePair,
+    },
+    /// Пара кандидатов номинирована
+    CandidatePairNominated(CandidatePair),
+    /// Соединение установлено (PHASE 2: will include connection info)
+    ConnectionEstablished,
+    /// Соединение закрыто
+    ConnectionClosed,
+    /// Ошибка в процессе подключения
+    Error(String),
+    /// Метрики обновлены
+    MetricsUpdated(ConnectivityMetrics),
+}
+
 /// === ГЛАВНАЯ СТРУКТУРА CONNECTIVITY ===
 
+/* PHASE 2: Connectivity wrapper will be rebuilt from scratch
 /// Главная структура для управления connectivity
 pub struct Connectivity {
     /// Менеджер connectivity
@@ -559,6 +705,7 @@ impl Connectivity {
         self.manager.shutdown().await
     }
 }
+*/
 
 /// Поддерживаемые возможности
 #[derive(Debug, Clone)]
@@ -574,11 +721,21 @@ impl SupportedFeatures {
     /// Получение списка активных features
     pub fn active_features(&self) -> Vec<&'static str> {
         let mut features = Vec::new();
-        if self.webrtc_ice { features.push("webrtc-ice-stack"); }
-        if self.libp2p_fallback { features.push("libp2p-fallback"); }
-        if self.relay_encryption { features.push("relay-encryption"); }
-        if self.nat_router_pools { features.push("nat-router-pools"); }
-        if self.upnp_support { features.push("upnp-support"); }
+        if self.webrtc_ice {
+            features.push("webrtc-ice-stack");
+        }
+        if self.libp2p_fallback {
+            features.push("libp2p-fallback");
+        }
+        if self.relay_encryption {
+            features.push("relay-encryption");
+        }
+        if self.nat_router_pools {
+            features.push("nat-router-pools");
+        }
+        if self.upnp_support {
+            features.push("upnp-support");
+        }
         features
     }
 
@@ -589,6 +746,7 @@ impl SupportedFeatures {
     }
 }
 
+/* PHASE 2: Utility functions will be rebuilt
 /// === UTILITY ФУНКЦИИ ===
 
 /// Создание стандартной connectivity системы
@@ -641,7 +799,9 @@ pub async fn create_auto_connectivity() -> Result<Connectivity> {
         Connectivity::with_config(config).await
     }
 }
+*/
 
+/* PHASE 2: Compatibility layer will be removed
 /// === COMPATIBILITY LAYER ===
 
 /// Compatibility layer для старого NAT API
@@ -698,6 +858,7 @@ pub mod nat_compat {
         }
     }
 }
+*/
 
 /// === КОНСТАНТЫ И ВЕРСИИ ===
 
@@ -738,6 +899,7 @@ mod tests {
     use super::*;
     use tokio::time::sleep;
 
+    /* PHASE 2: Connectivity tests will be rewritten
     #[tokio::test]
     async fn test_connectivity_creation() {
         let connectivity = create_test_connectivity().await;
@@ -755,6 +917,7 @@ mod tests {
         // В тестах должен быть доступен хотя бы один метод
         assert!(features.meets_minimum_requirements());
     }
+    */
 
     #[tokio::test]
     async fn test_candidate_creation() {
@@ -791,6 +954,7 @@ mod tests {
         assert!(info.contains("v2.0.0"));
     }
 
+    /* PHASE 2: Tests will be rewritten when Connectivity is rebuilt
     #[tokio::test]
     async fn test_auto_connectivity_creation() {
         let connectivity = create_auto_connectivity().await;
@@ -804,4 +968,5 @@ mod tests {
         let nat_manager = nat_compat::NatManager::new().await;
         assert!(nat_manager.is_ok());
     }
+    */
 }

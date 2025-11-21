@@ -14,28 +14,28 @@ use std::sync::Arc;
 #[cfg(feature = "relay-encryption")]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "relay-encryption")]
-use tracing::{debug, trace, warn, error};
+use tracing::{debug, error, trace, warn};
 
 #[cfg(feature = "relay-encryption")]
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
-    ChaCha20Poly1305, Nonce
+    ChaCha20Poly1305, Nonce,
 };
 
 #[cfg(feature = "relay-encryption")]
 use aes_gcm::{
-    Aes128Gcm, Aes256Gcm, KeyInit as AesKeyInit, Aead as AesAead,
-    Nonce as AesNonce
+    aead::{Aead as AesAead, KeyInit as AesKeyInit},
+    Aes128Gcm, Aes256Gcm, Nonce as AesNonce,
 };
 
 #[cfg(feature = "relay-encryption")]
 use super::{
-    EncryptionAlgorithm, EncryptionConfig, EncryptionResult, EncryptionMetadata, Encryptor
+    EncryptionAlgorithm, EncryptionConfig, EncryptionMetadata, EncryptionResult, Encryptor,
 };
 #[cfg(feature = "relay-encryption")]
 use crate::connectivity::config::HeaderEncryptionAlgorithm;
 #[cfg(feature = "relay-encryption")]
-use crate::protocol::{packet::PacketHeader, constants::SHARP_HEADER_SIZE};
+use crate::protocol::{constants::SHARP_HEADER_SIZE, packet::PacketHeader};
 
 /// Главный класс для шифрования SHARP заголовков
 #[cfg(feature = "relay-encryption")]
@@ -126,7 +126,10 @@ impl HeaderCrypto {
 
         let encryption_algorithm = EncryptionAlgorithm::from(algorithm);
 
-        debug!("Creating HeaderCrypto with algorithm: {:?}", encryption_algorithm);
+        debug!(
+            "Creating HeaderCrypto with algorithm: {:?}",
+            encryption_algorithm
+        );
 
         Ok(Self {
             algorithm: encryption_algorithm,
@@ -169,7 +172,10 @@ impl HeaderCrypto {
         match &result {
             Ok(_) => {
                 self.stats.write().record_encryption(start_time.elapsed());
-                trace!("Header encrypted successfully in {:?}", start_time.elapsed());
+                trace!(
+                    "Header encrypted successfully in {:?}",
+                    start_time.elapsed()
+                );
             }
             Err(_) => {
                 self.stats.write().record_encryption_error();
@@ -207,7 +213,10 @@ impl HeaderCrypto {
         match &decrypted_bytes {
             Ok(_) => {
                 self.stats.write().record_decryption(start_time.elapsed());
-                trace!("Header decrypted successfully in {:?}", start_time.elapsed());
+                trace!(
+                    "Header decrypted successfully in {:?}",
+                    start_time.elapsed()
+                );
             }
             Err(_) => {
                 self.stats.write().record_decryption_error();
@@ -239,21 +248,23 @@ impl HeaderCrypto {
             EncryptionAlgorithm::ChaCha20Poly1305 => {
                 self.decrypt_with_chacha20(&key, encrypted_data)
             }
-            EncryptionAlgorithm::AesGcm256 => {
-                self.decrypt_with_aes256(&key, encrypted_data)
-            }
-            EncryptionAlgorithm::AesGcm128 => {
-                self.decrypt_with_aes128(&key, encrypted_data)
-            }
+            EncryptionAlgorithm::AesGcm256 => self.decrypt_with_aes256(&key, encrypted_data),
+            EncryptionAlgorithm::AesGcm128 => self.decrypt_with_aes128(&key, encrypted_data),
         }
     }
 
     /// Шифрование с ChaCha20-Poly1305
-    fn encrypt_with_chacha20(&self, key: &[u8; 32], data: &[u8], key_version: u32) -> Result<Vec<u8>> {
+    fn encrypt_with_chacha20(
+        &self,
+        key: &[u8; 32],
+        data: &[u8],
+        key_version: u32,
+    ) -> Result<Vec<u8>> {
         let cipher = ChaCha20Poly1305::new(key.into());
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 
-        let ciphertext = cipher.encrypt(&nonce, data)
+        let ciphertext = cipher
+            .encrypt(&nonce, data)
             .map_err(|e| anyhow::anyhow!("ChaCha20 encryption failed: {}", e))?;
 
         // Формат: [version(4)] + [nonce(12)] + [ciphertext]
@@ -267,7 +278,8 @@ impl HeaderCrypto {
 
     /// Дешифрование с ChaCha20-Poly1305
     fn decrypt_with_chacha20(&self, key: &[u8; 32], encrypted_data: &[u8]) -> Result<Vec<u8>> {
-        if encrypted_data.len() < 16 { // 4 bytes version + 12 bytes nonce
+        if encrypted_data.len() < 16 {
+            // 4 bytes version + 12 bytes nonce
             return Err(anyhow::anyhow!("Encrypted data too short for ChaCha20"));
         }
 
@@ -278,16 +290,23 @@ impl HeaderCrypto {
         let nonce = Nonce::from_slice(nonce_bytes);
 
         let cipher = ChaCha20Poly1305::new(key.into());
-        cipher.decrypt(nonce, ciphertext)
+        cipher
+            .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("ChaCha20 decryption failed: {}", e))
     }
 
     /// Шифрование с AES-256-GCM
-    fn encrypt_with_aes256(&self, key: &[u8; 32], data: &[u8], key_version: u32) -> Result<Vec<u8>> {
+    fn encrypt_with_aes256(
+        &self,
+        key: &[u8; 32],
+        data: &[u8],
+        key_version: u32,
+    ) -> Result<Vec<u8>> {
         let cipher = Aes256Gcm::new(key.into());
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
-        let ciphertext = cipher.encrypt(&nonce, data)
+        let ciphertext = cipher
+            .encrypt(&nonce, data)
             .map_err(|e| anyhow::anyhow!("AES-256-GCM encryption failed: {}", e))?;
 
         // Формат: [version(4)] + [nonce(12)] + [ciphertext]
@@ -312,18 +331,25 @@ impl HeaderCrypto {
         let nonce = AesNonce::from_slice(nonce_bytes);
 
         let cipher = Aes256Gcm::new(key.into());
-        cipher.decrypt(nonce, ciphertext)
+        cipher
+            .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("AES-256-GCM decryption failed: {}", e))
     }
 
     /// Шифрование с AES-128-GCM
-    fn encrypt_with_aes128(&self, key: &[u8; 32], data: &[u8], key_version: u32) -> Result<Vec<u8>> {
+    fn encrypt_with_aes128(
+        &self,
+        key: &[u8; 32],
+        data: &[u8],
+        key_version: u32,
+    ) -> Result<Vec<u8>> {
         // Используем первые 16 байт ключа для AES-128
         let aes128_key = &key[..16];
         let cipher = Aes128Gcm::new(aes128_key.into());
         let nonce = Aes128Gcm::generate_nonce(&mut OsRng);
 
-        let ciphertext = cipher.encrypt(&nonce, data)
+        let ciphertext = cipher
+            .encrypt(&nonce, data)
             .map_err(|e| anyhow::anyhow!("AES-128-GCM encryption failed: {}", e))?;
 
         // Формат: [version(4)] + [nonce(12)] + [ciphertext]
@@ -350,7 +376,8 @@ impl HeaderCrypto {
         // Используем первые 16 байт ключа для AES-128
         let aes128_key = &key[..16];
         let cipher = Aes128Gcm::new(aes128_key.into());
-        cipher.decrypt(nonce, ciphertext)
+        cipher
+            .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("AES-128-GCM decryption failed: {}", e))
     }
 
@@ -372,8 +399,11 @@ impl HeaderCrypto {
 
         // Генерируем новый ключ из старого с помощью HKDF
         let old_key = *self.key.read();
-        let salt = format!("sharp-rotation-{}",
-                           SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()).into_bytes();
+        let salt = format!(
+            "sharp-rotation-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+        )
+        .into_bytes();
         let info = b"SHARP-256 key rotation";
 
         let new_key = super::utils::derive_key(&old_key, &salt, info)?;
@@ -385,7 +415,10 @@ impl HeaderCrypto {
 
         self.stats.write().record_key_rotation();
 
-        debug!("Key rotation completed, new version: {}", *self.key_version.read());
+        debug!(
+            "Key rotation completed, new version: {}",
+            *self.key_version.read()
+        );
 
         // Очищаем старый ключ из памяти
         let mut old_key_mut = old_key;
@@ -415,7 +448,10 @@ impl HeaderCrypto {
 
         self.stats.write().record_key_rotation();
 
-        debug!("Manual key rotation completed, new version: {}", *self.key_version.read());
+        debug!(
+            "Manual key rotation completed, new version: {}",
+            *self.key_version.read()
+        );
 
         // Очищаем старый ключ из памяти
         let mut old_key_mut = old_key;
@@ -448,8 +484,8 @@ impl HeaderCrypto {
             average_encrypt_time: stats.average_encrypt_time(),
             average_decrypt_time: stats.average_decrypt_time(),
             error_rate: if stats.headers_encrypted + stats.headers_decrypted > 0 {
-                (stats.encryption_errors + stats.decryption_errors) as f64 /
-                    (stats.headers_encrypted + stats.headers_decrypted) as f64
+                (stats.encryption_errors + stats.decryption_errors) as f64
+                    / (stats.headers_encrypted + stats.headers_decrypted) as f64
             } else {
                 0.0
             },
@@ -485,7 +521,7 @@ impl Encryptor for HeaderCrypto {
 
         Ok(EncryptionResult {
             encrypted_data: encrypted_data[16..].to_vec(), // Убираем version + nonce для совместимости
-            nonce: encrypted_data[4..16].to_vec(), // Извлекаем nonce
+            nonce: encrypted_data[4..16].to_vec(),         // Извлекаем nonce
             metadata: EncryptionMetadata {
                 algorithm: Some(self.algorithm),
                 timestamp: Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
@@ -665,7 +701,7 @@ impl Encryptor for AesGcm128Encryptor {
 #[cfg(feature = "relay-encryption")]
 mod tests {
     use super::*;
-    use crate::protocol::{packet::PacketHeader, constants::*};
+    use crate::protocol::{constants::*, packet::PacketHeader};
 
     #[test]
     fn test_header_crypto_creation() {
@@ -818,7 +854,10 @@ mod tests {
         let decrypted = crypto.decrypt(&encrypted_result).await.unwrap();
 
         assert_eq!(test_data, decrypted);
-        assert_eq!(encrypted_result.metadata.algorithm, Some(EncryptionAlgorithm::ChaCha20Poly1305));
+        assert_eq!(
+            encrypted_result.metadata.algorithm,
+            Some(EncryptionAlgorithm::ChaCha20Poly1305)
+        );
         assert!(encrypted_result.metadata.timestamp.is_some());
         assert_eq!(encrypted_result.metadata.key_version, Some(1));
     }

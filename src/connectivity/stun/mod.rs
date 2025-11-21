@@ -36,26 +36,24 @@
 pub mod attributes;
 pub mod client;
 pub mod integrity;
+pub mod ipv6;
 pub mod message;
 pub mod nat_detection;
 pub mod retransmission;
 pub mod transaction;
-pub mod ipv6;
 
 // Re-exports
 pub use attributes::{
-    StunAttribute, XorMappedAddress, MappedAddress,
-    ChangeRequest, ResponseOrigin, OtherAddress,
+    ChangeRequest, MappedAddress, OtherAddress, ResponseOrigin, StunAttribute, XorMappedAddress,
 };
 pub use client::{StunClient, StunClientConfig};
-pub use integrity::{MessageIntegrity, IntegrityError};
-pub use message::{StunMessage, StunMessageType, StunClass, StunMethod};
+pub use integrity::{IntegrityError, MessageIntegrity};
+pub use message::{StunClass, StunMessage, StunMessageType, StunMethod};
 pub use nat_detection::{
-    NatDetector, NatDetectionResult, NatMappingBehavior,
-    NatFilteringBehavior, NatType,
+    NatDetectionResult, NatDetector, NatFilteringBehavior, NatMappingBehavior, NatType,
 };
 pub use retransmission::{RetransmissionConfig, RetransmissionState};
-pub use transaction::{TransactionId, TransactionTracker, TransactionResult};
+pub use transaction::{TransactionId, TransactionResult, TransactionTracker};
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -231,23 +229,34 @@ pub enum StunError {
 /// Parse STUN server URL into address
 pub fn parse_stun_url(url: &str) -> Result<(SocketAddr, bool), StunError> {
     let (scheme, rest) = if url.starts_with("stuns:") {
-        (true, url.trim_start_matches("stuns:").trim_start_matches("//"))
+        (
+            true,
+            url.trim_start_matches("stuns:").trim_start_matches("//"),
+        )
     } else if url.starts_with("stun:") {
-        (false, url.trim_start_matches("stun:").trim_start_matches("//"))
+        (
+            false,
+            url.trim_start_matches("stun:").trim_start_matches("//"),
+        )
     } else {
         // Assume plain address
         (false, url)
     };
 
-    let addr: SocketAddr = rest.parse().map_err(|_| {
-        // Try adding default port
-        let with_port = if scheme {
-            format!("{}:{}", rest, constants::DEFAULT_STUNS_PORT)
-        } else {
-            format!("{}:{}", rest, constants::DEFAULT_STUN_PORT)
-        };
-        with_port.parse().map_err(|e| StunError::ParseError(format!("Invalid STUN URL '{}': {}", url, e)))
-    }).unwrap_or_else(|r: Result<SocketAddr, StunError>| r.unwrap());
+    let addr: SocketAddr = rest
+        .parse()
+        .map_err(|_| {
+            // Try adding default port
+            let with_port = if scheme {
+                format!("{}:{}", rest, constants::DEFAULT_STUNS_PORT)
+            } else {
+                format!("{}:{}", rest, constants::DEFAULT_STUN_PORT)
+            };
+            with_port
+                .parse()
+                .map_err(|e| StunError::ParseError(format!("Invalid STUN URL '{}': {}", url, e)))
+        })
+        .unwrap_or_else(|r: Result<SocketAddr, StunError>| r.unwrap());
 
     Ok((addr, scheme))
 }

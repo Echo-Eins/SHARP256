@@ -9,7 +9,9 @@ use std::net::SocketAddr;
 pub struct LibP2pClient;
 
 impl LibP2pClient {
-    pub fn new(_config: impl Into<Option<crate::connectivity::config::ConnectivityConfig>>) -> Result<Self> {
+    pub fn new(
+        _config: impl Into<Option<crate::connectivity::config::ConnectivityConfig>>,
+    ) -> Result<Self> {
         Ok(Self)
     }
 

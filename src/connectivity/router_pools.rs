@@ -8,7 +8,9 @@ use anyhow::Result;
 pub struct RouterPoolManager;
 
 impl RouterPoolManager {
-    pub fn new(_config: impl Into<Option<crate::connectivity::config::ConnectivityConfig>>) -> Result<Self> {
+    pub fn new(
+        _config: impl Into<Option<crate::connectivity::config::ConnectivityConfig>>,
+    ) -> Result<Self> {
         Ok(Self)
     }
 }

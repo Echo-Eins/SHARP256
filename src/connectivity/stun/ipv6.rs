@@ -204,11 +204,7 @@ pub fn is_usable_for_ice(addr: &Ipv6Addr) -> bool {
 }
 
 /// XOR an IPv6 address for XOR-MAPPED-ADDRESS
-pub fn xor_ipv6_address(
-    addr: &Ipv6Addr,
-    magic_cookie: u32,
-    transaction_id: &[u8; 12],
-) -> Ipv6Addr {
+pub fn xor_ipv6_address(addr: &Ipv6Addr, magic_cookie: u32, transaction_id: &[u8; 12]) -> Ipv6Addr {
     let mut result = [0u8; 16];
     let addr_bytes = addr.octets();
     let cookie = magic_cookie.to_be_bytes();
@@ -253,7 +249,9 @@ mod tests {
     fn test_xor_ipv6() {
         let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let magic = 0x2112A442u32;
-        let tid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+        let tid = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
 
         let xored = xor_ipv6_address(&addr, magic, &tid);
         let unxored = xor_ipv6_address(&xored, magic, &tid);
