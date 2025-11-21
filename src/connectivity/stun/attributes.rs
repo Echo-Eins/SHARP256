@@ -82,7 +82,11 @@ impl StunAttribute {
     }
 
     /// Encode attribute to bytes
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `buf` - Buffer to encode into
+    /// * `transaction_id` - 12-byte transaction ID from STUN message header (required for XOR-MAPPED-ADDRESS)
+    pub fn encode(&self, buf: &mut BytesMut, transaction_id: &[u8; 12]) -> Result<()> {
         let start_len = buf.len();
 
         match self {
@@ -100,7 +104,7 @@ impl StunAttribute {
                 buf.put_u16(ATTR_XOR_MAPPED_ADDRESS);
                 let value_start = buf.len();
                 buf.put_u16(0); // Placeholder for length
-                addr.encode(buf);
+                addr.encode(buf, transaction_id);
                 let value_len = buf.len() - value_start - 2;
                 buf[value_start..value_start + 2]
                     .copy_from_slice(&(value_len as u16).to_be_bytes());
@@ -213,7 +217,11 @@ impl StunAttribute {
     }
 
     /// Decode attribute from bytes
-    pub fn decode(buf: &mut &[u8]) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `buf` - Buffer to decode from
+    /// * `transaction_id` - 12-byte transaction ID from STUN message header (required for XOR-MAPPED-ADDRESS)
+    pub fn decode(buf: &mut &[u8], transaction_id: &[u8; 12]) -> Result<Self> {
         if buf.len() < 4 {
             return Err(anyhow::anyhow!("Attribute too short"));
         }
@@ -232,7 +240,7 @@ impl StunAttribute {
             ATTR_MAPPED_ADDRESS => StunAttribute::MappedAddress(MappedAddress::decode(value)?),
 
             ATTR_XOR_MAPPED_ADDRESS => {
-                StunAttribute::XorMappedAddress(XorMappedAddress::decode(value)?)
+                StunAttribute::XorMappedAddress(XorMappedAddress::decode(value, transaction_id)?)
             }
 
             ATTR_CHANGE_REQUEST => {
@@ -392,15 +400,23 @@ impl XorMappedAddress {
         Self { address }
     }
 
-    pub fn encode(&self, buf: &mut BytesMut) {
+    /// Encode XOR-MAPPED-ADDRESS attribute value
+    ///
+    /// RFC 8489 Section 15.2:
+    /// - X-Port is XOR'd with most significant 16 bits of magic cookie
+    /// - X-Address (IPv4): XOR'd with magic cookie
+    /// - X-Address (IPv6): XOR'd with magic cookie concatenated with transaction ID
+    pub fn encode(&self, buf: &mut BytesMut, transaction_id: &[u8; 12]) {
         buf.put_u8(0); // Reserved
         match self.address {
             SocketAddr::V4(addr) => {
-                buf.put_u8(0x01); // IPv4
-                                  // XOR port with high 16 bits of magic cookie
+                buf.put_u8(0x01); // IPv4 family
+
+                // XOR port with most significant 16 bits of magic cookie
                 let xport = addr.port() ^ ((MAGIC_COOKIE >> 16) as u16);
                 buf.put_u16(xport);
-                // XOR address with magic cookie
+
+                // XOR IPv4 address with magic cookie (4 bytes)
                 let ip_bytes = addr.ip().octets();
                 let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
                 buf.put_u8(ip_bytes[0] ^ cookie_bytes[0]);
@@ -409,32 +425,71 @@ impl XorMappedAddress {
                 buf.put_u8(ip_bytes[3] ^ cookie_bytes[3]);
             }
             SocketAddr::V6(addr) => {
-                buf.put_u8(0x02); // IPv6
+                buf.put_u8(0x02); // IPv6 family
+
+                // XOR port with most significant 16 bits of magic cookie
                 let xport = addr.port() ^ ((MAGIC_COOKIE >> 16) as u16);
                 buf.put_u16(xport);
-                // XOR with magic cookie + transaction ID (not implemented here)
-                // For now, just encode the IP directly
-                buf.put_slice(&addr.ip().octets());
+
+                // RFC 8489 Section 15.2: For IPv6, XOR with magic cookie + transaction ID
+                // Create 16-byte XOR mask: magic_cookie (4 bytes) + transaction_id (12 bytes)
+                let mut xor_mask = [0u8; 16];
+                xor_mask[0..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                xor_mask[4..16].copy_from_slice(transaction_id);
+
+                // XOR IPv6 address (16 bytes) with mask
+                let ip_bytes = addr.ip().octets();
+                for i in 0..16 {
+                    buf.put_u8(ip_bytes[i] ^ xor_mask[i]);
+                }
             }
         }
     }
 
     /// Decode XOR-MAPPED-ADDRESS from value bytes
-    /// Note: transaction_id is needed for IPv6 XOR operation
-    pub fn decode(value: &[u8]) -> Result<Self> {
+    ///
+    /// RFC 8489 Section 15.2:
+    /// - X-Port is XOR'd with most significant 16 bits of magic cookie
+    /// - X-Address (IPv4): XOR'd with magic cookie
+    /// - X-Address (IPv6): XOR'd with magic cookie concatenated with transaction ID
+    ///
+    /// # Arguments
+    /// * `value` - Attribute value bytes (family + port + address)
+    /// * `transaction_id` - 12-byte transaction ID from STUN message header
+    pub fn decode(value: &[u8], transaction_id: &[u8; 12]) -> Result<Self> {
+        // RFC 8489: Minimum length is 4 bytes (reserved + family + port)
         if value.len() < 4 {
-            return Err(anyhow::anyhow!("XOR-MAPPED-ADDRESS too short"));
+            return Err(anyhow::anyhow!(
+                "XOR-MAPPED-ADDRESS too short: {} bytes, expected at least 4",
+                value.len()
+            ));
+        }
+
+        // Validate reserved byte (must be 0)
+        if value[0] != 0 {
+            return Err(anyhow::anyhow!(
+                "XOR-MAPPED-ADDRESS reserved byte non-zero: 0x{:02X}",
+                value[0]
+            ));
         }
 
         let family = value[1];
         let xport = u16::from_be_bytes([value[2], value[3]]);
+
+        // De-obfuscate port: XOR with most significant 16 bits of magic cookie
         let port = xport ^ ((MAGIC_COOKIE >> 16) as u16);
 
         let address = match family {
             0x01 => {
-                if value.len() < 8 {
-                    return Err(anyhow::anyhow!("IPv4 XOR-MAPPED-ADDRESS too short"));
+                // IPv4: RFC 8489 requires exactly 8 bytes (1 reserved + 1 family + 2 port + 4 address)
+                if value.len() != 8 {
+                    return Err(anyhow::anyhow!(
+                        "IPv4 XOR-MAPPED-ADDRESS invalid length: {} bytes, expected 8",
+                        value.len()
+                    ));
                 }
+
+                // De-obfuscate IPv4 address: XOR with magic cookie
                 let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
                 let ip = Ipv4Addr::new(
                     value[4] ^ cookie_bytes[0],
@@ -445,17 +500,34 @@ impl XorMappedAddress {
                 SocketAddr::new(IpAddr::V4(ip), port)
             }
             0x02 => {
-                if value.len() < 20 {
-                    return Err(anyhow::anyhow!("IPv6 XOR-MAPPED-ADDRESS too short"));
+                // IPv6: RFC 8489 requires exactly 20 bytes (1 reserved + 1 family + 2 port + 16 address)
+                if value.len() != 20 {
+                    return Err(anyhow::anyhow!(
+                        "IPv6 XOR-MAPPED-ADDRESS invalid length: {} bytes, expected 20",
+                        value.len()
+                    ));
                 }
-                // For IPv6, XOR with magic cookie + transaction ID
-                // Simplified: just decode without full XOR
+
+                // RFC 8489 Section 15.2: For IPv6, XOR with magic cookie + transaction ID
+                // Create 16-byte XOR mask: magic_cookie (4 bytes) + transaction_id (12 bytes)
+                let mut xor_mask = [0u8; 16];
+                xor_mask[0..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                xor_mask[4..16].copy_from_slice(transaction_id);
+
+                // De-obfuscate IPv6 address: XOR with mask
                 let mut octets = [0u8; 16];
-                octets.copy_from_slice(&value[4..20]);
+                for i in 0..16 {
+                    octets[i] = value[4 + i] ^ xor_mask[i];
+                }
                 let ip = Ipv6Addr::from(octets);
                 SocketAddr::new(IpAddr::V6(ip), port)
             }
-            _ => return Err(anyhow::anyhow!("Unknown address family: {}", family)),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Unknown address family in XOR-MAPPED-ADDRESS: 0x{:02X}",
+                    family
+                ))
+            }
         };
 
         Ok(Self { address })
@@ -557,12 +629,125 @@ mod tests {
     fn test_xor_mapped_address_ipv4() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 12345);
         let xma = XorMappedAddress::new(addr);
+        let transaction_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
 
         let mut buf = BytesMut::new();
-        xma.encode(&mut buf);
+        xma.encode(&mut buf, &transaction_id);
 
-        let decoded = XorMappedAddress::decode(&buf).unwrap();
+        let decoded = XorMappedAddress::decode(&buf, &transaction_id).unwrap();
         assert_eq!(decoded.address, addr);
+    }
+
+    #[test]
+    fn test_xor_mapped_address_ipv4_rfc_example() {
+        // RFC 8489 Section 15.2 - Example XOR-MAPPED-ADDRESS for IPv4
+        // Original: 192.0.2.1:32853
+        // Magic Cookie: 0x2112A442
+        //
+        // X-Port = 32853 ^ 0x2112 = 0x8029 ^ 0x2112 = 0xA13B
+        // X-Address = 192.0.2.1 ^ 0x2112A442
+        //   = 0xC0000201 ^ 0x2112A442 = 0xE112A643
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 32853);
+        let xma = XorMappedAddress::new(addr);
+        let transaction_id = [0x00; 12];
+
+        let mut buf = BytesMut::new();
+        xma.encode(&mut buf, &transaction_id);
+
+        // Verify encoded format
+        assert_eq!(buf.len(), 8); // IPv4: 1 reserved + 1 family + 2 port + 4 address
+        assert_eq!(buf[0], 0x00); // Reserved
+        assert_eq!(buf[1], 0x01); // IPv4 family
+        assert_eq!(buf[2], 0xA1); // X-Port high byte
+        assert_eq!(buf[3], 0x3B); // X-Port low byte
+        assert_eq!(buf[4], 0xE1); // X-Address byte 0
+        assert_eq!(buf[5], 0x12); // X-Address byte 1
+        assert_eq!(buf[6], 0xA6); // X-Address byte 2
+        assert_eq!(buf[7], 0x43); // X-Address byte 3
+
+        // Verify round-trip
+        let decoded = XorMappedAddress::decode(&buf, &transaction_id).unwrap();
+        assert_eq!(decoded.address, addr);
+    }
+
+    #[test]
+    fn test_xor_mapped_address_ipv6() {
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0x85a3, 0x0000, 0x0000, 0x8a2e, 0x0370, 0x7334)),
+            12345,
+        );
+        let xma = XorMappedAddress::new(addr);
+        let transaction_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+
+        let mut buf = BytesMut::new();
+        xma.encode(&mut buf, &transaction_id);
+
+        // Verify encoded format
+        assert_eq!(buf.len(), 20); // IPv6: 1 reserved + 1 family + 2 port + 16 address
+        assert_eq!(buf[0], 0x00); // Reserved
+        assert_eq!(buf[1], 0x02); // IPv6 family
+
+        // Verify round-trip
+        let decoded = XorMappedAddress::decode(&buf, &transaction_id).unwrap();
+        assert_eq!(decoded.address, addr);
+    }
+
+    #[test]
+    fn test_xor_mapped_address_ipv6_full_xor() {
+        // Test that IPv6 XOR operation uses magic cookie + transaction ID
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080);
+        let transaction_id = [0xAA; 12];
+
+        let mut buf = BytesMut::new();
+        let xma = XorMappedAddress::new(addr);
+        xma.encode(&mut buf, &transaction_id);
+
+        // Manually verify XOR mask is applied correctly
+        // XOR mask = magic_cookie (4 bytes) + transaction_id (12 bytes)
+        let mut expected_xor_mask = [0u8; 16];
+        expected_xor_mask[0..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        expected_xor_mask[4..16].copy_from_slice(&transaction_id);
+
+        let ip_bytes = addr.ip().octets();
+        for i in 0..16 {
+            let expected_xor_byte = ip_bytes[i] ^ expected_xor_mask[i];
+            assert_eq!(buf[4 + i], expected_xor_byte, "Mismatch at byte {}", i);
+        }
+
+        // Verify round-trip
+        let decoded = XorMappedAddress::decode(&buf, &transaction_id).unwrap();
+        assert_eq!(decoded.address, addr);
+    }
+
+    #[test]
+    fn test_xor_mapped_address_length_validation() {
+        let transaction_id = [0x00; 12];
+
+        // Test IPv4 with wrong length (too short)
+        let too_short = vec![0x00, 0x01, 0x00, 0x00, 0x00];
+        assert!(XorMappedAddress::decode(&too_short, &transaction_id).is_err());
+
+        // Test IPv4 with wrong length (too long)
+        let too_long = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(XorMappedAddress::decode(&too_long, &transaction_id).is_err());
+
+        // Test IPv6 with wrong length (too short)
+        let ipv6_short = vec![0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(XorMappedAddress::decode(&ipv6_short, &transaction_id).is_err());
+
+        // Test IPv6 with wrong length (too long)
+        let mut ipv6_long = vec![0x00, 0x02, 0x00, 0x00];
+        ipv6_long.extend_from_slice(&[0x00; 17]); // 17 bytes instead of 16
+        assert!(XorMappedAddress::decode(&ipv6_long, &transaction_id).is_err());
+
+        // Test invalid family
+        let invalid_family = vec![0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(XorMappedAddress::decode(&invalid_family, &transaction_id).is_err());
+
+        // Test non-zero reserved byte
+        let nonzero_reserved = vec![0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(XorMappedAddress::decode(&nonzero_reserved, &transaction_id).is_err());
     }
 
     #[test]
@@ -586,12 +771,13 @@ mod tests {
 
     #[test]
     fn test_attribute_roundtrip() {
+        let transaction_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
         let attr = StunAttribute::Priority(1000);
         let mut buf = BytesMut::new();
-        attr.encode(&mut buf).unwrap();
+        attr.encode(&mut buf, &transaction_id).unwrap();
 
         let mut slice = &buf[..];
-        let decoded = StunAttribute::decode(&mut slice).unwrap();
+        let decoded = StunAttribute::decode(&mut slice, &transaction_id).unwrap();
 
         match decoded {
             StunAttribute::Priority(p) => assert_eq!(p, 1000),
@@ -601,9 +787,10 @@ mod tests {
 
     #[test]
     fn test_use_candidate() {
+        let transaction_id = [0x00; 12];
         let attr = StunAttribute::UseCandidate;
         let mut buf = BytesMut::new();
-        attr.encode(&mut buf).unwrap();
+        attr.encode(&mut buf, &transaction_id).unwrap();
 
         assert_eq!(&buf[..], &[0x00, 0x25, 0x00, 0x00]);
     }

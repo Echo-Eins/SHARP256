@@ -225,15 +225,16 @@ impl StunMessage {
 
         // Encode attributes first to get length
         let mut attr_buf = BytesMut::new();
+        let transaction_id_bytes = self.transaction_id.as_bytes();
         for attr in &self.attributes {
-            attr.encode(&mut attr_buf)?;
+            attr.encode(&mut attr_buf, transaction_id_bytes)?;
         }
 
         // Write header
         buf.put_u16(self.msg_type.encode());
         buf.put_u16(attr_buf.len() as u16);
         buf.put_u32(MAGIC_COOKIE);
-        buf.put_slice(&self.transaction_id.as_bytes());
+        buf.put_slice(transaction_id_bytes);
 
         // Write attributes
         buf.put_slice(&attr_buf);
@@ -248,9 +249,10 @@ impl StunMessage {
 
         // Encode attributes (excluding MESSAGE-INTEGRITY)
         let mut attr_buf = BytesMut::new();
+        let transaction_id_bytes = self.transaction_id.as_bytes();
         for attr in &self.attributes {
             if attr.attr_type() != ATTR_MESSAGE_INTEGRITY {
-                attr.encode(&mut attr_buf)?;
+                attr.encode(&mut attr_buf, transaction_id_bytes)?;
             }
         }
 
@@ -261,7 +263,7 @@ impl StunMessage {
         buf.put_u16(self.msg_type.encode());
         buf.put_u16(length_with_integrity as u16);
         buf.put_u32(MAGIC_COOKIE);
-        buf.put_slice(&self.transaction_id.as_bytes());
+        buf.put_slice(transaction_id_bytes);
 
         // Write attributes
         buf.put_slice(&attr_buf);
@@ -316,7 +318,7 @@ impl StunMessage {
         let mut attr_data = &data[HEADER_SIZE..HEADER_SIZE + msg_length];
 
         while attr_data.len() >= 4 {
-            let attr = StunAttribute::decode(&mut attr_data)?;
+            let attr = StunAttribute::decode(&mut attr_data, &transaction_bytes)?;
             attributes.push(attr);
         }
 
@@ -389,5 +391,109 @@ mod tests {
 
         let result = StunMessage::decode(&data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_xor_mapped_address_integration_ipv4() {
+        use super::super::attributes::{StunAttribute, XorMappedAddress};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Create a STUN message with XOR-MAPPED-ADDRESS attribute
+        let mut msg = StunMessage::new_binding_request();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 32853);
+        msg.add_attribute(StunAttribute::XorMappedAddress(XorMappedAddress::new(addr)));
+
+        // Encode the message
+        let encoded = msg.encode().unwrap();
+
+        // Decode the message
+        let decoded = StunMessage::decode(&encoded).unwrap();
+
+        // Verify transaction ID matches
+        assert_eq!(decoded.transaction_id, msg.transaction_id);
+
+        // Verify XOR-MAPPED-ADDRESS attribute is correctly decoded
+        let xor_attr = decoded
+            .get_attribute(ATTR_XOR_MAPPED_ADDRESS)
+            .expect("XOR-MAPPED-ADDRESS not found");
+
+        match xor_attr {
+            StunAttribute::XorMappedAddress(xma) => {
+                assert_eq!(xma.address, addr);
+            }
+            _ => panic!("Wrong attribute type"),
+        }
+    }
+
+    #[test]
+    fn test_xor_mapped_address_integration_ipv6() {
+        use super::super::attributes::{StunAttribute, XorMappedAddress};
+        use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+        // Create a STUN message with IPv6 XOR-MAPPED-ADDRESS attribute
+        let mut msg = StunMessage::new_binding_request();
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0x85a3, 0x0000, 0x0000, 0x8a2e, 0x0370, 0x7334)),
+            8080,
+        );
+        msg.add_attribute(StunAttribute::XorMappedAddress(XorMappedAddress::new(addr)));
+
+        // Encode the message
+        let encoded = msg.encode().unwrap();
+
+        // Decode the message
+        let decoded = StunMessage::decode(&encoded).unwrap();
+
+        // Verify transaction ID matches
+        assert_eq!(decoded.transaction_id, msg.transaction_id);
+
+        // Verify XOR-MAPPED-ADDRESS attribute is correctly decoded with IPv6
+        let xor_attr = decoded
+            .get_attribute(ATTR_XOR_MAPPED_ADDRESS)
+            .expect("XOR-MAPPED-ADDRESS not found");
+
+        match xor_attr {
+            StunAttribute::XorMappedAddress(xma) => {
+                assert_eq!(xma.address, addr);
+            }
+            _ => panic!("Wrong attribute type"),
+        }
+    }
+
+    #[test]
+    fn test_xor_mapped_address_different_transaction_ids() {
+        use super::super::attributes::{StunAttribute, XorMappedAddress};
+        use super::super::transaction::TransactionId;
+        use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+        // Create two messages with different transaction IDs but same address
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9090);
+
+        let mut msg1 = StunMessage::new_binding_request();
+        msg1.add_attribute(StunAttribute::XorMappedAddress(XorMappedAddress::new(addr)));
+        let encoded1 = msg1.encode().unwrap();
+
+        let mut msg2 = StunMessage::new_binding_request();
+        msg2.add_attribute(StunAttribute::XorMappedAddress(XorMappedAddress::new(addr)));
+        let encoded2 = msg2.encode().unwrap();
+
+        // Different transaction IDs should produce different encoded XOR-MAPPED-ADDRESS
+        // (for IPv6, since XOR mask includes transaction ID)
+        assert_ne!(msg1.transaction_id, msg2.transaction_id);
+        assert_ne!(encoded1, encoded2);
+
+        // But both should decode to the same address
+        let decoded1 = StunMessage::decode(&encoded1).unwrap();
+        let decoded2 = StunMessage::decode(&encoded2).unwrap();
+
+        let get_xor_addr = |msg: &StunMessage| -> SocketAddr {
+            match msg.get_attribute(ATTR_XOR_MAPPED_ADDRESS).unwrap() {
+                StunAttribute::XorMappedAddress(xma) => xma.address,
+                _ => panic!("Wrong attribute type"),
+            }
+        };
+
+        assert_eq!(get_xor_addr(&decoded1), addr);
+        assert_eq!(get_xor_addr(&decoded2), addr);
     }
 }
