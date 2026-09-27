@@ -1,3 +1,15 @@
-target/debug/
-Cargo.lock
-target/
+# Build artifacts
+/target/
+
+# IDE / editor state
+/.idea/
+/.vscode/
+*.iml
+
+# Runtime output of local test runs
+/received/
+*.sharp-part
+
+# OS noise
+.DS_Store
+Thumbs.db
