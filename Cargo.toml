@@ -1,8 +1,10 @@
 [package]
-name = "SHARP3"
+name = "sharp256"
 version = "0.3.0"
 edition = "2021"
-authors = ["SHARP Protocol Team"]
+authors = ["Echo_Eins"]
+license = "MIT"
+repository = "https://github.com/echo-eins/sharp256"
 description = "Swift Hash Assurance Rust Protocol - High-performance file transfer protocol"
 
 [dependencies]

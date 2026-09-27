@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use SHARP3::{init_logging, system_info, sender};
+use sharp256::{init_logging, system_info, sender};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -142,7 +142,7 @@ async fn run_headless(
 #[cfg(feature = "gui")]
 mod gui {
     use super::*;
-    use SHARP3::gui::SenderApp;
+    use sharp256::gui::SenderApp;
 
     pub fn run_sender_gui() -> Result<()> {
         let options = eframe::NativeOptions {

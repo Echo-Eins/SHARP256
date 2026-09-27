@@ -213,7 +213,7 @@ score = (1 - loss_rate) * bandwidth_utilization * (1 / (1 + rtt/100))
 
 ## Лицензия
 
-MIT
+MIT, см. файл [LICENSE](LICENSE).
 
 ## Автор
 

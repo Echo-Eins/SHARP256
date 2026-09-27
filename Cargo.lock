@@ -3,42 +3,6 @@
 version = 4
 
 [[package]]
-name = "SHARP3"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "base64",
- "bincode",
- "blake3",
- "bytes",
- "chrono",
- "clap",
- "dirs",
- "eframe",
- "egui",
- "if-addrs",
- "igd",
- "libc",
- "memmap2 0.9.5",
- "parking_lot",
- "rand",
- "rfd",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sysinfo",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "winapi",
-]
-
-[[package]]
 name = "ab_glyph"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3116,6 +3080,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "sharp256"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bincode",
+ "blake3",
+ "bytes",
+ "chrono",
+ "clap",
+ "dirs",
+ "eframe",
+ "egui",
+ "if-addrs",
+ "igd",
+ "libc",
+ "memmap2 0.9.5",
+ "parking_lot",
+ "rand",
+ "rfd",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "winapi",
 ]
 
 [[package]]

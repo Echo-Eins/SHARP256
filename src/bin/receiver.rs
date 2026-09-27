@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use SHARP3::{init_logging, system_info, Receiver};
+use sharp256::{init_logging, system_info, Receiver};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         // GUI режим
         #[cfg(feature = "gui")]
         {
-            SHARP3::gui::run_receiver_gui(args.output, args.bind)?;
+            sharp256::gui::run_receiver_gui(args.output, args.bind)?;
             Ok(())
         }
 
