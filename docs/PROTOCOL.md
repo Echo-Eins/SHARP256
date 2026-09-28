@@ -216,6 +216,8 @@ travel inside the handshake (section 2).
 | 10 | PROBE_ACK | R → S | `size:u16` (size of the probe datagram actually received) |
 | 11 | ABORT     | both  | `code:u16 len:u8 reason[]` |
 | 12 | FIN_DONE  | R → S | `verdict:u8` (the verdict the receiver acted on) |
+| 13 | PATH_CHALLENGE | both | `token[8]` (unpredictable) |
+| 14 | PATH_RESPONSE  | both | `token[8]` (echo of a challenge) |
 
 `kind` is 0 for a single file and 1 for a directory; a directory adds
 `tree = manifest_len:u64 manifest_hash[32] files:u64 dirs:u64` (section 6).
@@ -646,7 +648,50 @@ against the manifest.
 * The "256" of the name survives as the 256 KiB block granularity of the
   sender's read-ahead and as the 256-bit output of BLAKE3.
 
-## 8. Reachability and NAT
+## 8. Reachability, addresses and NAT
+
+### Finding the receiver
+
+`ID@host:port` is resolved to *every* address the name has, with the
+address families interleaved. Name resolution is a hint and nothing more:
+DNS and mDNS answers are unauthenticated and among the easiest records on a
+network to forge. Handshake attempts therefore rotate through all of the
+addresses (at most 8) until one answers, and completing a handshake takes
+the receiver's private key — so an address that is not the receiver simply
+never answers, and a forged or stale record costs time rather than safety.
+It also means a host whose first address is unreachable, the usual case
+being a broken IPv6 path, no longer strands the transfer. The address that
+answers an attempt sent to it is proven reachable by that round trip and
+becomes the session's address.
+
+### Address validation
+
+Either peer's address may change mid-transfer: a NAT rebinds, a laptop
+moves between links, a mobile connection changes base station. A session
+never follows such a change on trust. An authentic packet from an address
+that has not been proven is treated as a *claim*: the session keeps sending
+to the address it has already proven and sends a PATH_CHALLENGE carrying
+eight unpredictable bytes to the new one. Only a peer holding the session
+keys can produce the matching PATH_RESPONSE, and only delivery at the
+challenged address can return it, so the pair of frames proves both. The
+claim is accepted — and the session's traffic moves — the moment the token
+comes back **from the address it was sent to**. A challenge is repeated up
+to four times and then abandoned, leaving the proven address in place.
+
+This follows QUIC (RFC 9000 section 8) and is needed for the same reason:
+authentication proves who made a packet, not where it was sent from. An
+attacker on the path can copy an authentic packet and re-send it with a
+forged source address; without validation both ends would aim their traffic
+at whatever address it chose, and on the sending side that is the whole
+file. Nothing but the challenge is ever sent to an unproven address, so the
+mechanism cannot be used for amplification either: the one small frame it
+costs answers a packet at least as large. A repeated PATH_RESPONSE is
+caught by the packet-number window, and a token is used once.
+
+Handshakes are treated the same way, since a handshake message is just as
+easy to capture and repeat from elsewhere as any other packet.
+
+### NAT
 
 A receiver must be reachable at the address senders use. With the
 `nat-traversal` feature the receiver, in the background and without
@@ -658,9 +703,10 @@ as `ID@address`. STUN responses arrive on the transfer socket and are
 routed to the NAT task by the receiver's dispatcher.
 
 The sender needs no NAT handling: its outgoing datagrams create the mapping
-on its own NAT, and the receiver always answers the address datagrams come
-from. Two peers that are both behind NATs without a port forward cannot
-reach each other; that needs a rendezvous or relay service (section 11).
+on its own NAT, and the receiver answers the address a handshake came from
+(and follows a mapping that changes later through address validation). Two
+peers that are both behind NATs without a port forward cannot reach each
+other; that needs a rendezvous or relay service (section 11).
 
 ## 9. Security considerations
 
@@ -683,6 +729,16 @@ per-address rate limits, a session limit, the free-space check, sparse
 pre-allocation and the expiry of idle sessions bound what an authenticated
 but hostile sender can occupy. A directory listing is size-limited and
 validated before any file is created.
+
+**Traffic redirection.** Neither peer follows its counterpart to an address
+that has not answered a challenge, so a captured packet repeated from a
+forged source address cannot turn a transfer into a stream aimed at a third
+party (section 8). Nothing but the challenge goes to an unproven address.
+
+**Impossible statements.** An ACK describing more bytes than the file holds
+is dropped unread: the sender's staleness counter only grows, so believing
+one would have made every honest ACK afterwards look outdated and stalled
+the transfer permanently.
 
 **Not protected.** An observer still sees that two addresses exchange UDP
 traffic, its volume and timing, and the connection ids (random, changing

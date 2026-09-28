@@ -30,8 +30,32 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - Receivers can admit only listed sender IDs (`--allow`,
   `--authorized-senders FILE`); refused senders get an authenticated
   rejection. Resume state is bound to the sender's identity.
-- Authenticated packets make address changes safe: a session follows its
-  peer to a new address only on packets the peer really sent.
+- Address validation (PATH_CHALLENGE / PATH_RESPONSE, QUIC's RFC 9000
+  section 8). Authenticity proves who made a packet, not where it was sent
+  from, so an attacker on the path can copy one and repeat it with a forged
+  source address. A session therefore treats an unproven address as a claim:
+  it keeps sending to the address already proven and asks the new one to
+  echo eight unpredictable bytes. Only the holder of the session keys can
+  answer, and only delivery at that address can return it. Nothing else is
+  sent there meanwhile, so the mechanism cannot amplify either. A captured
+  packet can no longer aim a transfer at a third party.
+- Name resolution is a hint, not an authority: a name resolves to all of its
+  addresses (families interleaved) and handshake attempts rotate through
+  them, with the handshake deciding which one is the receiver. A poisoned
+  DNS or mDNS answer costs time rather than safety, and a host whose first
+  address is unreachable no longer strands the transfer.
+- The replay guard evicts in constant time, so a flood of fresh identities
+  cannot make admission cost grow with the table.
+- ACKs describing more bytes than the file holds are dropped unread: the
+  staleness counter only grows, so believing one would have stalled the
+  transfer for good.
+- A datagram refused for its size steps the packet size down towards the
+  minimum instead of failing the transfer. The ICMP message behind such a
+  refusal is unauthenticated, so a forged one now costs throughput at worst;
+  the size only ever grows again on an authenticated PROBE_ACK.
+- `docs/THREAT_MODEL.md`: adversary classes and what each can achieve, every
+  guarantee with the mechanism responsible, explicit non-goals and residual
+  risks.
 
 ### Directories
 - A directory is sent as one stream: a manifest (structure, sizes, Unix

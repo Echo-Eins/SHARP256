@@ -1677,9 +1677,22 @@ impl Engine {
                     return Ok(Some(SendBlock::Pacer(NO_BUFFER_BACKOFF)));
                 }
                 Err(err) if is_msgsize_error(&err) => {
-                    // The path shrank under us: fall back to the safe chunk.
+                    // The path will not carry this size. What says so is an
+                    // ICMP message the kernel believed, and an ICMP message
+                    // is not authenticated: a forged one and a path that
+                    // really shrank look exactly alike here. So we step down
+                    // instead of believing any claim about *how far*, and
+                    // keep stepping until the path carries something —
+                    // a tunnel with a small MTU behaves the same way. The
+                    // size only ever grows again on a PROBE_ACK, which is
+                    // authenticated, so a forged ICMP can cost throughput
+                    // and never correctness.
                     self.unsend(&batch.ranges);
-                    let smaller = SAFE_CHUNK.min(self.chunk);
+                    let smaller = if self.chunk > SAFE_CHUNK {
+                        SAFE_CHUNK
+                    } else {
+                        (self.chunk / 2).max(MIN_CHUNK)
+                    };
                     if smaller >= self.chunk {
                         return Err(SendError::Io(err));
                     }
