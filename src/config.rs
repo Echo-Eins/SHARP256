@@ -65,7 +65,7 @@ impl Default for TransportConfig {
             stall_timeout: Duration::from_secs(20),
             give_up_timeout: Duration::from_secs(300),
             handshake_timeout: Duration::from_secs(60),
-            socket_buffer_bytes: 8 << 20,
+            socket_buffer_bytes: 32 << 20,
             persist_interval: Duration::from_secs(2),
             writer_capacity_bytes: 64 << 20,
             session_ttl: Duration::from_secs(600),

@@ -35,7 +35,7 @@ use crate::config::{AcceptPolicy, IncomingRequest, ReceiverConfig, TransportConf
 use crate::crypto::handshake::{self as hs, CookieJar, HandshakeLimiter, ReplayGuard, Responder};
 use crate::crypto::replay::ReplayWindow;
 use crate::crypto::transport::{
-    begin_packet, peek_cid, SessionKeys, Suite, HEADER_LEN, OVERHEAD, TAG_LEN,
+    begin_packet, peek_cid, DirectionKeys, SessionKeys, Suite, HEADER_LEN, OVERHEAD, TAG_LEN,
 };
 use crate::crypto::{Identity, SharpId, NO_PSK};
 use crate::file::tree::{self, Manifest};
@@ -51,16 +51,17 @@ use crate::protocol::wire::{
 };
 use crate::protocol::RangeSet;
 use crate::state::{hex16, ReceiverState, StateStore};
-use crate::transport::socket::bind_udp;
+use crate::transport::io::{recv_buffers, BatchSocket, Received, RECV_BATCH, RECV_BUF_LEN};
+use crate::transport::parallel;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -75,8 +76,15 @@ pub enum RecvError {
 /// Resume state older than this is deleted when a receiver starts.
 const STATE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Datagrams a session may have queued before the dispatcher drops more.
+/// Deliveries a session may have queued before the dispatcher drops more,
+/// and the memory they may occupy.
 const SESSION_QUEUE: usize = 16_384;
+const SESSION_QUEUE_BYTES: u64 = 32 << 20;
+/// Received runs up to this size are copied for their session; larger ones
+/// hand over their whole buffer.
+const RUN_COPY_MAX: usize = 16 << 10;
+/// Receive calls the dispatcher makes before it lets other work run.
+const RECV_CALLS_PER_WAKEUP: usize = 64;
 /// Messages a session handles per wakeup before it checks its timers.
 const SESSION_BATCH: usize = 256;
 /// Senders whose last initiation timestamp is remembered (replay guard).
@@ -100,11 +108,20 @@ struct Handshake {
     at: Instant,
 }
 
+/// Datagrams from one receive buffer for a session: `buf` holds datagrams of
+/// `stride` bytes each (the last one may be shorter).
+struct Datagrams {
+    buf: Vec<u8>,
+    stride: usize,
+    from: SocketAddr,
+}
+
 /// Messages delivered to a session task.
 enum Incoming {
-    Packet {
-        data: Vec<u8>,
-        from: SocketAddr,
+    /// Datagrams in arrival order; `bytes` is the memory they occupy.
+    Datagrams {
+        runs: Vec<Datagrams>,
+        bytes: u64,
         at: Instant,
     },
     Handshake(Box<Handshake>),
@@ -116,6 +133,8 @@ enum Incoming {
 
 struct SessionHandle {
     tx: mpsc::Sender<Incoming>,
+    /// Bytes of datagrams queued for the session.
+    queued: Arc<AtomicU64>,
     /// The session's current connection id.
     cid: u64,
     task: tokio::task::JoinHandle<()>,
@@ -123,7 +142,7 @@ struct SessionHandle {
 
 struct Shared {
     cfg: ReceiverConfig,
-    socket: Arc<UdpSocket>,
+    socket: Arc<BatchSocket>,
     store: Option<StateStore>,
     cancel: CancellationToken,
     identity: Identity,
@@ -149,11 +168,12 @@ impl Receiver {
             }
         };
         std::fs::create_dir_all(&cfg.output_dir)?;
-        let socket = bind_udp(cfg.bind, cfg.transport.socket_buffer_bytes)?;
+        let socket = BatchSocket::bind(cfg.bind, cfg.transport.socket_buffer_bytes).await?;
         tracing::info!(
-            "receiver {} listening on {}, output {}",
+            "receiver {} listening on {} (up to {} datagrams per send), output {}",
             identity.id(),
             socket.local_addr()?,
+            socket.max_segments(),
             cfg.output_dir.display()
         );
         let store = match StateStore::open(cfg.state_dir.clone()) {
@@ -206,7 +226,7 @@ impl Receiver {
         let nat = if shared.cfg.nat_traversal {
             let events = shared.cfg.events.clone();
             crate::nat::spawn_receiver_discovery(
-                shared.socket.clone(),
+                shared.socket.udp(),
                 crate::nat::NatConfig::default(),
                 shared.cancel.clone(),
                 move |r| {
@@ -227,7 +247,15 @@ impl Receiver {
         let cancel = shared.cancel.clone();
         let (done_tx, mut done_rx) = mpsc::channel::<TransferKey>(256);
         let mut d = Dispatcher::new(shared.clone(), done_tx);
-        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut bufs = recv_buffers(RECV_BATCH);
+        let mut got = vec![
+            Received {
+                from: shared.cfg.bind,
+                len: 0,
+                stride: 0,
+            };
+            RECV_BATCH
+        ];
 
         loop {
             tokio::select! {
@@ -236,24 +264,28 @@ impl Receiver {
                         tracing::debug!("socket readiness error: {}", e);
                         continue;
                     }
-                    loop {
-                        let (n, from) = match socket.try_recv_from(&mut buf) {
-                            Ok(v) => v,
+                    for _ in 0..RECV_CALLS_PER_WAKEUP {
+                        let n = match socket.try_recv(&mut bufs, &mut got) {
+                            Ok(n) => n,
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(e) => {
                                 tracing::debug!("recv error: {}", e);
                                 break;
                             }
                         };
-                        let pkt = &buf[..n];
-                        #[cfg(feature = "nat-traversal")]
-                        if let Some(nat) = &nat {
-                            if crate::nat::stun::is_stun_response(pkt) {
-                                let _ = nat.stun_responses.try_send(pkt.to_vec());
-                                continue;
+                        let now = Instant::now();
+                        for (buf, r) in bufs.iter_mut().zip(&got[..n]) {
+                            #[cfg(feature = "nat-traversal")]
+                            if let Some(nat) = &nat {
+                                let pkt = &buf[..r.len];
+                                if r.stride >= r.len && crate::nat::stun::is_stun_response(pkt) {
+                                    let _ = nat.stun_responses.try_send(pkt.to_vec());
+                                    continue;
+                                }
                             }
+                            d.on_received(buf, *r, now);
                         }
-                        d.on_datagram(pkt, from, Instant::now());
+                        d.flush();
                     }
                 }
                 Some(key) = done_rx.recv() => d.forget(&key),
@@ -290,6 +322,9 @@ struct Dispatcher {
     replays: ReplayGuard,
     sessions: HashMap<TransferKey, SessionHandle>,
     by_cid: HashMap<u64, TransferKey>,
+    /// Datagrams collected for sessions during the current receive call.
+    outbox: Vec<(TransferKey, Vec<Datagrams>)>,
+    at: Instant,
     done_tx: mpsc::Sender<TransferKey>,
     dropped: u64,
 }
@@ -312,32 +347,61 @@ impl Dispatcher {
             replays: ReplayGuard::new(REPLAY_GUARD_CAPACITY),
             sessions: HashMap::new(),
             by_cid: HashMap::new(),
+            outbox: Vec::new(),
+            at: Instant::now(),
             done_tx,
             dropped: 0,
         }
     }
 
+    /// Routes the datagrams of one receive buffer. A run that belongs to one
+    /// session as a whole (always the case for datagrams the kernel
+    /// coalesced) is passed on in one piece, large ones without a copy.
+    fn on_received(&mut self, buf: &mut Vec<u8>, r: Received, now: Instant) {
+        self.at = now;
+        let run = &buf[..r.len];
+        let stride = r.stride.max(1);
+        let whole = peek_cid(run)
+            .and_then(|cid| self.by_cid.get(&cid).map(|key| (cid, *key)))
+            .filter(|(cid, _)| {
+                run.chunks(stride)
+                    .all(|d| d.len() >= OVERHEAD && peek_cid(d) == Some(*cid))
+            });
+        if let Some((_, key)) = whole {
+            let data = if r.len <= RUN_COPY_MAX {
+                run.to_vec()
+            } else {
+                let mut taken = std::mem::replace(buf, vec![0u8; RECV_BUF_LEN]);
+                taken.truncate(r.len);
+                taken
+            };
+            self.queue(
+                key,
+                Datagrams {
+                    buf: data,
+                    stride,
+                    from: r.from,
+                },
+            );
+            return;
+        }
+        for d in r.segments() {
+            self.on_datagram(&buf[d], r.from, now);
+        }
+    }
+
     fn on_datagram(&mut self, pkt: &[u8], from: SocketAddr, now: Instant) {
         if let Some(cid) = peek_cid(pkt) {
-            if let Some(key) = self.by_cid.get(&cid) {
-                if pkt.len() < OVERHEAD {
-                    return;
-                }
-                if let Some(s) = self.sessions.get(key) {
-                    let msg = Incoming::Packet {
-                        data: pkt.to_vec(),
-                        from,
-                        at: now,
-                    };
-                    if s.tx.try_send(msg).is_err() {
-                        self.dropped += 1;
-                        if self.dropped.is_power_of_two() {
-                            tracing::debug!(
-                                "session queue full: {} datagrams dropped so far",
-                                self.dropped
-                            );
-                        }
-                    }
+            if let Some(&key) = self.by_cid.get(&cid) {
+                if pkt.len() >= OVERHEAD {
+                    self.queue(
+                        key,
+                        Datagrams {
+                            buf: pkt.to_vec(),
+                            stride: pkt.len(),
+                            from,
+                        },
+                    );
                 }
                 return;
             }
@@ -345,7 +409,43 @@ impl Dispatcher {
         // Not for a known connection: an initiation by someone who knows our
         // ID, or nothing we ever answer.
         if self.responder.is_initiation(pkt) {
+            // Deliver what arrived before it first, keeping the order.
+            self.flush();
             self.on_initiation(pkt, from, now);
+        }
+    }
+
+    fn queue(&mut self, key: TransferKey, d: Datagrams) {
+        match self.outbox.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, runs)) => runs.push(d),
+            None => self.outbox.push((key, vec![d])),
+        }
+    }
+
+    /// Hands the collected datagrams to their sessions; a session that
+    /// cannot keep up loses them (the sender sees them as lost).
+    fn flush(&mut self) {
+        let at = self.at;
+        for (key, runs) in self.outbox.drain(..) {
+            let Some(s) = self.sessions.get(&key) else {
+                continue;
+            };
+            let bytes: u64 = runs.iter().map(|d| d.buf.capacity() as u64).sum();
+            let queued = s.queued.fetch_add(bytes, Ordering::AcqRel);
+            let refused = queued + bytes > SESSION_QUEUE_BYTES
+                || s.tx
+                    .try_send(Incoming::Datagrams { runs, bytes, at })
+                    .is_err();
+            if refused {
+                s.queued.fetch_sub(bytes, Ordering::AcqRel);
+                self.dropped += 1;
+                if self.dropped.is_power_of_two() {
+                    tracing::debug!(
+                        "session queue full: {} deliveries dropped so far",
+                        self.dropped
+                    );
+                }
+            }
         }
     }
 
@@ -355,7 +455,7 @@ impl Dispatcher {
             // Make the sender prove it receives at its address before we
             // spend public-key operations on it.
             if let Some(reply) = self.cookies.reply(pkt, from, now) {
-                let _ = self.shared.socket.try_send_to(&reply, from);
+                let _ = self.shared.socket.try_send(from, &reply);
             }
             return;
         }
@@ -450,13 +550,23 @@ impl Dispatcher {
         let shared = self.shared.clone();
         let done_tx = self.done_tx.clone();
         let session_tx = tx.clone();
+        let queued = Arc::new(AtomicU64::new(0));
+        let session_queued = queued.clone();
         let task = tokio::spawn(async move {
-            let session = Session::new(shared, key, from, session_tx);
+            let session = Session::new(shared, key, from, session_tx, session_queued);
             let key = session.run(rx).await;
             let _ = done_tx.send(key).await;
         });
         self.by_cid.insert(cid, key);
-        self.sessions.insert(key, SessionHandle { tx, cid, task });
+        self.sessions.insert(
+            key,
+            SessionHandle {
+                tx,
+                queued,
+                cid,
+                task,
+            },
+        );
     }
 
     /// Answers an authenticated initiation with a rejection; no session is
@@ -475,7 +585,7 @@ impl Dispatcher {
             ack: rejection(init.hello.timestamp, reason, message),
         });
         if let Ok((pkt, _)) = incoming.respond(self.new_cid(), &payload) {
-            let _ = self.shared.socket.try_send_to(&pkt, to);
+            let _ = self.shared.socket.try_send(to, &pkt);
         }
     }
 
@@ -669,8 +779,8 @@ struct TreeRecv {
     /// The verified manifest and its encoding (hashed again at the end).
     plan: Option<(Arc<Manifest>, Arc<Vec<u8>>)>,
     /// DATA beyond the manifest that arrived before the manifest was
-    /// complete: (offset, datagram, payload start, payload length).
-    early: Vec<(u64, Vec<u8>, usize, usize)>,
+    /// complete: (stream offset, bytes).
+    early: Vec<(u64, Vec<u8>)>,
     early_bytes: u64,
     /// The staging directory holds entries of an earlier attempt.
     resume: bool,
@@ -678,7 +788,10 @@ struct TreeRecv {
 
 /// Keys and packet state of the session's current handshake.
 struct Secure {
-    keys: SessionKeys,
+    keys: Arc<SessionKeys>,
+    /// Increases with every key change; decryption results of older keys
+    /// are discarded.
+    generation: u64,
     /// Our connection id: the sender addresses its packets to it.
     local_cid: u64,
     /// The sender's connection id: our packets are addressed to it.
@@ -688,11 +801,104 @@ struct Secure {
     auth_failures: u64,
 }
 
+/// File data found in one receive buffer: `(stream offset, start, len)` of
+/// every payload piece, handed to the writer together with the buffer.
+#[derive(Default)]
+struct Pieces {
+    list: Vec<(u64, usize, usize)>,
+    bytes: u64,
+}
+
+/// Deliveries with this many datagrams or more are decrypted on the crypto
+/// pool.
+const MIN_POOLED: usize = 8;
+
+/// A delivery, decrypted.
+struct OpenedDelivery {
+    seq: u64,
+    /// Key generation the datagrams were decrypted with.
+    generation: u64,
+    runs: Vec<Datagrams>,
+    opened: Vec<Vec<Opened>>,
+    bytes: u64,
+    at: Instant,
+}
+
+/// Deliveries between arriving and being processed: decrypted on the
+/// crypto pool (or right away, when small), then processed strictly in the
+/// order they arrived.
+struct OpenPipe {
+    next_seq: u64,
+    next_done: u64,
+    in_pool: usize,
+    ready: std::collections::BTreeMap<u64, OpenedDelivery>,
+    tx: mpsc::UnboundedSender<OpenedDelivery>,
+    rx: mpsc::UnboundedReceiver<OpenedDelivery>,
+}
+
+impl OpenPipe {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            next_seq: 0,
+            next_done: 0,
+            in_pool: 0,
+            ready: std::collections::BTreeMap::new(),
+            tx,
+            rx,
+        }
+    }
+}
+
+/// Decrypts the datagrams of a run in place. Only authenticity is
+/// established here; replays and contents are dealt with in order
+/// afterwards.
+fn open_datagrams(keys: &DirectionKeys, cid: u64, buf: &mut [u8], stride: usize) -> Vec<Opened> {
+    let len = buf.len();
+    let lengths = (0..len).step_by(stride).map(|s| (s + stride).min(len) - s);
+    parallel::split_lengths(buf, lengths)
+        .into_iter()
+        .map(|d| {
+            // Packets for a connection id we replaced are stale.
+            if peek_cid(d) != Some(cid) {
+                return Opened::Stale;
+            }
+            match keys.open(d) {
+                Ok((tb, pn, _)) => Opened::Ok(tb, pn),
+                Err(_) => Opened::Forged,
+            }
+        })
+        .collect()
+}
+
+/// What decrypting one datagram of a run found.
+#[derive(Debug, Clone, Copy)]
+enum Opened {
+    /// Addressed to a connection id we no longer use (or no session yet).
+    Stale,
+    /// Failed authentication.
+    Forged,
+    /// Authentic: its type byte and packet number.
+    Ok(u8, u64),
+}
+
+/// A control frame taken out of a receive buffer.
+struct Control {
+    msg_type: MsgType,
+    body: Vec<u8>,
+    /// Length of the datagram that carried it.
+    datagram_len: usize,
+}
+
 struct Session {
     shared: Arc<Shared>,
     cfg: TransportConfig,
     events: Option<EventCallback>,
     self_tx: mpsc::Sender<Incoming>,
+    /// Bytes of datagrams the dispatcher queued for us.
+    queued: Arc<AtomicU64>,
+    /// Deliveries being decrypted, or decrypted and waiting for their turn.
+    opening: OpenPipe,
 
     transfer_id: [u8; 16],
     sender: SharpId,
@@ -742,6 +948,7 @@ impl Session {
         key: TransferKey,
         peer: SocketAddr,
         self_tx: mpsc::Sender<Incoming>,
+        queued: Arc<AtomicU64>,
     ) -> Self {
         let now = Instant::now();
         let cfg = shared.cfg.transport.clone();
@@ -751,6 +958,8 @@ impl Session {
             cfg,
             events,
             self_tx,
+            queued,
+            opening: OpenPipe::new(),
             transfer_id: key.1,
             sender: key.0,
             peer,
@@ -813,7 +1022,7 @@ impl Session {
         if sec.keys.send.seal(&mut self.tx_buf).is_err() {
             return;
         }
-        if let Err(e) = self.shared.socket.try_send_to(&self.tx_buf, self.peer) {
+        if let Err(e) = self.shared.socket.try_send(self.peer, &self.tx_buf) {
             if e.kind() != io::ErrorKind::WouldBlock {
                 tracing::debug!("send {:?} failed: {}", msg.msg_type(), e);
             }
@@ -857,6 +1066,15 @@ impl Session {
                     for _ in 0..SESSION_BATCH {
                         let Ok(msg) = rx.try_recv() else { break };
                         if self.handle(msg).await.is_break() {
+                            return self.key();
+                        }
+                    }
+                }
+                r = self.opening.rx.recv(), if self.opening.in_pool > 0 => {
+                    if let Some(msg) = r {
+                        self.opening.in_pool -= 1;
+                        self.opening.ready.insert(msg.seq, msg);
+                        if self.process_ready().await.is_break() {
                             return self.key();
                         }
                     }
@@ -918,7 +1136,7 @@ impl Session {
 
     async fn handle(&mut self, msg: Incoming) -> ControlFlow<()> {
         match msg {
-            Incoming::Packet { data, from, at } => self.on_packet(data, from, at).await,
+            Incoming::Datagrams { runs, bytes, at } => self.on_delivery(runs, bytes, at).await,
             Incoming::Handshake(h) => {
                 // The sender performed a new handshake (after an outage or a
                 // restart): answer with our current state under new keys.
@@ -1282,9 +1500,9 @@ impl Session {
         tree.early_bytes = 0;
         self.open_tree_writer()?;
         let writer = self.writer.as_ref().expect("writer just opened");
-        for (offset, data, start, len) in early {
+        for (offset, data) in early {
             writer
-                .enqueue_slice(offset, data, start, len)
+                .enqueue(offset, data)
                 .map_err(|_| "the writer cannot take the buffered data".to_string())?;
         }
         Ok(())
@@ -1345,8 +1563,10 @@ impl Session {
         let sender_cid = h.incoming.sender_cid;
         match h.incoming.respond(h.cid, &payload) {
             Ok((pkt, split)) => {
+                let generation = self.secure.as_ref().map_or(1, |s| s.generation + 1);
                 self.secure = Some(Secure {
-                    keys: SessionKeys::derive(&split, false, h.suite),
+                    keys: Arc::new(SessionKeys::derive(&split, false, h.suite)),
+                    generation,
                     local_cid: h.cid,
                     peer_cid: sender_cid,
                     next_pn: 0,
@@ -1354,7 +1574,7 @@ impl Session {
                     auth_failures: 0,
                 });
                 self.peer = h.from;
-                if let Err(e) = self.shared.socket.try_send_to(&pkt, h.from) {
+                if let Err(e) = self.shared.socket.try_send(h.from, &pkt) {
                     tracing::debug!("sending handshake response failed: {}", e);
                 }
             }
@@ -1371,7 +1591,7 @@ impl Session {
             ack: rejection(h.init.hello.timestamp, reason, message),
         });
         if let Ok((pkt, _)) = h.incoming.respond(h.cid, &payload) {
-            let _ = self.shared.socket.try_send_to(&pkt, h.from);
+            let _ = self.shared.socket.try_send(h.from, &pkt);
         }
     }
 
@@ -1392,7 +1612,11 @@ impl Session {
 
     fn rwnd(&self) -> u64 {
         if let Some(w) = &self.writer {
-            return w.available();
+            // What the writer can take once the datagrams already queued
+            // for this session are processed.
+            return w
+                .available()
+                .saturating_sub(self.queued.load(Ordering::Relaxed));
         }
         if !matches!(self.phase, Phase::Receiving | Phase::Pending { .. }) {
             return 0;
@@ -1416,35 +1640,199 @@ impl Session {
 
     // ----- packets ---------------------------------------------------------
 
-    async fn on_packet(
+    /// Datagrams from the dispatcher: decrypted on the crypto pool when
+    /// there are many (the results are processed in order), otherwise right
+    /// away.
+    async fn on_delivery(
         &mut self,
-        mut data: Vec<u8>,
-        from: SocketAddr,
+        mut runs: Vec<Datagrams>,
+        bytes: u64,
         at: Instant,
     ) -> ControlFlow<()> {
-        let Some(sec) = self.secure.as_mut() else {
-            return ControlFlow::Continue(());
-        };
-        // Packets for a connection id we replaced are stale.
-        if peek_cid(&data) != Some(sec.local_cid) {
-            return ControlFlow::Continue(());
+        let seq = self.opening.next_seq;
+        self.opening.next_seq += 1;
+        let count: usize = runs
+            .iter()
+            .map(|r| r.buf.len().div_ceil(r.stride.max(1)))
+            .sum();
+        match (&self.secure, parallel::pool()) {
+            (Some(sec), Some(pool)) if count >= MIN_POOLED => {
+                let (keys, cid, generation) = (sec.keys.clone(), sec.local_cid, sec.generation);
+                let tx = self.opening.tx.clone();
+                self.opening.in_pool += 1;
+                pool.spawn(move || {
+                    let opened = runs
+                        .iter_mut()
+                        .map(|r| open_datagrams(&keys.recv, cid, &mut r.buf, r.stride.max(1)))
+                        .collect();
+                    let _ = tx.send(OpenedDelivery {
+                        seq,
+                        generation,
+                        runs,
+                        opened,
+                        bytes,
+                        at,
+                    });
+                });
+                ControlFlow::Continue(())
+            }
+            (secure, _) => {
+                let generation = secure.as_ref().map_or(0, |s| s.generation);
+                let opened = match secure {
+                    Some(sec) => runs
+                        .iter_mut()
+                        .map(|r| {
+                            open_datagrams(
+                                &sec.keys.recv,
+                                sec.local_cid,
+                                &mut r.buf,
+                                r.stride.max(1),
+                            )
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                self.opening.ready.insert(
+                    seq,
+                    OpenedDelivery {
+                        seq,
+                        generation,
+                        runs,
+                        opened,
+                        bytes,
+                        at,
+                    },
+                );
+                self.process_ready().await
+            }
         }
-        let tb = match sec.keys.recv.open(&mut data) {
-            Ok((tb, pn, _)) => {
-                if !sec.replay.accept(pn) {
-                    return ControlFlow::Continue(());
+    }
+
+    /// Processes decrypted deliveries in the order they arrived.
+    async fn process_ready(&mut self) -> ControlFlow<()> {
+        while let Some(d) = self.opening.ready.remove(&self.opening.next_done) {
+            self.opening.next_done += 1;
+            self.queued.fetch_sub(d.bytes, Ordering::AcqRel);
+            // Decrypted under keys that were replaced since: stale.
+            if self.secure.as_ref().map(|s| s.generation) != Some(d.generation) {
+                continue;
+            }
+            for (run, opened) in d.runs.into_iter().zip(d.opened) {
+                if self.on_run(run, opened, d.at).await.is_break() {
+                    return ControlFlow::Break(());
                 }
-                tb
             }
-            Err(_) => {
-                sec.auth_failures += 1;
-                return ControlFlow::Continue(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Handles the decrypted datagrams of one receive buffer. Their file
+    /// data goes to the writer as one command; control frames are acted
+    /// upon afterwards, so that nothing (a suspension, for one) can see data
+    /// counted as received that is not queued for writing.
+    async fn on_run(
+        &mut self,
+        run: Datagrams,
+        opened: Vec<Opened>,
+        at: Instant,
+    ) -> ControlFlow<()> {
+        let Datagrams { buf, stride, from } = run;
+        let stride = stride.max(1);
+        let len = buf.len();
+        let mut pieces = Pieces::default();
+        let mut controls = Vec::new();
+        let mut fatal = None;
+        for (k, opened) in opened.into_iter().enumerate() {
+            let start = k * stride;
+            let range = start..(start + stride).min(len);
+            let (tb, pn) = match opened {
+                Opened::Stale => continue,
+                Opened::Forged => {
+                    if let Some(sec) = &mut self.secure {
+                        sec.auth_failures += 1;
+                    }
+                    continue;
+                }
+                Opened::Ok(tb, pn) => (tb, pn),
+            };
+            if let Err(msg) =
+                self.on_opened(&buf, range, tb, pn, from, at, &mut pieces, &mut controls)
+            {
+                fatal = Some(msg);
+                break;
             }
+        }
+        self.commit(buf, pieces);
+        if let Some(msg) = fatal {
+            self.abandon(msg).await;
+            return ControlFlow::Break(());
+        }
+        for c in controls {
+            if self.on_control(c).await.is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        if matches!(self.phase, Phase::Receiving) {
+            if self.received.total() >= self.file_size {
+                self.send_ack(at);
+                self.begin_finishing();
+            } else if self.pkts_since_ack >= self.cfg.ack_every_packets {
+                self.send_ack(at);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Handles an authentic datagram at `range` of `buf`. DATA is recorded
+    /// right away (its payload position joins `pieces`); control frames are
+    /// collected. An error ends the transfer for good (a directory listing
+    /// that fails verification).
+    #[allow(clippy::too_many_arguments)]
+    fn on_opened(
+        &mut self,
+        buf: &[u8],
+        range: std::ops::Range<usize>,
+        tb: u8,
+        pn: u64,
+        from: SocketAddr,
+        at: Instant,
+        pieces: &mut Pieces,
+        controls: &mut Vec<Control>,
+    ) -> Result<(), String> {
+        let Some(sec) = self.secure.as_mut() else {
+            return Ok(());
         };
+        if !sec.replay.accept(pn) {
+            return Ok(());
+        }
         let Ok((msg_type, flags)) = parse_type_byte(tb) else {
-            return ControlFlow::Continue(());
+            return Ok(());
         };
-        let body_end = data.len() - TAG_LEN;
+        self.note_alive(from, at);
+        let body = range.start + HEADER_LEN..range.end - TAG_LEN;
+        if msg_type != MsgType::Data {
+            controls.push(Control {
+                msg_type,
+                body: buf[body].to_vec(),
+                datagram_len: range.len(),
+            });
+            return Ok(());
+        }
+        if body.len() < DATA_FIXED_LEN {
+            return Ok(());
+        }
+        let b = body.start;
+        let offset = u64::from_be_bytes(buf[b..b + 8].try_into().unwrap());
+        let ts = u32::from_be_bytes(buf[b + 8..b + 12].try_into().unwrap());
+        let payload = b + DATA_FIXED_LEN..body.end;
+        if flags & DATA_FLAG_RETRANSMIT != 0 {
+            self.retransmitted_bytes += payload.len() as u64;
+        }
+        self.on_data(offset, ts, buf, payload, at, pieces)
+    }
+
+    /// Something authentic arrived from the sender.
+    fn note_alive(&mut self, from: SocketAddr, at: Instant) {
         self.last_rx = at;
         if self.stalled {
             self.stalled = false;
@@ -1459,31 +1847,31 @@ impl Session {
             tracing::info!("sender address changed {} -> {}", self.peer, from);
             self.peer = from;
         }
+    }
 
-        // DATA: hand the datagram over by value so the payload goes to the
-        // writer without another copy.
-        if msg_type == MsgType::Data {
-            let body = &data[HEADER_LEN..body_end];
-            if body.len() < DATA_FIXED_LEN {
-                return ControlFlow::Continue(());
-            }
-            let offset = u64::from_be_bytes(body[..8].try_into().unwrap());
-            let ts = u32::from_be_bytes(body[8..12].try_into().unwrap());
-            let len = body.len() - DATA_FIXED_LEN;
-            if flags & DATA_FLAG_RETRANSMIT != 0 {
-                self.retransmitted_bytes += len as u64;
-            }
-            if let Err(msg) = self.on_data(offset, ts, data, HEADER_LEN + DATA_FIXED_LEN, len, at) {
-                self.abandon(msg).await;
-                return ControlFlow::Break(());
-            }
-            return ControlFlow::Continue(());
+    /// Queues the file data of one receive buffer for writing. Should the
+    /// writer refuse it after all, it is not received.
+    fn commit(&mut self, buf: Vec<u8>, pieces: Pieces) {
+        if pieces.list.is_empty() {
+            return;
         }
+        let refused = match &self.writer {
+            Some(w) => w.enqueue_pieces(buf, pieces.list).err(),
+            None => Some(pieces.list),
+        };
+        if let Some(list) = refused {
+            for &(s, _, len) in &list {
+                self.received.remove(s, s + len as u64);
+            }
+            self.writer_full_drops += list.len() as u64;
+        }
+    }
 
-        let decoded = match wire::decode_body(msg_type, &data[HEADER_LEN..body_end]) {
+    async fn on_control(&mut self, c: Control) -> ControlFlow<()> {
+        let decoded = match wire::decode_body(c.msg_type, &c.body) {
             Ok(m) => m,
             Err(e) => {
-                tracing::debug!("malformed {:?}: {}", msg_type, e);
+                tracing::debug!("malformed {:?}: {}", c.msg_type, e);
                 return ControlFlow::Continue(());
             }
         };
@@ -1497,7 +1885,7 @@ impl Session {
                 self.send(0, &Message::Pong(Pong { echo: p.timestamp }));
             }
             Message::Probe(_) => {
-                let size = data.len().min(u16::MAX as usize) as u16;
+                let size = c.datagram_len.min(u16::MAX as usize) as u16;
                 self.send(0, &Message::ProbeAck(ProbeAck { size }));
             }
             Message::FinAck(f) => {
@@ -1549,21 +1937,20 @@ impl Session {
         ControlFlow::Continue(())
     }
 
-    /// Handles a DATA payload `datagram[start..start + len]` for `offset`.
-    /// An error ends the transfer for good (a directory listing that fails
-    /// verification).
+    /// Handles a DATA payload `buf[payload]` for stream offset `offset`.
     fn on_data(
         &mut self,
         offset: u64,
         ts: u32,
-        datagram: Vec<u8>,
-        start: usize,
-        len: usize,
+        buf: &[u8],
+        payload: std::ops::Range<usize>,
         at: Instant,
+        pieces: &mut Pieces,
     ) -> Result<(), String> {
         if !matches!(self.phase, Phase::Receiving) {
             return Ok(());
         }
+        let len = payload.len();
         let len64 = len as u64;
         let end = match offset.checked_add(len64) {
             Some(end) if len > 0 && len64 <= MAX_CHUNK as u64 && end <= self.file_size => end,
@@ -1574,8 +1961,8 @@ impl Session {
         };
         let prev_highest = self.highest;
         // The manifest of a directory is collected in memory; the rest of
-        // the datagram (if any) is file data.
-        let (mut data_off, mut data_start, mut data_len) = (offset, start, len);
+        // the payload (if any) is file data.
+        let (mut data_off, mut data) = (offset, payload.clone());
         let mut manifest_done = false;
         if let Some(tree) = &mut self.tree {
             let m = tree.info.manifest_len;
@@ -1586,21 +1973,19 @@ impl Session {
                         if tree.buf.len() < e as usize {
                             tree.buf.resize(e as usize, 0);
                         }
-                        let a = start + (s - offset) as usize;
+                        let a = payload.start + (s - offset) as usize;
                         tree.buf[s as usize..e as usize]
-                            .copy_from_slice(&datagram[a..a + (e - s) as usize]);
+                            .copy_from_slice(&buf[a..a + (e - s) as usize]);
                         self.received.insert(s, e);
                         self.got_data = true;
                     }
                     manifest_done = self.received.contains(0, m);
                 }
-                let skip = (m_end - offset) as usize;
+                data.start += (m_end - offset) as usize;
                 data_off = m_end;
-                data_start += skip;
-                data_len -= skip;
             }
         }
-        if data_len > 0 && !self.store_data(data_off, datagram, data_start, data_len) {
+        if !data.is_empty() && !self.store_data(data_off, buf, data, pieces) {
             // Saturated: treated as not received; the shrinking receive
             // window slows the sender down.
             return Ok(());
@@ -1617,51 +2002,40 @@ impl Session {
             // but leave a moment for reordered packets to arrive.
             self.immediate_ack_at = Some(at + Duration::from_millis(2));
         }
-        if self.pkts_since_ack >= self.cfg.ack_every_packets {
-            self.send_ack(at);
-        }
-        if self.received.total() >= self.file_size {
-            self.send_ack(at);
-            self.begin_finishing();
-        }
         Ok(())
     }
 
-    /// Hands file data to the writer (or, while a directory's manifest is
-    /// incomplete, to the early buffer). Returns false when it had to be
+    /// Records file data `buf[data]` for stream offset `offset`: what is
+    /// new joins `pieces` for the writer (or, while a directory's manifest
+    /// is incomplete, the early buffer). Returns false when it had to be
     /// dropped because the writer is saturated.
-    fn store_data(&mut self, offset: u64, datagram: Vec<u8>, start: usize, len: usize) -> bool {
-        let end = offset + len as u64;
+    fn store_data(
+        &mut self,
+        offset: u64,
+        buf: &[u8],
+        data: std::ops::Range<usize>,
+        pieces: &mut Pieces,
+    ) -> bool {
+        let end = offset + data.len() as u64;
         let missing = self.received.holes(offset, end, usize::MAX);
         if missing.is_empty() {
             return true;
         }
         let need: u64 = missing.iter().map(|&(s, e)| e - s).sum();
-        let whole = missing.len() == 1 && missing[0] == (offset, end);
         if let Some(writer) = &self.writer {
-            if writer.available() < need {
+            if writer.available() < pieces.bytes + need {
                 self.writer_full_drops += 1;
                 return false;
             }
-            if whole {
-                if writer.enqueue_slice(offset, datagram, start, len).is_err() {
-                    self.writer_full_drops += 1;
-                    return false;
-                }
-                self.received.insert(offset, end);
-            } else {
-                // Partly known already (resent after a chunk-size change):
-                // write only the new sub-ranges.
-                for (s, e) in missing {
-                    let a = start + (s - offset) as usize;
-                    let b = start + (e - offset) as usize;
-                    if writer.enqueue(s, datagram[a..b].to_vec()).is_err() {
-                        self.writer_full_drops += 1;
-                        break;
-                    }
-                    self.received.insert(s, e);
-                }
+            // Usually the whole payload; after a chunk-size change only the
+            // sub-ranges not received before.
+            for (s, e) in missing {
+                pieces
+                    .list
+                    .push((s, data.start + (s - offset) as usize, (e - s) as usize));
+                self.received.insert(s, e);
             }
+            pieces.bytes += need;
         } else if let Some(tree) = self.tree.as_mut().filter(|t| t.plan.is_none()) {
             // The manifest is not complete yet: hold the data until the
             // writer knows which files it belongs to.
@@ -1670,15 +2044,9 @@ impl Session {
                 self.writer_full_drops += 1;
                 return false;
             }
-            if whole {
-                tree.early.push((offset, datagram, start, len));
-            } else {
-                for &(s, e) in &missing {
-                    let a = start + (s - offset) as usize;
-                    let b = start + (e - offset) as usize;
-                    tree.early
-                        .push((s, datagram[a..b].to_vec(), 0, (e - s) as usize));
-                }
+            for &(s, e) in &missing {
+                let a = data.start + (s - offset) as usize;
+                tree.early.push((s, buf[a..a + (e - s) as usize].to_vec()));
             }
             tree.early_bytes += need;
             for (s, e) in missing {

@@ -77,6 +77,7 @@ async fn start_receiver(
     state: &Path,
     mut cfg_fn: impl FnMut(&mut ReceiverConfig),
 ) -> TestReceiver {
+    init_test_logging();
     let mut cfg = ReceiverConfig::new("127.0.0.1:0".parse().unwrap(), out.to_path_buf());
     cfg.state_dir = Some(state.to_path_buf());
     cfg.transport = fast_transport();

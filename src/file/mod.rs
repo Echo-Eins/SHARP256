@@ -10,7 +10,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver as MpscReceiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{
+    sync_channel, Receiver as MpscReceiver, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -206,6 +208,12 @@ enum WriteCmd {
         data: Vec<u8>,
         start: usize,
         len: usize,
+    },
+    /// Write each `data[start..start + len]` at its `offset` (the payloads
+    /// of many datagrams received in one buffer).
+    WriteMany {
+        data: Vec<u8>,
+        pieces: Vec<(u64, usize, usize)>,
     },
     Flush(oneshot::Sender<io::Result<()>>),
     /// Write everything, sync and stop; `complete` also finishes a tree
@@ -416,6 +424,40 @@ impl FileWriter {
         }
     }
 
+    /// Queues the writes `data[start..start + len]` at `offset` for every
+    /// `(offset, start, len)` in `pieces`, as one command. Never blocks; on
+    /// refusal the pieces are handed back and nothing is queued.
+    pub fn enqueue_pieces(
+        &self,
+        data: Vec<u8>,
+        pieces: Vec<(u64, usize, usize)>,
+    ) -> Result<(), Vec<(u64, usize, usize)>> {
+        assert!(
+            pieces
+                .iter()
+                .all(|&(_, start, len)| start.checked_add(len).is_some_and(|e| e <= data.len())),
+            "enqueue_pieces: range outside the buffer"
+        );
+        let total: u64 = pieces.iter().map(|&(_, _, len)| len as u64).sum();
+        if self.queued_bytes() + total > self.capacity_bytes {
+            return Err(pieces);
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(pieces);
+        };
+        self.shared.queued_bytes.fetch_add(total, Ordering::AcqRel);
+        match tx.try_send(WriteCmd::WriteMany { data, pieces }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(cmd) | TrySendError::Disconnected(cmd)) => {
+                self.shared.queued_bytes.fetch_sub(total, Ordering::AcqRel);
+                match cmd {
+                    WriteCmd::WriteMany { pieces, .. } => Err(pieces),
+                    _ => unreachable!("the command sent is returned"),
+                }
+            }
+        }
+    }
+
     /// Requests an `fsync` after everything queued so far has been written.
     /// The returned receiver resolves when the data is durable.
     pub fn flush(&self) -> oneshot::Receiver<io::Result<()>> {
@@ -591,6 +633,11 @@ fn writer_loop(target: Target, rx: MpscReceiver<WriteCmd>, shared: Arc<WriterSha
                 start,
                 len,
             } => st.append(offset, &data[start..start + len]),
+            WriteCmd::WriteMany { data, pieces } => {
+                for (offset, start, len) in pieces {
+                    st.append(offset, &data[start..start + len]);
+                }
+            }
             WriteCmd::Flush(reply) => {
                 let r = st.sync(false);
                 let _ = reply.send(r);
@@ -826,6 +873,36 @@ mod tests {
         assert!(data[..5000].iter().all(|&b| b == 1));
         assert!(data[5000..].iter().all(|&b| b == 2));
         assert_eq!(hash_file(&path).unwrap(), *blake3::hash(&data).as_bytes());
+    }
+
+    #[tokio::test]
+    async fn writer_takes_many_pieces_of_one_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        let writer = FileWriter::open(&path, 300, 1 << 20).unwrap();
+        // Three datagrams in one buffer, payloads out of stream order.
+        let mut buf = vec![0u8; 400];
+        buf[10..110].fill(3);
+        buf[150..250].fill(1);
+        buf[290..390].fill(2);
+        writer
+            .enqueue_pieces(buf, vec![(200, 10, 100), (0, 150, 100), (100, 290, 100)])
+            .unwrap();
+        writer.flush().await.unwrap().unwrap();
+        assert_eq!(writer.queued_bytes(), 0);
+        writer.close().await.unwrap();
+        let data = std::fs::read(&path).unwrap();
+        assert!(data[..100].iter().all(|&b| b == 1));
+        assert!(data[100..200].iter().all(|&b| b == 2));
+        assert!(data[200..].iter().all(|&b| b == 3));
+        // Beyond the capacity: refused, and handed back.
+        let writer = FileWriter::open(&path, 4 << 20, 1 << 20).unwrap();
+        let pieces = vec![(0, 0, 1 << 19), (1 << 19, 1 << 19, (1 << 19) + 1)];
+        assert_eq!(
+            writer.enqueue_pieces(vec![0u8; (1 << 20) + 1], pieces.clone()),
+            Err(pieces)
+        );
+        assert_eq!(writer.queued_bytes(), 0);
     }
 
     #[test]

@@ -249,14 +249,26 @@ impl DirectionKeys {
         if buf.len() < HEADER_LEN {
             return Err(CryptoError::Malformed);
         }
-        let pn = u64::from_be_bytes(buf[CID_LEN + 1..HEADER_LEN].try_into().unwrap());
+        buf.extend_from_slice(&[0u8; TAG_LEN]);
+        self.seal_in_place(buf)
+    }
+
+    /// Seals a packet laid out in `pkt`: the unprotected header, the
+    /// plaintext body and [`TAG_LEN`] bytes of room for the tag at the end
+    /// (for packets built side by side in one buffer).
+    pub fn seal_in_place(&self, pkt: &mut [u8]) -> Result<(), CryptoError> {
+        if pkt.len() < OVERHEAD {
+            return Err(CryptoError::Malformed);
+        }
+        let pn = u64::from_be_bytes(pkt[CID_LEN + 1..HEADER_LEN].try_into().unwrap());
         let nonce = self.nonce(pn);
         let aead = self.aead(pn >> EPOCH_BITS);
-        let (head, body) = buf.split_at_mut(HEADER_LEN);
+        let (head, rest) = pkt.split_at_mut(HEADER_LEN);
+        let (body, tag_room) = rest.split_at_mut(rest.len() - TAG_LEN);
         let tag = aead.seal(&nonce, head, body)?;
-        buf.extend_from_slice(&tag);
+        tag_room.copy_from_slice(&tag);
         let mask = self.hp.mask(&tag);
-        for (b, m) in buf[CID_LEN..HEADER_LEN].iter_mut().zip(mask) {
+        for (b, m) in pkt[CID_LEN..HEADER_LEN].iter_mut().zip(mask) {
             *b ^= m;
         }
         Ok(())
@@ -319,6 +331,12 @@ impl SessionKeys {
 /// calls [`DirectionKeys::seal`].
 pub fn begin_packet(buf: &mut Vec<u8>, dcid: u64, type_byte: u8, pn: u64) {
     buf.clear();
+    push_header(buf, dcid, type_byte, pn);
+}
+
+/// Appends an unprotected packet header to `buf` (for packets built side by
+/// side; see [`DirectionKeys::seal_in_place`]).
+pub fn push_header(buf: &mut Vec<u8>, dcid: u64, type_byte: u8, pn: u64) {
     buf.extend_from_slice(&dcid.to_be_bytes());
     buf.push(type_byte);
     buf.extend_from_slice(&pn.to_be_bytes());
@@ -334,6 +352,40 @@ pub fn peek_cid(pkt: &[u8]) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::crypto::handshake::Split;
+
+    /// Throughput of sealing and opening full-size packets:
+    /// `cargo test --release --lib aead_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn aead_throughput() {
+        for suite in [Suite::Aes256Gcm, Suite::ChaCha20Poly1305] {
+            let keys = DirectionKeys::new(suite, &[7; 32]);
+            let n = 200_000u64;
+            let mut buf = Vec::with_capacity(1500);
+            let started = std::time::Instant::now();
+            for pn in 0..n {
+                begin_packet(&mut buf, 1, 3, pn);
+                buf.resize(1472 - TAG_LEN, 0xAB);
+                keys.seal(&mut buf).unwrap();
+            }
+            let secs = started.elapsed().as_secs_f64();
+            let started = std::time::Instant::now();
+            let mut pkt = buf.clone();
+            for _ in 0..n {
+                pkt.copy_from_slice(&buf);
+                keys.open(&mut pkt).unwrap();
+            }
+            let open_secs = started.elapsed().as_secs_f64();
+            println!(
+                "{}: seal {:.2} Gbit/s ({:.0} ns/packet), open {:.2} Gbit/s ({:.0} ns/packet)",
+                suite.name(),
+                n as f64 * 1472.0 * 8.0 / secs / 1e9,
+                secs * 1e9 / n as f64,
+                n as f64 * 1472.0 * 8.0 / open_secs / 1e9,
+                open_secs * 1e9 / n as f64
+            );
+        }
+    }
 
     fn split() -> Split {
         Split {

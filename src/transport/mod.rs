@@ -1,6 +1,8 @@
 //! Reliable transport built on top of the wire protocol.
 
 pub mod congestion;
+pub mod io;
+pub mod parallel;
 pub mod receiver;
 pub mod sender;
 pub mod socket;

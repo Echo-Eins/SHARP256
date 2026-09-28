@@ -21,9 +21,7 @@ pub fn bind_udp(addr: SocketAddr, buffer_bytes: usize) -> io::Result<UdpSocket> 
         // Accept IPv4-mapped peers on a v6 wildcard socket where the OS allows.
         let _ = socket.set_only_v6(false);
     }
-    // Best effort: the kernel clamps to its configured maximum.
-    let _ = socket.set_recv_buffer_size(buffer_bytes);
-    let _ = socket.set_send_buffer_size(buffer_bytes);
+    set_buffer_sizes(&socket, buffer_bytes);
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
@@ -31,6 +29,71 @@ pub fn bind_udp(addr: SocketAddr, buffer_bytes: usize) -> io::Result<UdpSocket> 
     set_dont_fragment(&udp);
     disable_udp_connreset(&udp);
     Ok(udp)
+}
+
+/// Asks for kernel socket buffers of `bytes` each. Linux caps ordinary
+/// requests at `net.core.rmem_max` / `wmem_max`; a privileged process may
+/// exceed them, which is tried first. Too small a receive buffer is worth a
+/// warning: at multi-gigabit rates it overflows whenever the process is
+/// briefly descheduled.
+fn set_buffer_sizes(socket: &socket2::Socket, bytes: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let val = bytes.min(i32::MAX as usize) as libc::c_int;
+        for opt in [libc::SO_RCVBUFFORCE, libc::SO_SNDBUFFORCE] {
+            // SAFETY: plain setsockopt with an integer value on a socket we
+            // own; failure (no privilege) is handled below.
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    &val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+    // Best effort: the kernel clamps to its configured maximum. (Linux
+    // reports twice the size asked for, to account for its bookkeeping.)
+    if socket.recv_buffer_size().is_ok_and(|n| n < bytes) {
+        let _ = socket.set_recv_buffer_size(bytes);
+    }
+    if socket.send_buffer_size().is_ok_and(|n| n < bytes) {
+        let _ = socket.set_send_buffer_size(bytes);
+    }
+    let got = socket.recv_buffer_size().unwrap_or(0);
+    if got < bytes / 2 {
+        let hint = if cfg!(target_os = "linux") {
+            format!(
+                " (raise the limit with: sysctl -w net.core.rmem_max={} net.core.wmem_max={})",
+                bytes, bytes
+            )
+        } else {
+            String::new()
+        };
+        // A few MiB serve a gigabit link well; below that, bursts overflow.
+        if got < 4 << 20 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "UDP receive buffer is only {} KiB (asked for {} KiB); fast transfers will \
+                     lose packets to it{}",
+                    got / 1024,
+                    bytes / 1024,
+                    hint
+                );
+            });
+        } else {
+            tracing::debug!(
+                "UDP receive buffer is {} KiB (asked for {} KiB){}",
+                got / 1024,
+                bytes / 1024,
+                hint
+            );
+        }
+    }
 }
 
 /// Marks outgoing datagrams "don't fragment" so that an oversized probe fails

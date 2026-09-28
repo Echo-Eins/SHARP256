@@ -43,6 +43,9 @@ dirs = "5.0"
 
 # Sockets: buffer sizing, path-MTU related options
 socket2 = { version = "0.5", features = ["all"] }
+# Batched datagram I/O: GSO/GRO and sendmmsg/recvmmsg on Linux, USO/URO on
+# Windows (0.6 needs a newer compiler than our MSRV)
+quinn-udp = { version = "0.5.14", default-features = false, features = ["tracing"] }
 rand = "0.8"
 parking_lot = "0.12"
 

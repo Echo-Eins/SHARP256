@@ -26,7 +26,9 @@
 use crate::config::{SenderConfig, TransportConfig};
 use crate::crypto::handshake::{self as hs, Initiator, COOKIE_REPLY_LEN};
 use crate::crypto::replay::ReplayWindow;
-use crate::crypto::transport::{begin_packet, peek_cid, SessionKeys, Suite};
+use crate::crypto::transport::{
+    begin_packet, peek_cid, push_header, DirectionKeys, SessionKeys, Suite, TAG_LEN,
+};
 use crate::crypto::{CryptoError, Identity, SharpId, NO_PSK};
 use crate::file::{hash_to_hex, sanitize_file_name, Source};
 use crate::progress::{emit, DirectoryInfo, EventCallback, TransferEvent, TransferStats};
@@ -37,13 +39,14 @@ use crate::protocol::wire::{
 use crate::protocol::RangeSet;
 use crate::state::{hex16, parse_hex16, SenderState, StateStore};
 use crate::transport::congestion::{burst_for_rate, Cubic, Pacer, RttEstimator};
-use crate::transport::socket::{bind_udp, is_msgsize_error, Clock};
+use crate::transport::io::{recv_buffers, BatchSocket, Received, MAX_SEND_BYTES};
+use crate::transport::parallel;
+use crate::transport::socket::{is_msgsize_error, Clock};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -94,7 +97,7 @@ pub struct TransferSummary {
 pub struct Sender {
     cfg: SenderConfig,
     identity: Identity,
-    socket: Arc<UdpSocket>,
+    socket: Arc<BatchSocket>,
     source: Arc<Source>,
     cancel: CancellationToken,
     store: Option<StateStore>,
@@ -129,10 +132,11 @@ impl Sender {
                 tracing::warn!("... and {} more not sent", tree.skipped().len() - 20);
             }
         }
-        let socket = bind_udp(cfg.bind, cfg.transport.socket_buffer_bytes)?;
+        let socket = BatchSocket::bind(cfg.bind, cfg.transport.socket_buffer_bytes).await?;
         tracing::info!(
-            "sender bound to {}, {} {} ({} bytes)",
+            "sender bound to {} (up to {} datagrams per send), {} {} ({} bytes)",
             socket.local_addr()?,
+            socket.max_segments(),
             if source.tree().is_some() {
                 "directory"
             } else {
@@ -330,6 +334,8 @@ enum SendBlock {
     Socket,
     /// Sent a large batch; let other work run, then continue.
     Yield,
+    /// Enough batches are being encrypted; wait for them.
+    Pipeline,
 }
 
 /// Where the payload of the next DATA packet lives.
@@ -365,6 +371,89 @@ const MAX_TAIL_PROBES: u32 = 2;
 /// Upper bound for the ACK delay a receiver may announce.
 const MAX_PEER_ACK_DELAY: Duration = Duration::from_secs(1);
 
+/// Most batches between being built and being sent (being encrypted, or
+/// waiting for their turn).
+const MAX_PIPELINE: usize = 8;
+/// Longest burst of one segmented send, at the pacing rate.
+const BATCH_BURST: Duration = Duration::from_millis(1);
+/// Batches with fewer datagrams are encrypted on the engine's own thread.
+const MIN_POOLED: usize = 8;
+/// Spare batch buffers kept for reuse.
+const MAX_SPARE: usize = 16;
+
+/// DATA datagrams encrypted together and sent with one call where the
+/// platform allows.
+struct Batch {
+    seq: u64,
+    buf: Vec<u8>,
+    /// Length of every datagram but the last.
+    segment: usize,
+    /// The byte range each datagram carries.
+    ranges: Vec<(u64, u64)>,
+    /// Encryption failed (never expected).
+    failed: bool,
+}
+
+/// Batches on their way from being built to being sent: encrypted on the
+/// crypto pool (or right away, when small), then sent strictly in the order
+/// they were built.
+struct Pipe {
+    next_seq: u64,
+    next_send: u64,
+    in_pool: usize,
+    ready: BTreeMap<u64, Batch>,
+    results_tx: tokio::sync::mpsc::UnboundedSender<Batch>,
+    results: tokio::sync::mpsc::UnboundedReceiver<Batch>,
+    spare: Vec<Vec<u8>>,
+}
+
+impl Pipe {
+    fn new() -> Self {
+        let (results_tx, results) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            next_seq: 0,
+            next_send: 0,
+            in_pool: 0,
+            ready: BTreeMap::new(),
+            results_tx,
+            results,
+            spare: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.in_pool + self.ready.len()
+    }
+
+    fn take_buf(&mut self) -> Vec<u8> {
+        self.spare
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(MAX_SEND_BYTES))
+    }
+
+    fn recycle(&mut self, mut buf: Vec<u8>) {
+        if self.spare.len() < MAX_SPARE {
+            buf.clear();
+            self.spare.push(buf);
+        }
+    }
+}
+
+/// Encrypts the datagrams of a batch, which start at `starts`.
+fn seal_all(keys: &DirectionKeys, buf: &mut [u8], starts: &[usize]) -> bool {
+    let total = buf.len();
+    let lengths =
+        (0..starts.len()).map(|i| starts.get(i + 1).copied().unwrap_or(total) - starts[i]);
+    parallel::split_lengths(buf, lengths)
+        .into_iter()
+        .all(|p| keys.seal_in_place(p).is_ok())
+}
+
+/// Receive buffers of the sender (it only receives acknowledgements).
+const RX_BUFFERS: usize = 8;
+/// Receive calls per turn of the loop before it sends again.
+const MAX_RECV_CALLS: usize = 64;
+
 /// Handshake attempts kept alive at once (a response may answer any of them).
 const MAX_ATTEMPTS: usize = 4;
 /// While the receiver's user decides, ask for the decision this often.
@@ -379,7 +468,7 @@ struct Peer {
 
 /// An established encrypted session with the receiver.
 struct Secure {
-    keys: SessionKeys,
+    keys: Arc<SessionKeys>,
     /// Our connection id: the receiver addresses its packets to it.
     local_cid: u64,
     /// The receiver's connection id: our packets are addressed to it.
@@ -404,7 +493,7 @@ struct AckRecord {
 
 struct Engine {
     cfg: TransportConfig,
-    socket: Arc<UdpSocket>,
+    socket: Arc<BatchSocket>,
     peer: SocketAddr,
     reader: Arc<Source>,
     size: u64,
@@ -471,6 +560,10 @@ struct Engine {
     /// Whether the current round already saw a congestion signal.
     round_congestive: bool,
     random_loss_events: u64,
+    /// Most bytes in flight during the current and the previous round
+    /// (whether the congestion window is actually used).
+    peak_inflight: u64,
+    prev_peak_inflight: u64,
 
     // Tail loss probes (RFC 8985 section 7).
     last_send_at: Instant,
@@ -505,13 +598,22 @@ struct Engine {
     read_buf: Vec<u8>,
     tx_buf: Vec<u8>,
     ctl_buf: Vec<u8>,
+    /// Batches between being built and being sent.
+    pipe: Pipe,
+    /// DATA datagrams of the batch being built, back to back.
+    batch: Vec<u8>,
+    /// Per datagram of `batch`: where it starts, and the range it carries
+    /// (retransmitted or not).
+    batch_items: Vec<(usize, u64, u64, bool)>,
+    rx_bufs: Vec<Vec<u8>>,
+    rx_meta: Vec<Received>,
 }
 
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn new(
         cfg: TransportConfig,
-        socket: Arc<UdpSocket>,
+        socket: Arc<BatchSocket>,
         peer: SocketAddr,
         auth: Peer,
         reader: Arc<Source>,
@@ -573,6 +675,8 @@ impl Engine {
             bg_lost: 0.0,
             round_congestive: false,
             random_loss_events: 0,
+            peak_inflight: 0,
+            prev_peak_inflight: 0,
             last_send_at: now,
             tail_probes: 0,
             tail_probe_count: 0,
@@ -599,6 +703,18 @@ impl Engine {
             read_buf: Vec::new(),
             tx_buf: Vec::with_capacity(MAX_CHUNK as usize + DATA_OVERHEAD),
             ctl_buf: Vec::with_capacity(MAX_CONTROL_DATAGRAM),
+            pipe: Pipe::new(),
+            batch: Vec::with_capacity(MAX_SEND_BYTES),
+            batch_items: Vec::new(),
+            rx_bufs: recv_buffers(RX_BUFFERS),
+            rx_meta: vec![
+                Received {
+                    from: peer,
+                    len: 0,
+                    stride: 0,
+                };
+                RX_BUFFERS
+            ],
         }
     }
 
@@ -607,11 +723,39 @@ impl Engine {
     }
 
     fn send_datagram(&self, bytes: &[u8]) -> io::Result<()> {
-        match self.socket.try_send_to(bytes, self.peer) {
-            Ok(_) => Ok(()),
+        match self.socket.try_send(self.peer, bytes) {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Handles everything queued on the socket.
+    fn drain_socket(&mut self) -> Result<(), SendError> {
+        for _ in 0..MAX_RECV_CALLS {
+            let n = match self.socket.try_recv(&mut self.rx_bufs, &mut self.rx_meta) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => {
+                    tracing::debug!("recv error: {}", e);
+                    return Ok(());
+                }
+            };
+            for i in 0..n {
+                let r = self.rx_meta[i];
+                let mut buf = std::mem::take(&mut self.rx_bufs[i]);
+                let mut result = Ok(());
+                for d in r.segments() {
+                    result = self.on_datagram(&mut buf[d], r.from);
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                self.rx_bufs[i] = buf;
+                result?;
+            }
+        }
+        Ok(())
     }
 
     /// Encrypts `msg` as a transport packet and sends it. Without an
@@ -633,8 +777,8 @@ impl Engine {
             .send
             .seal(&mut self.ctl_buf)
             .map_err(io::Error::other)?;
-        match self.socket.try_send_to(&self.ctl_buf, self.peer) {
-            Ok(_) => Ok(()),
+        match self.socket.try_send(self.peer, &self.ctl_buf) {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
         }
@@ -721,7 +865,7 @@ impl Engine {
                     SendError::Protocol("receiver chose an unknown cipher".into())
                 })?;
                 self.secure = Some(Secure {
-                    keys: SessionKeys::derive(&split, true, suite),
+                    keys: Arc::new(SessionKeys::derive(&split, true, suite)),
                     local_cid: cid,
                     peer_cid: receiver_cid,
                     next_pn: 0,
@@ -769,7 +913,6 @@ impl Engine {
         let mut delay = Duration::from_millis(250);
         let mut next_attempt = Instant::now();
         let mut next_poll: Option<Instant> = None;
-        let mut buf = vec![0u8; MAX_DATAGRAM];
         let socket = self.socket.clone();
         let cancel = self.cancel.clone();
         loop {
@@ -846,16 +989,7 @@ impl Engine {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
                 _ = cancel.cancelled() => return Err(SendError::Cancelled),
             }
-            loop {
-                match socket.try_recv_from(&mut buf) {
-                    Ok((n, from)) => self.on_datagram(&mut buf[..n], from)?,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tracing::debug!("recv error during handshake: {}", e);
-                        break;
-                    }
-                }
-            }
+            self.drain_socket()?;
         }
     }
 
@@ -948,7 +1082,6 @@ impl Engine {
         candidates.sort_unstable_by(|a, b| b.cmp(a));
         candidates.dedup();
 
-        let mut buf = vec![0u8; MAX_DATAGRAM];
         let socket = self.socket.clone();
         let wait = (self.rtt.srtt() * 3).clamp(Duration::from_millis(150), Duration::from_secs(2));
         for cand in candidates {
@@ -976,14 +1109,12 @@ impl Engine {
                     if now >= deadline {
                         break;
                     }
-                    let r = tokio::select! {
-                        r = socket.recv_from(&mut buf) => r,
+                    tokio::select! {
+                        r = socket.readable() => { let _ = r; }
                         _ = tokio::time::sleep(deadline - now) => break,
                         _ = self.cancel.cancelled() => return Err(SendError::Cancelled),
-                    };
-                    if let Ok((n, from)) = r {
-                        self.on_datagram(&mut buf[..n], from)?;
                     }
+                    self.drain_socket()?;
                 }
             }
             if acked {
@@ -1050,7 +1181,6 @@ impl Engine {
         let mut hash_task = Some(hash_task);
         let socket = self.socket.clone();
         let cancel = self.cancel.clone();
-        let mut buf = vec![0u8; MAX_DATAGRAM];
         let mut next_tick = Instant::now() + TICK;
         let mut next_progress = Instant::now() + self.cfg.progress_interval;
 
@@ -1060,16 +1190,7 @@ impl Engine {
             }
 
             // 1. Input: everything that is already queued on the socket.
-            loop {
-                match socket.try_recv_from(&mut buf) {
-                    Ok((n, from)) => self.on_datagram(&mut buf[..n], from)?,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tracing::debug!("recv error: {}", e);
-                        break;
-                    }
-                }
-            }
+            self.drain_socket()?;
             // An answer to a re-handshake or state query: adopt the
             // receiver's view of what it holds.
             if let Some(ack) = self.answer.take() {
@@ -1124,11 +1245,18 @@ impl Engine {
                 }
                 SendBlock::Pacer(d) => deadline = deadline.min(now + d),
                 SendBlock::Socket => want_write = true,
-                SendBlock::Idle | SendBlock::Window => {}
+                SendBlock::Idle | SendBlock::Window | SendBlock::Pipeline => {}
             }
+            let sealing = self.pipe.in_pool > 0;
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
                 r = socket.writable(), if want_write => { let _ = r; }
+                r = self.pipe.results.recv(), if sealing => {
+                    if let Some(batch) = r {
+                        self.pipe.in_pool -= 1;
+                        self.pipe.ready.insert(batch.seq, batch);
+                    }
+                }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
                 _ = cancel.cancelled() => {}
             }
@@ -1229,6 +1357,13 @@ impl Engine {
     }
 
     fn fill_window(&mut self, now: Instant) -> Result<SendBlock, SendError> {
+        while let Ok(batch) = self.pipe.results.try_recv() {
+            self.pipe.in_pool -= 1;
+            self.pipe.ready.insert(batch.seq, batch);
+        }
+        if let Some(block) = self.flush_ready()? {
+            return Ok(block);
+        }
         if self.stalled
             || self.fin_verdict.is_some()
             || self.pending_fin.is_some()
@@ -1239,63 +1374,122 @@ impl Engine {
         self.pacer.refill(now);
         let mut sent_in_call = 0usize;
         loop {
-            if self.pending.is_empty() {
-                return Ok(SendBlock::Idle);
+            if self.pipe.len() >= MAX_PIPELINE {
+                return Ok(SendBlock::Pipeline);
             }
-            let chunk = self.chunk as u64;
-            if self.inflight_bytes > 0 && self.inflight_bytes + chunk > self.window() {
-                return Ok(SendBlock::Window);
+            let block = self.build_batch(now)?;
+            if !self.batch_items.is_empty() {
+                sent_in_call += self.batch_items.len();
+                self.record_sent(now);
+                self.dispatch_batch();
+                if let Some(b) = self.flush_ready()? {
+                    return Ok(b);
+                }
+            }
+            if let Some(b) = block {
+                return Ok(b);
+            }
+            if sent_in_call >= MAX_BATCH {
+                return Ok(SendBlock::Yield);
+            }
+        }
+    }
+
+    /// Builds the next batch of DATA datagrams, unencrypted, in `batch`: as
+    /// many as the window, the pacer and one segmented send allow. Every
+    /// datagram of a batch but the last has the full size. Returns why the
+    /// batch ended early, if it did.
+    fn build_batch(&mut self, now: Instant) -> Result<Option<SendBlock>, SendError> {
+        self.batch.clear();
+        self.batch_items.clear();
+        let chunk = self.chunk as u64;
+        let full = self.chunk as usize + DATA_OVERHEAD;
+        // A segmented send leaves as one burst; keep it to about a
+        // millisecond at the pacing rate (as TCP sizes its offload bursts)
+        // so that shallow buffers on the path are not overrun.
+        let burst = (self.pacer.rate() * BATCH_BURST.as_secs_f64() / full as f64) as usize;
+        let max_items = self
+            .socket
+            .max_segments()
+            .min(MAX_SEND_BYTES / full)
+            .min(burst.max(2))
+            .max(1);
+        let mut outstanding = self.inflight_bytes;
+        let ts = self.clock.now_us_at(now).max(1);
+        let mut block = None;
+        while self.batch_items.len() < max_items {
+            if self.pending.is_empty() {
+                block = Some(SendBlock::Idle);
+                break;
+            }
+            if outstanding > 0 && outstanding + chunk > self.window() {
+                block = Some(SendBlock::Window);
+                break;
             }
             if !self.pacer.try_take(chunk) {
-                return Ok(SendBlock::Pacer(self.pacer.delay_for(chunk)));
+                block = Some(SendBlock::Pacer(self.pacer.delay_for(chunk)));
+                break;
             }
-            let (s, e) = match self.pending.take_first(chunk) {
-                Some(r) => r,
-                None => return Ok(SendBlock::Idle),
+            let Some((s, e)) = self.pending.take_first(chunk) else {
+                block = Some(SendBlock::Idle);
+                break;
             };
             let retransmit = s < self.highest_sent;
             let src = match self.load_payload(s, e, retransmit) {
                 Ok(src) => src,
                 Err(err) => {
                     self.pending.insert(s, e);
+                    self.pacer.refund(chunk);
+                    self.unbuild_batch();
                     return Err(SendError::Io(err));
                 }
             };
-            let ts = self.clock.now_us().max(1);
+            let sec = self.secure.as_mut().expect("checked by fill_window");
+            let at = self.batch.len();
+            let pn = sec.next_pn;
+            sec.next_pn += 1;
             let flags = if retransmit { DATA_FLAG_RETRANSMIT } else { 0 };
-            {
-                let sec = self.secure.as_mut().expect("checked above");
-                let payload: &[u8] = match src {
-                    PayloadSrc::Cache(a, b) => &self.cache[a..b],
-                    PayloadSrc::Buf => &self.read_buf[..],
-                };
-                seal_data(sec, &mut self.tx_buf, flags, s, ts, payload)
-                    .map_err(|e| SendError::Protocol(e.to_string()))?;
+            push_header(
+                &mut self.batch,
+                sec.peer_cid,
+                type_byte(MsgType::Data, flags),
+                pn,
+            );
+            self.batch.extend_from_slice(&s.to_be_bytes());
+            self.batch.extend_from_slice(&ts.to_be_bytes());
+            let payload: &[u8] = match src {
+                PayloadSrc::Cache(a, b) => &self.cache[a..b],
+                PayloadSrc::Buf => &self.read_buf[..],
+            };
+            self.batch.extend_from_slice(payload);
+            self.batch.extend_from_slice(&[0u8; TAG_LEN]);
+            self.batch_items.push((at, s, e, retransmit));
+            outstanding += e - s;
+            if e - s < chunk {
+                // Only the last datagram of a segmented send may be shorter.
+                break;
             }
-            match self.socket.try_send_to(&self.tx_buf, self.peer) {
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    self.pending.insert(s, e);
-                    self.pacer.refund(chunk);
-                    return Ok(SendBlock::Socket);
-                }
-                Err(err) if is_msgsize_error(&err) => {
-                    // The path shrank under us: fall back to the safe chunk.
-                    self.pending.insert(s, e);
-                    self.pacer.refund(chunk);
-                    let smaller = SAFE_CHUNK.min(self.chunk);
-                    if smaller < self.chunk {
-                        tracing::warn!("EMSGSIZE: reducing chunk {} -> {}", self.chunk, smaller);
-                        self.set_chunk(smaller);
-                        continue;
-                    }
-                    return Err(SendError::Io(err));
-                }
-                Err(err) => {
-                    self.pending.insert(s, e);
-                    return Err(SendError::Io(err));
-                }
-            }
+        }
+        Ok(block)
+    }
+
+    /// Puts the ranges of a batch that was built but not counted as sent
+    /// back, and returns their pacing tokens.
+    fn unbuild_batch(&mut self) {
+        let chunk = self.chunk as u64;
+        for &(_, s, e, _) in &self.batch_items {
+            self.pending.insert(s, e);
+            self.pacer.refund(chunk);
+        }
+        self.batch.clear();
+        self.batch_items.clear();
+    }
+
+    /// Counts the datagrams of the batch just built as sent (they leave
+    /// within microseconds, in order).
+    fn record_sent(&mut self, now: Instant) {
+        for i in 0..self.batch_items.len() {
+            let (_, s, e, _) = self.batch_items[i];
             let len = e - s;
             self.seq += 1;
             self.inflight.insert(
@@ -1310,13 +1504,133 @@ impl Engine {
             self.inflight_bytes += len;
             self.bytes_sent += len;
             self.round_sent += len;
-            self.last_send_at = now;
             self.retransmitted_bytes += e.min(self.highest_sent).saturating_sub(s);
             self.highest_sent = self.highest_sent.max(e);
-            sent_in_call += 1;
-            if sent_in_call >= MAX_BATCH {
-                return Ok(SendBlock::Yield);
+        }
+        self.peak_inflight = self.peak_inflight.max(self.inflight_bytes);
+        self.last_send_at = now;
+    }
+
+    /// Encrypts the batch just built: on the crypto pool when it is large
+    /// (the engine carries on meanwhile), otherwise right here.
+    fn dispatch_batch(&mut self) {
+        let keys = self
+            .secure
+            .as_ref()
+            .expect("checked by fill_window")
+            .keys
+            .clone();
+        let seq = self.pipe.next_seq;
+        self.pipe.next_seq += 1;
+        let starts: Vec<usize> = self.batch_items.iter().map(|item| item.0).collect();
+        let ranges: Vec<(u64, u64)> = self
+            .batch_items
+            .iter()
+            .map(|&(_, s, e, _)| (s, e))
+            .collect();
+        self.batch_items.clear();
+        let fresh = self.pipe.take_buf();
+        let mut buf = std::mem::replace(&mut self.batch, fresh);
+        let segment = starts.get(1).copied().unwrap_or(buf.len());
+        match parallel::pool() {
+            Some(pool) if starts.len() >= MIN_POOLED => {
+                let tx = self.pipe.results_tx.clone();
+                self.pipe.in_pool += 1;
+                pool.spawn(move || {
+                    let failed = !seal_all(&keys.send, &mut buf, &starts);
+                    let _ = tx.send(Batch {
+                        seq,
+                        buf,
+                        segment,
+                        ranges,
+                        failed,
+                    });
+                });
             }
+            _ => {
+                let failed = !seal_all(&keys.send, &mut buf, &starts);
+                self.pipe.ready.insert(
+                    seq,
+                    Batch {
+                        seq,
+                        buf,
+                        segment,
+                        ranges,
+                        failed,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Sends encrypted batches in order, as far as the socket takes them.
+    fn flush_ready(&mut self) -> Result<Option<SendBlock>, SendError> {
+        while let Some(batch) = self.pipe.ready.remove(&self.pipe.next_send) {
+            if batch.failed {
+                self.unsend(&batch.ranges);
+                return Err(SendError::Protocol("cannot encrypt a packet".into()));
+            }
+            let sent = self
+                .socket
+                .try_send_segments(self.peer, &batch.buf, batch.segment);
+            match sent {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.pipe.ready.insert(batch.seq, batch);
+                    return Ok(Some(SendBlock::Socket));
+                }
+                Err(err) if is_msgsize_error(&err) => {
+                    // The path shrank under us: fall back to the safe chunk.
+                    self.unsend(&batch.ranges);
+                    let smaller = SAFE_CHUNK.min(self.chunk);
+                    if smaller >= self.chunk {
+                        return Err(SendError::Io(err));
+                    }
+                    tracing::warn!("EMSGSIZE: reducing chunk {} -> {}", self.chunk, smaller);
+                    self.set_chunk(smaller);
+                }
+                Err(err) if batch.ranges.len() > 1 && self.socket.max_segments() == 1 => {
+                    // The network stack refused segmentation offload (and it
+                    // is off now): send these datagrams one by one.
+                    tracing::debug!("segmented send failed ({}); sending datagrams singly", err);
+                    self.send_singly(&batch)?;
+                }
+                Err(err) => {
+                    self.unsend(&batch.ranges);
+                    return Err(SendError::Io(err));
+                }
+            }
+            self.pipe.next_send += 1;
+            self.pipe.recycle(batch.buf);
+        }
+        Ok(None)
+    }
+
+    fn send_singly(&mut self, batch: &Batch) -> Result<(), SendError> {
+        for (k, datagram) in batch.buf.chunks(batch.segment).enumerate() {
+            match self.socket.try_send(self.peer, datagram) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.unsend(&batch.ranges[k..]);
+                    return Ok(());
+                }
+                Err(err) => {
+                    self.unsend(&batch.ranges[k..]);
+                    return Err(SendError::Io(err));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes ranges that were counted as sent but never left back into
+    /// `pending`.
+    fn unsend(&mut self, ranges: &[(u64, u64)]) {
+        for &(s, e) in ranges {
+            if self.inflight.get(&s).is_some_and(|inf| inf.end == e) {
+                self.remove_inflight(s);
+            }
+            self.pending.insert(s, e);
         }
     }
 
@@ -1634,8 +1948,15 @@ impl Engine {
             tracing::debug!("re-queued {} B reported missing but not tracked", healed);
         }
 
-        if acked > 0 {
+        // Grow the window only while it is used (RFC 9002, 7.8): a sender
+        // limited by its own speed or by the receiver would otherwise build
+        // a window it never fills, and pacing derived from it would stop
+        // pacing.
+        let window_used = 2 * self.peak_inflight.max(self.prev_peak_inflight) >= self.cc.cwnd();
+        if acked > 0 && window_used {
             self.cc.on_ack(acked, now, &self.rtt);
+        }
+        if acked > 0 {
             self.rtt.reset_backoff();
             self.last_ack_progress = now;
             self.tail_probes = 0;
@@ -1683,6 +2004,8 @@ impl Engine {
         self.round_sent = 0;
         self.round_lost = 0;
         self.round_congestive = false;
+        self.prev_peak_inflight = self.peak_inflight;
+        self.peak_inflight = self.inflight_bytes;
     }
 
     /// Background (non-congestive) loss rate of the path.
@@ -1773,8 +2096,8 @@ impl Engine {
             )
             .map_err(|e| SendError::Protocol(e.to_string()))?;
         }
-        match self.socket.try_send_to(&self.tx_buf, self.peer) {
-            Ok(_) => {}
+        match self.socket.try_send(self.peer, &self.tx_buf) {
+            Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(err) => return Err(SendError::Io(err)),
         }

@@ -502,12 +502,13 @@ impl Pacer {
     }
 }
 
-/// Burst allowance for a given pacing rate: at least 2 ms worth of data (so
-/// that 1 ms timer granularity does not cap throughput on fast paths) and at
+/// Burst allowance for a given pacing rate: 1 ms worth of data (the timer
+/// granularity; a sender that sends in segmented batches emits a burst in
+/// microseconds, and longer bursts overrun shallow buffers on the path), at
 /// least 16 chunks, at most 1024 chunks.
 pub fn burst_for_rate(rate: f64, chunk: u16) -> f64 {
     let chunk = chunk.max(1) as f64;
-    (rate * 0.002).clamp(16.0 * chunk, 1024.0 * chunk)
+    (rate * 0.001).clamp(16.0 * chunk, 1024.0 * chunk)
 }
 
 #[cfg(test)]
@@ -763,7 +764,7 @@ mod tests {
     #[test]
     fn burst_scales_with_rate_within_bounds() {
         assert_eq!(burst_for_rate(1_000.0, 1000), 16_000.0); // floor: 16 chunks
-        assert_eq!(burst_for_rate(125_000_000.0, 1000), 250_000.0); // 2 ms at 1 Gbit/s
+        assert_eq!(burst_for_rate(125_000_000.0, 1000), 125_000.0); // 1 ms at 1 Gbit/s
         assert_eq!(burst_for_rate(1e12, 1000), 1_024_000.0); // ceiling: 1024 chunks
     }
 }
