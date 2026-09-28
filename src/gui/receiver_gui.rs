@@ -42,6 +42,8 @@ struct Shared {
     listen: String,
     receiver_id: String,
     reachability: Option<String>,
+    /// Relays that have taken our registration, as senders should name them.
+    relays: Vec<String>,
     error: Option<String>,
 }
 
@@ -156,6 +158,14 @@ impl ReceiverApp {
                     }
                 }
                 TransferEvent::Reachability { summary, .. } => sh.reachability = Some(summary),
+                // Its own line, not the network summary: the two arrive in
+                // either order, and one overwriting the other lost whichever
+                // came first.
+                TransferEvent::RelayRegistered { relay, .. } => {
+                    if !sh.relays.contains(&relay) {
+                        sh.relays.push(relay);
+                    }
+                }
                 TransferEvent::IncomingRequest { .. } => {}
             }
         }));
@@ -276,6 +286,12 @@ impl eframe::App for ReceiverApp {
                 if let Some(r) = &sh.reachability {
                     ui.label(format!("Network: {}", r));
                 }
+                for relay in &sh.relays {
+                    ui.label(format!(
+                        "Registered with relay {}: senders can add --relay {}",
+                        relay, relay
+                    ));
+                }
             });
             if let Some(e) = &sh.error {
                 ui.colored_label(egui::Color32::RED, e);
@@ -364,6 +380,7 @@ struct View {
     listen: String,
     receiver_id: String,
     reachability: Option<String>,
+    relays: Vec<String>,
     error: Option<String>,
 }
 
@@ -375,6 +392,7 @@ impl Shared {
             listen: self.listen.clone(),
             receiver_id: self.receiver_id.clone(),
             reachability: self.reachability.clone(),
+            relays: self.relays.clone(),
             error: self.error.clone(),
         }
     }

@@ -71,6 +71,18 @@ pub const FILE_HASH_LEN: usize = 32;
 /// 2^64 is a cheap thing to give up.
 pub const RESERVED_CID: u64 = u64::from_be_bytes(*b"SHRELAY1");
 
+/// Whether an endpoint may pick `cid` as a connection id.
+///
+/// Zero means "none"; [`RESERVED_CID`] marks relay control messages; and an
+/// id whose second four bytes are the STUN magic cookie (0x2112A442, RFC
+/// 8489) would make a packet addressed to it look like STUN on a socket
+/// that also carries STUN, and be handed to the wrong reader. Giving up one
+/// id in 2^32 makes that impossible instead of merely unlikely.
+pub fn is_usable_cid(cid: u64) -> bool {
+    const STUN_MAGIC_COOKIE: u64 = 0x2112_A442;
+    cid != 0 && cid != RESERVED_CID && cid & 0xFFFF_FFFF != STUN_MAGIC_COOKIE
+}
+
 /// Length of the unpredictable token of a PATH_CHALLENGE / PATH_RESPONSE.
 /// Eight bytes make guessing one hopeless (2^-64 per try) while keeping the
 /// frame small enough to be sent freely.
@@ -139,3 +151,22 @@ pub const MAX_TREE_PATH: usize = 4096;
 pub const CAP_NONE: u32 = 0;
 /// Capabilities this implementation supports.
 pub const SUPPORTED_CAPS: u32 = CAP_NONE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A packet addressed to a connection id is only ever taken for what it
+    /// is: never for a relay's control message, never for STUN.
+    #[test]
+    fn no_connection_id_looks_like_something_else() {
+        assert!(!is_usable_cid(0));
+        assert!(!is_usable_cid(RESERVED_CID));
+        // A Binding response prefix, then the cookie: exactly what the
+        // receiver would otherwise have handed to NAT discovery.
+        assert!(!is_usable_cid(0x0101_0000_2112_A442));
+        assert!(!is_usable_cid(0xFFFF_FFFF_2112_A442));
+        assert!(is_usable_cid(0x0101_0000_2112_A443));
+        assert!(is_usable_cid(1));
+    }
+}

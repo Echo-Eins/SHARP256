@@ -12,6 +12,10 @@ pub type Range = (u64, u64);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RangeSet {
     map: BTreeMap<u64, u64>,
+    /// Sum of the lengths of the ranges, kept up to date by every change so
+    /// that asking for it costs nothing: it is read on every ACK, and a set
+    /// broken into many pieces would otherwise make each one a walk.
+    bytes: u64,
 }
 
 #[inline]
@@ -25,6 +29,7 @@ impl RangeSet {
     pub fn new() -> Self {
         Self {
             map: BTreeMap::new(),
+            bytes: 0,
         }
     }
 
@@ -63,7 +68,23 @@ impl RangeSet {
             end = end.max(e);
         }
         self.map.insert(start, end);
+        self.bytes += added;
         added
+    }
+
+    /// Whether inserting `[start, end)` would make one more range: nothing
+    /// already present overlaps it or touches either end. Only such an
+    /// insert grows the set; any other extends or joins what is there.
+    pub fn would_add_range(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        if let Some((_, &pe)) = self.map.range(..=start).next_back() {
+            if pe >= start {
+                return false;
+            }
+        }
+        self.map.range(start..=end).next().is_none()
     }
 
     /// Removes `[start, end)`. Returns the number of bytes actually removed.
@@ -103,6 +124,7 @@ impl RangeSet {
         for (s, e) in to_insert {
             self.map.insert(s, e);
         }
+        self.bytes -= removed;
         removed
     }
 
@@ -128,7 +150,7 @@ impl RangeSet {
 
     /// Total number of bytes present.
     pub fn total(&self) -> u64 {
-        self.map.iter().map(|(&s, &e)| e - s).sum()
+        self.bytes
     }
 
     /// End of the contiguous run that covers `from`; `from` itself if it is
@@ -198,6 +220,7 @@ impl RangeSet {
         if take_end < e {
             self.map.insert(take_end, e);
         }
+        self.bytes -= take_end - s;
         Some((s, take_end))
     }
 
@@ -330,8 +353,21 @@ mod tests {
                     }
                 }
                 assert_eq!(removed, expect);
+            } else if next() % 5 == 0 {
+                let before = set.total();
+                if let Some((ts, te)) = set.take_first(1 + next() % 40) {
+                    for i in ts..te {
+                        assert!(bits[i as usize]);
+                        bits[i as usize] = false;
+                    }
+                    assert_eq!(set.total(), before - (te - ts));
+                }
             } else {
+                // Only an insert that touches nothing makes one more range.
+                let grows = set.would_add_range(s, e);
+                let ranges = set.len();
                 let added = set.insert(s, e);
+                assert_eq!(set.len() == ranges + 1, grows, "[{}, {})", s, e);
                 let mut expect = 0;
                 for i in s..e {
                     if !bits[i as usize] {

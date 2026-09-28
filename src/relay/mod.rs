@@ -73,13 +73,26 @@ pub const PROOF_LEN: usize = 16;
 ///
 /// Both sides derive the same key: the public keys go into it in a fixed
 /// order, peer first, so it does not matter which of the two is computing.
-pub fn auth_key(ours: &Identity, theirs: &SharpId, peer: &SharpId, relay: &SharpId) -> [u8; 32] {
-    let dh = ours.shared_secret(theirs);
-    let mut material = [0u8; 96];
+///
+/// `None` when the other side's key is a small-order point. The exchange
+/// would then come out the same whatever our secret is, so the "key" would
+/// be one anybody could compute — and an identity nobody holds could be
+/// registered by anyone.
+pub fn auth_key(
+    ours: &Identity,
+    theirs: &SharpId,
+    peer: &SharpId,
+    relay: &SharpId,
+) -> Option<[u8; 32]> {
+    let dh = ours.shared_secret(theirs)?;
+    let mut material = zeroize::Zeroizing::new([0u8; 96]);
     material[..32].copy_from_slice(&dh[..]);
     material[32..64].copy_from_slice(peer.as_bytes());
     material[64..].copy_from_slice(relay.as_bytes());
-    blake3::derive_key("sharp256 relay v1 registration", &material)
+    Some(blake3::derive_key(
+        "sharp256 relay v1 registration",
+        &material[..],
+    ))
 }
 
 /// The proof carried by a message, over everything in it that precedes it.
@@ -507,8 +520,8 @@ mod tests {
         let (rid, oid) = (relay.id(), owner.id());
 
         // Both sides reach the same key from their long-term keys alone.
-        let by_owner = auth_key(&owner, &rid, &oid, &rid);
-        let by_relay = auth_key(&relay, &oid, &oid, &rid);
+        let by_owner = auth_key(&owner, &rid, &oid, &rid).unwrap();
+        let by_relay = auth_key(&relay, &oid, &oid, &rid).unwrap();
         assert_eq!(by_owner, by_relay);
 
         let mut bytes = Message::Register {
@@ -534,7 +547,7 @@ mod tests {
 
         // Somebody who merely knows the published identity cannot make one.
         let impostor = Identity::generate();
-        let theirs = auth_key(&impostor, &rid, &oid, &rid);
+        let theirs = auth_key(&impostor, &rid, &oid, &rid).unwrap();
         assert!(!proof_is_good(&theirs, &bytes));
 
         // Nor can any byte of the message be altered afterwards.

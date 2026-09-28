@@ -256,7 +256,10 @@ pub async fn discover_with(
         return out;
     };
     let client = StunClient::new(servers.to_vec()).with_timing(timing.per_try, timing.tries);
-    let v6 = local.is_ipv6();
+    let reach = crate::address::Reach::of(socket);
+    // A dual-stack socket is tested over IPv4, which is where the NATs are;
+    // its IPv6 addresses are published as they are, being the host's own.
+    let family = (reach.v4() && reach.v6()).then_some(false);
 
     // Test I against each server in turn. One server that offers a usable
     // second address is all the real tests need; otherwise a second server's
@@ -264,7 +267,7 @@ pub async fn discover_with(
     let mut primary: Option<(SocketAddr, BindingResponse)> = None;
     let mut second_opinion: Option<SocketAddr> = None;
     for name in servers {
-        let Some(addr) = resolve_server(name, v6).await else {
+        let Some(addr) = resolve_server(name, reach, family).await else {
             continue;
         };
         let Ok(Some(reply)) = client
@@ -295,7 +298,7 @@ pub async fn discover_with(
     out.mapped = Some(first.mapped);
     out.tested_with = Some(server);
     out.port_preserved = Some(first.mapped.port() == local.port());
-    if means_no_nat(first.mapped.ip()) {
+    if means_no_nat(first.mapped.ip().to_canonical()) {
         out.open_internet = true;
         out.mapping = Mapping::EndpointIndependent;
     }
@@ -305,7 +308,8 @@ pub async fn discover_with(
     // sending there, so it is screened first.
     let other = first
         .other_address
-        .filter(|o| is_usable_server_address(*o, server));
+        .filter(|o| is_usable_server_address(*o, server))
+        .and_then(|o| reach.native(o));
     if other.is_none() {
         tracing::debug!(
             "STUN: {} offers no usable second address; \
@@ -447,6 +451,7 @@ async fn hairpinning(
     if !is_usable_server_address(mapped, local) {
         return None;
     }
+    let mapped = crate::address::Reach::of(socket).native(mapped)?;
     let tid = transaction_id();
     let request = binding_request(&tid);
     for _ in 0..timing.tries.max(1) {

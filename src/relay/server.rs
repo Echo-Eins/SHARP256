@@ -241,8 +241,25 @@ struct Allocation {
     /// port back instead of burning another one.
     sender: SocketAddr,
     receiver: SocketAddr,
+    /// Whether the two were told about each other; a port is only handed
+    /// back on the same terms it was made.
+    disclose: bool,
     sender_ticket: [u8; TOKEN_LEN],
     receiver_ticket: [u8; TOKEN_LEN],
+}
+
+/// What one side is told about the other: the address, or nothing at all
+/// when the receiver asked to stay hidden.
+fn shown(addr: SocketAddr, disclose: bool) -> SocketAddr {
+    if disclose {
+        return addr;
+    }
+    let ip: std::net::IpAddr = if addr.is_ipv6() {
+        std::net::Ipv6Addr::UNSPECIFIED.into()
+    } else {
+        std::net::Ipv4Addr::UNSPECIFIED.into()
+    };
+    SocketAddr::new(ip, 0)
 }
 
 /// A running relay.
@@ -348,7 +365,9 @@ impl Relay {
     /// could have made. Both sides work the key out from their long-term
     /// keys alone, so there is nothing to exchange and nothing to store.
     fn owns(&self, id: &SharpId, raw: &[u8]) -> bool {
-        let key = super::auth_key(&self.identity, id, id, &self.identity.id());
+        let Some(key) = super::auth_key(&self.identity, id, id, &self.identity.id()) else {
+            return false;
+        };
         super::proof_is_good(&key, raw)
     }
 
@@ -459,48 +478,55 @@ impl Relay {
                 // the caller; there is then no direct path to try and the
                 // pair meets at the relay's port.
                 let disclose = !reg.private;
-                let share = (self.cfg.max_allocations / 4).max(2);
-                let mine = self
-                    .allocations
-                    .iter()
-                    .filter(|a| a.requested_by == from.ip())
-                    .count();
-                if self.allocations.len() >= self.cfg.max_allocations || mine >= share {
-                    if mine >= share {
-                        tracing::info!(
-                            "relay: {} already holds {} of {} ports",
-                            from.ip(),
-                            mine,
-                            self.cfg.max_allocations
-                        );
+                // The same pair asking again means our answer went missing,
+                // not that they want a second port. That has to be settled
+                // before the limits: a sender that already holds its whole
+                // share would otherwise be refused the very port it has.
+                let granted = match self.existing(from, receiver, disclose) {
+                    Some(granted) => Some(granted),
+                    None => {
+                        let share = (self.cfg.max_allocations / 4).max(2);
+                        let mine = self
+                            .allocations
+                            .iter()
+                            .filter(|a| a.requested_by == from.ip() && !a.task.is_finished())
+                            .count();
+                        let live = self
+                            .allocations
+                            .iter()
+                            .filter(|a| !a.task.is_finished())
+                            .count();
+                        if live >= self.cfg.max_allocations || mine >= share {
+                            if mine >= share {
+                                tracing::info!(
+                                    "relay: {} already holds {} of {} ports",
+                                    from.ip(),
+                                    mine,
+                                    self.cfg.max_allocations
+                                );
+                            }
+                            self.reply(
+                                from,
+                                Message::Error {
+                                    code: Refusal::Busy,
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                        self.allocate(from, receiver, disclose).await
                     }
-                    self.reply(
-                        from,
-                        Message::Error {
-                            code: Refusal::Busy,
-                        },
-                    )
-                    .await;
-                    return;
-                }
-                match self.allocate(from, receiver).await {
+                };
+                match granted {
                     Some((port, sender_ticket, receiver_ticket)) => {
                         // Each side is told where the other appears to be,
                         // so they can try a direct path first and leave the
                         // relay carrying nothing.
-                        let hidden = SocketAddr::new(
-                            if receiver.is_ipv6() {
-                                std::net::Ipv6Addr::UNSPECIFIED.into()
-                            } else {
-                                std::net::Ipv4Addr::UNSPECIFIED.into()
-                            },
-                            0,
-                        );
                         self.reply(
                             from,
                             Message::Allocated {
                                 port,
-                                peer: if disclose { receiver } else { hidden },
+                                peer: shown(receiver, disclose),
                                 ticket: sender_ticket,
                             },
                         )
@@ -509,7 +535,7 @@ impl Relay {
                             receiver,
                             Message::Incoming {
                                 port,
-                                peer: if disclose { from } else { hidden },
+                                peer: shown(from, disclose),
                                 ticket: receiver_ticket,
                             },
                         )
@@ -558,21 +584,33 @@ impl Relay {
         }
     }
 
+    /// The port this pair already holds, if it still does. Only one made
+    /// under the same terms counts: a receiver that has since asked to stay
+    /// hidden gets a port that repeats nothing about where it is.
+    fn existing(
+        &self,
+        sender: SocketAddr,
+        receiver: SocketAddr,
+        disclose: bool,
+    ) -> Option<(u16, [u8; TOKEN_LEN], [u8; TOKEN_LEN])> {
+        self.allocations
+            .iter()
+            .find(|a| {
+                a.sender == sender
+                    && a.receiver == receiver
+                    && a.disclose == disclose
+                    && !a.task.is_finished()
+            })
+            .map(|a| (a.port, a.sender_ticket, a.receiver_ticket))
+    }
+
     /// Sets a port aside for one pair and starts carrying it.
     async fn allocate(
         &mut self,
         sender: SocketAddr,
         receiver: SocketAddr,
+        disclose: bool,
     ) -> Option<(u16, [u8; TOKEN_LEN], [u8; TOKEN_LEN])> {
-        // The same pair asking again means our answer went missing, not that
-        // they want a second port. Hand back the one they already have.
-        if let Some(a) = self
-            .allocations
-            .iter()
-            .find(|a| a.sender == sender && a.receiver == receiver && !a.task.is_finished())
-        {
-            return Some((a.port, a.sender_ticket, a.receiver_ticket));
-        }
         let bind = SocketAddr::new(self.cfg.bind.ip(), 0);
         let sock = Arc::new(UdpSocket::bind(bind).await.ok()?);
         let port = sock.local_addr().ok()?.port();
@@ -586,7 +624,7 @@ impl Relay {
             port,
             sender_ticket,
             receiver_ticket,
-            sender_control: sender,
+            sender_shown: shown(sender, disclose),
             receiver_control: receiver,
             idle: self.cfg.idle,
             cancel: self.cancel.clone(),
@@ -597,6 +635,7 @@ impl Relay {
             requested_by: sender.ip(),
             sender,
             receiver,
+            disclose,
             sender_ticket,
             receiver_ticket,
         });
@@ -633,10 +672,13 @@ struct Carried {
     port: u16,
     sender_ticket: [u8; TOKEN_LEN],
     receiver_ticket: [u8; TOKEN_LEN],
-    /// Where the control exchange reached each side. Used to repeat the
+    /// What the receiver is told about the sender when the introduction is
+    /// repeated: exactly what the first one said, so a private registration
+    /// learns no more the second time than the first.
+    sender_shown: SocketAddr,
+    /// Where the control exchange reached the receiver. Used to repeat the
     /// introduction, and never as a peer address: what counts here is
     /// whichever address presents the ticket.
-    sender_control: SocketAddr,
     receiver_control: SocketAddr,
     idle: Duration,
     cancel: CancellationToken,
@@ -668,7 +710,7 @@ async fn carry(c: Carried) {
         port,
         sender_ticket,
         receiver_ticket,
-        sender_control,
+        sender_shown,
         receiver_control,
         idle,
         cancel,
@@ -773,7 +815,7 @@ async fn carry(c: Carried) {
                     next_introduce = now + INTRODUCE_EVERY;
                     let msg = Message::Incoming {
                         port,
-                        peer: sender_control,
+                        peer: sender_shown,
                         ticket: receiver_ticket,
                     };
                     let _ = control.send_to(&msg.encode(), receiver_control).await;
@@ -860,12 +902,16 @@ mod wire_tests {
     }
 
     async fn start_relay() -> (SocketAddr, SharpId, CancellationToken) {
-        let cancel = CancellationToken::new();
-        let cfg = Config {
+        start_relay_with(Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             idle: Duration::from_secs(5),
             ..Config::default()
-        };
+        })
+        .await
+    }
+
+    async fn start_relay_with(cfg: Config) -> (SocketAddr, SharpId, CancellationToken) {
+        let cancel = CancellationToken::new();
         let relay = Relay::bind(cfg, cancel.clone()).await.expect("binds");
         let addr = relay.local_addr().unwrap();
         let id = relay.id();
@@ -914,7 +960,7 @@ mod wire_tests {
         flags: u8,
     ) -> Option<Message> {
         let id = identity.id();
-        let key = crate::relay::auth_key(identity, relay_id, &id, relay_id);
+        let key = crate::relay::auth_key(identity, relay_id, &id, relay_id).unwrap();
         let mut token = [0u8; TOKEN_LEN];
         for _ in 0..2 {
             let msg = signed(
@@ -952,7 +998,7 @@ mod wire_tests {
 
         // A registration is only accepted once it echoes a token bound to
         // the address the relay saw, so a forged source gets nowhere.
-        let key = crate::relay::auth_key(&owner, &relay_id, &id, &relay_id);
+        let key = crate::relay::auth_key(&owner, &relay_id, &id, &relay_id).unwrap();
         let first = ask(
             &rc,
             relay,
@@ -1139,7 +1185,8 @@ mod wire_tests {
         // Somebody who merely knows the identity cannot end its
         // registration: the proof is the owner's to make.
         let impostor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let wrong_key = crate::relay::auth_key(&Identity::generate(), &relay_id, &id, &relay_id);
+        let wrong_key =
+            crate::relay::auth_key(&Identity::generate(), &relay_id, &id, &relay_id).unwrap();
         let stolen = token_for(&impostor, relay, Identity::generate().id()).await;
         let forged = signed(
             &wrong_key,
@@ -1161,7 +1208,7 @@ mod wire_tests {
         );
 
         // The owner's own goodbye is taken.
-        let key = crate::relay::auth_key(&owner, &relay_id, &id, &relay_id);
+        let key = crate::relay::auth_key(&owner, &relay_id, &id, &relay_id).unwrap();
         let token = token_for(&rc, relay, id).await;
         let bye = signed(
             &key,
@@ -1201,7 +1248,7 @@ mod wire_tests {
         // The attacker knows the published identity and nothing else.
         let impostor = Identity::generate();
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let wrong = crate::relay::auth_key(&impostor, &relay_id, &id, &relay_id);
+        let wrong = crate::relay::auth_key(&impostor, &relay_id, &id, &relay_id).unwrap();
         let mut token = [0u8; TOKEN_LEN];
         for _ in 0..2 {
             let msg = signed(
@@ -1254,6 +1301,49 @@ mod wire_tests {
         cancel.cancel();
     }
 
+    /// A small-order point is an identity nobody holds and anybody can
+    /// claim: the exchange with it comes out the same whatever the relay's
+    /// secret, so the "proof" is one anyone can make. It is never taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_identity_nobody_holds_cannot_be_registered() {
+        let (relay, relay_id, cancel) = start_relay().await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // One token proves the address for all of them; asking for one each
+        // time would run into the relay's rate limit instead.
+        let token = token_for(&sock, relay, Identity::generate().id()).await;
+        for point in crate::crypto::identity::tests::low_order_points() {
+            let id = SharpId::from_public(point);
+            // What anybody could compute for it: the exchange is all zeros.
+            let mut material = [0u8; 96];
+            material[32..64].copy_from_slice(id.as_bytes());
+            material[64..].copy_from_slice(relay_id.as_bytes());
+            let key = blake3::derive_key("sharp256 relay v1 registration", &material);
+            let msg = signed(
+                &key,
+                Message::Register {
+                    id,
+                    token,
+                    flags: 0,
+                    proof: [0; crate::relay::PROOF_LEN],
+                },
+            );
+            sock.send_to(&msg, relay).await.unwrap();
+            let answer = recv_message(&sock, Duration::from_secs(2)).await;
+            assert!(
+                matches!(
+                    answer,
+                    Some(Message::Error {
+                        code: Refusal::BadToken
+                    })
+                ),
+                "{:02x?} was registered by somebody who holds nothing: {:?}",
+                point,
+                answer
+            );
+        }
+        cancel.cancel();
+    }
+
     /// A receiver that asks to stay hidden is not described to the caller:
     /// there is then no direct path to try, and the pair meets at the
     /// relay's port. It costs the relay's bandwidth, and it is the only
@@ -1293,6 +1383,96 @@ mod wire_tests {
             panic!("the receiver was not introduced");
         };
         assert!(peer.ip().is_unspecified() && peer.port() == 0);
+
+        // Nor when the introduction is repeated, which it is for as long as
+        // the receiver has not shown up at the port. A repeat that said more
+        // than the first would give away exactly what was asked to be kept.
+        let mut repeats = 0;
+        while let Some(msg) = recv_message(&rc, Duration::from_secs(1)).await {
+            if let Message::Incoming { peer, .. } = msg {
+                repeats += 1;
+                assert!(
+                    peer.ip().is_unspecified() && peer.port() == 0,
+                    "a repeated introduction disclosed the caller: {}",
+                    peer
+                );
+            }
+            if repeats >= 2 {
+                break;
+            }
+        }
+        assert!(repeats >= 2, "the introduction was never repeated");
+        cancel.cancel();
+    }
+
+    /// A sender whose answer went missing asks again, and must get the port
+    /// it already holds — even when that port is the last of its share. A
+    /// relay that checked the limits first would refuse it the very thing
+    /// it has, and the transfer would fail on one lost datagram.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn asking_again_returns_the_same_port_even_at_the_limit() {
+        let (relay, relay_id, cancel) = start_relay_with(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            idle: Duration::from_secs(5),
+            // A share of two ports per address.
+            max_allocations: 8,
+            ..Config::default()
+        })
+        .await;
+        let owner = Identity::generate();
+        let id = owner.id();
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            register(&rc, relay, &relay_id, &owner, 0).await,
+            Some(Message::Registered { .. })
+        ));
+
+        // Two senders on the same host take its whole share.
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let Some(Message::Allocated { port, ticket, .. }) = with_token(&first, relay, |token| {
+            Message::Connect { target: id, token }
+        })
+        .await
+        else {
+            panic!("the first sender got no port");
+        };
+        assert!(matches!(
+            with_token(&second, relay, |token| Message::Connect {
+                target: id,
+                token
+            })
+            .await,
+            Some(Message::Allocated { .. })
+        ));
+        // A third is over the share.
+        let third = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            with_token(&third, relay, |token| Message::Connect {
+                target: id,
+                token
+            })
+            .await,
+            Some(Message::Error {
+                code: Refusal::Busy
+            })
+        ));
+
+        // The first asks again and is handed back what it already has.
+        let again = with_token(&first, relay, |token| Message::Connect {
+            target: id,
+            token,
+        })
+        .await;
+        let Some(Message::Allocated {
+            port: again_port,
+            ticket: again_ticket,
+            ..
+        }) = again
+        else {
+            panic!("a sender was refused the port it holds: {:?}", again);
+        };
+        assert_eq!((again_port, again_ticket), (port, ticket));
         cancel.cancel();
     }
 

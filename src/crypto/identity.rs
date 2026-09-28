@@ -33,6 +33,19 @@ impl SharpId {
         &self.0
     }
 
+    /// Whether this is one of the handful of points every Diffie-Hellman
+    /// with sends to zero, whatever the other side's secret. Such a "key"
+    /// has no private half: anyone can claim it, and anything derived from
+    /// it with our secret is a constant everybody can compute. No real
+    /// identity is one, so it is refused wherever an identity comes in.
+    ///
+    /// Clamping makes every X25519 scalar a multiple of eight, which
+    /// annihilates exactly the small-order points (on the curve and on its
+    /// twist), so one multiplication by any scalar tells them apart.
+    pub fn is_low_order(&self) -> bool {
+        x25519_dalek::x25519([1; KEY_LEN], self.0) == [0; KEY_LEN]
+    }
+
     /// Short form for display ("sh-abcdefgh…").
     pub fn short(&self) -> String {
         let full = self.to_string();
@@ -68,6 +81,8 @@ pub enum IdError {
     Encoding,
     #[error("SHARP ID checksum mismatch (typo?)")]
     Checksum,
+    #[error("SHARP ID is not a usable public key")]
+    Weak,
 }
 
 impl FromStr for SharpId {
@@ -91,7 +106,11 @@ impl FromStr for SharpId {
         if data[KEY_LEN..] != Self::checksum(&key) {
             return Err(IdError::Checksum);
         }
-        Ok(Self(key))
+        let id = Self(key);
+        if id.is_low_order() {
+            return Err(IdError::Weak);
+        }
+        Ok(id)
     }
 }
 
@@ -141,10 +160,17 @@ impl Identity {
     /// is why transfers use the Noise handshake instead. It is the right tool
     /// for proving to a party that already knows your public key that you
     /// hold the private one, which is what registering with a relay needs.
-    pub fn shared_secret(&self, other: &SharpId) -> Zeroizing<[u8; KEY_LEN]> {
+    ///
+    /// `None` when `other` is a small-order point: the result would then be
+    /// the same for every secret, known to anyone, and prove nothing.
+    pub fn shared_secret(&self, other: &SharpId) -> Option<Zeroizing<[u8; KEY_LEN]>> {
         let sk = x25519_dalek::StaticSecret::from(*self.secret());
         let pk = x25519_dalek::PublicKey::from(*other.as_bytes());
-        Zeroizing::new(sk.diffie_hellman(&pk).to_bytes())
+        let shared = sk.diffie_hellman(&pk);
+        if !shared.was_contributory() {
+            return None;
+        }
+        Some(Zeroizing::new(shared.to_bytes()))
     }
 
     /// Default location of the identity file in the per-user data directory.
@@ -319,7 +345,7 @@ pub(crate) fn base32_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -331,6 +357,58 @@ mod tests {
             assert_eq!(base32_decode(&s.to_uppercase()).unwrap(), data);
         }
         assert!(base32_decode("a1").is_none());
+    }
+
+    /// The small-order points of Curve25519 and its twist, in every
+    /// encoding X25519 accepts (the top bit is ignored, so each also comes
+    /// with it set). Any of them sends every exchange to zero.
+    pub(crate) fn low_order_points() -> Vec<[u8; KEY_LEN]> {
+        let hex = |s: &str| -> [u8; KEY_LEN] {
+            let mut out = [0u8; KEY_LEN];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+            }
+            out
+        };
+        let canonical = [
+            hex("0000000000000000000000000000000000000000000000000000000000000000"),
+            hex("0100000000000000000000000000000000000000000000000000000000000000"),
+            hex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+            hex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+            // p - 1, p and p + 1: non-canonical, but decoded all the same.
+            hex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            hex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            hex("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+        ];
+        let mut all = canonical.to_vec();
+        for mut p in canonical {
+            p[KEY_LEN - 1] |= 0x80;
+            all.push(p);
+        }
+        all
+    }
+
+    #[test]
+    fn a_key_with_no_private_half_is_not_an_identity() {
+        let me = Identity::generate();
+        for point in low_order_points() {
+            let id = SharpId::from_public(point);
+            assert!(id.is_low_order(), "{:02x?} was taken for a real key", point);
+            // Typed in, it is refused like any other bad ID.
+            assert_eq!(id.to_string().parse::<SharpId>(), Err(IdError::Weak));
+            // And nothing is derived from it: the "secret" would be the
+            // same constant for everyone.
+            assert!(me.shared_secret(&id).is_none());
+        }
+        // Real keys are none of those, and agree on a secret.
+        for _ in 0..64 {
+            let other = Identity::generate();
+            assert!(!other.id().is_low_order());
+            assert_eq!(
+                me.shared_secret(&other.id()).map(|k| *k),
+                other.shared_secret(&me.id()).map(|k| *k)
+            );
+        }
     }
 
     #[test]

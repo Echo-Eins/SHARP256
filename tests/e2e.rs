@@ -1058,6 +1058,31 @@ impl FakeSender {
         self.keys.send.seal(&mut buf).unwrap();
         self.sock.send_to(&buf, self.to).await.unwrap();
     }
+
+    /// The `received_bytes` of every ACK that arrives within `within`.
+    async fn acked_bytes(&mut self, within: Duration) -> Vec<u64> {
+        use sharp256::protocol::wire::{self, Message};
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        let deadline = Instant::now() + within;
+        while let Ok(Ok((n, _))) = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.sock.recv_from(&mut buf),
+        )
+        .await
+        {
+            let Ok((type_byte, _, body)) = self.keys.recv.open(&mut buf[..n]) else {
+                continue;
+            };
+            let Ok((t, _)) = wire::parse_type_byte(type_byte) else {
+                continue;
+            };
+            if let Ok(Message::Ack(ack)) = wire::decode_body(t, body) {
+                out.push(ack.received_bytes);
+            }
+        }
+        out
+    }
 }
 
 /// Waits for the receiver's `Failed` event and returns (error, resumable).
@@ -1081,6 +1106,88 @@ async fn wait_failed(
             _ => panic!("no failure reported within {:?}", timeout),
         }
     }
+}
+
+/// A sender that scatters one-byte pieces across a file makes the receiver
+/// keep one entry for each — to hold, to persist for resume and to walk on
+/// every ACK. Past a fixed number of pieces, only data that joins what is
+/// already there is taken, so the cost is bounded whatever the sender does,
+/// and a transfer filling its holes in keeps going.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
+    use sharp256::protocol::wire::{Data, Message};
+    // The receiver's limit on separate pieces per transfer.
+    const CAP: u64 = 1 << 16;
+    const PIECES: u64 = CAP + CAP / 4;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let r = start_receiver(&out, &state, |_| {}).await;
+    let hello = sharp256::protocol::wire::Hello {
+        file_size: 4 * PIECES,
+        ..fake_hello(rand::random(), "shards.bin")
+    };
+    let (mut fake, status) = FakeSender::connect_with(&r, hello).await;
+    assert_eq!(status, sharp256::protocol::constants::HELLO_ACCEPTED);
+
+    // One byte at every other odd offset: no two pieces touch.
+    for i in 0..PIECES {
+        fake.send(&Message::Data(Data {
+            offset: 4 * i + 1,
+            timestamp: 1,
+            payload: b"x",
+        }))
+        .await;
+        // Slowly enough that the receiver's queue drops none of them.
+        if i % 256 == 255 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    let held = fake
+        .acked_bytes(Duration::from_secs(2))
+        .await
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    assert!(
+        held <= CAP,
+        "the receiver kept {} separate pieces; the cap is {}",
+        held,
+        CAP
+    );
+    assert!(
+        held >= CAP - CAP / 16,
+        "only {} pieces arrived, too few to reach the cap: the test proves nothing",
+        held
+    );
+
+    // Data that joins pieces already there is still taken: [2, 5) touches
+    // the pieces at 1 and 5, so it grows nothing and fills a hole.
+    fake.send(&Message::Data(Data {
+        offset: 2,
+        timestamp: 1,
+        payload: b"yyy",
+    }))
+    .await;
+    // And so is the start of the file, which nothing precedes.
+    fake.send(&Message::Data(Data {
+        offset: 0,
+        timestamp: 1,
+        payload: b"z",
+    }))
+    .await;
+    let after = fake
+        .acked_bytes(Duration::from_millis(500))
+        .await
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        after,
+        held + 4,
+        "data that joins existing pieces was refused"
+    );
+    stop_receiver(r).await;
 }
 
 /// A HELLO that is never followed by data must not hold a session slot and an

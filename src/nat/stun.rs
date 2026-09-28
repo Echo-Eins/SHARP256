@@ -37,13 +37,10 @@ const CHANGE_PORT: u32 = 0x02;
 
 /// True for datagrams that look like STUN Binding responses.
 ///
-/// A transport packet begins with a random 64-bit connection id, so one
-/// could in principle land on a STUN-shaped prefix and be swallowed here.
-/// It needs the top sixteen bits to be one of three values and the next
-/// thirty-two to be the STUN cookie: about one session in 10^14, and the
-/// session would have to be dispatched by this receiver at the same time.
-/// Worth stating precisely rather than claiming, as this once did, that
-/// the two "can never be confused".
+/// A transport packet begins with a random 64-bit connection id, and no
+/// endpoint ever picks one whose second four bytes are the STUN cookie
+/// ([`crate::protocol::constants::is_usable_cid`]), so the two cannot be
+/// confused: every packet this says yes to really is STUN-shaped.
 pub fn is_stun_response(pkt: &[u8]) -> bool {
     if pkt.len() < STUN_HEADER_LEN {
         return false;
@@ -449,13 +446,14 @@ impl StunClient {
         responses: &mut mpsc::Receiver<Incoming>,
         want: usize,
     ) -> Vec<SocketAddr> {
-        let v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        let reach = crate::address::Reach::of(socket);
+        let family = (reach.v4() && reach.v6()).then_some(false);
         let mut out = Vec::new();
         for server in &self.servers {
             if out.len() >= want {
                 break;
             }
-            let Some(addr) = resolve_server(server, v6).await else {
+            let Some(addr) = resolve_server(server, reach, family).await else {
                 tracing::debug!("STUN: cannot resolve {}", server);
                 continue;
             };
@@ -478,21 +476,29 @@ impl StunClient {
 /// client as a small reflector aimed at an address of its choosing. There is
 /// no amplification to be had (we send a request and it draws no reply from
 /// the victim), but the packets should not be sent at all.
-pub fn is_usable_server_address(addr: SocketAddr, same_family_as: SocketAddr) -> bool {
-    if addr.is_ipv6() != same_family_as.is_ipv6() || addr.port() == 0 {
+pub fn is_usable_server_address(addr: SocketAddr, local: SocketAddr) -> bool {
+    // The socket has to be able to reach it at all: an IPv4 socket cannot
+    // send to IPv6, and an IPv6 socket bound to one address cannot send to
+    // IPv4 either.
+    if addr.port() == 0 || !crate::address::Reach::assume(local).reaches(addr) {
         return false;
     }
+    // Screen the address, not one spelling of it. On a dual-stack socket
+    // `::ffff:127.0.0.1` is loopback and `::ffff:224.0.0.1` multicast, and
+    // the IPv6 checks know nothing about either.
+    let addr = crate::address::canonical(addr);
     // Loopback is acceptable only when we are on loopback ourselves. A
     // stranger must never be able to point a socket with a public address
     // back into this host; a server that really is on this host, and the
     // simulated NAT the tests run against, still work.
-    let we_are_on_loopback = same_family_as.ip().is_loopback();
+    let we_are_on_loopback = crate::address::canonical(local).ip().is_loopback();
     match addr.ip() {
         std::net::IpAddr::V4(v4) => {
             if v4.is_loopback() {
                 return we_are_on_loopback;
             }
-            !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() || v4.is_link_local())
+            // 0.0.0.0/8 is "this network": nothing is addressed there.
+            !(v4.octets()[0] == 0 || v4.is_multicast() || v4.is_broadcast() || v4.is_link_local())
         }
         std::net::IpAddr::V6(v6) => {
             if v6.is_loopback() {
@@ -507,15 +513,31 @@ pub fn is_usable_server_address(addr: SocketAddr, same_family_as: SocketAddr) ->
     }
 }
 
-pub async fn resolve_server(server: &str, v6: bool) -> Option<SocketAddr> {
+/// Resolves a server name to an address `socket` can reach, written the way
+/// that socket sends to it and sees replies from it.
+///
+/// `family` picks which one a dual-stack socket should use: `Some(true)`
+/// for IPv6, `Some(false)` for IPv4, `None` for whichever comes first.
+pub async fn resolve_server(
+    server: &str,
+    reach: crate::address::Reach,
+    family: Option<bool>,
+) -> Option<SocketAddr> {
+    let fits = |a: &SocketAddr| {
+        let a = crate::address::canonical(*a);
+        family.is_none_or(|v6| a.is_ipv6() == v6) && reach.reaches(a)
+    };
     if let Ok(addr) = server.parse::<SocketAddr>() {
-        return (addr.is_ipv6() == v6).then_some(addr);
+        return fits(&addr).then(|| reach.native(addr)).flatten();
     }
-    let mut addrs = tokio::time::timeout(Duration::from_secs(2), lookup_host(server))
+    let addrs = tokio::time::timeout(Duration::from_secs(2), lookup_host(server))
         .await
         .ok()?
         .ok()?;
-    addrs.find(|a| a.is_ipv6() == v6)
+    addrs
+        .into_iter()
+        .find(|a| fits(a))
+        .and_then(|a| reach.native(a))
 }
 
 #[cfg(test)]
@@ -648,7 +670,8 @@ mod tests {
     }
 
     /// An address a stranger told us to send to is filtered: loopback,
-    /// multicast, link-local, port 0 and the wrong family are all refused.
+    /// multicast, link-local, port 0 and anything the socket cannot reach
+    /// are all refused, in whichever spelling they come.
     #[test]
     fn server_addresses_are_screened_before_we_send_there() {
         let v4: SocketAddr = "198.51.100.1:3478".parse().unwrap();
@@ -671,7 +694,7 @@ mod tests {
                 bad
             );
         }
-        // Family must match the socket we would send from.
+        // The socket we would send from has to be able to reach it.
         assert!(!is_usable_server_address(v6, v4));
         assert!(!is_usable_server_address(v4, v6));
         assert!(is_usable_server_address(
@@ -683,6 +706,43 @@ mod tests {
         assert!(!is_usable_server_address(
             "[fe80::1]:3479".parse().unwrap(),
             v6
+        ));
+
+        // "This network" is nobody's address.
+        assert!(!is_usable_server_address(
+            "0.1.2.3:3478".parse().unwrap(),
+            v4
+        ));
+
+        // A dual-stack socket sees IPv4 in its mapped spelling, and the
+        // screen must see through it: loopback, multicast and broadcast in
+        // disguise are what they are.
+        let dual: SocketAddr = "[::]:5555".parse().unwrap();
+        for bad in [
+            "[::ffff:127.0.0.1]:3478",
+            "[::ffff:224.0.0.1]:3478",
+            "[::ffff:255.255.255.255]:3478",
+            "[::ffff:169.254.1.1]:3478",
+            "[::ffff:0.0.0.0]:3478",
+        ] {
+            assert!(
+                !is_usable_server_address(bad.parse().unwrap(), dual),
+                "{} accepted",
+                bad
+            );
+        }
+        assert!(is_usable_server_address(
+            "[::ffff:198.51.100.2]:3479".parse().unwrap(),
+            dual
+        ));
+        assert!(is_usable_server_address(
+            "198.51.100.2:3479".parse().unwrap(),
+            dual
+        ));
+        // And an IPv4 socket told about a mapped address can reach it.
+        assert!(is_usable_server_address(
+            "[::ffff:198.51.100.2]:3479".parse().unwrap(),
+            v4
         ));
 
         // From loopback, loopback is fine: a server on this host, and the

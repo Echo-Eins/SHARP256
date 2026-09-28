@@ -1,7 +1,105 @@
 //! Receiver addresses as users write them: `<SHARP ID>@<host>:<port>`.
 
 use crate::crypto::SharpId;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+
+/// `addr` in the one form code that compares or screens addresses should
+/// see. An IPv4 peer that reaches a dual-stack IPv6 socket appears as
+/// `::ffff:a.b.c.d`; it is the same peer as `a.b.c.d`, and a check that
+/// only knew about one spelling would let the other straight through.
+pub fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// Which addresses a socket can send to, and how it writes them.
+///
+/// An IPv4 socket reaches only IPv4. An IPv6 socket bound to the wildcard
+/// with dual-stack allowed (which [`crate::transport::socket::bind_udp`]
+/// asks for) reaches both, but addresses IPv4 peers in their mapped form —
+/// and receives from them in that form, so everything compared against
+/// what arrives must be written the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reach {
+    v4: bool,
+    v6: bool,
+    /// IPv4 addresses are written mapped into IPv6.
+    mapped: bool,
+}
+
+impl Reach {
+    /// What a socket bound at `local` reaches, assuming a wildcard IPv6
+    /// socket was allowed to be dual-stack. If it was not, sending to a
+    /// mapped address simply fails, which every caller already survives.
+    pub fn assume(local: SocketAddr) -> Self {
+        Self::with(local, true)
+    }
+
+    /// What `socket` reaches, asking the system whether it is dual-stack.
+    pub fn of(socket: &tokio::net::UdpSocket) -> Self {
+        let Ok(local) = socket.local_addr() else {
+            return Self {
+                v4: false,
+                v6: false,
+                mapped: false,
+            };
+        };
+        let dual = local.is_ipv6()
+            && socket2::SockRef::from(socket)
+                .only_v6()
+                .is_ok_and(|only| !only);
+        Self::with(local, dual)
+    }
+
+    fn with(local: SocketAddr, dual: bool) -> Self {
+        match local.ip() {
+            IpAddr::V4(_) => Self {
+                v4: true,
+                v6: false,
+                mapped: false,
+            },
+            IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => Self {
+                v4: true,
+                v6: false,
+                mapped: true,
+            },
+            IpAddr::V6(ip) => Self {
+                v4: dual && ip.is_unspecified(),
+                v6: true,
+                mapped: true,
+            },
+        }
+    }
+
+    /// `addr` as this socket sends to it and sees replies from it, or
+    /// `None` if it cannot reach it at all.
+    pub fn native(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        let addr = canonical(addr);
+        match addr.ip() {
+            IpAddr::V4(v4) if self.v4 => Some(if self.mapped {
+                SocketAddr::new(v4.to_ipv6_mapped().into(), addr.port())
+            } else {
+                addr
+            }),
+            IpAddr::V6(_) if self.v6 => Some(addr),
+            _ => None,
+        }
+    }
+
+    /// Whether this socket can reach `addr` at all.
+    pub fn reaches(&self, addr: SocketAddr) -> bool {
+        self.native(addr).is_some()
+    }
+
+    /// Whether it can reach IPv4 addresses.
+    pub fn v4(&self) -> bool {
+        self.v4
+    }
+
+    /// Whether it can reach IPv6 addresses.
+    pub fn v6(&self) -> bool {
+        self.v6
+    }
+}
 
 /// Splits `sh-…@host:port` into the receiver's identity and its address.
 ///
@@ -122,6 +220,51 @@ pub async fn resolve_all(host_port: &str) -> std::io::Result<Vec<SocketAddr>> {
 mod tests {
     use super::*;
     use crate::crypto::Identity;
+
+    /// A dual-stack socket sees IPv4 peers as mapped IPv6 addresses. Code
+    /// comparing those with addresses written the ordinary way — a relay
+    /// from the command line, a candidate from DNS — must see them as one.
+    #[test]
+    fn every_socket_family_writes_addresses_its_own_way() {
+        let v4: SocketAddr = "198.51.100.7:5555".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:198.51.100.7]:5555".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::7]:5555".parse().unwrap();
+        assert_eq!(canonical(mapped), v4);
+        assert_eq!(canonical(v4), v4);
+        assert_eq!(canonical(v6), v6);
+
+        let ipv4 = Reach::assume("0.0.0.0:0".parse().unwrap());
+        assert_eq!(ipv4.native(v4), Some(v4));
+        assert_eq!(ipv4.native(mapped), Some(v4));
+        assert_eq!(ipv4.native(v6), None);
+
+        let dual = Reach::assume("[::]:0".parse().unwrap());
+        assert_eq!(dual.native(v4), Some(mapped));
+        assert_eq!(dual.native(mapped), Some(mapped));
+        assert_eq!(dual.native(v6), Some(v6));
+
+        // Bound to one IPv6 address, a socket cannot speak IPv4 at all.
+        let only6 = Reach::assume("[2001:db8::1]:0".parse().unwrap());
+        assert_eq!(only6.native(v4), None);
+        assert_eq!(only6.native(v6), Some(v6));
+        // Bound to a mapped address, it speaks nothing but IPv4.
+        let only4 = Reach::assume("[::ffff:198.51.100.1]:0".parse().unwrap());
+        assert_eq!(only4.native(v4), Some(mapped));
+        assert_eq!(only4.native(v6), None);
+    }
+
+    #[tokio::test]
+    async fn a_socket_reports_what_it_can_reach() {
+        let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reach = Reach::of(&v4);
+        assert!(reach.reaches("127.0.0.1:9".parse().unwrap()));
+        assert!(!reach.reaches("[::1]:9".parse().unwrap()));
+        // An IPv6 socket, where this host has IPv6 at all.
+        if let Ok(v6) = crate::transport::socket::bind_udp("[::]:0".parse().unwrap(), 1 << 16) {
+            let reach = Reach::of(&v6);
+            assert!(reach.reaches("[::1]:9".parse().unwrap()));
+        }
+    }
 
     #[test]
     fn parses_id_and_address() {

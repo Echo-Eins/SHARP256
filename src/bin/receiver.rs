@@ -220,6 +220,20 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
                 println!("From outside, senders use: {}@{}", id, addr);
             }
         }
+        TransferEvent::RelayRegistered { relay, private, .. } => {
+            // The relay, not where it sees us: that is our mapping towards
+            // it, and nobody else would arrive at it.
+            println!(
+                "Relay:       registered with {}{}; senders can add --relay {}",
+                relay,
+                if private {
+                    " (it will not tell senders where we are)"
+                } else {
+                    ""
+                },
+                relay
+            );
+        }
         TransferEvent::Stalled { since, .. } => {
             println!(
                 "No packets from sender for {:?}; keeping state for resume",

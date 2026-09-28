@@ -127,6 +127,18 @@ pub enum TransferEvent {
         address: Option<String>,
         summary: String,
     },
+    /// Receiver side: a relay has taken this receiver's registration, so
+    /// senders that cannot reach it directly can name that relay.
+    RelayRegistered {
+        /// The relay, as configured.
+        relay: String,
+        /// Where the relay sees this receiver. Not an address to publish:
+        /// it is the mapping towards the relay, and under the NAT a relay
+        /// exists for, nobody else would arrive at it.
+        observed: String,
+        /// The relay was asked not to tell senders where we are.
+        private: bool,
+    },
 }
 
 pub type EventCallback = Arc<dyn Fn(TransferEvent) + Send + Sync>;

@@ -95,9 +95,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 fn random_cid() -> u64 {
     loop {
         let c = rand::rngs::OsRng.next_u64();
-        // Zero means "none", and one value is reserved so that a relay can
-        // tell traffic from its own control messages.
-        if c != 0 && c != crate::protocol::constants::RESERVED_CID {
+        // Some values mean something else on the wire; see there.
+        if crate::protocol::constants::is_usable_cid(c) {
             return c;
         }
     }
@@ -155,6 +154,12 @@ impl Initiator {
         receiver: &SharpId,
         psk: &[u8; 32],
     ) -> Result<Self, CryptoError> {
+        // Every exchange with such a key comes out the same whatever the
+        // secrets, so the handshake would authenticate nobody. Parsing an ID
+        // already refuses one; this is for callers that built it by hand.
+        if receiver.is_low_order() {
+            return Err(CryptoError::Handshake("receiver key is not usable".into()));
+        }
         let state = snow::Builder::new(params())
             .local_private_key(identity.secret())
             .remote_public_key(receiver.as_bytes())
@@ -314,6 +319,12 @@ impl Responder {
             .and_then(|s| <[u8; KEY_LEN]>::try_from(s).ok())
             .map(SharpId::from_public)
             .ok_or(CryptoError::Malformed)?;
+        // A static key with no private half. Anyone could present it, so it
+        // identifies nobody — and a sender limit keyed on identities would
+        // count everyone presenting it as one stranger.
+        if sender.is_low_order() {
+            return Err(CryptoError::Malformed);
+        }
         Ok(Incoming {
             state,
             sender_cid,
@@ -596,6 +607,18 @@ mod tests {
         for len in 0..400usize {
             let junk: Vec<u8> = (0..len).map(|i| (i * 131 + 7) as u8).collect();
             assert!(!responder.is_initiation(&junk));
+        }
+    }
+
+    /// A receiver "key" with no private half would make every exchange in
+    /// the handshake come out the same whatever the secrets, so the
+    /// handshake would authenticate nobody. It is refused before one starts.
+    #[test]
+    fn a_low_order_receiver_key_is_refused() {
+        let s = Identity::generate();
+        for point in crate::crypto::identity::tests::low_order_points() {
+            let id = SharpId::from_public(point);
+            assert!(Initiator::new(&s, &id, &PSK).is_err());
         }
     }
 

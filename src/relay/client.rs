@@ -133,7 +133,12 @@ pub async fn serve(
     // A secret only this receiver and this relay can work out, from their
     // long-term keys and nothing else. It is what turns "I am sh-…" into
     // something the relay can check.
-    let key = super::auth_key(&identity, &relay_id, &id, &relay_id);
+    let Some(key) = super::auth_key(&identity, &relay_id, &id, &relay_id) else {
+        // Parsing an ID refuses these, so only a caller that built one by
+        // hand gets here; there is no relay to prove anything to.
+        tracing::warn!("relay {}: its identity is not a usable key", relay);
+        return;
+    };
     let flags = if private { super::REGISTER_PRIVATE } else { 0 };
     let mut token = [0u8; TOKEN_LEN];
     let mut registered = false;

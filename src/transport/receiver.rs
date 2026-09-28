@@ -96,6 +96,14 @@ const EARLY_MAX_BYTES: u64 = 16 << 20;
 const EARLY_MAX_ITEMS: usize = 16_384;
 /// How long an unanswered address challenge waits before it is repeated.
 const PATH_RETRY: Duration = Duration::from_millis(250);
+/// Separate pieces of a file one session may hold. Each costs an entry to
+/// keep, to persist for resume and to walk when describing holes, and a
+/// sender that scattered one-byte pieces across a large file could
+/// otherwise make as many as it liked. An honest transfer stays far below
+/// this — its pieces are the holes loss left inside one window — and at
+/// the cap only data that joins what is already here is taken, which the
+/// lowest hole always does, so it slows and never stops.
+const MAX_RECEIVED_RANGES: usize = 1 << 16;
 
 /// A transfer is identified by who sends it and its transfer id.
 type TransferKey = (SharpId, [u8; 16]);
@@ -253,7 +261,7 @@ impl Receiver {
         // introduced to it, and carried if the introduction is not enough.
         // Their control messages arrive on this same socket.
         #[cfg(feature = "nat-traversal")]
-        let relays = spawn_relay_clients(&shared).await;
+        let relays = spawn_relay_clients(&shared);
 
         let socket = shared.socket.clone();
         let cancel = shared.cancel.clone();
@@ -288,29 +296,8 @@ impl Receiver {
                         let now = Instant::now();
                         for (buf, r) in bufs.iter_mut().zip(&got[..n]) {
                             #[cfg(feature = "nat-traversal")]
-                            if let Some(nat) = &nat {
-                                let pkt = &buf[..r.len];
-                                // STUN travels on the transfer socket, so
-                                // discovery never competes for datagrams.
-                                // The hairpinning test looks for our own
-                                // request coming back, hence requests too.
-                                if r.stride >= r.len && crate::nat::stun::is_stun_message(pkt) {
-                                    let _ = nat.stun_responses.try_send((pkt.to_vec(), r.from));
-                                    continue;
-                                }
-                            }
-                            #[cfg(feature = "nat-traversal")]
-                            if !relays.is_empty() && r.stride >= r.len {
-                                let pkt = &buf[..r.len];
-                                if crate::relay::is_control(pkt) {
-                                    for c in &relays {
-                                        if c.addr == r.from {
-                                            let _ = c.tx.try_send((pkt.to_vec(), r.from));
-                                            break;
-                                        }
-                                    }
-                                    continue;
-                                }
+                            if side_channel(nat.as_ref(), &relays, &buf[..r.len], r.from, r.stride) {
+                                continue;
                             }
                             d.on_received(buf, *r, now);
                         }
@@ -326,11 +313,21 @@ impl Receiver {
                     for h in handles {
                         let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
                     }
-                    // The NAT task observes the same token and removes its
-                    // UPnP port forward.
+                    // The NAT task observes the same token and gives its
+                    // port forward back, and each relay task says goodbye
+                    // so the relay stops sending people to an address
+                    // nothing answers at. Both at once, and not for long.
                     #[cfg(feature = "nat-traversal")]
-                    if let Some(nat) = nat {
-                        let _ = tokio::time::timeout(Duration::from_secs(5), nat.task).await;
+                    {
+                        let mut tasks = relays.tasks;
+                        if let Some(nat) = nat {
+                            tasks.push(nat.task);
+                        }
+                        // They run on their own; one deadline covers all.
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        for t in tasks {
+                            let _ = tokio::time::timeout_at(deadline, t).await;
+                        }
                     }
                     return Ok(());
                 }
@@ -647,9 +644,8 @@ impl Dispatcher {
     fn new_cid(&self) -> u64 {
         loop {
             let c = rand::rngs::OsRng.next_u64();
-            // Zero means "none", and one value is reserved so that a relay
-            // can tell traffic from its own control messages.
-            if c != 0 && c != RESERVED_CID && !self.by_cid.contains_key(&c) {
+            // Some values mean something else on the wire; see there.
+            if is_usable_cid(c) && !self.by_cid.contains_key(&c) {
                 return c;
             }
         }
@@ -687,10 +683,33 @@ struct RelayClient {
     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
 }
 
+/// The relays this receiver registers with.
+#[cfg(feature = "nat-traversal")]
+struct RelayClients {
+    /// Filled in as each relay's name resolves, so a slow or dead name
+    /// server holds up nothing: transfers are served from the start.
+    list: Arc<parking_lot::RwLock<Vec<RelayClient>>>,
+    /// One task per relay; each says goodbye to its relay when cancelled,
+    /// which is worth waiting a moment for on the way out.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// How long one attempt at resolving a relay's name may take, and the most
+/// the retries back off to. A name that does not resolve at start-up — the
+/// network not up yet, say — is tried again, since the relay may be the
+/// only way anyone can reach us.
+#[cfg(feature = "nat-traversal")]
+const RELAY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "nat-traversal")]
+const RELAY_RESOLVE_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
 /// Registers this receiver with every configured relay, in the background.
 #[cfg(feature = "nat-traversal")]
-async fn spawn_relay_clients(shared: &Arc<Shared>) -> Vec<RelayClient> {
-    let mut out = Vec::new();
+fn spawn_relay_clients(shared: &Arc<Shared>) -> RelayClients {
+    let list: Arc<parking_lot::RwLock<Vec<RelayClient>>> =
+        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let reach = crate::address::Reach::of(&shared.socket.udp());
+    let mut tasks = Vec::new();
     for name in &shared.cfg.relays {
         // Registering means proving we own our identity against the relay's
         // public key, so a receiver has to be told which relay it is talking
@@ -711,20 +730,18 @@ async fn spawn_relay_clients(shared: &Arc<Shared>) -> Vec<RelayClient> {
                 continue;
             }
         };
-        let addr = match crate::address::resolve(&host).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!("relay \"{}\": cannot resolve {}: {}", name, host, e);
-                continue;
-            }
-        };
-        let (tx, rx) = mpsc::channel(32);
         let socket = shared.socket.udp();
         let identity = shared.identity.clone();
         let private = shared.cfg.relay_private;
         let cancel = shared.cancel.clone();
         let events = shared.cfg.events.clone();
-        tokio::spawn(async move {
+        let list = list.clone();
+        tasks.push(tokio::spawn(async move {
+            let Some(addr) = resolve_relay(&host, reach, &cancel).await else {
+                return;
+            };
+            let (tx, rx) = mpsc::channel(32);
+            list.write().push(RelayClient { addr, tx });
             crate::relay::client::serve(
                 socket,
                 addr,
@@ -746,26 +763,108 @@ async fn spawn_relay_clients(shared: &Arc<Shared>) -> Vec<RelayClient> {
                          through it with --relay {}",
                         addr,
                         observed,
-                        addr
+                        host
                     );
                     emit(
                         &events,
-                        TransferEvent::Reachability {
-                            advertised: None,
-                            address: None,
-                            summary: format!(
-                                "registered with the relay at {}; senders can use --relay {}",
-                                addr, addr
-                            ),
+                        TransferEvent::RelayRegistered {
+                            relay: host.clone(),
+                            observed: observed.to_string(),
+                            private,
                         },
                     );
                 },
             )
             .await;
-        });
-        out.push(RelayClient { addr, tx });
+        }));
     }
-    out
+    RelayClients { list, tasks }
+}
+
+/// Resolves a relay's name to the first address this socket can reach,
+/// trying again with growing pauses until it does or the receiver stops.
+#[cfg(feature = "nat-traversal")]
+async fn resolve_relay(
+    host: &str,
+    reach: crate::address::Reach,
+    cancel: &CancellationToken,
+) -> Option<SocketAddr> {
+    let mut wait = Duration::from_secs(2);
+    let mut told = false;
+    loop {
+        let attempt = tokio::select! {
+            r = tokio::time::timeout(RELAY_RESOLVE_TIMEOUT, crate::address::resolve_all(host)) => r,
+            _ = cancel.cancelled() => return None,
+        };
+        let why = match attempt {
+            Ok(Ok(all)) => match all.iter().find_map(|a| reach.native(*a)) {
+                Some(a) => return Some(a),
+                None => format!(
+                    "none of its addresses ({:?}) can be reached from this socket",
+                    all
+                ),
+            },
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "the name did not resolve in time".to_string(),
+        };
+        if told {
+            tracing::debug!("relay {}: {}; trying again in {:?}", host, why, wait);
+        } else {
+            tracing::warn!("relay {}: {}; trying again in {:?}", host, why, wait);
+            told = true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = cancel.cancelled() => return None,
+        }
+        wait = (wait * 2).min(RELAY_RESOLVE_BACKOFF_MAX);
+    }
+}
+
+/// Hands a run of datagrams that belongs to NAT discovery or to a relay
+/// over to it, and says whether it did.
+///
+/// The kernel may have coalesced several datagrams from one sender into the
+/// run (they are `stride` bytes apart), so each is looked at on its own:
+/// passing only whole single datagrams, as this once did, lost every
+/// message that happened to arrive in a batch.
+#[cfg(feature = "nat-traversal")]
+fn side_channel(
+    nat: Option<&crate::nat::NatTask>,
+    relays: &RelayClients,
+    run: &[u8],
+    from: SocketAddr,
+    stride: usize,
+) -> bool {
+    let stride = stride.max(1);
+    let first = &run[..stride.min(run.len())];
+    // STUN travels on the transfer socket, so discovery never competes for
+    // datagrams. The hairpinning test looks for our own request coming
+    // back, hence requests too.
+    if let Some(nat) = nat {
+        if crate::nat::stun::is_stun_message(first) {
+            for d in run.chunks(stride) {
+                if crate::nat::stun::is_stun_message(d) {
+                    let _ = nat.stun_responses.try_send((d.to_vec(), from));
+                }
+            }
+            return true;
+        }
+    }
+    // A relay's control messages. They can never be traffic: the
+    // connection id they would parse as is one no endpoint ever picks.
+    if crate::relay::is_control(first) {
+        let list = relays.list.read();
+        if let Some(c) = list.iter().find(|c| c.addr == from) {
+            for d in run.chunks(stride) {
+                if crate::relay::is_control(d) {
+                    let _ = c.tx.try_send((d.to_vec(), from));
+                }
+            }
+        }
+        return true;
+    }
+    false
 }
 
 fn rejection(echo_ts: u32, reason: u8, message: &str) -> HelloAck {
@@ -1089,6 +1188,9 @@ struct Session {
     last_progress_bytes: u64,
     retransmitted_bytes: u64,
     writer_full_drops: u64,
+    /// DATA refused because it would have split the file into more pieces
+    /// than [`MAX_RECEIVED_RANGES`].
+    fragment_drops: u64,
     /// Whether this session stored any new data (idle sessions expire early).
     got_data: bool,
     phase: Phase,
@@ -1145,6 +1247,7 @@ impl Session {
             last_progress_bytes: 0,
             retransmitted_bytes: 0,
             writer_full_drops: 0,
+            fragment_drops: 0,
             got_data: false,
             phase: Phase::Receiving,
         }
@@ -2181,6 +2284,16 @@ impl Session {
                 return Ok(());
             }
         };
+        // Past the cap, only data that extends or joins what is here. The
+        // start of the file counts as something to join, or a transfer
+        // whose first bytes were lost could never get them back.
+        if self.received.len() >= MAX_RECEIVED_RANGES
+            && offset > 0
+            && self.received.would_add_range(offset, end)
+        {
+            self.fragment_drops += 1;
+            return Ok(());
+        }
         let prev_highest = self.highest;
         // The manifest of a directory is collected in memory; the rest of
         // the payload (if any) is file data.
@@ -2677,6 +2790,13 @@ impl Session {
                 "transfer {}: {} packets dropped because the writer was saturated",
                 self.tid_hex(),
                 self.writer_full_drops
+            );
+        }
+        if self.fragment_drops > 0 {
+            tracing::info!(
+                "transfer {}: {} packets refused for splitting the file into too many pieces",
+                self.tid_hex(),
+                self.fragment_drops
             );
         }
         if let Some(writer) = self.writer.take() {
