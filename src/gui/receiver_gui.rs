@@ -41,6 +41,8 @@ struct Shared {
     pending: Vec<PendingRequest>,
     listen: String,
     receiver_id: String,
+    /// How a sender is told to reach us.
+    contact: String,
     reachability: Option<String>,
     /// Relays that have taken our registration, as senders should name them.
     relays: Vec<String>,
@@ -61,6 +63,11 @@ impl ReceiverApp {
                 .identity
                 .as_ref()
                 .map(|i| i.id().to_string())
+                .unwrap_or_default(),
+            contact: cfg
+                .identity
+                .as_ref()
+                .map(|i| cfg.contact_hint(&i.id()))
                 .unwrap_or_default(),
             ..Default::default()
         }));
@@ -277,11 +284,7 @@ impl eframe::App for ReceiverApp {
                     }
                 });
                 ui.label(format!("Listening on {}", sh.listen));
-                ui.label(format!(
-                    "Senders use: {}@<this host>:{}",
-                    sh.receiver_id,
-                    sh.listen.rsplit(':').next().unwrap_or("")
-                ));
+                ui.label(format!("Senders use: {}", sh.contact));
                 ui.label(format!("Output directory: {}", self.output_dir));
                 if let Some(r) = &sh.reachability {
                     ui.label(format!("Network: {}", r));
@@ -379,6 +382,7 @@ struct View {
     history: VecDeque<Finished>,
     listen: String,
     receiver_id: String,
+    contact: String,
     reachability: Option<String>,
     relays: Vec<String>,
     error: Option<String>,
@@ -391,6 +395,7 @@ impl Shared {
             history: self.history.clone(),
             listen: self.listen.clone(),
             receiver_id: self.receiver_id.clone(),
+            contact: self.contact.clone(),
             reachability: self.reachability.clone(),
             relays: self.relays.clone(),
             error: self.error.clone(),

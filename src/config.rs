@@ -267,6 +267,34 @@ impl std::fmt::Debug for ReceiverConfig {
 }
 
 impl ReceiverConfig {
+    /// Whether this receiver is to be reached only through its relays: it
+    /// asked them to keep its address to themselves, so it publishes none
+    /// of its own either — no NAT discovery, no port forward, no direct
+    /// candidates — or the relay would be hiding what the receiver itself
+    /// hands out.
+    pub fn relay_only(&self) -> bool {
+        self.relay_private && !self.relays.is_empty()
+    }
+
+    /// How a sender should be told to reach this receiver, before anything
+    /// has been discovered about the network.
+    pub fn contact_hint(&self, id: &crate::crypto::SharpId) -> String {
+        if self.relay_only() {
+            let relays: Vec<String> = self
+                .relays
+                .iter()
+                .map(|r| {
+                    // Senders need only the address part.
+                    let host = r.rsplit_once('@').map_or(r.as_str(), |(_, h)| h);
+                    format!("--relay {}", host)
+                })
+                .collect();
+            format!("{} {}", id, relays.join(" "))
+        } else {
+            format!("{}@<this host>:{}", id, self.bind.port())
+        }
+    }
+
     pub fn new(bind: SocketAddr, output_dir: PathBuf) -> Self {
         Self {
             bind,

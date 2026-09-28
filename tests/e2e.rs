@@ -146,6 +146,16 @@ async fn wait_completed(
     }
 }
 
+/// Resume state files in `state`. The sender also keeps its newest
+/// handshake timestamp there, which is not resume state and outlives every
+/// transfer by design.
+fn resume_files(state: &Path) -> usize {
+    std::fs::read_dir(state)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name() != "initiation.stamp")
+        .count()
+}
+
 fn assert_same(a: &Path, b: &Path) {
     let da = std::fs::read(a).unwrap();
     let db = std::fs::read(b).unwrap();
@@ -358,7 +368,7 @@ async fn transfers_of_many_sizes_are_byte_exact() {
         }
     }
     // Nothing left in the state directory.
-    let leftover = std::fs::read_dir(&state).unwrap().count();
+    let leftover = resume_files(&state);
     assert_eq!(leftover, 0, "state files must be removed after success");
     stop_receiver(r).await;
 }
@@ -491,10 +501,7 @@ async fn resumes_after_receiver_restart_during_outage() {
     // The partial file and its state must exist.
     let part = out.join("resume.bin.sharp-part");
     assert!(part.exists(), "partial file kept for resume");
-    assert!(
-        std::fs::read_dir(&state).unwrap().count() >= 1,
-        "state persisted"
-    );
+    assert!(resume_files(&state) >= 1, "state persisted");
 
     // Keep the outage a bit longer than the sender's stall timeout, then
     // bring up a new receiver on a new port and reconnect the proxy.
@@ -542,7 +549,7 @@ async fn resumes_after_receiver_restart_during_outage() {
         size
     );
     assert!(!part.exists());
-    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    assert_eq!(resume_files(&state), 0);
     stop_receiver(r2).await;
 }
 
@@ -1023,7 +1030,7 @@ impl FakeSender {
         use sharp256::crypto::{SessionKeys, Suite};
         use sharp256::protocol::wire;
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (init, pkt) = fake_initiation_with(r.id, hello);
+        let (mut init, pkt) = fake_initiation_with(r.id, hello);
         sock.send_to(&pkt, r.addr).await.unwrap();
         let mut buf = vec![0u8; 2048];
         let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
@@ -1210,11 +1217,7 @@ async fn idle_session_after_handshake_is_dropped() {
     assert!(error.contains("no data"), "{}", error);
     assert!(!resumable);
     assert!(!part.exists(), "empty partial file removed");
-    assert_eq!(
-        std::fs::read_dir(&state).unwrap().count(),
-        0,
-        "no state left"
-    );
+    assert_eq!(resume_files(&state), 0, "no state left");
     stop_receiver(r).await;
 }
 
@@ -1240,7 +1243,7 @@ async fn abort_before_data_releases_the_session_at_once() {
     assert!(error.contains("changed my mind"), "{}", error);
     assert!(!resumable);
     assert!(!part.exists(), "empty partial file removed");
-    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    assert_eq!(resume_files(&state), 0);
     stop_receiver(r).await;
 }
 
@@ -1708,7 +1711,7 @@ async fn directory_tree_arrives_intact() {
         b"mine"
     );
     assert!(partial_leftovers(&out).is_empty());
-    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    assert_eq!(resume_files(&state), 0);
     stop_receiver(r).await;
 }
 
@@ -1810,7 +1813,7 @@ async fn directory_resumes_after_receiver_restart() {
     assert_eq!(Path::new(&path), out.join("photos"));
     assert_same_tree(&root, Path::new(&path));
     assert!(partial_leftovers(&out).is_empty());
-    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    assert_eq!(resume_files(&state), 0);
     stop_receiver(r2).await;
 }
 
@@ -2573,6 +2576,170 @@ async fn a_lost_introduction_is_repeated() {
     );
 
     mapping_task.abort();
+    cancel.cancel();
+    relay_task.abort();
+    stop_receiver(r).await;
+}
+
+/// With one address to try, the handshake used to keep re-sending every
+/// quarter of a second for ever: a single address never counted as tried,
+/// so it never backed off. On a path slower than that — intercontinental,
+/// satellite, a loaded mobile link — every answer arrived after a newer
+/// attempt had replaced the one it answered, only the newest may be
+/// adopted, and the handshake timed out every time. Retries now wait at
+/// least as long as an answer has shown the round trip to take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_slower_than_the_retry_interval_still_completes_the_handshake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let file = make_file(&src, "far-away.bin", 64 << 10, 0x51_0E);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            reverse_delay: Duration::from_millis(400),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let cfg = sender_cfg(&file, proxy.addr, r.id, &state);
+    let summary = tokio::time::timeout(Duration::from_secs(40), run_sender(cfg))
+        .await
+        .expect("the transfer finishes")
+        .expect("the handshake completes over a slow path");
+    assert_eq!(summary.file_size, 64 << 10);
+    wait_completed(&mut r.events, Duration::from_secs(10)).await;
+    assert_same(&file, &out.join("far-away.bin"));
+    stop_receiver(r).await;
+}
+
+/// The connection id a handshake answer is addressed to travels in the
+/// clear, so anyone who sees an initiation can send something to it. The
+/// sender used to use its attempt up on whatever arrived first, so one junk
+/// datagram per attempt — no dropping, no keys, just being on the path —
+/// stopped the handshake for good. Now only an authentic answer counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn junk_addressed_to_a_handshake_attempt_does_not_stop_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let file = make_file(&src, "junk.bin", 64 << 10, 0x7A_4C);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+
+    // A forwarder that, for every datagram from the sender, first sends the
+    // sender a datagram of rubbish addressed to the same connection id —
+    // which, for an initiation, is the attempt's own.
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let front_addr = front.local_addr().unwrap();
+    let target = r.addr;
+    let injected = Arc::new(AtomicU64::new(0));
+    let count = injected.clone();
+    let task = tokio::spawn(async move {
+        let mut client = None;
+        let mut up = vec![0u8; 65536];
+        let mut down = vec![0u8; 65536];
+        let mut rng = Rng(0x7A_4C);
+        loop {
+            tokio::select! {
+                r = front.recv_from(&mut up) => {
+                    let Ok((n, from)) = r else { continue };
+                    client = Some(from);
+                    if n >= 8 {
+                        let mut junk = up[..8].to_vec();
+                        junk.extend((0..142).map(|_| rng.next() as u8));
+                        let _ = front.send_to(&junk, from).await;
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = back.send_to(&up[..n], target).await;
+                }
+                r = back.recv_from(&mut down) => {
+                    let Ok((n, _)) = r else { continue };
+                    if let Some(c) = client {
+                        let _ = front.send_to(&down[..n], c).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let cfg = sender_cfg(&file, front_addr, r.id, &state);
+    let summary = tokio::time::timeout(Duration::from_secs(30), run_sender(cfg))
+        .await
+        .expect("the transfer finishes")
+        .expect("junk does not stop the handshake");
+    assert_eq!(summary.file_size, 64 << 10);
+    wait_completed(&mut r.events, Duration::from_secs(10)).await;
+    assert_same(&file, &out.join("junk.bin"));
+    assert!(injected.load(Ordering::Relaxed) > 0, "nothing was injected");
+    task.abort();
+    stop_receiver(r).await;
+}
+
+/// A receiver that asked its relay to keep its address to itself publishes
+/// none either, and is written as its ID alone: the sender is given no
+/// address at all, only the relay, and the transfer goes through it.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_can_be_reached_by_its_id_and_a_relay_alone() {
+    use sharp256::relay::server::{Config, Relay};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 256 << 10;
+    let file = make_file(&src, "hidden.bin", size, 0x41DE);
+
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_id = relay.id();
+    let relay_task = tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![format!("{}@{}", relay_id, relay_addr)];
+        cfg.relay_private = true;
+    })
+    .await;
+    // Registered, and said so.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            r.events.recv(),
+        )
+        .await
+        {
+            Ok(Some(TransferEvent::RelayRegistered { private, .. })) => {
+                assert!(private);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            _ => panic!("the receiver never registered with the relay"),
+        }
+    }
+
+    // The address the sender is given: the ID, and nothing after it.
+    let (id, hosts) = sharp256::address::parse_peer(&r.id.to_string()).unwrap();
+    assert!(hosts.is_empty());
+    let mut scfg = sender_cfg(&file, "0.0.0.0:0".parse().unwrap(), id, &state);
+    scfg.relays = vec![relay_addr.to_string()];
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(scfg))
+        .await
+        .expect("the transfer finishes in time")
+        .expect("the transfer completes through the relay");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(10)).await;
+    assert_same(&file, &out.join("hidden.bin"));
+
     cancel.cancel();
     relay_task.abort();
     stop_receiver(r).await;

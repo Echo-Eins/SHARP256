@@ -142,7 +142,10 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
     println!("Output:      {}", cfg.output_dir.canonicalize()?.display());
     println!("Listening:   {}", cfg.bind);
     println!("Receiver ID: {}", id);
-    println!("Senders use: {}@<this host>:{}", id, cfg.bind.port());
+    if cfg.relay_private && cfg.relays.is_empty() {
+        println!("Warning:     --relay-private does nothing without --relay");
+    }
+    println!("Senders use: {}", cfg.contact_hint(&id));
     match &cfg.allowed_senders {
         Some(list) => println!("Accepting:   {} allowed sender(s) only", list.len()),
         None => {

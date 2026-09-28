@@ -233,8 +233,17 @@ impl Receiver {
 
         // NAT discovery runs in the background; its STUN responses arrive on
         // this socket and are handed over below.
+        // Not for a receiver that is to be reached only through its relays:
+        // discovery would ask the router to open a port and publish the
+        // very addresses the relays were asked to keep to themselves.
         #[cfg(feature = "nat-traversal")]
-        let nat = if shared.cfg.nat_traversal {
+        if shared.cfg.relay_only() {
+            tracing::info!(
+                "reachable only through the relays: not discovering or publishing direct addresses"
+            );
+        }
+        #[cfg(feature = "nat-traversal")]
+        let nat = if shared.cfg.nat_traversal && !shared.cfg.relay_only() {
             let events = shared.cfg.events.clone();
             let id = shared.identity.id();
             crate::nat::spawn_receiver_discovery(
@@ -843,6 +852,11 @@ fn side_channel(
     // back, hence requests too.
     if let Some(nat) = nat {
         if crate::nat::stun::is_stun_message(first) {
+            // Discovery is over once its task has let go of the channel;
+            // copying the datagram only to have the send fail is waste.
+            if nat.stun_responses.is_closed() {
+                return true;
+            }
             for d in run.chunks(stride) {
                 if crate::nat::stun::is_stun_message(d) {
                     let _ = nat.stun_responses.try_send((d.to_vec(), from));

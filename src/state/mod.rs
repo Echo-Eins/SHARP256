@@ -127,6 +127,26 @@ impl StateStore {
         self.dir.join(format!("send-{}.json", key))
     }
 
+    fn stamp_path(&self) -> PathBuf {
+        self.dir.join("initiation.stamp")
+    }
+
+    /// The newest handshake timestamp a previous run used (see
+    /// `crypto::handshake::raise_initiation_timestamp_floor`); 0 if none.
+    pub fn load_stamp(&self) -> u64 {
+        fs::read_to_string(self.stamp_path())
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn save_stamp(&self, stamp: u64) -> io::Result<()> {
+        let path = self.stamp_path();
+        let tmp = path.with_extension("stamp.tmp");
+        fs::write(&tmp, stamp.to_string())?;
+        fs::rename(&tmp, path)
+    }
+
     fn write_atomic(path: &Path, json: &str) -> io::Result<()> {
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, json)?;

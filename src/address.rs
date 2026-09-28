@@ -109,11 +109,22 @@ impl Reach {
 /// candidates in the sense ICE uses the word: the sender tries each until
 /// one answers, and the handshake, not the list, decides which one is really
 /// the receiver.
+///
+/// A receiver that is reached only through a relay publishes no address at
+/// all, and is written as its ID alone; the list of hosts is then empty, and
+/// the sender has to be given the relay.
 pub fn parse_peer(s: &str) -> Result<(SharpId, Vec<String>), String> {
     let s = s.trim();
-    let (id, hosts) = s.rsplit_once('@').ok_or_else(|| {
-        "a receiver is written as <ID>@<host>:<port>, e.g. sh-…@203.0.113.5:5555".to_string()
-    })?;
+    let Some((id, hosts)) = s.rsplit_once('@') else {
+        return match s.parse::<SharpId>() {
+            Ok(id) => Ok((id, Vec::new())),
+            Err(_) => Err(
+                "a receiver is written as <ID>@<host>:<port>, e.g. sh-…@203.0.113.5:5555 \
+                 (or as its ID alone, with --relay)"
+                    .to_string(),
+            ),
+        };
+    };
     let id: SharpId = id.parse().map_err(|e| format!("receiver ID: {}", e))?;
     let mut out = Vec::new();
     for host in hosts.split(',') {
@@ -275,6 +286,10 @@ mod tests {
         let (_, hosts) = parse_peer(&format!("{}@[::1]:7", id)).unwrap();
         assert_eq!(hosts, ["[::1]:7"]);
         assert!(parse_peer("10.0.0.2:5555").is_err());
+        // Reached only through a relay: the ID alone, and no address.
+        let (p, hosts) = parse_peer(&id.to_string()).unwrap();
+        assert_eq!(p, id);
+        assert!(hosts.is_empty());
         assert!(parse_peer(&format!("{}@host", id)).is_err());
         assert!(parse_peer("sh-bad@10.0.0.2:1").is_err());
     }

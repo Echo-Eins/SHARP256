@@ -113,16 +113,32 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     // A receiver may publish several addresses, and each name may have
     // several of its own. Try them all and let the handshake decide which
     // one is the receiver.
-    let addrs = sharp256::address::resolve_candidates(&hosts)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let addr = addrs[0];
+    // A receiver reached only through a relay publishes no address.
+    let addrs = if hosts.is_empty() {
+        if args.relays.is_empty() {
+            anyhow::bail!(
+                "{} has no address: write it as <ID>@<host>:<port>, or name the relay it \
+                 registered with using --relay",
+                receiver
+            );
+        }
+        Vec::new()
+    } else {
+        sharp256::address::resolve_candidates(&hosts)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+    };
+    // An unspecified address stands for "none yet": the relays supply them.
+    let addr = addrs
+        .first()
+        .copied()
+        .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
     let identity = load_identity(&args.identity)?;
     let sender_id = identity.id();
     println!("{}", system_info());
 
     let mut cfg = SenderConfig::new(addr, receiver_id, file.clone());
-    cfg.alternate_peers = addrs[1..].to_vec();
+    cfg.alternate_peers = addrs.get(1..).unwrap_or_default().to_vec();
     cfg.bind = args.bind;
     let _ = args.no_nat;
     cfg.relays = args.relays.clone();

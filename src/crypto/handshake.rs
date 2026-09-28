@@ -43,10 +43,13 @@ pub const MAC_LEN: usize = 16;
 const E_LEN: usize = 32;
 const S_LEN: usize = 32 + 16;
 const AEAD_TAG: usize = 16;
-/// Initiation size without payload.
-pub const INITIATION_OVERHEAD: usize = CID_LEN + E_LEN + S_LEN + AEAD_TAG + 2 * MAC_LEN;
-/// Response size without payload.
-pub const RESPONSE_OVERHEAD: usize = 2 * CID_LEN + E_LEN + AEAD_TAG + 2 * MAC_LEN;
+/// Initiation size without payload. The sender's connection id is in it
+/// twice: in the clear, where the receiver's dispatcher can see it, and
+/// sealed at the start of the Noise payload, where nobody can change it.
+pub const INITIATION_OVERHEAD: usize = 2 * CID_LEN + E_LEN + S_LEN + AEAD_TAG + 2 * MAC_LEN;
+/// Response size without payload; both connection ids in the clear, and the
+/// receiver's sealed again inside, for the same reason.
+pub const RESPONSE_OVERHEAD: usize = 3 * CID_LEN + E_LEN + AEAD_TAG + 2 * MAC_LEN;
 pub const COOKIE_REPLY_LEN: usize = CID_LEN + 24 + 16 + AEAD_TAG;
 /// How long a cookie secret is used before it is replaced.
 pub const COOKIE_LIFETIME: Duration = Duration::from_secs(120);
@@ -113,24 +116,42 @@ fn split_of(state: &mut snow::HandshakeState) -> Split {
     }
 }
 
+/// The newest initiation timestamp handed out by this process.
+static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
 /// Strictly increasing wall-clock timestamp (nanoseconds since the Unix
 /// epoch) carried in initiations: a receiver accepts an initiation from a
 /// given sender only if its timestamp exceeds the last one it saw, so
 /// recorded initiations cannot be replayed.
 pub fn initiation_timestamp() -> u64 {
-    static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut prev = LAST.load(Ordering::Relaxed);
+    let mut prev = LAST_TIMESTAMP.load(Ordering::Relaxed);
     loop {
         let next = now.max(prev + 1);
-        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+        match LAST_TIMESTAMP.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => return next,
             Err(p) => prev = p,
         }
     }
+}
+
+/// The newest timestamp [`initiation_timestamp`] has handed out, for saving
+/// across restarts.
+pub fn last_initiation_timestamp() -> u64 {
+    LAST_TIMESTAMP.load(Ordering::Relaxed)
+}
+
+/// Never hand out a timestamp at or below `floor` — the newest one a
+/// previous run used. A receiver refuses an initiation that is not newer
+/// than the last it took from us, silently, as it must refuse replays; so a
+/// sender whose clock was set back since then would otherwise be refused
+/// without a word until the clock caught up again.
+pub fn raise_initiation_timestamp_floor(floor: u64) {
+    LAST_TIMESTAMP.fetch_max(floor, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +203,12 @@ impl Initiator {
         self.cid
     }
 
+    /// Whether an answer has been read into this attempt, so that it can
+    /// take no other.
+    pub fn is_spent(&self) -> bool {
+        self.state.is_handshake_finished()
+    }
+
     /// Builds the initiation datagram. `cookie` is the latest cookie received
     /// from this receiver, if any.
     pub fn initiation(
@@ -191,7 +218,8 @@ impl Initiator {
     ) -> Result<Vec<u8>, CryptoError> {
         let mut out = vec![0u8; INITIATION_OVERHEAD + payload.len()];
         out[..CID_LEN].copy_from_slice(&self.cid.to_be_bytes());
-        let n = self.state.write_message(payload, &mut out[CID_LEN..])?;
+        let sealed = [&self.cid.to_be_bytes()[..], payload].concat();
+        let n = self.state.write_message(&sealed, &mut out[CID_LEN..])?;
         let end = CID_LEN + n;
         out.truncate(end + 2 * MAC_LEN);
         self.last_mac1 = mac(&self.receiver_mac1_key, &out[..end]);
@@ -220,7 +248,19 @@ impl Initiator {
 
     /// Completes the handshake with the receiver's response. Returns the
     /// receiver's connection id, the response payload and the key split.
-    pub fn read_response(mut self, pkt: &[u8]) -> Result<(u64, Vec<u8>, Split), CryptoError> {
+    ///
+    /// A datagram that is not the receiver's answer leaves the attempt as
+    /// it was, ready for the real one: the connection id it is addressed to
+    /// travels in the clear, so anyone who sees the initiation can send
+    /// something to it, and consuming the attempt on the first such thing
+    /// would let one junk datagram per attempt stop a handshake for good.
+    /// The Noise state restores itself when a message fails to decrypt.
+    /// Once an answer has been read (see [`Initiator::is_spent`]), the
+    /// attempt is finished either way.
+    pub fn read_response(&mut self, pkt: &[u8]) -> Result<(u64, Vec<u8>, Split), CryptoError> {
+        if self.state.is_handshake_finished() {
+            return Err(CryptoError::Malformed);
+        }
         let n = pkt.len();
         if n < RESPONSE_OVERHEAD || pkt[..CID_LEN] != self.cid.to_be_bytes() {
             return Err(CryptoError::Malformed);
@@ -232,13 +272,25 @@ impl Initiator {
         ) {
             return Err(CryptoError::Mac);
         }
-        let responder_cid = u64::from_be_bytes(pkt[CID_LEN..2 * CID_LEN].try_into().unwrap());
         let mut payload = vec![0u8; n];
         let len = self
             .state
             .read_message(&pkt[2 * CID_LEN..body_end], &mut payload)?;
         payload.truncate(len);
-        if responder_cid == 0 || !self.state.is_handshake_finished() {
+        // The receiver's connection id is taken from inside, where it is
+        // sealed, never from the clear copy: that one is covered only by a
+        // mac1 anyone who knows our public key can make, so a copy of the
+        // answer could be raced ahead of it with the id changed, and the
+        // whole session would then be addressed to a connection the
+        // receiver does not have. Refusing such a copy is not an option —
+        // reading it has already finished the handshake — but it no
+        // longer matters what the clear copy says.
+        if len < CID_LEN || !self.state.is_handshake_finished() {
+            return Err(CryptoError::Malformed);
+        }
+        let responder_cid = u64::from_be_bytes(payload[..CID_LEN].try_into().unwrap());
+        payload.drain(..CID_LEN);
+        if responder_cid == 0 {
             return Err(CryptoError::Malformed);
         }
         let split = split_of(&mut self.state);
@@ -314,6 +366,16 @@ impl Responder {
         let mut payload = vec![0u8; n];
         let len = state.read_message(&pkt[CID_LEN..n - 2 * MAC_LEN], &mut payload)?;
         payload.truncate(len);
+        // The connection id in the clear is covered by nothing but mac1,
+        // whose key anyone can work out from our public key, so a copy of
+        // an initiation could arrive with it changed — and the answer would
+        // then go to a connection the sender does not have. The sealed copy
+        // is the sender's; a packet where the two differ was altered on the
+        // way, and is refused before it counts for anything.
+        if len < CID_LEN || payload[..CID_LEN] != pkt[..CID_LEN] {
+            return Err(CryptoError::Malformed);
+        }
+        payload.drain(..CID_LEN);
         let sender = state
             .get_remote_static()
             .and_then(|s| <[u8; KEY_LEN]>::try_from(s).ok())
@@ -344,7 +406,8 @@ impl Incoming {
         let mut out = vec![0u8; RESPONSE_OVERHEAD + payload.len()];
         out[..CID_LEN].copy_from_slice(&self.sender_cid.to_be_bytes());
         out[CID_LEN..2 * CID_LEN].copy_from_slice(&receiver_cid.to_be_bytes());
-        let n = self.state.write_message(payload, &mut out[2 * CID_LEN..])?;
+        let sealed = [&receiver_cid.to_be_bytes()[..], payload].concat();
+        let n = self.state.write_message(&sealed, &mut out[2 * CID_LEN..])?;
         let end = 2 * CID_LEN + n;
         out.truncate(end + 2 * MAC_LEN);
         let m1 = mac(&mac1_key(self.sender.as_bytes()), &out[..end]);
@@ -631,6 +694,74 @@ mod tests {
         let incoming = responder.read_initiation(&pkt).unwrap();
         let (resp, _) = incoming.respond(5, b"r").unwrap();
         assert!(init.read_response(&resp).is_err());
+    }
+
+    /// The connection id an answer is addressed to travels in the clear, so
+    /// anyone who saw the initiation can send something to it — even with
+    /// a valid mac1, if they know the sender's public key. None of it may
+    /// use the attempt up: the real answer, arriving after, still completes
+    /// the handshake.
+    #[test]
+    fn junk_addressed_to_an_attempt_does_not_use_it_up() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), PSK);
+        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let pkt = init.initiation(b"p", None).unwrap();
+        let (resp, _) = responder
+            .read_initiation(&pkt)
+            .unwrap()
+            .respond(7, b"r")
+            .unwrap();
+        let body_end = resp.len() - 2 * MAC_LEN;
+        for i in [2 * CID_LEN, 2 * CID_LEN + 40, body_end - 1] {
+            let mut junk = resp.clone();
+            junk[i] ^= 0x40;
+            // Re-made so that it passes the mac1 check and reaches Noise.
+            let m1 = mac(&mac1_key(s.public()), &junk[..body_end]);
+            junk[body_end..body_end + MAC_LEN].copy_from_slice(&m1);
+            assert!(init.read_response(&junk).is_err());
+            assert!(!init.is_spent());
+        }
+        assert!(init.read_response(&resp[..resp.len() - 1]).is_err());
+        let (rcid, payload, _) = init.read_response(&resp).expect("the real answer");
+        assert_eq!((rcid, payload.as_slice()), (7, &b"r"[..]));
+        assert!(init.is_spent());
+        // And nothing more can be read into it.
+        assert!(init.read_response(&resp).is_err());
+    }
+
+    /// The connection ids travel in the clear, covered only by mac1 — whose
+    /// key is derived from a public key. Changed on the way, they must not
+    /// be believed: the receiver refuses an initiation whose id was
+    /// altered, and the sender takes the receiver's id from where it is
+    /// sealed, so an altered answer raced ahead of the real one sets up the
+    /// session exactly as the real one would have.
+    #[test]
+    fn connection_ids_changed_on_the_way_are_not_believed() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), PSK);
+        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let pkt = init.initiation(b"p", None).unwrap();
+        let end = pkt.len() - 2 * MAC_LEN;
+        let mut altered = pkt.clone();
+        altered[0] ^= 1;
+        let m1 = mac(&mac1_key(r.public()), &altered[..end]);
+        altered[end..end + MAC_LEN].copy_from_slice(&m1);
+        assert!(responder.is_initiation(&altered));
+        assert!(responder.read_initiation(&altered).is_err());
+
+        let incoming = responder.read_initiation(&pkt).unwrap();
+        assert_eq!(incoming.sender_cid, init.cid());
+        assert_eq!(incoming.payload, b"p");
+        let (resp, _) = incoming.respond(0x1234, b"r").unwrap();
+        let body_end = resp.len() - 2 * MAC_LEN;
+        let mut altered = resp.clone();
+        altered[CID_LEN + 3] ^= 0x55;
+        let m1 = mac(&mac1_key(s.public()), &altered[..body_end]);
+        altered[body_end..body_end + MAC_LEN].copy_from_slice(&m1);
+        let (rcid, payload, _) = init.read_response(&altered).unwrap();
+        assert_eq!(rcid, 0x1234, "the id in the clear was believed");
+        assert_eq!(payload, b"r");
     }
 
     #[test]

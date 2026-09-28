@@ -164,6 +164,11 @@ impl Sender {
                 None
             }
         };
+        // Carry on above the newest handshake timestamp an earlier run
+        // used, in case the clock has been set back since (see there).
+        if let Some(store) = &store {
+            hs::raise_initiation_timestamp_floor(store.load_stamp());
+        }
         Ok(Self {
             cfg,
             identity,
@@ -345,6 +350,11 @@ impl Sender {
         let reach = crate::address::Reach::of(&self.socket.udp());
         let mut candidates: Vec<SocketAddr> = Vec::new();
         for a in std::iter::once(&self.cfg.peer).chain(&self.cfg.alternate_peers) {
+            // An unspecified address stands for "none": a receiver that is
+            // reached only through a relay publishes no address of its own.
+            if a.ip().is_unspecified() {
+                continue;
+            }
             match reach.native(*a) {
                 Some(n) if !candidates.contains(&n) => candidates.push(n),
                 Some(_) => {}
@@ -355,15 +365,23 @@ impl Sender {
                 ),
             }
         }
-        let Some(&first) = candidates.first() else {
-            return Err(SendError::Io(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                format!(
-                    "none of the receiver's addresses can be reached from {} \
-                     (to use IPv6, bind the sender to [::]:0)",
-                    self.socket.local_addr()?
-                ),
-            )));
+        let first = match candidates.first() {
+            Some(&first) => first,
+            // Nothing to try until a relay turns something up.
+            None if !self.cfg.relays.is_empty() => {
+                tracing::info!("no direct address for the receiver; asking the relays");
+                self.cfg.peer
+            }
+            None => {
+                return Err(SendError::Io(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!(
+                        "none of the receiver's addresses can be reached from {} \
+                         (to use IPv6, bind the sender to [::]:0)",
+                        self.socket.local_addr()?
+                    ),
+                )));
+            }
         };
         // Relays add more as they answer, while the addresses above are
         // already being tried.
@@ -416,6 +434,9 @@ impl Sender {
         }
 
         if let Some(store) = &self.store {
+            if let Err(e) = store.save_stamp(hs::last_initiation_timestamp()) {
+                tracing::debug!("could not save the handshake timestamp: {}", e);
+            }
             match &result {
                 Err(SendError::PeerUnreachable(_)) | Err(SendError::Cancelled) => {
                     let st = SenderState {
@@ -662,6 +683,8 @@ struct Engine {
     cfg: TransportConfig,
     /// Which addresses the socket can send to, and how it writes them.
     reach: crate::address::Reach,
+    /// Datagrams the network refused to send, for the log.
+    send_failures: u64,
     socket: Arc<BatchSocket>,
     /// The receiver's proven address: everything we send goes there.
     peer: SocketAddr,
@@ -832,6 +855,7 @@ impl Engine {
         Self {
             cfg,
             reach: crate::address::Reach::of(&socket.udp()),
+            send_failures: 0,
             socket,
             peer,
             path: PathProbe::new(),
@@ -1010,17 +1034,24 @@ impl Engine {
     /// Before that, attempts rotate through every address the receiver's
     /// name gave us: only one of them may be reachable, and only the
     /// handshake can tell which one is really the receiver.
-    fn next_target(&mut self) -> SocketAddr {
-        if self.secure.is_some() || self.candidates.len() <= 1 {
-            return self.peer;
+    fn next_target(&mut self) -> Option<SocketAddr> {
+        if self.secure.is_some() {
+            return Some(self.peer);
         }
         // An address that already answered beats carrying on round the ring.
         if let Some(known) = self.answered_at.take() {
-            return known;
+            return Some(known);
         }
+        // Nothing to try until a relay turns something up.
+        if self.candidates.is_empty() {
+            return None;
+        }
+        // Round the ring, however short. A single address used not to move
+        // it, so it counted as untried for ever and the handshake never
+        // started backing off.
         let target = self.candidates[self.next_candidate % self.candidates.len()];
         self.next_candidate = self.next_candidate.wrapping_add(1);
-        target
+        Some(target)
     }
 
     /// Whether any candidate address is still untried. While that holds, the
@@ -1087,9 +1118,8 @@ impl Engine {
     /// next candidate in the rotation.
     fn send_initiation_to(&mut self, to: Option<SocketAddr>) -> Result<(), SendError> {
         let now = Instant::now();
-        let to = match to {
-            Some(to) => to,
-            None => self.next_target(),
+        let Some(to) = to.or_else(|| self.next_target()) else {
+            return Ok(());
         };
         let mut attempt = Initiator::new(&self.auth.identity, &self.auth.receiver, &self.auth.psk)
             .map_err(|e| SendError::Handshake(e.to_string()))?;
@@ -1115,13 +1145,24 @@ impl Engine {
         match self.socket.try_send(to, &pkt) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => {}
-            // One unreachable address (a broken IPv6 path, say) must not end
-            // the transfer while other candidates are untried.
-            Err(e) if self.candidates.len() > 1 && self.secure.is_none() => {
-                tracing::debug!("cannot reach {}: {}", to, e);
+            // Never the end of the transfer. One unreachable address (a
+            // broken IPv6 path, say) must not end it while others are
+            // untried, and a network that is gone for a moment — a Wi-Fi
+            // hand-over, an interface coming back up — must not end it
+            // either: the handshake has its own deadline, and a session
+            // its own rules for when the peer is gone.
+            Err(e) => {
+                self.send_failures += 1;
+                if self.send_failures.is_power_of_two() {
+                    tracing::info!(
+                        "cannot send to {} ({}; {} time(s) so far)",
+                        to,
+                        e,
+                        self.send_failures
+                    );
+                }
                 return Ok(());
             }
-            Err(e) => return Err(SendError::Io(e)),
         }
         if self.attempts.len() >= MAX_ATTEMPTS {
             self.attempts.pop_front();
@@ -1144,10 +1185,17 @@ impl Engine {
         pkt: &[u8],
         from: SocketAddr,
     ) -> Result<(), SendError> {
+        let (sent_at, target) = (self.attempts[idx].1, self.attempts[idx].2);
         if pkt.len() == COOKIE_REPLY_LEN {
+            // A cookie proves our address to the receiver we sent to, so
+            // only a reply from there is worth keeping. Anybody who saw the
+            // initiation can make one (see below), and keeping whichever
+            // came last let them replace the real one with theirs.
+            if from != target {
+                return Ok(());
+            }
             if let Some(cookie) = self.attempts[idx].0.read_cookie_reply(pkt) {
-                let issued_by = self.attempts[idx].2;
-                tracing::debug!("{} is under load and asked for a cookie", issued_by);
+                tracing::debug!("{} is under load and asked for a cookie", target);
                 // Keep it for the next scheduled attempt, and send nothing
                 // now. A cookie reply is sealed under a key derived from the
                 // receiver's *public* key, with the initiation's own mac1 as
@@ -1159,10 +1207,41 @@ impl Engine {
                 // WireGuard carries the cookie on the next retry for the same
                 // reason; so do we. A real receiver under load loses nothing
                 // but the wait it was asking for anyway.
-                self.cookie = Some((cookie, Instant::now(), issued_by));
+                self.cookie = Some((cookie, Instant::now(), target));
             }
             return Ok(());
         }
+        // Authenticated before anything is believed or used up. The
+        // connection id this is addressed to travels in the clear, so it
+        // may come from anyone who saw the initiation; a failed read leaves
+        // the attempt ready for the real answer.
+        let read = self.attempts[idx].0.read_response(pkt);
+        let (receiver_cid, payload, split) = match read {
+            Ok(v) => v,
+            Err(e) => {
+                if self.attempts[idx].0.is_spent() {
+                    self.attempts.remove(idx);
+                }
+                match e {
+                    // Not made by the receiver we talk to; ignore.
+                    CryptoError::Mac | CryptoError::Malformed => {}
+                    // The receiver authenticated our initiation but its
+                    // response does not decrypt: it mixes in a different
+                    // pre-shared key — or somebody who knows our public key
+                    // is sending rubbish, which costs them the same.
+                    e => {
+                        self.handshake_failures += 1;
+                        tracing::debug!("handshake response rejected: {}", e);
+                    }
+                }
+                return Ok(());
+            }
+        };
+        let now = Instant::now();
+        // However it ends, the round trip is real and worth knowing: it is
+        // how long the next attempt must at least wait (see `handshake`).
+        self.rtt.on_sample(now.saturating_duration_since(sent_at));
+        let (attempt, _, _) = self.attempts.remove(idx).expect("index in range");
         // Only the newest attempt may be adopted, and that is not a detail:
         // when several initiations are outstanding, both ends have to agree
         // on which one won. The receiver's replay guard already decides it —
@@ -1172,77 +1251,60 @@ impl Engine {
         // keys and connection ids, and the transfer would stall until the
         // next re-handshake.
         //
-        // A superseded response is not wasted, though: it proves that
-        // address answers, so the next initiation goes straight back to it
-        // instead of carrying on round the candidates.
-        if idx + 1 != self.attempts.len() {
-            let target = self.attempts[idx].2;
+        // A superseded answer is not wasted, though: it proves that address
+        // answers, so the next initiation goes straight back to it instead
+        // of carrying on round the candidates — and not before its round
+        // trip has had time to complete.
+        if idx < self.attempts.len() {
             if self.answered_at != Some(target) {
                 tracing::debug!("{} answered a superseded attempt; trying it again", target);
                 self.answered_at = Some(target);
             }
             return Ok(());
         }
-        let (attempt, sent_at, target) = self.attempts.remove(idx).expect("index in range");
         let cid = attempt.cid();
-        match attempt.read_response(pkt) {
-            Ok((receiver_cid, payload, split)) => {
-                let resp = wire::decode_response(&payload)
-                    .map_err(|e| SendError::Protocol(format!("bad handshake response: {}", e)))?;
-                let now = Instant::now();
-                self.rtt.on_sample(now.saturating_duration_since(sent_at));
-                if resp.ack.status == HELLO_REJECTED {
-                    return Err(SendError::Rejected {
-                        reason: reason_name(resp.ack.reason).to_string(),
-                        message: resp.ack.message,
-                    });
-                }
-                let suite = Suite::from_u8(resp.suite).ok_or_else(|| {
-                    SendError::Protocol("receiver chose an unknown cipher".into())
-                })?;
-                self.secure = Some(Secure {
-                    keys: Arc::new(SessionKeys::derive(&split, true, suite)),
-                    local_cid: cid,
-                    peer_cid: receiver_cid,
-                    next_pn: 0,
-                    replay: ReplayWindow::new(),
-                    auth_failures: 0,
-                });
-                // Older attempts are obsolete now.
-                self.attempts.clear();
-                // We sent this attempt to `target` and got back an answer
-                // bound to it, so `target` is reachable and is the receiver:
-                // that round trip is the proof, and it settles which of the
-                // candidate addresses a name resolved to is the real one.
-                if self.peer != target {
-                    tracing::info!("receiver answered at {}", target);
-                    self.peer = target;
-                }
-                // The new keys are in place, so liveness and — when the
-                // answer came from an address we have not proven — its
-                // validation can both run under them. A handshake response
-                // is authentic, but authenticity says nothing about where
-                // it was sent from: it could have been captured and repeated
-                // with a forged source. Until that address answers a
-                // challenge, the file keeps going to the proven one.
-                self.path.reset();
-                self.note_alive(now, from);
-                tracing::debug!(
-                    "session with {} established ({})",
-                    self.auth.receiver.short(),
-                    suite.name()
-                );
-                self.answer = Some(resp.ack);
-            }
-            // Not made by the receiver we talk to; ignore.
-            Err(CryptoError::Mac) | Err(CryptoError::Malformed) => {}
-            Err(e) => {
-                // The receiver authenticated our initiation but its response
-                // does not decrypt: it mixes in a different pre-shared key.
-                self.handshake_failures += 1;
-                tracing::debug!("handshake response rejected: {}", e);
-            }
+        let resp = wire::decode_response(&payload)
+            .map_err(|e| SendError::Protocol(format!("bad handshake response: {}", e)))?;
+        if resp.ack.status == HELLO_REJECTED {
+            return Err(SendError::Rejected {
+                reason: reason_name(resp.ack.reason).to_string(),
+                message: resp.ack.message,
+            });
         }
+        let suite = Suite::from_u8(resp.suite)
+            .ok_or_else(|| SendError::Protocol("receiver chose an unknown cipher".into()))?;
+        self.secure = Some(Secure {
+            keys: Arc::new(SessionKeys::derive(&split, true, suite)),
+            local_cid: cid,
+            peer_cid: receiver_cid,
+            next_pn: 0,
+            replay: ReplayWindow::new(),
+            auth_failures: 0,
+        });
+        // Older attempts are obsolete now.
+        self.attempts.clear();
+        // We sent this attempt to `target` and got back an answer bound to
+        // it, so `target` is reachable and is the receiver: that round trip
+        // is the proof, and it settles which of the candidate addresses a
+        // name resolved to is the real one.
+        if self.peer != target {
+            tracing::info!("receiver answered at {}", target);
+            self.peer = target;
+        }
+        // The new keys are in place, so liveness and — when the answer came
+        // from an address we have not proven — its validation can both run
+        // under them. A handshake response is authentic, but authenticity
+        // says nothing about where it was sent from: it could have been
+        // captured and repeated with a forged source. Until that address
+        // answers a challenge, the file keeps going to the proven one.
+        self.path.reset();
+        self.note_alive(now, from);
+        tracing::debug!(
+            "session with {} established ({})",
+            self.auth.receiver.short(),
+            suite.name()
+        );
+        self.answer = Some(resp.ack);
         Ok(())
     }
 
@@ -1319,15 +1381,28 @@ impl Engine {
             if self.secure.is_none() && now >= next_attempt {
                 let brisk = self.candidates_left();
                 self.send_initiation()?;
-                if brisk {
+                let step = if brisk {
                     // Still addresses nobody has tried. A dead one must not
                     // hold up the rest, so keep the probes close together
                     // and start backing off only once the ring is complete.
-                    next_attempt = now + CANDIDATE_PROBE;
+                    CANDIDATE_PROBE
                 } else {
-                    next_attempt = now + delay;
+                    let d = delay;
                     delay = (delay * 2).min(Duration::from_secs(4));
-                }
+                    d
+                };
+                // And never sooner than an answer could be back. Only the
+                // newest attempt can be adopted, so on a path slower than
+                // the retry interval every answer used to arrive after a
+                // newer attempt had replaced the one it answered — and the
+                // handshake never completed. Once any answer has shown how
+                // long the round trip is, the retries wait that long.
+                let patience = if self.rtt.has_sample() {
+                    self.rtt.srtt() * 3 / 2 + Duration::from_millis(20)
+                } else {
+                    Duration::ZERO
+                };
+                next_attempt = now + step.max(patience);
             }
             if let Some(at) = next_poll {
                 if now >= at {
@@ -1352,9 +1427,13 @@ impl Engine {
             // what moving the introductions off the critical path was meant
             // to avoid.
             let mut found = None;
+            // Once every relay task is done the channel is closed, and a
+            // closed channel is always ready: without the guard this loop
+            // would spin for as long as the handshake lasts.
+            let relays_pending = !self.found_rx.is_closed();
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
-                a = self.found_rx.recv() => { found = a; }
+                a = self.found_rx.recv(), if relays_pending => { found = a; }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
                 _ = cancel.cancelled() => return Err(SendError::Cancelled),
             }
