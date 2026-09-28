@@ -96,9 +96,22 @@ fn set_buffer_sizes(socket: &socket2::Socket, bytes: usize) {
     }
 }
 
-/// Marks outgoing datagrams "don't fragment" so that an oversized probe fails
-/// (locally with EMSGSIZE, or by being dropped on the path) instead of being
-/// silently fragmented. Best effort; other platforms keep default behaviour.
+/// Marks outgoing datagrams "don't fragment" so that an oversized probe is
+/// dropped on the path instead of being silently fragmented — and makes the
+/// socket ignore what ICMP says about the path MTU.
+///
+/// That second half matters. In the ordinary mode (`IP_PMTUDISC_DO`) the
+/// kernel believes every "fragmentation needed" message that matches the
+/// socket, and from then on refuses to send anything larger — including to
+/// us, with EMSGSIZE. ICMP is not authenticated, so one forged message could
+/// shrink every datagram of a transfer, or refuse the control messages
+/// outright. In probe mode the kernel sets DF and otherwise leaves the path
+/// MTU to us: it is found with PROBE, which the receiver acknowledges
+/// under the session's keys (RFC 8899, datagram PLPMTUD), and a real drop
+/// shows up as full-size packets being lost while small ones are not.
+/// EMSGSIZE is then only ever about the local interface.
+///
+/// Best effort; other platforms keep their default behaviour.
 pub fn set_dont_fragment(socket: &UdpSocket) {
     let is_v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
     #[cfg(target_os = "linux")]
@@ -108,7 +121,7 @@ pub fn set_dont_fragment(socket: &UdpSocket) {
         // SAFETY: plain setsockopt on a socket we own, with a correctly sized
         // integer option value.
         unsafe {
-            let val: libc::c_int = libc::IP_PMTUDISC_DO;
+            let val: libc::c_int = libc::IP_PMTUDISC_PROBE;
             libc::setsockopt(
                 fd,
                 libc::IPPROTO_IP,
@@ -117,7 +130,7 @@ pub fn set_dont_fragment(socket: &UdpSocket) {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             if is_v6 {
-                let val6: libc::c_int = libc::IPV6_PMTUDISC_DO;
+                let val6: libc::c_int = libc::IPV6_PMTUDISC_PROBE;
                 libc::setsockopt(
                     fd,
                     libc::IPPROTO_IPV6,
@@ -151,6 +164,29 @@ pub fn set_dont_fragment(socket: &UdpSocket) {
                     IPPROTO_IPV6 as i32,
                     IPV6_DONTFRAG,
                     &val as *const u32 as *const i8,
+                    std::mem::size_of::<u32>() as i32,
+                );
+            }
+            // Probe mode where the system has it (IP_MTU_DISCOVER with
+            // IP_PMTUDISC_PROBE, ws2ipdef.h; Windows 10 1703 and later).
+            // Older systems refuse the option and keep DF alone.
+            const IP_MTU_DISCOVER: i32 = 71;
+            const IPV6_MTU_DISCOVER: i32 = 71;
+            const IP_PMTUDISC_PROBE: u32 = 3;
+            let probe = IP_PMTUDISC_PROBE;
+            setsockopt(
+                s,
+                IPPROTO_IP,
+                IP_MTU_DISCOVER,
+                &probe as *const u32 as *const i8,
+                std::mem::size_of::<u32>() as i32,
+            );
+            if is_v6 {
+                setsockopt(
+                    s,
+                    IPPROTO_IPV6 as i32,
+                    IPV6_MTU_DISCOVER,
+                    &probe as *const u32 as *const i8,
                     std::mem::size_of::<u32>() as i32,
                 );
             }

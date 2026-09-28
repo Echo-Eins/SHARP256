@@ -185,6 +185,9 @@ struct Impairment {
     drop_first_len: Option<(usize, u32)>,
     /// Flip one random bit in this fraction of datagrams.
     corrupt: f64,
+    /// From this long after the proxy starts, silently drop every datagram
+    /// longer than this: a path MTU that shrank, with no ICMP to say so.
+    mtu_after: Option<(Duration, usize)>,
 }
 
 impl Impairment {
@@ -200,6 +203,7 @@ impl Impairment {
             drop_len: None,
             drop_first_len: None,
             corrupt: 0.0,
+            mtu_after: None,
         }
     }
 }
@@ -234,6 +238,7 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
 
     let (t_target, t_black, t_bytes) = (target.clone(), blackhole.clone(), to_target_bytes.clone());
     let task = tokio::spawn(async move {
+        let started = Instant::now();
         let mut rng = Rng(imp.seed | 1);
         let mut client: Option<SocketAddr> = None;
         let mut data_index: u64 = 0;
@@ -257,6 +262,11 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
             }
             if imp.drop_len == Some(pkt.len()) {
                 continue;
+            }
+            if let Some((after, len)) = imp.mtu_after {
+                if pkt.len() > len && started.elapsed() >= after {
+                    continue;
+                }
             }
             if let Some((len, n)) = imp.drop_first_len {
                 if pkt.len() == len && dropped_first < n {
@@ -396,6 +406,7 @@ async fn survives_loss_duplication_and_reordering() {
             drop_len: None,
             drop_first_len: None,
             corrupt: 0.0,
+            mtu_after: None,
         },
     )
     .await;
@@ -445,6 +456,7 @@ async fn survives_heavy_loss() {
             drop_len: None,
             drop_first_len: None,
             corrupt: 0.0,
+            mtu_after: None,
         },
     )
     .await;
@@ -1409,6 +1421,7 @@ async fn tampered_packets_are_ignored() {
         r.addr,
         Impairment {
             corrupt: 0.05,
+            mtu_after: None,
             seed: 65,
             ..Impairment::none()
         },
@@ -2742,5 +2755,194 @@ async fn a_receiver_can_be_reached_by_its_id_and_a_relay_alone() {
 
     cancel.cancel();
     relay_task.abort();
+    stop_receiver(r).await;
+}
+
+// ---------------------------------------------------------------------------
+// Tests that change the network under a transfer. They run only inside a
+// private network namespace (scripts/netns-tests.sh), where changing the
+// loopback interface disturbs nothing else.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod netns {
+    use std::ffi::CString;
+
+    fn ioctl_ifreq(name: &str, request: libc::c_ulong, fill: impl FnOnce(&mut libc::ifreq)) {
+        let name = CString::new(name).unwrap();
+        // SAFETY: an ifreq is plain data; zeroed is a valid value for it,
+        // and the name fits (interface names are short and NUL-terminated).
+        let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (d, s) in req.ifr_name.iter_mut().zip(name.as_bytes_with_nul()) {
+            *d = *s as libc::c_char;
+        }
+        fill(&mut req);
+        // SAFETY: a datagram socket used only for interface ioctls, with a
+        // fully initialised ifreq.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            assert!(fd >= 0, "socket");
+            let rc = libc::ioctl(fd, request as _, &mut req);
+            libc::close(fd);
+            assert_eq!(rc, 0, "ioctl {:#x} on {}", request, name.to_str().unwrap());
+        }
+    }
+
+    /// Whether the test runs inside the namespace `scripts/netns-tests.sh`
+    /// makes.
+    pub fn active() -> bool {
+        std::env::var_os("SHARP_NETNS").is_some()
+    }
+
+    pub fn set_up(name: &str, up: bool) {
+        let flags = if up {
+            libc::IFF_UP | libc::IFF_RUNNING | libc::IFF_LOOPBACK
+        } else {
+            libc::IFF_LOOPBACK
+        };
+        ioctl_ifreq(name, libc::SIOCSIFFLAGS as _, |r| {
+            r.ifr_ifru.ifru_flags = flags as libc::c_short;
+        });
+    }
+
+    pub fn set_mtu(name: &str, mtu: i32) {
+        ioctl_ifreq(name, libc::SIOCSIFMTU as _, |r| r.ifr_ifru.ifru_mtu = mtu);
+    }
+
+    pub fn set_addr(name: &str, ip: std::net::Ipv4Addr) {
+        ioctl_ifreq(name, libc::SIOCSIFADDR as _, |r| {
+            // SAFETY: sockaddr_in fits in the sockaddr of the union.
+            let sin = unsafe {
+                &mut *(&mut r.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in)
+            };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_addr.s_addr = u32::from(ip).to_be();
+        });
+    }
+}
+
+/// The path MTU drops under a running transfer. The sockets take the path
+/// MTU from nothing but acknowledged PROBEs, so what reports a drop here is
+/// the interface refusing the size: that is one step down for everything
+/// built at the old size, never one step per batch — which used to walk the
+/// chunk to the floor on a single event, and then end the transfer.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "changes the network: run with scripts/netns-tests.sh"]
+async fn netns_a_smaller_mtu_mid_transfer_only_costs_throughput() {
+    assert!(netns::active(), "run with scripts/netns-tests.sh");
+    netns::set_up("lo", true);
+    netns::set_mtu("lo", 1500);
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 96 << 20;
+    let file = make_file(&src, "mtu-drop.bin", size, 7);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let mut cfg = sender_cfg(&file, r.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(64 << 20);
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        netns::set_mtu("lo", 1400);
+    });
+    let summary = tokio::time::timeout(Duration::from_secs(120), run_sender(cfg))
+        .await
+        .expect("the transfer finishes")
+        .expect("a smaller MTU does not end the transfer");
+    assert_eq!(summary.file_size, size as u64);
+    assert!(
+        summary.chunk_size >= SAFE_CHUNK_FOR_TESTS,
+        "one drop walked the chunk down to {}",
+        summary.chunk_size
+    );
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&file, &out.join("mtu-drop.bin"));
+    stop_receiver(r).await;
+}
+
+/// The chunk every path carries (1232-byte datagrams); what a single MTU
+/// drop to 1400 must leave the transfer at.
+#[cfg(target_os = "linux")]
+const SAFE_CHUNK_FOR_TESTS: u16 = sharp256::protocol::constants::SAFE_CHUNK;
+
+/// The address the transfer runs over disappears for two and a half
+/// seconds, as when Wi-Fi drops, and comes back. Sends fail meanwhile with
+/// "network unreachable"; the transfer used to end on the first one and
+/// delete its resume state. It now waits, as it would for any silence.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "changes the network: run with scripts/netns-tests.sh"]
+async fn netns_a_brief_outage_does_not_end_the_transfer() {
+    assert!(netns::active(), "run with scripts/netns-tests.sh");
+    let ip: std::net::Ipv4Addr = "10.9.9.9".parse().unwrap();
+    netns::set_up("lo", true);
+    netns::set_mtu("lo", 65536);
+    netns::set_addr("lo:1", ip);
+    netns::set_up("lo:1", true);
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 48 << 20;
+    let file = make_file(&src, "outage.bin", size, 8);
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.bind = "0.0.0.0:0".parse().unwrap();
+    })
+    .await;
+    let peer: SocketAddr = format!("{}:{}", ip, r.addr.port()).parse().unwrap();
+    let mut cfg = sender_cfg(&file, peer, r.id, &state);
+    cfg.bind = "0.0.0.0:0".parse().unwrap();
+    cfg.transport.max_rate_bytes = Some(8 << 20);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        netns::set_up("lo:1", false);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        netns::set_addr("lo:1", ip);
+        netns::set_up("lo:1", true);
+    });
+    let summary = tokio::time::timeout(Duration::from_secs(120), run_sender(cfg))
+        .await
+        .expect("the transfer finishes")
+        .expect("a brief outage does not end the transfer");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&file, &out.join("outage.bin"));
+    stop_receiver(r).await;
+}
+
+/// The path MTU shrinks with nothing to say so: every datagram above 1300
+/// bytes simply vanishes, as behind a tunnel whose ICMP is filtered — and
+/// the sockets ignore ICMP anyway, so that a forged one cannot shrink a
+/// transfer. What gives the drop away is full-size packets being lost while
+/// the receiver's small ones keep arriving; the sender takes that as its
+/// cue to step down, instead of retransmitting into the hole until it gives
+/// up (RFC 8899, section 4.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_that_silently_stops_carrying_full_packets_is_stepped_down_from() {
+    use sharp256::protocol::constants::SAFE_CHUNK;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 8 << 20;
+    let file = make_file(&src, "black-hole.bin", size, 0xB1AC);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            mtu_after: Some((Duration::from_millis(300), 1300)),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let mut cfg = sender_cfg(&file, proxy.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(8 << 20);
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("the transfer does not stall in the black hole")
+        .expect("the transfer completes");
+    assert_eq!(summary.file_size, size as u64);
+    assert!(
+        summary.chunk_size <= SAFE_CHUNK,
+        "still sending {} byte chunks into a 1300-byte path",
+        summary.chunk_size
+    );
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("black-hole.bin"));
     stop_receiver(r).await;
 }

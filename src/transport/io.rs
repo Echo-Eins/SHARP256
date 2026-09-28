@@ -9,7 +9,7 @@
 //! sender in a single buffer). Platforms without these features fall back
 //! to one datagram per call transparently.
 
-use crate::transport::socket::{bind_udp, is_msgsize_error, set_dont_fragment};
+use crate::transport::socket::{bind_udp, set_dont_fragment};
 use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
@@ -101,10 +101,13 @@ impl BatchSocket {
 
     /// Sends `contents` as datagrams of `segment` bytes each (the last one
     /// may be shorter), with one system call where the platform allows. On
-    /// an error nothing may be assumed sent. A segmented send that fails for
-    /// any reason but a full buffer or the path MTU turns segmentation off
-    /// for this socket ([`BatchSocket::max_segments`] becomes 1), so the
-    /// caller can send the datagrams one by one instead.
+    /// an error nothing may be assumed sent. A segmented send that fails the
+    /// way a driver without segmentation offload fails turns it off for this
+    /// socket ([`BatchSocket::max_segments`] becomes 1), so the caller can
+    /// send the datagrams one by one instead. Any other failure — the
+    /// network being unreachable for a moment, say — leaves it on: turning
+    /// it off for good on a transient error cost the rest of the transfer
+    /// its fastest way to send.
     pub fn try_send_segments(
         &self,
         to: SocketAddr,
@@ -117,11 +120,7 @@ impl BatchSocket {
         debug_assert!(contents.len().div_ceil(segment) <= self.max_segments());
         let sent = self.transmit(to, contents, Some(segment));
         if let Err(e) = &sent {
-            if e.kind() != io::ErrorKind::WouldBlock
-                && !is_msgsize_error(e)
-                && !is_no_buffer_error(e)
-                && !self.segments_failed.swap(true, Ordering::Relaxed)
-            {
+            if is_segmentation_error(e) && !self.segments_failed.swap(true, Ordering::Relaxed) {
                 tracing::info!(
                     "segmented send failed ({}); sending datagrams one by one",
                     e
@@ -177,6 +176,30 @@ impl BatchSocket {
     }
 }
 
+/// How a segmented send fails when the driver or the stack cannot segment:
+/// Linux answers EIO from a driver without the offload, and EINVAL or
+/// EOPNOTSUPP where the option is not understood; Windows answers
+/// WSAEINVAL or WSAEOPNOTSUPP.
+fn is_segmentation_error(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EIO) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENOPROTOOPT)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEINVAL, WSAEOPNOTSUPP
+        matches!(e.raw_os_error(), Some(10022) | Some(10045))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = e;
+        true
+    }
+}
+
 /// The network stack is momentarily out of buffers (a full device queue):
 /// worth a retry shortly, unlike other send errors.
 pub fn is_no_buffer_error(e: &io::Error) -> bool {
@@ -218,21 +241,44 @@ mod tests {
         assert_eq!(single.segments().collect::<Vec<_>>(), vec![0..10]);
     }
 
-    /// A segmented send that fails for a reason other than a full buffer or
-    /// the path MTU turns segmentation off for the socket, so the caller
-    /// falls back to single datagrams.
+    /// Segmentation is turned off only by a failure that says the stack or
+    /// driver cannot segment. Anything else — here an address the socket
+    /// cannot reach, standing in for a network that is gone for a moment —
+    /// leaves it on: turning it off for good on a transient error cost the
+    /// rest of the transfer its fastest way to send.
     #[tokio::test]
-    async fn failed_segmented_send_turns_segmentation_off() {
+    async fn only_a_segmentation_failure_turns_segmentation_off() {
         let a = BatchSocket::bind("127.0.0.1:0".parse().unwrap(), 1 << 20)
             .await
             .unwrap();
         if a.max_segments() == 1 {
             return; // no segmentation offload here
         }
-        // An IPv6 destination cannot be reached from an IPv4 socket.
+        let before = a.max_segments();
         let to: SocketAddr = "[2001:db8::1]:9".parse().unwrap();
         assert!(a.try_send_segments(to, &[0u8; 3000], 1000).is_err());
-        assert_eq!(a.max_segments(), 1);
+        assert_eq!(a.max_segments(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segmentation_failures_are_told_apart_from_the_rest() {
+        let err = |code| io::Error::from_raw_os_error(code);
+        for code in [libc::EIO, libc::EINVAL, libc::EOPNOTSUPP] {
+            assert!(is_segmentation_error(&err(code)), "{}", code);
+        }
+        for code in [
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+            libc::ENETDOWN,
+            libc::EADDRNOTAVAIL,
+            libc::EAFNOSUPPORT,
+            libc::EMSGSIZE,
+            libc::ENOBUFS,
+            libc::EPERM,
+        ] {
+            assert!(!is_segmentation_error(&err(code)), "{}", code);
+        }
     }
 
     /// Segmented sends arrive as separate datagrams of the right sizes,

@@ -554,6 +554,9 @@ const MAX_SPARE: usize = 16;
 struct Batch {
     seq: u64,
     buf: Vec<u8>,
+    /// The chunk size it was built with. A batch built before a step-down
+    /// that then fails for its size says nothing new about the path.
+    chunk: u16,
     /// Length of every datagram but the last.
     segment: usize,
     /// The byte range each datagram carries.
@@ -638,6 +641,17 @@ const MAX_CANDIDATES: usize = 12;
 /// already sent. Holes past this wait for the queue to drain and are
 /// reported again; data actually lost in flight is always queued.
 const MAX_HEALED_RANGES: usize = 1 << 16;
+/// How long to wait before sending again after the network refused a send
+/// for a reason other than a full buffer.
+const SEND_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// How long after stepping the chunk down its old size is tried again, with
+/// a PROBE the receiver has to acknowledge; and how much longer each later
+/// try waits.
+const MTU_RAISE_AFTER: Duration = Duration::from_secs(30);
+/// Retransmission timeouts in a row, with no data acknowledged while the
+/// receiver is still heard from, before full-size packets are taken to be
+/// too big for the path (RFC 8899, section 4.3).
+const MTU_BLACKHOLE_RTOS: u32 = 2;
 
 /// A relay we are talking to, and the inbox its datagrams go into.
 type RelayInbox = (SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>);
@@ -685,6 +699,11 @@ struct Engine {
     reach: crate::address::Reach,
     /// Datagrams the network refused to send, for the log.
     send_failures: u64,
+    /// Retransmission timeouts in a row that looked like a path losing
+    /// only full-size packets.
+    mtu_suspect: u32,
+    /// When to try a larger chunk again, and which.
+    mtu_raise: Option<(Instant, u16)>,
     socket: Arc<BatchSocket>,
     /// The receiver's proven address: everything we send goes there.
     peer: SocketAddr,
@@ -856,6 +875,8 @@ impl Engine {
             cfg,
             reach: crate::address::Reach::of(&socket.udp()),
             send_failures: 0,
+            mtu_suspect: 0,
+            mtu_raise: None,
             socket,
             peer,
             path: PathProbe::new(),
@@ -1409,7 +1430,9 @@ impl Engine {
                     let ts = self.clock.now_us().max(1);
                     self.probe_ts.push(ts);
                     let hello = Message::Hello(self.hello(ts));
-                    self.send_frame(HELLO_FLAG_RESUME, &hello)?;
+                    // Lost like any datagram if it cannot be sent; the
+                    // next poll asks again.
+                    let _ = self.send_frame(HELLO_FLAG_RESUME, &hello);
                     next_poll = Some(now + DECISION_POLL);
                 }
             }
@@ -1988,6 +2011,7 @@ impl Engine {
         let fresh = self.pipe.take_buf();
         let mut buf = std::mem::replace(&mut self.batch, fresh);
         let segment = starts.get(1).copied().unwrap_or(buf.len());
+        let chunk = self.chunk;
         match parallel::pool() {
             Some(pool) if starts.len() >= MIN_POOLED => {
                 let tx = self.pipe.results_tx.clone();
@@ -1997,6 +2021,7 @@ impl Engine {
                     let _ = tx.send(Batch {
                         seq,
                         buf,
+                        chunk,
                         segment,
                         ranges,
                         failed,
@@ -2010,6 +2035,7 @@ impl Engine {
                     Batch {
                         seq,
                         buf,
+                        chunk,
                         segment,
                         ranges,
                         failed,
@@ -2020,6 +2046,13 @@ impl Engine {
     }
 
     /// Sends encrypted batches in order, as far as the socket takes them.
+    ///
+    /// No send error ends the transfer. A network that is gone for a moment
+    /// — a Wi-Fi hand-over, an interface going down and up — refuses sends
+    /// for that moment, and ending the transfer on the first refusal threw
+    /// away what the liveness rules exist to decide: whether the receiver
+    /// is still there, and how long to keep trying before keeping the state
+    /// for resume.
     fn flush_ready(&mut self) -> Result<Option<SendBlock>, SendError> {
         while let Some(batch) = self.pipe.ready.remove(&self.pipe.next_send) {
             if batch.failed {
@@ -2029,8 +2062,8 @@ impl Engine {
             let sent = self
                 .socket
                 .try_send_segments(self.peer, &batch.buf, batch.segment);
-            match sent {
-                Ok(()) => {}
+            let block = match sent {
+                Ok(()) => None,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     self.pipe.ready.insert(batch.seq, batch);
                     return Ok(Some(SendBlock::Socket));
@@ -2042,61 +2075,96 @@ impl Engine {
                     self.pipe.ready.insert(batch.seq, batch);
                     return Ok(Some(SendBlock::Pacer(NO_BUFFER_BACKOFF)));
                 }
-                Err(err) if is_msgsize_error(&err) => {
-                    // The path will not carry this size. What says so is an
-                    // ICMP message the kernel believed, and an ICMP message
-                    // is not authenticated: a forged one and a path that
-                    // really shrank look exactly alike here. So we step down
-                    // instead of believing any claim about *how far*, and
-                    // keep stepping until the path carries something —
-                    // a tunnel with a small MTU behaves the same way. The
-                    // size only ever grows again on a PROBE_ACK, which is
-                    // authenticated, so a forged ICMP can cost throughput
-                    // and never correctness.
-                    self.unsend(&batch.ranges);
-                    let smaller = if self.chunk > SAFE_CHUNK {
-                        SAFE_CHUNK
-                    } else {
-                        (self.chunk / 2).max(MIN_CHUNK)
-                    };
-                    if smaller >= self.chunk {
-                        return Err(SendError::Io(err));
-                    }
-                    tracing::warn!("EMSGSIZE: reducing chunk {} -> {}", self.chunk, smaller);
-                    self.set_chunk(smaller);
-                }
                 Err(err) if batch.ranges.len() > 1 && self.socket.max_segments() == 1 => {
                     // The network stack refused segmentation offload (and it
                     // is off now): send these datagrams one by one.
                     tracing::debug!("segmented send failed ({}); sending datagrams singly", err);
-                    self.send_singly(&batch)?;
+                    self.send_singly(&batch)
                 }
                 Err(err) => {
                     self.unsend(&batch.ranges);
-                    return Err(SendError::Io(err));
+                    self.on_send_error(&err, batch.chunk)
                 }
-            }
+            };
             self.pipe.next_send += 1;
             self.pipe.recycle(batch.buf);
+            if block.is_some() {
+                return Ok(block);
+            }
         }
         Ok(None)
     }
 
-    fn send_singly(&mut self, batch: &Batch) -> Result<(), SendError> {
+    /// Sends a batch one datagram at a time; what does not leave goes back
+    /// into `pending`. Returns what to wait for, if it had to stop.
+    fn send_singly(&mut self, batch: &Batch) -> Option<SendBlock> {
         for (k, datagram) in batch.buf.chunks(batch.segment).enumerate() {
             match self.socket.try_send(self.peer, datagram) {
                 Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&err) => {
-                    self.unsend(&batch.ranges[k..]);
-                    return Ok(());
-                }
                 Err(err) => {
                     self.unsend(&batch.ranges[k..]);
-                    return Err(SendError::Io(err));
+                    return Some(if err.kind() == io::ErrorKind::WouldBlock {
+                        SendBlock::Socket
+                    } else if is_no_buffer_error(&err) {
+                        SendBlock::Pacer(NO_BUFFER_BACKOFF)
+                    } else {
+                        self.on_send_error(&err, batch.chunk)
+                            .unwrap_or(SendBlock::Yield)
+                    });
                 }
             }
         }
-        Ok(())
+        None
+    }
+
+    /// What a refused send means, for data built with `built_with` chunks
+    /// (or, for a single datagram, carrying that much file data). Returns
+    /// what to wait for before sending again, if anything.
+    fn on_send_error(&mut self, err: &io::Error, built_with: u16) -> Option<SendBlock> {
+        if is_msgsize_error(err) {
+            // Too big for the local interface: the sockets ignore what ICMP
+            // claims about the path (see `set_dont_fragment`), so this is
+            // no stranger's say-so. One step down per size the path refuses
+            // — a whole pipeline of batches built at the old size fails
+            // together, and stepping down once for each used to walk the
+            // chunk to the floor on a single event, and then end the
+            // transfer. The size grows again only on an acknowledged PROBE.
+            if built_with > self.chunk || self.step_down_chunk("the interface refused the size") {
+                return None;
+            }
+            // Nothing smaller to try. Keep trying, slowly; the liveness
+            // rules decide when to stop.
+            return Some(SendBlock::Pacer(SEND_ERROR_BACKOFF));
+        }
+        self.send_failures += 1;
+        if self.send_failures.is_power_of_two() {
+            tracing::warn!(
+                "cannot send to {} ({}; {} time(s) so far); still trying",
+                self.peer,
+                err,
+                self.send_failures
+            );
+        }
+        Some(SendBlock::Pacer(SEND_ERROR_BACKOFF))
+    }
+
+    /// One step down in chunk size: to the size every path carries, then
+    /// by halves to the floor. False when already at the floor.
+    fn step_down_chunk(&mut self, why: &str) -> bool {
+        let smaller = if self.chunk > SAFE_CHUNK {
+            SAFE_CHUNK
+        } else {
+            (self.chunk / 2).max(MIN_CHUNK)
+        };
+        if smaller >= self.chunk {
+            return false;
+        }
+        tracing::warn!("{}: reducing chunk {} -> {}", why, self.chunk, smaller);
+        // Worth trying the old size again later: what shrank the path may
+        // have been a moment's detour.
+        self.mtu_raise = Some((Instant::now() + MTU_RAISE_AFTER, self.chunk));
+        self.set_chunk(smaller);
+        true
     }
 
     /// Takes ranges that were counted as sent but never left back into
@@ -2216,6 +2284,15 @@ impl Engine {
                 if self.probe_acks.len() < 16 {
                     self.probe_acks.push(p.size);
                 }
+                // The size we stepped down from gets through again.
+                if let Some((_, size)) = self.mtu_raise {
+                    let chunk = (p.size as usize).saturating_sub(DATA_OVERHEAD);
+                    if chunk == size as usize && size > self.chunk {
+                        tracing::info!("path carries {} byte chunks again", size);
+                        self.set_chunk(size);
+                        self.mtu_raise = None;
+                    }
+                }
             }
             // The receiver is validating an address of ours: echo the token
             // back from the address it challenged, and nowhere else.
@@ -2247,13 +2324,15 @@ impl Engine {
         } else {
             VERDICT_MISMATCH
         };
-        self.send_frame(
+        // If it cannot be sent it is as good as lost, and a lost verdict is
+        // asked for again (the receiver repeats its FIN).
+        let _ = self.send_frame(
             0,
             &Message::FinAck(wire::FinAck {
                 verdict,
                 file_hash: my_hash,
             }),
-        )?;
+        );
         if self.fin_verdict.is_none() {
             tracing::info!(
                 "receiver reported completion; whole-file hash {}",
@@ -2506,6 +2585,7 @@ impl Engine {
             self.rtt.reset_backoff();
             self.last_ack_progress = now;
             self.tail_probes = 0;
+            self.mtu_suspect = 0;
         }
         if !lost.is_empty() {
             let lost_bytes: u64 = lost.iter().map(|&(s, e)| e - s).sum();
@@ -2647,7 +2727,14 @@ impl Engine {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&err) => {
                 return Ok(())
             }
-            Err(err) => return Err(SendError::Io(err)),
+            // As for any other datagram: never the end of the transfer. It
+            // repeats a range sent earlier, at the size it was sent at, so
+            // that — not the current chunk — is what was refused.
+            Err(err) => {
+                let size = (e - s).min(u16::MAX as u64) as u16;
+                self.on_send_error(&err, size);
+                return Ok(());
+            }
         }
         self.seq += 1;
         if let Some(inf) = self.inflight.get_mut(&s) {
@@ -2720,6 +2807,32 @@ impl Engine {
                 bytes,
                 self.cc.cwnd()
             );
+            // The receiver is still heard from — its ACKs and PONGs are
+            // small — but no data has got through. That is what a path
+            // whose MTU shrank looks like once ICMP is not believed: every
+            // full-size packet vanishes and nothing else does. Step down,
+            // and try the old size again later with an acknowledged PROBE.
+            let heard =
+                now.saturating_duration_since(self.last_rx) < self.cfg.stall_timeout.max(rto * 3);
+            let stuck = now.saturating_duration_since(self.last_ack_progress) >= rto;
+            if heard && stuck {
+                self.mtu_suspect += 1;
+                if self.mtu_suspect >= MTU_BLACKHOLE_RTOS {
+                    self.mtu_suspect = 0;
+                    self.step_down_chunk(
+                        "full-size packets are lost while small ones get through (MTU black hole?)",
+                    );
+                }
+            }
+        }
+        // Try the size we stepped down from again: one PROBE, which only an
+        // acknowledgement under the session's keys can answer.
+        if let Some((at, size)) = self.mtu_raise {
+            if now >= at && size > self.chunk {
+                let wire = (size as usize + DATA_OVERHEAD) as u16;
+                let _ = self.send_frame(0, &Message::Probe(Probe { size: wire }));
+                self.mtu_raise = Some((now + MTU_RAISE_AFTER * 2, size));
+            }
         }
 
         // Nothing queued or in flight, yet the receiver still misses bytes:
