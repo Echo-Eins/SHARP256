@@ -1,323 +1,323 @@
-use anyhow::{Context, Result};
-use bytes::{BufMut, BytesMut, Buf};
-use std::net::SocketAddr;
-use tokio::time::{timeout, Duration};
-use rand::Rng;
+//! Minimal STUN client (RFC 8489 Binding requests) used by the receiver to
+//! learn the public address its transfer socket is mapped to.
+//!
+//! Requests go out on the transfer socket itself (the mapping of *that*
+//! socket is what matters); responses are handed over by the receiver's
+//! dispatcher through a channel, so discovery never competes with the
+//! transport for incoming datagrams.
+
+use anyhow::{anyhow, bail, Result};
+use rand::RngCore;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket};
+use tokio::sync::mpsc;
 
-// STUN константы
-const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
+pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
-const BINDING_RESPONSE: u16 = 0x0101;
-const MAPPED_ADDRESS: u16 = 0x0001;
-const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const BINDING_SUCCESS: u16 = 0x0101;
+const BINDING_ERROR: u16 = 0x0111;
+const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const STUN_HEADER_LEN: usize = 20;
 
-/// STUN клиент для определения внешнего адреса
+/// True for datagrams that look like STUN Binding responses. SHARP datagrams
+/// start with "SH", so the two can never be confused.
+pub fn is_stun_response(pkt: &[u8]) -> bool {
+    if pkt.len() < STUN_HEADER_LEN {
+        return false;
+    }
+    let msg_type = u16::from_be_bytes([pkt[0], pkt[1]]);
+    (msg_type == BINDING_SUCCESS || msg_type == BINDING_ERROR)
+        && pkt[4..8] == STUN_MAGIC_COOKIE.to_be_bytes()
+}
+
+/// A random 96-bit transaction id from a cryptographically secure generator
+/// (RFC 8489 section 6).
+pub fn transaction_id() -> [u8; 12] {
+    let mut tid = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut tid);
+    tid
+}
+
+/// Binding request without attributes.
+pub fn binding_request(tid: &[u8; 12]) -> [u8; STUN_HEADER_LEN] {
+    let mut msg = [0u8; STUN_HEADER_LEN];
+    msg[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+    // message length 0
+    msg[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    msg[8..20].copy_from_slice(tid);
+    msg
+}
+
+/// Extracts the mapped address from a Binding success response for `tid`.
+/// XOR-MAPPED-ADDRESS is preferred; MAPPED-ADDRESS is accepted from legacy
+/// servers.
+pub fn parse_binding_response(data: &[u8], tid: &[u8; 12]) -> Result<SocketAddr> {
+    if data.len() < STUN_HEADER_LEN {
+        bail!("STUN response too short");
+    }
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    if data[4..8] != STUN_MAGIC_COOKIE.to_be_bytes() {
+        bail!("bad STUN magic cookie");
+    }
+    if data[8..20] != tid[..] {
+        bail!("STUN transaction id mismatch");
+    }
+    if msg_type == BINDING_ERROR {
+        bail!("STUN server returned an error response");
+    }
+    if msg_type != BINDING_SUCCESS {
+        bail!("not a STUN binding response");
+    }
+    let len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if len % 4 != 0 || STUN_HEADER_LEN + len > data.len() {
+        bail!("bad STUN message length");
+    }
+    let body = &data[STUN_HEADER_LEN..STUN_HEADER_LEN + len];
+    let mut pos = 0;
+    let mut legacy = None;
+    while pos + 4 <= body.len() {
+        let attr = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let alen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+        let start = pos + 4;
+        let end = start + alen;
+        if end > body.len() {
+            bail!("STUN attribute overruns the message");
+        }
+        let value = &body[start..end];
+        match attr {
+            ATTR_XOR_MAPPED_ADDRESS => return parse_address(value, Some(tid)),
+            ATTR_MAPPED_ADDRESS => legacy = Some(parse_address(value, None)?),
+            _ => {}
+        }
+        pos = end + (4 - alen % 4) % 4;
+    }
+    legacy.ok_or_else(|| anyhow!("no mapped address in STUN response"))
+}
+
+fn parse_address(value: &[u8], xor_tid: Option<&[u8; 12]>) -> Result<SocketAddr> {
+    if value.len() < 4 {
+        bail!("STUN address attribute too short");
+    }
+    let family = value[1];
+    let mut port = u16::from_be_bytes([value[2], value[3]]);
+    let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+    if xor_tid.is_some() {
+        port ^= (STUN_MAGIC_COOKIE >> 16) as u16;
+    }
+    match family {
+        0x01 => {
+            if value.len() < 8 {
+                bail!("IPv4 STUN address too short");
+            }
+            let mut ip = [value[4], value[5], value[6], value[7]];
+            if xor_tid.is_some() {
+                for (b, c) in ip.iter_mut().zip(cookie) {
+                    *b ^= c;
+                }
+            }
+            Ok(SocketAddr::new(Ipv4Addr::from(ip).into(), port))
+        }
+        0x02 => {
+            if value.len() < 20 {
+                bail!("IPv6 STUN address too short");
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&value[4..20]);
+            if let Some(tid) = xor_tid {
+                let mask = cookie.iter().chain(tid.iter());
+                for (b, m) in ip.iter_mut().zip(mask) {
+                    *b ^= m;
+                }
+            }
+            Ok(SocketAddr::new(Ipv6Addr::from(ip).into(), port))
+        }
+        _ => bail!("unknown STUN address family {}", family),
+    }
+}
+
+/// STUN client working on a shared socket plus a response channel.
 pub struct StunClient {
     servers: Vec<String>,
+    per_try: Duration,
+    tries: u32,
 }
 
 impl StunClient {
     pub fn new(servers: Vec<String>) -> Self {
-        Self { servers }
+        Self {
+            servers,
+            per_try: Duration::from_secs(1),
+            tries: 2,
+        }
     }
 
-    /// Получение mapped address через STUN
-    pub async fn get_mapped_address(&self, socket: &UdpSocket) -> Result<SocketAddr> {
-        let servers: Vec<_> = self.servers.iter().take(3).collect();
-
-        for attempt in 0..3 {
-            let mut tids = Vec::new();
-
-            // Отправляем запросы ко всем серверам
-            for server in &servers {
-                if let Ok(addr) = self.resolve_server(server).await {
-                    let tid = self.generate_transaction_id();
-                    let req = self.create_binding_request(&tid);
-                    if socket.send_to(&req, addr).await.is_ok() {
-                        tids.push(tid);
+    /// Asks one server for the mapped address of `socket`.
+    pub async fn query(
+        &self,
+        socket: &UdpSocket,
+        server: SocketAddr,
+        responses: &mut mpsc::Receiver<Vec<u8>>,
+    ) -> Result<SocketAddr> {
+        let tid = transaction_id();
+        let request = binding_request(&tid);
+        for _ in 0..self.tries {
+            socket.send_to(&request, server).await?;
+            let deadline = Instant::now() + self.per_try;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(left, responses.recv()).await {
+                    Ok(Some(pkt)) => {
+                        if let Ok(addr) = parse_binding_response(&pkt, &tid) {
+                            return Ok(addr);
+                        }
                     }
-                }
-            }
-
-            let mut buf = vec![0u8; 1024];
-            if let Ok(Ok((size, _))) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
-                for tid in tids {
-                    if let Ok(addr) = self.parse_binding_response(&buf[..size], &tid) {
-                        return Ok(addr);
-                    }
-                }
-            }
-            tracing::debug!("STUN attempt {} failed", attempt + 1);
-        }
-        
-        anyhow::bail!("All STUN servers failed")
-    }
-
-    /// Определение типа NAT через несколько STUN серверов
-    pub async fn detect_nat_type(&self, socket: &UdpSocket) -> Result<Vec<(SocketAddr, bool)>> {
-        let mut results = Vec::new();
-
-        let servers: Vec<_> = self.servers.iter().take(3).collect();
-
-        for (idx, server) in servers.iter().enumerate() {
-            if let Ok(addr) = self.query_stun_server(socket, server).await {
-                if idx == 0 {
-                    results.push((addr, false));
-                } else {
-                    let changed = results.first().map(|(first, _)| first.ip() != addr.ip() || first.port() != addr.port()).unwrap_or(false);
-                    results.push((addr, changed));
+                    Ok(None) => bail!("STUN response channel closed"),
+                    Err(_) => break,
                 }
             }
         }
-        
-        Ok(results)
+        bail!("no answer from STUN server {}", server)
     }
 
-    /// Запрос к STUN серверу
-    async fn query_stun_server(&self, socket: &UdpSocket, server: &str) -> Result<SocketAddr> {
-        let server_addr = self.resolve_server(server).await?;
-
-        // Создаем STUN Binding Request
-        let transaction_id = self.generate_transaction_id();
-        let request = self.create_binding_request(&transaction_id);
-        
-        // Отправляем запрос
-        socket.send_to(&request, server_addr).await?;
-        
-        // Ждем ответ
-        let mut buffer = vec![0u8; 1024];
-        let (size, _) = timeout(
-            Duration::from_secs(2),
-            socket.recv_from(&mut buffer)
-        ).await
-        .context("STUN response timeout")??;
-        
-        // Парсим ответ
-        self.parse_binding_response(&buffer[..size], &transaction_id)
-    }
-
-    async fn resolve_server(&self, server: &str) -> Result<SocketAddr> {
-        match server.parse() {
-            Ok(addr) => Ok(addr),
-            Err(_) => {
-                let mut addrs = lookup_host(server)
-                    .await
-                    .with_context(|| format!("Invalid STUN server address: {}", server))?;
-                addrs
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("DNS lookup failed for {}", server))
-            }
-        }
-    }
-
-    /// Создание STUN Binding Request
-    fn create_binding_request(&self, transaction_id: &[u8; 12]) -> Vec<u8> {
-        let mut buf = BytesMut::with_capacity(20);
-        
-        // Message Type: Binding Request
-        buf.put_u16(BINDING_REQUEST);
-        // Message Length: 0 (no attributes)
-        buf.put_u16(0);
-        // Magic Cookie
-        buf.put_u32(STUN_MAGIC_COOKIE);
-        // Transaction ID
-        buf.put_slice(transaction_id);
-        
-        buf.to_vec()
-    }
-
-    /// Парсинг STUN Binding Response
-    fn parse_binding_response(&self, data: &[u8], expected_tid: &[u8; 12]) -> Result<SocketAddr> {
-        if data.len() < 20 {
-            anyhow::bail!("STUN response too short");
-        }
-        
-        let mut buf = BytesMut::from(data);
-        
-        // Проверяем тип сообщения
-        let msg_type = buf.get_u16();
-        if msg_type != BINDING_RESPONSE {
-            anyhow::bail!("Not a binding response");
-        }
-        
-        let msg_length = buf.get_u16() as usize;
-        let magic = buf.get_u32();
-
-        if msg_length > buf.remaining() {
-            anyhow::bail!("STUN message length invalid");
-        }
-
-        if magic != STUN_MAGIC_COOKIE {
-            anyhow::bail!("Invalid magic cookie");
-        }
-        
-        // Проверяем Transaction ID
-        let mut tid = [0u8; 12];
-        buf.copy_to_slice(&mut tid);
-        if tid != *expected_tid {
-            anyhow::bail!("Transaction ID mismatch");
-        }
-        
-        // Парсим атрибуты
-        let mut remaining = msg_length;
-        while remaining >= 4 && buf.remaining() >= 4 {
-            let attr_type = buf.get_u16();
-            let attr_length = buf.get_u16() as usize;
-            
-            if buf.remaining() < attr_length {
+    /// Mapped addresses reported by up to `want` different servers.
+    pub async fn mapped_addresses(
+        &self,
+        socket: &UdpSocket,
+        responses: &mut mpsc::Receiver<Vec<u8>>,
+        want: usize,
+    ) -> Vec<SocketAddr> {
+        let v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        let mut out = Vec::new();
+        for server in &self.servers {
+            if out.len() >= want {
                 break;
             }
-            
-            match attr_type {
-                XOR_MAPPED_ADDRESS => {
-                    return self.parse_xor_mapped_address(&mut buf, attr_length, &tid);
+            let Some(addr) = resolve(server, v6).await else {
+                tracing::debug!("STUN: cannot resolve {}", server);
+                continue;
+            };
+            match self.query(socket, addr, responses).await {
+                Ok(mapped) => {
+                    tracing::debug!("STUN: {} reports {}", server, mapped);
+                    out.push(mapped);
                 }
-                MAPPED_ADDRESS => {
-                    return self.parse_mapped_address(&mut buf, attr_length);
-                }
-                _ => {
-                    // Пропускаем неизвестный атрибут
-                    buf.advance(attr_length);
-                }
+                Err(e) => tracing::debug!("STUN: {}", e),
             }
-            
-            // Выравнивание на 32-битную границу
-            let padding = (4 - (attr_length % 4)) % 4;
-            if buf.remaining() >= padding {
-                buf.advance(padding);
-            }
-            
-            remaining = remaining.saturating_sub(4 + attr_length + padding);
         }
-        
-        anyhow::bail!("No mapped address found in STUN response")
+        out
     }
+}
 
-    /// Парсинг XOR-MAPPED-ADDRESS
-    fn parse_xor_mapped_address(&self, buf: &mut BytesMut, length: usize, transaction_id: &[u8; 12]) -> Result<SocketAddr> {
-        if length < 8 {
-            anyhow::bail!("XOR-MAPPED-ADDRESS too short");
-        }
-        
-        let _ = buf.get_u8(); // Пропускаем reserved
-        let family = buf.get_u8();
-        let port = buf.get_u16() ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-        
-        match family {
-            0x01 => {
-                // IPv4
-                let ip_bytes = buf.get_u32() ^ STUN_MAGIC_COOKIE;
-                let ip = std::net::Ipv4Addr::from(ip_bytes);
-                Ok(SocketAddr::new(ip.into(), port))
-            }
-            0x02 => {
-                // IPv6
-                if length < 20 {
-                    anyhow::bail!("IPv6 XOR-MAPPED-ADDRESS too short");
-                }
-                
-                let mut addr_bytes = [0u8; 16];
-                buf.copy_to_slice(&mut addr_bytes);
-
-                // XOR all 16 bytes with magic cookie and transaction ID
-                // RFC 5389: first 4 bytes are XORed with the magic cookie,
-                // the remaining 12 bytes are XORed with the transaction ID
-
-                for i in 0..4 {
-                    addr_bytes[i] ^= ((STUN_MAGIC_COOKIE >> (8 * (3 - i))) & 0xFF) as u8;
-                }
-                for i in 0..12 {
-                    addr_bytes[i + 4] ^= transaction_id[i];
-                }
-                
-                let ip = std::net::Ipv6Addr::from(addr_bytes);
-                Ok(SocketAddr::new(ip.into(), port))
-            }
-            _ => anyhow::bail!("Unknown address family"),
-        }
+async fn resolve(server: &str, v6: bool) -> Option<SocketAddr> {
+    if let Ok(addr) = server.parse::<SocketAddr>() {
+        return (addr.is_ipv6() == v6).then_some(addr);
     }
-
-    /// Парсинг MAPPED-ADDRESS (legacy)
-    fn parse_mapped_address(&self, buf: &mut BytesMut, length: usize) -> Result<SocketAddr> {
-        if length < 8 {
-            anyhow::bail!("MAPPED-ADDRESS too short");
-        }
-        
-        let _ = buf.get_u8(); // Пропускаем reserved
-        let family = buf.get_u8();
-        let port = buf.get_u16();
-        
-        match family {
-            0x01 => {
-                // IPv4
-                let ip = std::net::Ipv4Addr::from(buf.get_u32());
-                Ok(SocketAddr::new(ip.into(), port))
-            }
-            0x02 => {
-                // IPv6
-                if length < 20 {
-                    anyhow::bail!("IPv6 MAPPED-ADDRESS too short");
-                }
-                let mut addr_bytes = [0u8; 16];
-                buf.copy_to_slice(&mut addr_bytes);
-                let ip = std::net::Ipv6Addr::from(addr_bytes);
-                Ok(SocketAddr::new(ip.into(), port))
-            }
-            _ => anyhow::bail!("Unknown address family"),
-        }
-    }
-
-    /// Генерация случайного Transaction ID
-    fn generate_transaction_id(&self) -> [u8; 12] {
-        let mut tid = [0u8; 12];
-        rand::thread_rng().fill(&mut tid);
-        tid
-    }
-
+    let mut addrs = tokio::time::timeout(Duration::from_secs(2), lookup_host(server))
+        .await
+        .ok()?
+        .ok()?;
+    addrs.find(|a| a.is_ipv6() == v6)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv6Addr};
-    use bytes::BytesMut;
+
+    fn response(tid: &[u8; 12], attrs: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (t, v) in attrs {
+            body.extend_from_slice(&t.to_be_bytes());
+            body.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            body.extend_from_slice(v);
+            body.resize(body.len() + (4 - v.len() % 4) % 4, 0);
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        msg.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        msg.extend_from_slice(tid);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    fn xor_v4(ip: Ipv4Addr, port: u16) -> Vec<u8> {
+        let mut v = vec![0, 0x01];
+        v.extend_from_slice(&(port ^ (STUN_MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+        let c = STUN_MAGIC_COOKIE.to_be_bytes();
+        v.extend(ip.octets().iter().zip(c).map(|(a, b)| a ^ b));
+        v
+    }
 
     #[test]
-    fn parse_ipv6_xor_mapped_address() {
-        let client = StunClient::new(vec![]);
-
-        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    fn parses_ipv6_xor_mapped_address() {
+        let tid: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let port: u16 = 54321;
+        let mut v = vec![0, 0x02];
+        v.extend_from_slice(&(port ^ (STUN_MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+        let mask: Vec<u8> = STUN_MAGIC_COOKIE
+            .to_be_bytes()
+            .into_iter()
+            .chain(tid)
+            .collect();
+        v.extend(ip.octets().iter().zip(mask).map(|(a, b)| a ^ b));
+        let msg = response(&tid, &[(ATTR_XOR_MAPPED_ADDRESS, v)]);
+        assert!(is_stun_response(&msg));
+        assert_eq!(
+            parse_binding_response(&msg, &tid).unwrap(),
+            SocketAddr::new(ip.into(), port)
+        );
+    }
 
-        // Create XOR-MAPPED-ADDRESS attribute value
-        let mut attr_value = BytesMut::with_capacity(20);
-        attr_value.put_u8(0); // reserved
-        attr_value.put_u8(0x02); // family
-        attr_value.put_u16(port ^ ((STUN_MAGIC_COOKIE >> 16) as u16));
-        let ip_bytes = ip.octets();
-        let mut xored_ip = [0u8; 16];
-        for i in 0..4 {
-            xored_ip[i] = ip_bytes[i] ^ ((STUN_MAGIC_COOKIE >> (8 * (3 - i))) & 0xFF) as u8;
-        }
-        for i in 0..12 {
-            xored_ip[i + 4] = ip_bytes[i + 4] ^ transaction_id[i];
-        }
-        attr_value.extend_from_slice(&xored_ip);
+    #[test]
+    fn prefers_xor_mapped_and_skips_unknown_attributes() {
+        let tid = transaction_id();
+        let legacy = {
+            let mut v = vec![0, 0x01];
+            v.extend_from_slice(&1111u16.to_be_bytes());
+            v.extend_from_slice(&[10, 0, 0, 1]);
+            v
+        };
+        let msg = response(
+            &tid,
+            &[
+                (0x8022, b"software/1.0".to_vec()), // SOFTWARE, 12 bytes
+                (ATTR_MAPPED_ADDRESS, legacy),
+                (0x802b, vec![1, 2, 3]), // odd length, padded
+                (
+                    ATTR_XOR_MAPPED_ADDRESS,
+                    xor_v4(Ipv4Addr::new(203, 0, 113, 7), 40000),
+                ),
+            ],
+        );
+        assert_eq!(
+            parse_binding_response(&msg, &tid).unwrap(),
+            "203.0.113.7:40000".parse::<SocketAddr>().unwrap()
+        );
+    }
 
-        // Build STUN message
-        let msg_len = 4 + attr_value.len();
-        let mut msg = BytesMut::with_capacity(20 + msg_len);
-        msg.put_u16(BINDING_RESPONSE);
-        msg.put_u16(msg_len as u16);
-        msg.put_u32(STUN_MAGIC_COOKIE);
-        msg.put_slice(&transaction_id);
-        msg.put_u16(XOR_MAPPED_ADDRESS);
-        msg.put_u16(attr_value.len() as u16);
-        msg.put_slice(&attr_value);
-
-        let result = client.parse_binding_response(&msg, &transaction_id).unwrap();
-        assert_eq!(result, SocketAddr::new(ip.into(), port));
+    #[test]
+    fn accepts_legacy_mapped_address_and_rejects_garbage() {
+        let tid = transaction_id();
+        let mut v = vec![0, 0x01];
+        v.extend_from_slice(&5555u16.to_be_bytes());
+        v.extend_from_slice(&[198, 51, 100, 9]);
+        let msg = response(&tid, &[(ATTR_MAPPED_ADDRESS, v)]);
+        assert_eq!(
+            parse_binding_response(&msg, &tid).unwrap(),
+            "198.51.100.9:5555".parse::<SocketAddr>().unwrap()
+        );
+        // Wrong transaction id, truncated message, SHARP datagram.
+        assert!(parse_binding_response(&msg, &transaction_id()).is_err());
+        assert!(parse_binding_response(&msg[..msg.len() - 3], &tid).is_err());
+        assert!(!is_stun_response(b"SH\x02\x03................"));
+        assert!(is_stun_response(&msg));
+        let req = binding_request(&tid);
+        assert!(!is_stun_response(&req));
     }
 }

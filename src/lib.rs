@@ -1,60 +1,47 @@
-pub mod protocol {
-    pub mod constants;
-    pub mod packet;
-    pub mod ack;
-}
+//! SHARP-256 (Swift Hash Assurance Rust Protocol): reliable, BLAKE3-verified
+//! file transfer over UDP with adaptive rate control and resumable sessions.
 
-pub mod buffer;
+pub mod config;
 pub mod file;
-pub mod sao;
-pub mod state;
 pub mod progress;
-pub mod sender;
-pub mod receiver;
+pub mod protocol;
+pub mod state;
+pub mod transport;
 
-pub mod fragmentation;
 #[cfg(feature = "nat-traversal")]
 pub mod nat;
 
 #[cfg(feature = "gui")]
 pub mod gui;
 
+pub use config::{AcceptPolicy, IncomingRequest, ReceiverConfig, SenderConfig, TransportConfig};
+pub use progress::{EventCallback, TransferEvent, TransferStats};
+pub use transport::{Receiver, RecvError, SendError, Sender, TransferSummary};
 
-// Re-export основных типов
-pub use sender::Sender;
-pub use receiver::Receiver;
-pub use protocol::constants::*;
-pub use fragmentation::*;
-/// Инициализация логирования
-pub fn init_logging(level: &str) {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-    
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(level)))
-        .init();
-}
-
-/// Версия протокола
+/// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Получение информации о системе
+/// Initialises `tracing` with the given default level (overridable by
+/// `RUST_LOG`).
+pub fn init_logging(level: &str) {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let _ = tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(filter)
+        .try_init();
+}
+
+/// Short description of the host, printed by the CLI tools.
 pub fn system_info() -> String {
-    use sysinfo::System;
-    
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    
     format!(
-        "SHARP-256 Protocol v{}\n\
-         OS: {} {}\n\
-         CPU: {} cores\n\
-         Memory: {} MB available",
+        "SHARP-256 v{} (protocol v{}) on {} {} with {} CPU threads",
         VERSION,
-        System::name().unwrap_or_else(|| "Unknown".to_string()),
-        System::os_version().unwrap_or_else(|| "Unknown".to_string()),
-        sys.cpus().len(),
-        sys.available_memory() / 1024 / 1024
+        protocol::constants::PROTOCOL_VERSION,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     )
 }

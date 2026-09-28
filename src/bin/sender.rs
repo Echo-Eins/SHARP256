@@ -1,13 +1,17 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use sharp256::{init_logging, system_info, sender};
+use sharp256::progress::{format_bytes, format_rate, parse_rate};
+use sharp256::{init_logging, system_info, Sender, SenderConfig, TransferEvent};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "SHARP-256 File Sender", long_about = None)]
+#[command(author, version, about = "SHARP-256 file sender", long_about = None)]
 struct Args {
-    /// File to send (if not specified, GUI will be launched)
+    /// File to send (omit to open the GUI, if built with it)
     file: Option<PathBuf>,
 
     /// Receiver address (IP:port)
@@ -17,19 +21,32 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0:0")]
     bind: SocketAddr,
 
-    /// Enable encryption (TLS 1.3)
-    #[arg(short, long)]
-    encrypt: bool,
-
-    /// Disable NAT traversal features
-    #[arg(long)]
+    /// Accepted for compatibility; the sender needs no NAT handling
+    #[arg(long, hide = true)]
     no_nat: bool,
 
+    /// Largest chunk of file bytes per packet (probed downwards if the path
+    /// cannot carry it). Default fits a 1500-byte MTU.
+    #[arg(long)]
+    chunk_size: Option<u16>,
+
+    /// Skip path-MTU probing and use the chunk size as configured
+    #[arg(long)]
+    no_probe: bool,
+
+    /// Cap the send rate, e.g. 50M, 800K, 1G (bits per second)
+    #[arg(long)]
+    max_rate: Option<String>,
+
+    /// Directory for resume state (default: per-user data directory)
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = "warn")]
     log_level: String,
 
-    /// Run without GUI (headless mode)
+    /// Run without GUI
     #[arg(long)]
     headless: bool,
 }
@@ -37,125 +54,119 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    // Инициализация логирования
     init_logging(&args.log_level);
 
-    // Выводим информацию о системе
-    println!("{}", system_info());
-    println!();
-
-    // Определяем режим работы
-    if args.headless || (args.file.is_some() && args.receiver.is_some()) {
-        // Headless режим
-        if let (Some(file), Some(receiver)) = (args.file.clone(), args.receiver) {
-            // Проверяем существование файла
-            if !file.exists() {
-                anyhow::bail!("File not found: {:?}", file);
-            }
-
-            if file.is_dir() {
-                anyhow::bail!("Cannot send directory: {:?}", file);
-            }
-
-            let file_size = std::fs::metadata(&file)?.len();
-            println!("File: {:?}", file);
-            println!(
-                "Size: {} bytes ({:.2} MB)",
-                file_size,
-                file_size as f64 / 1024.0 / 1024.0
-            );
-            println!("Receiver: {}", receiver);
-            println!(
-                "Encryption: {}",
-                if args.encrypt { "enabled" } else { "disabled" }
-            );
-
-            #[cfg(feature = "nat-traversal")]
+    match (&args.file, args.receiver) {
+        (Some(file), Some(receiver)) => run_headless(&args, file.clone(), receiver).await,
+        _ if args.headless => {
+            anyhow::bail!("headless mode needs both <FILE> and <RECEIVER>")
+        }
+        _ => {
+            #[cfg(feature = "gui")]
             {
-                if !args.no_nat {
-                    println!("NAT traversal: enabled (STUN/UPnP/Hole-punching)");
-                } else {
-                    println!("NAT traversal: disabled");
-                }
+                sharp256::gui::run_sender_gui(args.file.clone(), args.receiver)
             }
-
-            println!();
-
-            run_headless(file, receiver, args.bind, args.encrypt).await
-        } else {
-            anyhow::bail!("In headless mode, both file and receiver address must be specified")
-        }
-    } else {
-        // GUI режим
-        #[cfg(feature = "gui")]
-        {
-            gui::run_sender_gui()?;
-            Ok(())
-        }
-
-        #[cfg(not(feature = "gui"))]
-        {
-            println!("GUI not available. Please specify file and receiver address.");
-            println!("Usage: sharp-sender <file> <receiver_address>");
-            anyhow::bail!("Missing required arguments for headless mode")
+            #[cfg(not(feature = "gui"))]
+            {
+                anyhow::bail!("usage: sharp-sender <FILE> <RECEIVER_IP:PORT>")
+            }
         }
     }
 }
 
-async fn run_headless(
-    file: PathBuf,
-    receiver: SocketAddr,
-    bind: SocketAddr,
-    encrypt: bool,
-) -> Result<()> {
-    println!("Starting transfer in headless mode...");
+async fn run_headless(args: &Args, file: PathBuf, receiver: SocketAddr) -> Result<()> {
+    if !file.is_file() {
+        anyhow::bail!("not a file: {}", file.display());
+    }
+    let size = std::fs::metadata(&file)?.len();
+    println!("{}", system_info());
+    println!("File:      {} ({})", file.display(), format_bytes(size));
+    println!("Receiver:  {}", receiver);
 
-    // Создаем отправителя
-    let sender = sender::Sender::new(bind, receiver, &file, encrypt).await?;
-
-    // Проверяем допустимую фрагментацию и выводим результат
-    match sender.detect_fragmentation().await {
-        Ok(size) => println!("Selected payload size: {} bytes", size),
-        Err(e) => println!("Fragmentation check failed: {}", e),
+    let mut cfg = SenderConfig::new(receiver, file);
+    cfg.bind = args.bind;
+    let _ = args.no_nat;
+    cfg.state_dir = args.state_dir.clone();
+    if let Some(c) = args.chunk_size {
+        cfg.transport.max_chunk = c;
+    }
+    cfg.transport.probe_mtu = !args.no_probe;
+    if let Some(r) = &args.max_rate {
+        let bps = parse_rate(r).map_err(|e| anyhow::anyhow!(e))?;
+        cfg.transport.max_rate_bytes = Some(bps / 8);
+        println!("Rate cap:  {}", format_rate(bps as f64));
     }
 
-    // Показываем доступный адрес для подключения
-    match sender.get_connectable_address().await {
-        Ok(addr) => println!("Sender available at: {}", addr),
-        Err(_) => println!("Sender listening on: {}", bind),
-    }
+    let last_print = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
+    cfg.events = Some(Arc::new(move |ev: TransferEvent| match ev {
+        TransferEvent::Started {
+            peer,
+            chunk_size,
+            resumed_from,
+            ..
+        } => {
+            println!("Connected to {} (chunk {} B)", peer, chunk_size);
+            if resumed_from > 0 {
+                println!(
+                    "Resuming: {} already at receiver",
+                    format_bytes(resumed_from)
+                );
+            }
+        }
+        TransferEvent::Progress(s) => {
+            let now_ms = started.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(last_print.load(Ordering::Relaxed)) >= 1000 {
+                last_print.store(now_ms, Ordering::Relaxed);
+                let eta = s
+                    .eta
+                    .map(|d| format!("{}s", d.as_secs()))
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{:5.1}%  {:>10}  {:>14}  rtt {:6.2} ms  cwnd {:>9}  retx {:>9}  eta {}{}",
+                    s.fraction() * 100.0,
+                    format_bytes(s.bytes_done),
+                    format_rate(s.rate_bps),
+                    s.rtt_ms,
+                    format_bytes(s.cwnd_bytes),
+                    format_bytes(s.retransmitted_bytes),
+                    eta,
+                    if s.stalled { "  [stalled]" } else { "" }
+                );
+            }
+        }
+        TransferEvent::Stalled { since, .. } => {
+            println!("No answer from receiver for {:?}; waiting...", since);
+        }
+        TransferEvent::Recovered { .. } => println!("Receiver is back; continuing"),
+        _ => {}
+    }));
 
-    // Запускаем передачу
-    match sender.start_transfer().await {
-        Ok(()) => {
-            println!("\nTransfer completed successfully!");
+    let sender = Sender::new(cfg).await.context("cannot start sender")?;
+    let cancel = sender.cancel_token();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\nCancelling...");
+            cancel.cancel();
+        }
+    });
+
+    match sender.run().await {
+        Ok(summary) => {
+            println!(
+                "\nDone: {} in {:.2?} ({} avg), {} retransmitted, {} loss events, BLAKE3 {}",
+                format_bytes(summary.file_size),
+                summary.elapsed,
+                format_rate(summary.avg_rate_bps),
+                format_bytes(summary.retransmitted_bytes),
+                summary.loss_events,
+                summary.file_hash_hex
+            );
             Ok(())
         }
         Err(e) => {
             eprintln!("\nTransfer failed: {}", e);
-            Err(e)
+            std::process::exit(1);
         }
-    }
-}
-
-#[cfg(feature = "gui")]
-mod gui {
-    use super::*;
-    use sharp256::gui::SenderApp;
-
-    pub fn run_sender_gui() -> Result<()> {
-        let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([800.0, 600.0])
-                .with_title("SHARP-256 Sender"),
-            ..Default::default()
-        };
-
-        eframe::run_native(
-            "SHARP-256 Sender",
-            options,
-            Box::new(|_cc| Box::new(SenderApp::new())),
-        ).map_err(|e| anyhow::anyhow!("GUI error: {}", e))
     }
 }
