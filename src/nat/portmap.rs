@@ -364,6 +364,23 @@ pub struct Mapping {
 }
 
 impl Mapping {
+    /// A mapping as a router at `router` might have granted it.
+    #[cfg(test)]
+    pub(crate) fn for_tests(router: SocketAddr, external_ip: Option<IpAddr>, port: u16) -> Self {
+        Self {
+            router,
+            protocol: Protocol::Pcp,
+            nonce: [0; 12],
+            client: Ipv4Addr::new(192, 168, 1, 50),
+            internal_port: port,
+            grant: Grant {
+                external_port: port,
+                external_ip,
+                lifetime: 3600,
+            },
+        }
+    }
+
     pub fn protocol(&self) -> Protocol {
         self.protocol
     }
@@ -522,23 +539,6 @@ pub async fn request_at(
         internal_port,
         grant,
     })
-}
-
-/// Tries every plausible router until one grants a forward.
-pub async fn request(client: Ipv4Addr, internal_port: u16, lifetime: u32) -> Result<Mapping> {
-    let candidates = gateway_candidates();
-    if candidates.is_empty() {
-        bail!("no router address to ask");
-    }
-    let mut last = anyhow!("no router answered");
-    for gw in candidates {
-        let router = SocketAddr::new(IpAddr::V4(gw), PORT);
-        match request_at(router, client, internal_port, lifetime).await {
-            Ok(m) => return Ok(m),
-            Err(e) => last = e,
-        }
-    }
-    Err(last)
 }
 
 #[cfg(test)]

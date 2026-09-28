@@ -462,9 +462,12 @@ async fn announce(socket: &UdpSocket, allocated: SocketAddr, ticket: [u8; TOKEN_
 /// has a way back open when the other side's first packet arrives.
 ///
 /// The address comes from the relay, which is not trusted, so it is screened
-/// the same way a STUN server's suggestions are. There is nothing to amplify
-/// here — these draw no reply at all — but a handful of unasked-for
-/// datagrams should still not be aimed at a stranger.
+/// the same way a STUN server's suggestions are: never this host, a
+/// multicast or broadcast group, or an address the socket cannot reach.
+/// What the screen cannot do is tell a sender from anyone else the relay
+/// might name, here or on the internet; what bounds that is the allowance
+/// in [`serve`] and how little is sent — four datagrams of a dozen bytes
+/// that draw no reply from anyone.
 async fn punch(socket: &UdpSocket, peer: SocketAddr) {
     let Ok(local) = socket.local_addr() else {
         return;

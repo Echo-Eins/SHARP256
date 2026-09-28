@@ -411,6 +411,23 @@ impl StunClient {
                         if message_transaction_id(&pkt) != Some(tid) {
                             continue;
                         }
+                        // A plain request is answered by the server it went
+                        // to, and by nobody else: the transaction id travels
+                        // in the clear, so anyone who sees the request can
+                        // answer it too. A CHANGE-REQUEST is answered from
+                        // elsewhere by design; where it came from is the
+                        // result, and the tests judge it themselves.
+                        if !(change_ip || change_port) && from != server {
+                            continue;
+                        }
+                        if u16::from_be_bytes([pkt[0], pkt[1]]) == BINDING_ERROR {
+                            // Refused outright (a server without RFC 5780
+                            // answers a CHANGE-REQUEST with 420): that is not
+                            // silence, and waiting out the other tries for
+                            // an answer that is not coming would make it
+                            // look like some.
+                            bail!("{} refused the request", server);
+                        }
                         if let Ok(response) = parse_binding_response(&pkt, &tid) {
                             return Ok(Some(StunReply { response, from }));
                         }
@@ -667,6 +684,70 @@ mod tests {
             let flags = u32::from_be_bytes(req[24..28].try_into().unwrap());
             assert_eq!(flags, want);
         }
+    }
+
+    /// A plain request is answered by the server it went to. The
+    /// transaction id travels in the clear, so anyone who sees the request
+    /// can answer it — and used to be believed, whatever it said our
+    /// address was. And a server that refuses a request says so, which is
+    /// not the same as silence.
+    #[tokio::test]
+    async fn only_the_server_asked_can_answer_and_a_refusal_is_not_silence() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = server_sock.local_addr().unwrap();
+        let stranger: SocketAddr = "127.0.0.9:3478".parse().unwrap();
+        let (tx, mut rx) = mpsc::channel::<Incoming>(8);
+        let client = StunClient::new(vec![]).with_timing(Duration::from_millis(300), 1);
+
+        let genuine: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        let forged: SocketAddr = "203.0.113.66:1".parse().unwrap();
+        let answer = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = server_sock.recv_from(&mut buf).await.unwrap();
+            let tid = message_transaction_id(&buf[..n]).unwrap();
+            tx.send((binding_success(&tid, forged, None, None), stranger))
+                .await
+                .unwrap();
+            tx.send((binding_success(&tid, genuine, None, None), server))
+                .await
+                .unwrap();
+            let _ = from;
+            (server_sock, tx)
+        });
+        let reply = client
+            .transaction(&sock, server, &mut rx, false, false)
+            .await
+            .unwrap()
+            .expect("the server answered");
+        assert_eq!(reply.from, server);
+        assert_eq!(
+            reply.response.mapped, genuine,
+            "a stranger's answer was believed"
+        );
+
+        // A refusal ends the transaction at once, as an error.
+        let (server_sock, tx) = answer.await.unwrap();
+        let refuse = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, _) = server_sock.recv_from(&mut buf).await.unwrap();
+            let mut err = buf[..n].to_vec();
+            err[0..2].copy_from_slice(&BINDING_ERROR.to_be_bytes());
+            err[2..4].copy_from_slice(&0u16.to_be_bytes());
+            err.truncate(20);
+            tx.send((err, server)).await.unwrap();
+        });
+        let client = StunClient::new(vec![]).with_timing(Duration::from_secs(5), 3);
+        let started = std::time::Instant::now();
+        assert!(client
+            .transaction(&sock, server, &mut rx, true, true)
+            .await
+            .is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited out a refusal"
+        );
+        refuse.await.unwrap();
     }
 
     /// An address a stranger told us to send to is filtered: loopback,

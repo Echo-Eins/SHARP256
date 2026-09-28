@@ -55,7 +55,6 @@ egui = { version = "0.24", optional = true }
 rfd = { version = "0.12", optional = true }
 
 # NAT traversal (optional)
-igd = { version = "0.12", features = ["aio"], optional = true }
 if-addrs = { version = "0.6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -73,7 +72,7 @@ tempfile = "3"
 [features]
 default = ["gui", "nat-traversal"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd"]
-nat-traversal = ["dep:igd", "dep:if-addrs"]
+nat-traversal = ["dep:if-addrs"]
 
 [[bin]]
 name = "sharp-sender"

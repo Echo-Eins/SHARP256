@@ -206,7 +206,17 @@ impl Default for Timing {
 /// skips asking the router for a port forward and publishes a local address
 /// as the public one.
 fn means_no_nat(ip: IpAddr) -> bool {
-    let routable = match ip {
+    is_globally_routable(ip)
+        && if_addrs::get_if_addrs()
+            .map(|ifs| ifs.iter().any(|i| i.ip() == ip))
+            .unwrap_or(false)
+}
+
+/// Whether `ip` can be reached from the internet at large, as far as its
+/// address alone can say: not private, not carrier-grade NAT, not loopback,
+/// link-local, documentation or unspecified.
+pub(crate) fn is_globally_routable(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
         IpAddr::V4(v4) => {
             !(v4.is_private()
                 || v4.is_loopback()
@@ -226,11 +236,7 @@ fn means_no_nat(ip: IpAddr) -> bool {
                 || v6.segments()[0] & 0xffc0 == 0xfe80
                 || v6.segments()[0] & 0xfe00 == 0xfc00)
         }
-    };
-    routable
-        && if_addrs::get_if_addrs()
-            .map(|ifs| ifs.iter().any(|i| i.ip() == ip))
-            .unwrap_or(false)
+    }
 }
 
 /// Runs the RFC 5780 tests on `socket`, falling back to a cross-check
