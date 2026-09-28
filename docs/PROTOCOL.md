@@ -702,7 +702,8 @@ substituted ID. Identity files are protected only by file permissions.
   `recvmmsg` and UDP GRO, which delivers runs of datagrams from one sender
   in one buffer; the dispatcher passes a run to its session as a whole,
   large runs without copying. Platforms without these features fall back
-  to one datagram per call transparently.
+  to one datagram per call transparently, and so does a socket whose
+  segmented sends fail although the stack offered them (some drivers).
 * **Packet crypto off the engine threads.** AES-256-GCM costs about 1.4 µs
   per full packet on one core. The sender hands batches of eight or more
   datagrams to a pool of worker threads for sealing and carries on; sealed

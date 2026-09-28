@@ -216,7 +216,7 @@ cargo test --release --no-default-features --features nat-traversal --test e2e -
 SHARP_BENCH="5%" cargo test --release --no-default-features --features nat-traversal --test e2e -- --ignored --nocapture bench
 ```
 
-Юнит-тесты (72) покрывают ключи и ID, рукопожатие (включая неверные ключи,
+Юнит-тесты (73) покрывают ключи и ID, рукопожатие (включая неверные ключи,
 секреты, cookie, повторы), AEAD и защиту заголовка, формат кадров и
 манифеста (с враждебными и битыми данными), сборку деревьев и коллизии,
 пакетный ввод-вывод, пул шифрования, CUBIC/пейсер, файлы и состояние.

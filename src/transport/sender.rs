@@ -39,7 +39,9 @@ use crate::protocol::wire::{
 use crate::protocol::RangeSet;
 use crate::state::{hex16, parse_hex16, SenderState, StateStore};
 use crate::transport::congestion::{burst_for_rate, Cubic, Pacer, RttEstimator};
-use crate::transport::io::{recv_buffers, BatchSocket, Received, MAX_SEND_BYTES};
+use crate::transport::io::{
+    is_no_buffer_error, recv_buffers, BatchSocket, Received, MAX_SEND_BYTES,
+};
 use crate::transport::parallel;
 use crate::transport::socket::{is_msgsize_error, Clock};
 use std::collections::{BTreeMap, VecDeque};
@@ -374,6 +376,8 @@ const MAX_PEER_ACK_DELAY: Duration = Duration::from_secs(1);
 /// Most batches between being built and being sent (being encrypted, or
 /// waiting for their turn).
 const MAX_PIPELINE: usize = 8;
+/// Wait before retrying a send the network stack had no buffers for.
+const NO_BUFFER_BACKOFF: Duration = Duration::from_millis(1);
 /// Longest burst of one segmented send, at the pacing rate.
 const BATCH_BURST: Duration = Duration::from_millis(1);
 /// Batches with fewer datagrams are encrypted on the engine's own thread.
@@ -722,10 +726,12 @@ impl Engine {
         hex16(&self.transfer_id)
     }
 
+    /// Sends a single datagram. A full buffer drops it, like the network
+    /// would; the protocol retries what matters.
     fn send_datagram(&self, bytes: &[u8]) -> io::Result<()> {
         match self.socket.try_send(self.peer, bytes) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -779,7 +785,7 @@ impl Engine {
             .map_err(io::Error::other)?;
         match self.socket.try_send(self.peer, &self.ctl_buf) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -1579,6 +1585,13 @@ impl Engine {
                     self.pipe.ready.insert(batch.seq, batch);
                     return Ok(Some(SendBlock::Socket));
                 }
+                Err(err) if is_no_buffer_error(&err) => {
+                    // The device queue is full; the socket may well be
+                    // writable, so retry after a moment instead of waiting
+                    // for a writability change that may not come.
+                    self.pipe.ready.insert(batch.seq, batch);
+                    return Ok(Some(SendBlock::Pacer(NO_BUFFER_BACKOFF)));
+                }
                 Err(err) if is_msgsize_error(&err) => {
                     // The path shrank under us: fall back to the safe chunk.
                     self.unsend(&batch.ranges);
@@ -1610,7 +1623,7 @@ impl Engine {
         for (k, datagram) in batch.buf.chunks(batch.segment).enumerate() {
             match self.socket.try_send(self.peer, datagram) {
                 Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&err) => {
                     self.unsend(&batch.ranges[k..]);
                     return Ok(());
                 }
@@ -2098,7 +2111,9 @@ impl Engine {
         }
         match self.socket.try_send(self.peer, &self.tx_buf) {
             Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&err) => {
+                return Ok(())
+            }
             Err(err) => return Err(SendError::Io(err)),
         }
         self.seq += 1;

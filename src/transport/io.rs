@@ -9,10 +9,11 @@
 //! sender in a single buffer). Platforms without these features fall back
 //! to one datagram per call transparently.
 
-use crate::transport::socket::{bind_udp, set_dont_fragment};
+use crate::transport::socket::{bind_udp, is_msgsize_error, set_dont_fragment};
 use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
@@ -50,6 +51,9 @@ impl Received {
 pub struct BatchSocket {
     io: Arc<UdpSocket>,
     state: UdpSocketState,
+    /// A segmented send failed although the network stack offered the
+    /// feature (some drivers do); datagrams go out one by one from then on.
+    segments_failed: AtomicBool,
 }
 
 impl BatchSocket {
@@ -66,6 +70,7 @@ impl BatchSocket {
         Ok(Self {
             io: Arc::new(io),
             state,
+            segments_failed: AtomicBool::new(false),
         })
     }
 
@@ -83,6 +88,9 @@ impl BatchSocket {
     /// Most datagrams one [`BatchSocket::try_send_segments`] may carry (1
     /// without segmentation offload, or after the kernel refused it).
     pub fn max_segments(&self) -> usize {
+        if self.segments_failed.load(Ordering::Relaxed) {
+            return 1;
+        }
         self.state.max_gso_segments().clamp(1, MAX_SEGMENTS)
     }
 
@@ -93,7 +101,10 @@ impl BatchSocket {
 
     /// Sends `contents` as datagrams of `segment` bytes each (the last one
     /// may be shorter), with one system call where the platform allows. On
-    /// an error nothing may be assumed sent.
+    /// an error nothing may be assumed sent. A segmented send that fails for
+    /// any reason but a full buffer or the path MTU turns segmentation off
+    /// for this socket ([`BatchSocket::max_segments`] becomes 1), so the
+    /// caller can send the datagrams one by one instead.
     pub fn try_send_segments(
         &self,
         to: SocketAddr,
@@ -104,7 +115,20 @@ impl BatchSocket {
             return self.transmit(to, contents, None);
         }
         debug_assert!(contents.len().div_ceil(segment) <= self.max_segments());
-        self.transmit(to, contents, Some(segment))
+        let sent = self.transmit(to, contents, Some(segment));
+        if let Err(e) = &sent {
+            if e.kind() != io::ErrorKind::WouldBlock
+                && !is_msgsize_error(e)
+                && !is_no_buffer_error(e)
+                && !self.segments_failed.swap(true, Ordering::Relaxed)
+            {
+                tracing::info!(
+                    "segmented send failed ({}); sending datagrams one by one",
+                    e
+                );
+            }
+        }
+        sent
     }
 
     fn transmit(&self, to: SocketAddr, contents: &[u8], segment: Option<usize>) -> io::Result<()> {
@@ -153,6 +177,25 @@ impl BatchSocket {
     }
 }
 
+/// The network stack is momentarily out of buffers (a full device queue):
+/// worth a retry shortly, unlike other send errors.
+pub fn is_no_buffer_error(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::ENOBUFS)
+    }
+    #[cfg(windows)]
+    {
+        // WSAENOBUFS
+        e.raw_os_error() == Some(10055)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 /// A set of receive buffers for [`BatchSocket::try_recv`].
 pub fn recv_buffers(count: usize) -> Vec<Vec<u8>> {
     (0..count).map(|_| vec![0u8; RECV_BUF_LEN]).collect()
@@ -173,6 +216,23 @@ mod tests {
         assert_eq!(r.segments().collect::<Vec<_>>(), vec![0..4, 4..8, 8..10]);
         let single = Received { stride: 10, ..r };
         assert_eq!(single.segments().collect::<Vec<_>>(), vec![0..10]);
+    }
+
+    /// A segmented send that fails for a reason other than a full buffer or
+    /// the path MTU turns segmentation off for the socket, so the caller
+    /// falls back to single datagrams.
+    #[tokio::test]
+    async fn failed_segmented_send_turns_segmentation_off() {
+        let a = BatchSocket::bind("127.0.0.1:0".parse().unwrap(), 1 << 20)
+            .await
+            .unwrap();
+        if a.max_segments() == 1 {
+            return; // no segmentation offload here
+        }
+        // An IPv6 destination cannot be reached from an IPv4 socket.
+        let to: SocketAddr = "[2001:db8::1]:9".parse().unwrap();
+        assert!(a.try_send_segments(to, &[0u8; 3000], 1000).is_err());
+        assert_eq!(a.max_segments(), 1);
     }
 
     /// Segmented sends arrive as separate datagrams of the right sizes,
