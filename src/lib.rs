@@ -1,5 +1,7 @@
-//! SHARP-256 (Swift Hash Assurance Rust Protocol): reliable, BLAKE3-verified
-//! file transfer over UDP with adaptive rate control and resumable sessions.
+//! SHARP-256 (Swift Hash Assurance Rust Protocol): encrypted, mutually
+//! authenticated, BLAKE3-verified transfer of files and directories over UDP,
+//! with adaptive rate control, batched I/O for multi-gigabit links and
+//! resumable sessions. The wire protocol is specified in `docs/PROTOCOL.md`.
 
 pub mod address;
 pub mod config;

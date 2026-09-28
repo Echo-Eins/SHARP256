@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.5.0 — protocol v3 (unreleased)
+
+Version 3 puts the version 2 transport inside an authenticated, encrypted
+channel, transfers whole directories and moves datagrams in batches for
+multi-gigabit links. Version 2 peers cannot talk to version 3 peers (the
+version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+### Security
+- Long-term X25519 identities, created on first use and kept in the
+  per-user data directory with owner-only permissions. A peer is addressed
+  by its SHARP ID (`sh-` + 56 base32 characters with a checksum); senders
+  use `ID@host:port`.
+- Noise `IKpsk2_25519_ChaChaPoly_BLAKE2s` handshake: the receiver is
+  authenticated by its ID, the sender by its static key (sent encrypted),
+  fresh keys per session (forward secrecy), optional shared secret turned
+  into the pre-shared key with Argon2id (64 MiB, 3 passes) and salted with
+  the receiver's key.
+- Every datagram after the handshake is AEAD-protected (AES-256-GCM when
+  both sides have AES instructions, ChaCha20-Poly1305 otherwise) with QUIC
+  style header protection, per-epoch keys (2^22 packets) and a replay
+  window. Forged, corrupted and replayed packets are dropped before they
+  are looked at. This replaces the unauthenticated integrity tag of v2.
+- Stealth: without a valid mac1 (which needs the receiver's ID) a datagram
+  gets no answer. Under load the receiver demands address-bound cookies
+  (as WireGuard does), so spoofed floods cost one MAC per packet and cannot
+  be amplified. Per-address handshake rate limits and a replay guard on
+  initiation timestamps.
+- Receivers can admit only listed sender IDs (`--allow`,
+  `--authorized-senders FILE`); refused senders get an authenticated
+  rejection. Resume state is bound to the sender's identity.
+- Authenticated packets make address changes safe: a session follows its
+  peer to a new address only on packets the peer really sent.
+
+### Directories
+- A directory is sent as one stream: a manifest (structure, sizes, Unix
+  permission bits, modification times) followed by the file contents, so
+  resume and the final BLAKE3 verification cover names, structure and
+  metadata too.
+- The receiver verifies the manifest against the hash announced in HELLO
+  and decodes it strictly (single-component names only, no `.`/`..`,
+  parents first, sorted unique siblings, bounded depth, path length, entry
+  count and size) before creating anything; data that overtakes the
+  manifest waits in a bounded buffer.
+- The tree is built in a private staging directory with create-new
+  semantics (names that collide on the local file system are reported,
+  never overwritten; names are mapped for Windows), then hashed, given its
+  times and permissions (never set-id bits, masked by the umask) and
+  renamed into place without replacing anything. Symbolic links and special
+  files are skipped and reported by the sender.
+- Interrupted directory transfers resume after a restart of either side;
+  the manifest is kept with the resume state.
+- CLI and GUI senders accept folders; receivers show "N files in M folders".
+
+### Performance
+- Batched datagram I/O via quinn-udp: up to 64 datagrams per segmented
+  send (GSO on Linux, USO on Windows), `recvmmsg` with UDP GRO on receive;
+  coalesced runs travel from the dispatcher to their session without
+  copies, and all payloads of a run reach the writer as one command.
+- Packet encryption and decryption run on a pool of worker threads while
+  the engines carry on; results are used strictly in order.
+  `SHARP256_CRYPTO_THREADS` sets the pool size (0 disables it).
+- Loopback on a 4-core VM running both ends: 2 GiB in 3.5 s
+  (4.9 Gbit/s, no retransmissions), up from 1.1 Gbit/s.
+- Segmented sends carry at most about 1 ms of data at the pacing rate and
+  the pacer's burst is 1 ms, so shallow buffers are not overrun; the
+  congestion window grows only while it is used (RFC 9002, 7.8); the
+  receiver's window accounts for datagrams it has not processed yet.
+- Socket buffers default to 32 MiB; a privileged process exceeds
+  `net.core.rmem_max`, otherwise the receiver prints the `sysctl` that
+  raises it.
+
+### Protocol
+- HELLO_ACK status "pending": while the receiver's user decides, the
+  sender polls and starts as soon as the transfer is accepted.
+- The frame type and flags share one (masked) byte; the magic, version and
+  connection-id header of v2 are gone (connection ids are now 64-bit and
+  chosen by each recipient).
+- New reject reasons: sender not authorised, no cipher suite in common,
+  unsupported request.
+
+### Fixed
+- The first handshake packet of every transfer was silently dropped
+  because the socket was used before the runtime had seen it writable,
+  which cost a 250 ms retry.
+- Writer errors (disk full, colliding names) now end a transfer promptly
+  instead of surfacing only when the file is closed.
+
+### Front ends
+- CLI tools print and take SHARP IDs (`--id`, `--identity`), a shared
+  secret (`--secret` or `SHARP256_SECRET`) and receiver allow-lists; the
+  receiver prints the address string senders need.
+- The GUIs show the own ID with a copy button, the peer's ID, the cipher
+  in use and folder contents; the sender picks files or folders.
+
 ## 0.4.0 — protocol v2 (unreleased)
 
 A ground-up rewrite of the transport. The 0.3 prototype could not complete

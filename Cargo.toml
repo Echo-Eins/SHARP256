@@ -1,12 +1,12 @@
 [package]
 name = "sharp256"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Echo_Eins"]
 license = "MIT"
 repository = "https://github.com/echo-eins/sharp256"
-description = "SHARP-256: Swift Hash Assurance Rust Protocol - reliable, BLAKE3-verified file transfer over UDP"
+description = "SHARP-256: Swift Hash Assurance Rust Protocol - encrypted, reliable, BLAKE3-verified transfer of files and directories over UDP"
 
 [dependencies]
 # Async runtime
