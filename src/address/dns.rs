@@ -318,7 +318,7 @@ impl Interleaver {
 }
 
 /// Resolves `host` for both families at once and hands each address to
-/// `deliver` when [`Interleaver`] says so. `want_v6`/`want_v4` leave out a
+/// `deliver` when `Interleaver` says so. `want_v6`/`want_v4` leave out a
 /// family the caller cannot use (an IPv4-only socket has no use for AAAA
 /// answers, and asking costs a round trip to the name server).
 ///

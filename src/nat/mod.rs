@@ -61,7 +61,7 @@ pub struct NatConfig {
     /// out; this is the switch for the second concern.
     pub publish_lan_addresses: bool,
     /// How often the mapping behind a published address is checked with a
-    /// request, between the keepalives (see [`maintain`]).
+    /// request, between the keepalives (see `maintain`).
     pub mapping_check: Duration,
     /// How often this host's own addresses are looked at again.
     pub host_refresh: Duration,
@@ -504,7 +504,7 @@ pub struct Reachability {
     /// from the internet.
     pub double_nat: bool,
     /// This host's own addresses worth publishing, best first (see
-    /// [`host_addresses`]).
+    /// `host_addresses`).
     pub host: Vec<IpAddr>,
 }
 
@@ -683,7 +683,7 @@ pub struct NatTask {
 /// router that is slow to answer, or never does, no longer holds up telling
 /// the user where the receiver can be reached.
 ///
-/// After that the task maintains it all (see [`maintain`]): the NAT mapping
+/// After that the task maintains it all (see `maintain`): the NAT mapping
 /// a published address rests on is kept alive and checked, its lifetime
 /// measured where the server allows, this host's own addresses looked at
 /// again now and then, and a port forward renewed — each change reported

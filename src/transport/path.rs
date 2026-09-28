@@ -180,7 +180,7 @@ impl PathProbe {
     /// Re-sends unanswered challenges, each claim waiting twice as long as
     /// the time before — starting from `rto`, which should be an estimate
     /// of the round trip and not one already backed off — and gives a claim
-    /// up after [`MAX_TRIES`]. Losing a challenge must not cost the session
+    /// up after `MAX_TRIES`. Losing a challenge must not cost the session
     /// its chance to follow a peer that really did move.
     pub fn poll(&mut self, now: Instant, rto: Duration) -> Vec<Challenge> {
         self.forget_old(now);
