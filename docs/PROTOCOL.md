@@ -748,10 +748,52 @@ not taken for ours.
 
 The sender needs no NAT handling: its outgoing datagrams create the mapping
 on its own NAT, and the receiver answers the address a handshake came from
-(and follows a mapping that changes later through address validation). Two
-peers that are both behind NATs with no forward, or behind a NAT whose
-mapping changes per destination, cannot reach each other directly; that
-needs a rendezvous to punch through or a relay to meet at (section 11).
+(and follows a mapping that changes later through address validation).
+
+**When nothing else works.** Two peers both behind NATs that give out a
+different port per destination cannot reach each other however hard either
+tries: no address either can publish is the address the other would need.
+For that case there is a relay (`sharp-relay`), which either side names as
+`--relay host:port`.
+
+A receiver registers its identity with the relay, over its transfer socket,
+and keeps the registration alive. A sender asks to be put through, and the
+relay does two things at once:
+
+1. **Introduces them.** It tells each end where the other appears to be, and
+   they push outwards simultaneously — the receiver with a few small
+   datagrams that draw no reply, the sender with its handshake. That is hole
+   punching, and where the NATs allow it the transfer runs directly and the
+   relay carries nothing.
+2. **Sets a port aside.** The relay allocates a UDP port for the pair. Each
+   end presents the ticket it was given, which both says which side it is
+   and opens the way back through its own NAT — the relay cannot assume
+   either address, because the NAT it exists to get around is precisely the
+   kind that uses a different port here than it did for the control
+   exchange. Once both have presented tickets, datagrams are copied between
+   exactly those two addresses.
+
+The sender takes both as candidates, after its own: the direct one first,
+the relayed one last, so a relay is only used when it has to be.
+
+The relay is trusted with nothing. It carries sealed transport packets, so
+it cannot read them, cannot alter one without the AEAD rejecting it, and
+cannot inject one without the peers' keys; it cannot impersonate a peer,
+because completing a handshake takes that peer's private key; and it decides
+nothing about who may send to whom, since the receiver still admits or
+refuses a sender by its identity. The worst a hostile relay achieves is
+refusing to carry the traffic. Registering an identity is therefore not
+worth guarding heavily — somebody registering an identity that is not theirs
+gets senders connected to them and then fails the handshake. What *is*
+guarded is what a stranger could be made to suffer: a registration is
+accepted only once it echoes a token derived from the address the relay saw,
+so a forged source address cannot point the relay's traffic at somebody who
+never asked for it.
+
+This is also the honest answer to hiding one's own address from a peer: run
+the traffic through a relay you control. Forging a source address is not an
+alternative to it — a transfer needs a return path, and it is an attack
+technique rather than a defence.
 
 ## 9. Security considerations
 

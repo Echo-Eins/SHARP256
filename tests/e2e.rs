@@ -2154,3 +2154,123 @@ async fn the_newest_handshake_wins_on_both_sides() {
     assert_eq!(stalls, 0, "the sender lost the session and had to recover");
     stop_receiver(r).await;
 }
+
+#[cfg(feature = "nat-traversal")]
+/// One mapping of a NAT that hands out a port per destination: it belongs
+/// to one inside host and one outside address, and lets nothing else
+/// through in either direction. The inside address is learned from whoever
+/// first sends through it, exactly as a NAT learns it.
+///
+/// This is what leaves a receiver unreachable no matter what it publishes,
+/// and the reason relays exist. The counter records datagrams turned away,
+/// which is how a test can tell a direct attempt was made and refused.
+async fn one_way_mapping(
+    only_from: SocketAddr,
+) -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let refused = Arc::new(AtomicU64::new(0));
+    let counter = refused.clone();
+    let task = tokio::spawn(async move {
+        let mut inside: Option<SocketAddr> = None;
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            if from == only_from {
+                // Inbound, and only from the address this mapping was
+                // opened towards.
+                if let Some(inside) = inside {
+                    let _ = sock.send_to(&buf[..n], inside).await;
+                }
+                continue;
+            }
+            match inside {
+                // Outbound from the host this mapping belongs to.
+                Some(known) if known == from => {
+                    let _ = sock.send_to(&buf[..n], only_from).await;
+                }
+                // Somebody else entirely: a stranger who learned the
+                // address and tried it. This is the case that makes the
+                // address worthless to publish.
+                Some(_) => {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {
+                    inside = Some(from);
+                    let _ = sock.send_to(&buf[..n], only_from).await;
+                }
+            }
+        }
+    });
+    (addr, refused, task)
+}
+
+/// When neither end can be reached from the other — both behind NATs that
+/// give out a different port for every destination, which nothing either
+/// side can fix — a relay is what is left. It introduces the two and then
+/// carries the transfer, without being trusted with any of it: the traffic
+/// stays sealed end to end and the sender is still admitted on the strength
+/// of its identity.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
+    use sharp256::relay::server::{Config, Relay};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 512 << 10;
+    let file = make_file(&src, "through-a-relay.bin", size, 0xBEEF);
+
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_task = tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+
+    // The receiver talks to the relay only through a mapping that lets
+    // nothing else back in, so the address the relay sees it at is worth
+    // nothing to anybody but the relay.
+    let (receiver_mapping, refused, mapping_task) = one_way_mapping(relay_addr).await;
+    let r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![receiver_mapping.to_string()];
+    })
+    .await;
+    // Let the registration, which travels through the mapping, complete.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The sender is given an address that leads nowhere, plus the relay.
+    // Anything that reaches the receiver has to have come through it.
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let mut scfg = sender_cfg(&file, dead_addr, r.id, &state);
+    scfg.relays = vec![relay_addr.to_string()];
+
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(scfg))
+        .await
+        .expect("the relay path is found in time")
+        .expect("the transfer completes through the relay");
+    assert_eq!(summary.file_size, size as u64);
+    assert_same(&file, &out.join("through-a-relay.bin"));
+
+    // The relay told the sender where the receiver appeared to be, the
+    // sender tried it, and the mapping turned it away — so what completed
+    // the transfer was the relay carrying it, not a direct path.
+    assert!(
+        refused.load(Ordering::Relaxed) > 0,
+        "the direct address was never tried, so this proved nothing"
+    );
+
+    mapping_task.abort();
+    cancel.cancel();
+    relay_task.abort();
+    stop_receiver(r).await;
+}

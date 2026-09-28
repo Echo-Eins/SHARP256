@@ -149,6 +149,10 @@ pub struct SenderConfig {
     /// Pre-shared key (see `crypto::psk_from_passphrase`), if the receiver
     /// requires one.
     pub psk: Option<[u8; 32]>,
+    /// Relays to ask for an introduction when the receiver's own addresses
+    /// do not answer. Each adds two more candidates: where the receiver
+    /// appears to be, and the relay's own port for the pair.
+    pub relays: Vec<String>,
     pub events: Option<EventCallback>,
 }
 
@@ -164,6 +168,7 @@ impl std::fmt::Debug for SenderConfig {
             .field("state_dir", &self.state_dir)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
+            .field("relays", &self.relays)
             .field("events", &self.events.is_some())
             .finish()
     }
@@ -181,6 +186,7 @@ impl SenderConfig {
             state_dir: None,
             identity: None,
             psk: None,
+            relays: Vec::new(),
             events: None,
         }
     }
@@ -202,9 +208,18 @@ pub struct ReceiverConfig {
     pub max_sessions_per_sender: usize,
     pub transport: TransportConfig,
     pub state_dir: Option<PathBuf>,
-    /// Discover the public address (STUN) and ask the router for a port
-    /// forward (UPnP) in the background. Requires the `nat-traversal` feature.
+    /// Discover the public address (STUN), measure what the NAT does and
+    /// ask the router for a port forward in the background. Requires the
+    /// `nat-traversal` feature.
     pub nat_traversal: bool,
+    /// Relays to register with, as `host:port`. A relay introduces a sender
+    /// and this receiver to each other, and carries the transfer when they
+    /// cannot meet directly — the case where both are behind NATs that give
+    /// out a different port per destination, which nothing either end can
+    /// do anything about. It is not trusted with anything: the traffic is
+    /// sealed end to end, and a sender is still admitted on the strength of
+    /// its identity.
+    pub relays: Vec<String>,
     pub accept: AcceptPolicy,
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
@@ -233,6 +248,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("transport", &self.transport)
             .field("state_dir", &self.state_dir)
             .field("nat_traversal", &self.nat_traversal)
+            .field("relays", &self.relays)
             .field("accept", &self.accept)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
@@ -255,6 +271,7 @@ impl ReceiverConfig {
             transport: TransportConfig::default(),
             state_dir: None,
             nat_traversal: false,
+            relays: Vec::new(),
             accept: AcceptPolicy::AcceptAll,
             identity: None,
             psk: None,

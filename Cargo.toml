@@ -83,6 +83,11 @@ path = "src/bin/sender.rs"
 name = "sharp-receiver"
 path = "src/bin/receiver.rs"
 
+[[bin]]
+name = "sharp-relay"
+path = "src/bin/relay.rs"
+required-features = ["nat-traversal"]
+
 # Cryptography and hashing in dependencies are painfully slow unoptimised;
 # debug builds of this crate stay debuggable while tests run at usable speed.
 [profile.dev.package."*"]

@@ -90,6 +90,22 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   only ever produce addresses worth *trying*. Addresses a server tells us to
   send to are screened first, so clients cannot be used as reflectors, and
   PCP's nonce is checked so another request's answer is not taken for ours.
+- `sharp-relay`: a meeting point for the case nothing on either side can
+  fix — both peers behind NATs that give out a different port per
+  destination, where no address either can publish is the one the other
+  would need. It introduces the two so they can punch through directly, and
+  allocates a UDP port for the pair when that is not enough. Either end
+  names one with `--relay host:port`.
+- The relay is trusted with nothing: it carries sealed transport packets, so
+  it cannot read, alter or inject one, and it cannot impersonate a peer
+  because completing a handshake takes that peer's private key. A receiver
+  still admits or refuses a sender by its identity. Registering an identity
+  that is not yours therefore buys only a failed handshake; what is guarded
+  is registering from a forged source address, which would point the relay's
+  traffic at a stranger, so a registration must echo a token derived from
+  the address the relay saw. Each side of an allocated port binds itself
+  with a ticket, from whatever address its NAT gives it there, and only
+  those two addresses are carried.
 
 ### Directories
 - A directory is sent as one stream: a manifest (structure, sizes, Unix

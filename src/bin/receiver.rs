@@ -20,9 +20,17 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0:5555")]
     bind: SocketAddr,
 
-    /// Disable NAT traversal (STUN / UPnP)
+    /// Disable NAT traversal (address discovery, NAT behaviour tests, port
+    /// forwarding)
     #[arg(long)]
     no_nat: bool,
+
+    /// Register with a relay at <host>:<port>, so senders that cannot reach
+    /// this receiver directly can still be put through. May be repeated.
+    /// The relay is not trusted with anything: transfers stay sealed end to
+    /// end and senders are still admitted by their identity.
+    #[arg(long = "relay", value_name = "HOST:PORT")]
+    relays: Vec<String>,
 
     /// Replace existing files with the same name instead of writing "name (1)"
     #[arg(long)]
@@ -89,6 +97,7 @@ async fn main() -> Result<()> {
     cfg.overwrite = args.overwrite;
     cfg.max_sessions = args.max_sessions.max(1);
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
+    cfg.relays = args.relays.clone();
     cfg.state_dir = args.state_dir.clone();
     if let Some(c) = args.chunk_size {
         cfg.transport.max_chunk = c;

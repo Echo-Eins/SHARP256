@@ -95,7 +95,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 fn random_cid() -> u64 {
     loop {
         let c = rand::rngs::OsRng.next_u64();
-        if c != 0 {
+        // Zero means "none", and one value is reserved so that a relay can
+        // tell traffic from its own control messages.
+        if c != 0 && c != crate::protocol::constants::RESERVED_CID {
             return c;
         }
     }

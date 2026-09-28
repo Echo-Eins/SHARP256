@@ -193,6 +193,46 @@ impl Sender {
         &self.source
     }
 
+    /// Asks each configured relay to put us through to the receiver, and
+    /// returns the addresses that buys us.
+    ///
+    /// This runs on the transfer socket before anything else does, which is
+    /// the point: the way back through our own NAT belongs to this socket,
+    /// so an introduction arranged from any other one would describe a path
+    /// that does not exist.
+    #[cfg(feature = "nat-traversal")]
+    async fn relay_candidates(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        if self.cfg.relays.is_empty() {
+            return out;
+        }
+        let socket = self.socket.udp();
+        for name in &self.cfg.relays {
+            let Ok(addr) = name.parse::<SocketAddr>() else {
+                tracing::warn!("relay \"{}\" is not a <host>:<port> address", name);
+                continue;
+            };
+            match crate::relay::client::connect(&socket, addr, &self.cfg.receiver_id, &self.cancel)
+                .await
+            {
+                Ok(i) => {
+                    tracing::info!(
+                        "relay {} says the receiver is at {}, and will carry the transfer on {}",
+                        addr,
+                        i.peer,
+                        i.relayed
+                    );
+                    out.push(i.peer);
+                    out.push(i.relayed);
+                }
+                // A relay that cannot help is not a failure: the addresses
+                // we already have may well work.
+                Err(e) => tracing::info!("relay {}: {}", addr, e),
+            }
+        }
+        out
+    }
+
     /// Runs the transfer to completion.
     pub async fn run(self) -> Result<TransferSummary, SendError> {
         // A directory is named after itself even when given as "." or "..".
@@ -239,6 +279,17 @@ impl Sender {
         for a in &self.cfg.alternate_peers {
             if !candidates.contains(a) {
                 candidates.push(*a);
+            }
+        }
+        // A relay adds two more: where it sees the receiver, which both ends
+        // now push towards at once and which therefore often works directly,
+        // and the relay's own port, which works whenever anything does. They
+        // go last, so a direct path is always preferred and the relay
+        // carries nothing unless it has to.
+        #[cfg(feature = "nat-traversal")]
+        for a in self.relay_candidates().await {
+            if !candidates.contains(&a) {
+                candidates.push(a);
             }
         }
 

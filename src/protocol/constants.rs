@@ -62,6 +62,15 @@ pub const BLOCK_SIZE: u64 = 256 * 1024;
 /// Whole-file hash length (BLAKE3-256).
 pub const FILE_HASH_LEN: usize = 32;
 
+/// A connection id no endpoint ever picks.
+///
+/// A datagram starting with these eight bytes is a relay control message
+/// (see `crate::relay`). A relay carrying traffic has to tell the two apart,
+/// and it does so by these bytes, so a packet whose connection id happened
+/// to equal them would be swallowed instead of forwarded. One value out of
+/// 2^64 is a cheap thing to give up.
+pub const RESERVED_CID: u64 = u64::from_be_bytes(*b"SHRELAY1");
+
 /// Length of the unpredictable token of a PATH_CHALLENGE / PATH_RESPONSE.
 /// Eight bytes make guessing one hopeless (2^-64 per try) while keeping the
 /// frame small enough to be sent freely.

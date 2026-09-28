@@ -26,6 +26,11 @@ struct Args {
     #[arg(long, hide = true)]
     no_nat: bool,
 
+    /// Ask a relay at <host>:<port> to put this transfer through when the
+    /// receiver's own addresses do not answer. May be repeated.
+    #[arg(long = "relay", value_name = "HOST:PORT")]
+    relays: Vec<String>,
+
     /// Largest chunk of file bytes per packet (probed downwards if the path
     /// cannot carry it). Default fits a 1500-byte MTU.
     #[arg(long)]
@@ -120,6 +125,7 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     cfg.alternate_peers = addrs[1..].to_vec();
     cfg.bind = args.bind;
     let _ = args.no_nat;
+    cfg.relays = args.relays.clone();
     cfg.state_dir = args.state_dir.clone();
     cfg.identity = Some(identity);
     if let Some(secret) = &args.secret {

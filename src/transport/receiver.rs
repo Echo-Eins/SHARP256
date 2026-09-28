@@ -248,6 +248,13 @@ impl Receiver {
             None
         };
 
+        // Relays run alongside: each registers this receiver so that a
+        // sender who cannot reach any of its addresses can still be
+        // introduced to it, and carried if the introduction is not enough.
+        // Their control messages arrive on this same socket.
+        #[cfg(feature = "nat-traversal")]
+        let relays = spawn_relay_clients(&shared);
+
         let socket = shared.socket.clone();
         let cancel = shared.cancel.clone();
         let (done_tx, mut done_rx) = mpsc::channel::<TransferKey>(256);
@@ -289,6 +296,19 @@ impl Receiver {
                                 // request coming back, hence requests too.
                                 if r.stride >= r.len && crate::nat::stun::is_stun_message(pkt) {
                                     let _ = nat.stun_responses.try_send((pkt.to_vec(), r.from));
+                                    continue;
+                                }
+                            }
+                            #[cfg(feature = "nat-traversal")]
+                            if !relays.is_empty() && r.stride >= r.len {
+                                let pkt = &buf[..r.len];
+                                if crate::relay::is_control(pkt) {
+                                    for c in &relays {
+                                        if c.addr == r.from {
+                                            let _ = c.tx.try_send((pkt.to_vec(), r.from));
+                                            break;
+                                        }
+                                    }
                                     continue;
                                 }
                             }
@@ -627,7 +647,9 @@ impl Dispatcher {
     fn new_cid(&self) -> u64 {
         loop {
             let c = rand::rngs::OsRng.next_u64();
-            if c != 0 && !self.by_cid.contains_key(&c) {
+            // Zero means "none", and one value is reserved so that a relay
+            // can tell traffic from its own control messages.
+            if c != 0 && c != RESERVED_CID && !self.by_cid.contains_key(&c) {
                 return c;
             }
         }
@@ -655,6 +677,50 @@ impl Dispatcher {
             }
         }
     }
+}
+
+/// A relay this receiver is registered with, and the channel the dispatcher
+/// hands its control messages over on.
+#[cfg(feature = "nat-traversal")]
+struct RelayClient {
+    addr: SocketAddr,
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+}
+
+/// Registers this receiver with every configured relay, in the background.
+#[cfg(feature = "nat-traversal")]
+fn spawn_relay_clients(shared: &Arc<Shared>) -> Vec<RelayClient> {
+    let mut out = Vec::new();
+    for name in &shared.cfg.relays {
+        // A relay is named by address, not by identity: it is not trusted
+        // with anything, so there is nothing to authenticate it for.
+        let Ok(addr) = name.parse::<SocketAddr>() else {
+            tracing::warn!("relay \"{}\" is not a <host>:<port> address", name);
+            continue;
+        };
+        let (tx, rx) = mpsc::channel(32);
+        let socket = shared.socket.udp();
+        let id = shared.identity.id();
+        let cancel = shared.cancel.clone();
+        let events = shared.cfg.events.clone();
+        let relay_id = id;
+        tokio::spawn(async move {
+            crate::relay::client::serve(socket, addr, id, rx, cancel, move |observed| {
+                tracing::info!("senders may also use: {}@{}", relay_id, observed);
+                emit(
+                    &events,
+                    TransferEvent::Reachability {
+                        advertised: Some(observed.to_string()),
+                        address: Some(format!("{}@{}", relay_id, observed)),
+                        summary: format!("registered with the relay at {}", addr),
+                    },
+                );
+            })
+            .await;
+        });
+        out.push(RelayClient { addr, tx });
+    }
+    out
 }
 
 fn rejection(echo_ts: u32, reason: u8, message: &str) -> HelloAck {

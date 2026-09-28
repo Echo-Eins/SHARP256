@@ -15,6 +15,9 @@ pub mod transport;
 #[cfg(feature = "nat-traversal")]
 pub mod nat;
 
+#[cfg(feature = "nat-traversal")]
+pub mod relay;
+
 #[cfg(feature = "gui")]
 pub mod gui;
 
