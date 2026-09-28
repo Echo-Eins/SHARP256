@@ -228,6 +228,7 @@ impl Receiver {
         #[cfg(feature = "nat-traversal")]
         let nat = if shared.cfg.nat_traversal {
             let events = shared.cfg.events.clone();
+            let id = shared.identity.id();
             crate::nat::spawn_receiver_discovery(
                 shared.socket.udp(),
                 crate::nat::NatConfig::default(),
@@ -237,6 +238,7 @@ impl Receiver {
                         &events,
                         TransferEvent::Reachability {
                             advertised: r.advertised().map(|a| a.to_string()),
+                            address: r.address_string(&id),
                             summary: r.describe(),
                         },
                     )

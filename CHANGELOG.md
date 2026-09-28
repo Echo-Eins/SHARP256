@@ -61,6 +61,36 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   guarantee with the mechanism responsible, explicit non-goals and residual
   risks.
 
+### Getting through NAT
+- The receiver measures what the NAT in front of it actually does, with the
+  tests of RFC 5780 run on the transfer socket itself: whether the external
+  port follows the destination (which decides whether any address is worth
+  publishing at all) and which inbound packets reach a mapping already open
+  (which decides whether the sender must be let in first), plus hairpinning
+  and port preservation. "NAT type" in the RFC 3489 sense is gone; it was
+  never one property. Where a server cannot measure something the answer is
+  "unknown" rather than a guess — in particular, an answer to CHANGE-REQUEST
+  counts only if it arrives from the address it was asked to come from,
+  since a server that ignores the attribute answers from its primary address
+  and would otherwise look like a wide-open filter.
+- Port forwards are now asked for over PCP (RFC 6887) and NAT-PMP (RFC 6886)
+  as well as UPnP-IGD. The two binary protocols go first: they are two
+  datagrams against UPnP's multicast discovery plus HTTP and SOAP, and they
+  are what most routers of the last decade implement. The router is found
+  from the routing table where that is readable, and from the first address
+  of each local subnet otherwise.
+- Every address the receiver might be reached at is published together, as
+  `ID@host:port,host:port,…` — the port forward, the address the world sees,
+  and the local ones — as candidates in the sense of ICE (RFC 8445). The
+  sender tries them a quarter of a second apart while any are untried, then
+  backs off. Since completing a handshake takes the receiver's private key,
+  publishing an address that might not work risks nothing and costs a
+  quarter of a second.
+- None of this is trusted: STUN servers and routers are unauthenticated and
+  only ever produce addresses worth *trying*. Addresses a server tells us to
+  send to are screened first, so clients cannot be used as reflectors, and
+  PCP's nonce is checked so another request's answer is not taken for ours.
+
 ### Directories
 - A directory is sent as one stream: a manifest (structure, sizes, Unix
   permission bits, modification times) followed by the file contents, so
@@ -185,9 +215,8 @@ rather than the symptoms. The wire format is specified in
   partial file.
 
 ### Reachability
-- NAT handling moved to the receiver, in the background: STUN reports the
-  public address, UPnP-IGD maps a port (renewed, removed on shutdown).
-  Transfers start immediately. The sender needs no NAT handling.
+- NAT handling moved to the receiver, in the background, so transfers start
+  immediately. The sender needs no NAT handling of its own.
 
 ### Fixed
 - Receiver no longer blocks its receive loop while a transfer is running.

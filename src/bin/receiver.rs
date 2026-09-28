@@ -188,9 +188,14 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
         TransferEvent::Reachability {
             summary,
             advertised,
+            address,
         } => {
             println!("Network: {}", summary);
-            if let Some(addr) = advertised {
+            // Every address a sender might reach us at, best first: the
+            // sender tries each in turn and the handshake decides.
+            if let Some(full) = address {
+                println!("Senders use: {}", full);
+            } else if let Some(addr) = advertised {
                 println!("From outside, senders use: {}@{}", id, addr);
             }
         }

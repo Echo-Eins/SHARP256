@@ -117,10 +117,14 @@ pub enum TransferEvent {
         directory: Option<DirectoryInfo>,
         resumed_bytes: u64,
     },
-    /// Receiver side: result of NAT discovery (STUN / UPnP).
+    /// Receiver side: what NAT discovery found (STUN, RFC 5780 behaviour
+    /// tests, and a port forward via PCP, NAT-PMP or UPnP).
     Reachability {
         /// Address senders outside the local network should use, if known.
         advertised: Option<String>,
+        /// The whole address to hand a sender, `ID@host:port,…`, listing
+        /// every candidate address this receiver may be reached at.
+        address: Option<String>,
         summary: String,
     },
 }

@@ -66,7 +66,7 @@ impl SenderApp {
                 return;
             }
         };
-        let (receiver_id, host) = match crate::address::parse_peer(&self.receiver_addr) {
+        let (receiver_id, hosts) = match crate::address::parse_peer(&self.receiver_addr) {
             Ok(v) => v,
             Err(e) => {
                 self.error = Some(e);
@@ -129,10 +129,10 @@ impl SenderApp {
                 }
             };
             rt.block_on(async move {
-                let addrs = match crate::address::resolve_all(&host).await {
+                let addrs = match crate::address::resolve_candidates(&hosts).await {
                     Ok(a) => a,
                     Err(e) => {
-                        *state.lock() = State::Failed(format!("cannot resolve {}: {}", host, e));
+                        *state.lock() = State::Failed(e);
                         repaint.request_repaint();
                         return;
                     }

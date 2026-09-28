@@ -2057,3 +2057,100 @@ async fn one_sender_cannot_take_every_session_slot() {
     drop(held);
     stop_receiver(r).await;
 }
+
+/// A relay that forwards both ways, delaying each direction on its own.
+/// The delays let a test decide exactly which handshake answer arrives
+/// first, which is what the rule about superseded attempts turns on.
+async fn delayed_relay(
+    target: SocketAddr,
+    request_delay: Duration,
+    response_delay: Duration,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let inbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let outbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = inbound.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let client: Arc<parking_lot::Mutex<Option<SocketAddr>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let mut from_sender = vec![0u8; 65536];
+        let mut from_receiver = vec![0u8; 65536];
+        loop {
+            tokio::select! {
+                res = inbound.recv_from(&mut from_sender) => {
+                    let Ok((n, from)) = res else { continue };
+                    *client.lock() = Some(from);
+                    let (pkt, out) = (from_sender[..n].to_vec(), outbound.clone());
+                    tokio::spawn(async move {
+                        if !request_delay.is_zero() {
+                            tokio::time::sleep(request_delay).await;
+                        }
+                        let _ = out.send_to(&pkt, target).await;
+                    });
+                }
+                res = outbound.recv_from(&mut from_receiver) => {
+                    let Ok((n, _)) = res else { continue };
+                    let Some(to) = *client.lock() else { continue };
+                    let (pkt, back) = (from_receiver[..n].to_vec(), inbound.clone());
+                    tokio::spawn(async move {
+                        if !response_delay.is_zero() {
+                            tokio::time::sleep(response_delay).await;
+                        }
+                        let _ = back.send_to(&pkt, to).await;
+                    });
+                }
+            }
+        }
+    });
+    (addr, task)
+}
+
+/// With several candidate addresses in flight, both ends have to agree on
+/// which handshake won. The receiver's replay guard already decides it —
+/// initiation timestamps must increase, so it keeps the newest it accepted.
+/// The sender follows the same rule and adopts only its newest attempt.
+///
+/// Here the answer to the *first* attempt comes back after the second has
+/// already gone out, and the second reaches the receiver later still.
+/// Adopting the first answer would leave the two sides holding different
+/// keys and connection ids: every packet the sender sent would be dropped
+/// unrouted until the stall timer fired and a new handshake repaired it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_newest_handshake_wins_on_both_sides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 400 << 10;
+    let file = make_file(&src, "candidates2.bin", size, 0x7A11);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+
+    // First candidate: reaches the receiver at once, but its answers crawl.
+    let (first, t1) = delayed_relay(r.addr, Duration::ZERO, Duration::from_millis(400)).await;
+    // Second: its answers are quick, but requests take a long way round, so
+    // it moves the receiver on well after the first answer has landed.
+    let (second, t2) = delayed_relay(r.addr, Duration::from_millis(700), Duration::ZERO).await;
+
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let mut cfg = sender_cfg(&file, first, r.id, &state);
+    cfg.alternate_peers = vec![second];
+    cfg.events = Some(Arc::new(move |ev| {
+        let _ = tx.send(ev);
+    }));
+
+    let summary = run_sender(cfg).await.expect("the transfer completes");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&file, &out.join("candidates2.bin"));
+
+    t1.abort();
+    t2.abort();
+    // Adopting the superseded answer would have left the sender talking to
+    // connection ids the receiver had already retired, and the only way out
+    // of that is the stall timer.
+    let mut stalls = 0;
+    while let Ok(ev) = events.try_recv() {
+        if matches!(ev, TransferEvent::Stalled { .. }) {
+            stalls += 1;
+        }
+    }
+    assert_eq!(stalls, 0, "the sender lost the session and had to recover");
+    stop_receiver(r).await;
+}

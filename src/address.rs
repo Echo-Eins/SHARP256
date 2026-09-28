@@ -4,16 +4,33 @@ use crate::crypto::SharpId;
 use std::net::SocketAddr;
 
 /// Splits `sh-…@host:port` into the receiver's identity and its address.
-pub fn parse_peer(s: &str) -> Result<(SharpId, String), String> {
+///
+/// A receiver behind a NAT may be reachable at more than one address and
+/// publishes them all, separated by commas — its port forward, the address
+/// the world sees it at, and its addresses on the local network. They are
+/// candidates in the sense ICE uses the word: the sender tries each until
+/// one answers, and the handshake, not the list, decides which one is really
+/// the receiver.
+pub fn parse_peer(s: &str) -> Result<(SharpId, Vec<String>), String> {
     let s = s.trim();
-    let (id, host) = s.rsplit_once('@').ok_or_else(|| {
+    let (id, hosts) = s.rsplit_once('@').ok_or_else(|| {
         "a receiver is written as <ID>@<host>:<port>, e.g. sh-…@203.0.113.5:5555".to_string()
     })?;
     let id: SharpId = id.parse().map_err(|e| format!("receiver ID: {}", e))?;
-    if host.is_empty() || !host.contains(':') {
-        return Err(format!("\"{}\" is not <host>:<port>", host));
+    let mut out = Vec::new();
+    for host in hosts.split(',') {
+        let host = host.trim();
+        if host.is_empty() || !host.contains(':') {
+            return Err(format!("\"{}\" is not <host>:<port>", host));
+        }
+        if !out.iter().any(|h| h == host) {
+            out.push(host.to_string());
+        }
     }
-    Ok((id, host.to_string()))
+    if out.is_empty() {
+        return Err("no address given after \"@\"".to_string());
+    }
+    Ok((id, out))
 }
 
 /// Most addresses one name contributes. A name that resolves to more than
@@ -26,6 +43,34 @@ pub const MAX_ADDRESSES: usize = 8;
 /// one address, and only one of them may be reachable.
 pub async fn resolve(host_port: &str) -> std::io::Result<SocketAddr> {
     Ok(resolve_all(host_port).await?[0])
+}
+
+/// Resolves every candidate a receiver published (see [`parse_peer`]) into
+/// the addresses to try, in the order given and without repeats.
+///
+/// A candidate that does not resolve is reported only when *none* of them
+/// do: a receiver behind a NAT publishes addresses it cannot know are
+/// reachable from where the sender sits, and one of them failing to resolve
+/// is expected rather than an error.
+pub async fn resolve_candidates(hosts: &[String]) -> Result<Vec<SocketAddr>, String> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut last_error = None;
+    for host in hosts {
+        match resolve_all(host).await {
+            Ok(addrs) => {
+                for a in addrs {
+                    if !out.contains(&a) && out.len() < MAX_ADDRESSES {
+                        out.push(a);
+                    }
+                }
+            }
+            Err(e) => last_error = Some(format!("cannot resolve {}: {}", host, e)),
+        }
+    }
+    if out.is_empty() {
+        return Err(last_error.unwrap_or_else(|| "no address to connect to".to_string()));
+    }
+    Ok(out)
 }
 
 /// Resolves `host:port` to every address it names, at most
@@ -81,14 +126,38 @@ mod tests {
     #[test]
     fn parses_id_and_address() {
         let id = Identity::generate().id();
-        let (p, host) = parse_peer(&format!("{}@10.0.0.2:5555", id)).unwrap();
+        let (p, hosts) = parse_peer(&format!("{}@10.0.0.2:5555", id)).unwrap();
         assert_eq!(p, id);
-        assert_eq!(host, "10.0.0.2:5555");
-        let (_, host) = parse_peer(&format!("{}@[::1]:7", id)).unwrap();
-        assert_eq!(host, "[::1]:7");
+        assert_eq!(hosts, ["10.0.0.2:5555"]);
+        let (_, hosts) = parse_peer(&format!("{}@[::1]:7", id)).unwrap();
+        assert_eq!(hosts, ["[::1]:7"]);
         assert!(parse_peer("10.0.0.2:5555").is_err());
         assert!(parse_peer(&format!("{}@host", id)).is_err());
         assert!(parse_peer("sh-bad@10.0.0.2:1").is_err());
+    }
+
+    /// A receiver behind a NAT publishes every address it might be reached
+    /// at; the sender takes them all.
+    #[test]
+    fn parses_a_list_of_candidate_addresses() {
+        let id = Identity::generate().id();
+        let (p, hosts) = parse_peer(&format!(
+            "{}@203.0.113.5:5555,[2001:db8::1]:5555,192.168.1.7:5555",
+            id
+        ))
+        .unwrap();
+        assert_eq!(p, id);
+        assert_eq!(
+            hosts,
+            ["203.0.113.5:5555", "[2001:db8::1]:5555", "192.168.1.7:5555"]
+        );
+        // Spacing is forgiven and repeats are collapsed.
+        let (_, hosts) = parse_peer(&format!("{}@10.0.0.2:1, 10.0.0.3:1 ,10.0.0.2:1", id)).unwrap();
+        assert_eq!(hosts, ["10.0.0.2:1", "10.0.0.3:1"]);
+        // One bad entry spoils the list rather than being silently dropped:
+        // a typo should be reported, not turned into a mystery timeout.
+        assert!(parse_peer(&format!("{}@10.0.0.2:1,nonsense", id)).is_err());
+        assert!(parse_peer(&format!("{}@10.0.0.2:1,", id)).is_err());
     }
 
     #[tokio::test]

@@ -473,6 +473,8 @@ const MAX_RECV_CALLS: usize = 64;
 const MAX_ATTEMPTS: usize = 4;
 /// While the receiver's user decides, ask for the decision this often.
 const DECISION_POLL: Duration = Duration::from_secs(1);
+/// Gap between initiations while candidate addresses are still untried.
+const CANDIDATE_PROBE: Duration = Duration::from_millis(250);
 
 /// Who we are, whom we talk to, and the shared secret.
 struct Peer {
@@ -533,6 +535,13 @@ struct Engine {
     /// through them until one answers.
     candidates: Vec<SocketAddr>,
     next_candidate: usize,
+    /// A candidate that answered an attempt we could not adopt. Worth going
+    /// straight back to rather than finishing the round.
+    answered_at: Option<SocketAddr>,
+    /// Initiations sent so far; while this is below the number of
+    /// candidates, there are still untried addresses and probing stays
+    /// brisk.
+    probes_sent: usize,
     /// Answer to a handshake or to a state query, not yet acted upon.
     answer: Option<HelloAck>,
     /// Still negotiating: every HELLO_ACK counts, including the one the
@@ -676,6 +685,8 @@ impl Engine {
             cookie: None,
             candidates,
             next_candidate: 0,
+            answered_at: None,
+            probes_sent: 0,
             answer: None,
             negotiating: true,
             handshake_failures: 0,
@@ -838,9 +849,20 @@ impl Engine {
         if self.secure.is_some() || self.candidates.len() <= 1 {
             return self.peer;
         }
+        // An address that already answered beats carrying on round the ring.
+        if let Some(known) = self.answered_at.take() {
+            return known;
+        }
         let target = self.candidates[self.next_candidate % self.candidates.len()];
         self.next_candidate = self.next_candidate.wrapping_add(1);
         target
+    }
+
+    /// Whether any candidate address is still untried. While that holds, the
+    /// handshake probes briskly instead of backing off: an address that is
+    /// simply dead should not hold up the ones behind it.
+    fn candidates_left(&self) -> bool {
+        self.secure.is_none() && self.probes_sent < self.candidates.len()
     }
 
     /// Starts a new handshake attempt: a fresh ephemeral key and connection
@@ -893,6 +915,7 @@ impl Engine {
             self.attempts.pop_front();
         }
         self.attempts.push_back((attempt, now, to));
+        self.probes_sent += 1;
         tracing::debug!(
             "handshake initiation sent to {} ({})",
             to,
@@ -917,6 +940,26 @@ impl Engine {
                 // Retry at the address that asked for the cookie: it is only
                 // worth anything there.
                 self.send_initiation_to(Some(issued_by))?;
+            }
+            return Ok(());
+        }
+        // Only the newest attempt may be adopted, and that is not a detail:
+        // when several initiations are outstanding, both ends have to agree
+        // on which one won. The receiver's replay guard already decides it —
+        // initiation timestamps must increase, so an older one arriving late
+        // is refused and the receiver keeps the newest it saw. Adopting an
+        // older response here would leave the two sides holding different
+        // keys and connection ids, and the transfer would stall until the
+        // next re-handshake.
+        //
+        // A superseded response is not wasted, though: it proves that
+        // address answers, so the next initiation goes straight back to it
+        // instead of carrying on round the candidates.
+        if idx + 1 != self.attempts.len() {
+            let target = self.attempts[idx].2;
+            if self.answered_at != Some(target) {
+                tracing::debug!("{} answered a superseded attempt; trying it again", target);
+                self.answered_at = Some(target);
             }
             return Ok(());
         }
@@ -1053,9 +1096,17 @@ impl Engine {
                 });
             }
             if self.secure.is_none() && now >= next_attempt {
+                let brisk = self.candidates_left();
                 self.send_initiation()?;
-                next_attempt = now + delay;
-                delay = (delay * 2).min(Duration::from_secs(4));
+                if brisk {
+                    // Still addresses nobody has tried. A dead one must not
+                    // hold up the rest, so keep the probes close together
+                    // and start backing off only once the ring is complete.
+                    next_attempt = now + CANDIDATE_PROBE;
+                } else {
+                    next_attempt = now + delay;
+                    delay = (delay * 2).min(Duration::from_secs(4));
+                }
             }
             if let Some(at) = next_poll {
                 if now >= at {

@@ -103,13 +103,14 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     if !file.exists() {
         anyhow::bail!("no such file or folder: {}", file.display());
     }
-    let (receiver_id, host) =
+    let (receiver_id, hosts) =
         sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?;
-    // A name usually has more than one address; try them all and let the
-    // handshake decide which one is the receiver.
-    let addrs = sharp256::address::resolve_all(&host)
+    // A receiver may publish several addresses, and each name may have
+    // several of its own. Try them all and let the handshake decide which
+    // one is the receiver.
+    let addrs = sharp256::address::resolve_candidates(&hosts)
         .await
-        .with_context(|| format!("cannot resolve {}", host))?;
+        .map_err(|e| anyhow::anyhow!(e))?;
     let addr = addrs[0];
     let identity = load_identity(&args.identity)?;
     let sender_id = identity.id();

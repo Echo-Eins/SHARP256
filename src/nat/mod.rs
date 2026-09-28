@@ -174,6 +174,50 @@ async fn forward_port(local_addr: SocketAddr, lease: u32) -> Option<PortForward>
     }
 }
 
+/// This host's own addresses that a peer on the same network could use.
+///
+/// A socket bound to one address has only that one; a wildcard socket is
+/// reachable on every interface. Loopback is left out: a candidate nobody
+/// but this host can use is only a quarter of a second wasted for whoever
+/// tries it.
+fn host_addresses(local: SocketAddr) -> Vec<IpAddr> {
+    if !local.ip().is_unspecified() {
+        return if local.ip().is_loopback() {
+            Vec::new()
+        } else {
+            vec![local.ip()]
+        };
+    }
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut out: Vec<IpAddr> = Vec::new();
+    for i in ifaces {
+        let ip = i.ip();
+        if ip.is_loopback() || out.contains(&ip) {
+            continue;
+        }
+        // A wildcard IPv6 socket usually also serves IPv4; a wildcard IPv4
+        // one never serves IPv6.
+        if ip.is_ipv6() && !local.is_ipv6() {
+            continue;
+        }
+        // An IPv6 link-local address (fe80::/10) only works with the scope
+        // it belongs to, which a written address does not carry.
+        // `Ipv6Addr::is_unicast_link_local` would say this, but it is newer
+        // than the Rust version this crate supports.
+        match ip {
+            IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80 => continue,
+            _ => {}
+        }
+        out.push(ip);
+        if out.len() >= MAX_CANDIDATES {
+            break;
+        }
+    }
+    out
+}
+
 /// This host's own IPv4 addresses, for a socket bound to the wildcard.
 fn local_ipv4_addresses() -> Vec<std::net::Ipv4Addr> {
     if_addrs::get_if_addrs()
@@ -188,6 +232,41 @@ fn local_ipv4_addresses() -> Vec<std::net::Ipv4Addr> {
         })
         .unwrap_or_default()
 }
+
+/// Where a candidate address came from. The names are ICE's (RFC 8445
+/// section 5.1.1), because the idea is the same: gather every address a peer
+/// might reach us at, publish them all, and let the checks decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// An address of this host, as it sees itself. Reaches peers on the same
+    /// network and nobody else.
+    Host,
+    /// The address a STUN server sees us at, which is the NAT's mapping.
+    ServerReflexive,
+    /// A port the router agreed to forward to us.
+    PortForward,
+}
+
+impl CandidateKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            CandidateKind::Host => "host",
+            CandidateKind::ServerReflexive => "seen from outside",
+            CandidateKind::PortForward => "port forward",
+        }
+    }
+}
+
+/// One address a sender may be able to reach this receiver at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Candidate {
+    pub addr: SocketAddr,
+    pub kind: CandidateKind,
+}
+
+/// Candidates a receiver publishes at most. The sender tries them in turn,
+/// so a long list costs setup time.
+pub const MAX_CANDIDATES: usize = 6;
 
 /// Outcome of a discovery run.
 #[derive(Debug, Clone)]
@@ -217,6 +296,63 @@ impl Reachability {
             Reachable::OncePublished | Reachable::ByPunching => self.public_addr,
             _ => None,
         }
+    }
+
+    /// Every address a sender might reach this receiver at, best first.
+    ///
+    /// The ones that work from outside come first, because that is who the
+    /// address gets given to; the host addresses follow for a sender on the
+    /// same network. The sender tries them in turn a quarter of a second
+    /// apart and lets the handshake decide, so a candidate that does not
+    /// work costs that much and nothing else — which is exactly why it is
+    /// safe to publish addresses we are not sure about.
+    pub fn candidates(&self) -> Vec<Candidate> {
+        let mut out: Vec<Candidate> = Vec::new();
+        let mut add = |addr: SocketAddr, kind: CandidateKind| {
+            if addr.port() != 0
+                && !addr.ip().is_unspecified()
+                && out.len() < MAX_CANDIDATES
+                && !out.iter().any(|c| c.addr == addr)
+            {
+                out.push(Candidate { addr, kind });
+            }
+        };
+        if let Some(a) = self.upnp_addr {
+            add(a, CandidateKind::PortForward);
+        }
+        // Worth publishing only when the mapping does not change with the
+        // destination; otherwise this address is the one *a STUN server*
+        // reaches us at and tells a sender nothing.
+        if let Some(p) = self.public_addr {
+            if self.behaviour.open_internet
+                || matches!(
+                    self.behaviour.reachable(),
+                    Reachable::OncePublished | Reachable::ByPunching
+                )
+            {
+                add(p, CandidateKind::ServerReflexive);
+            }
+        }
+        for ip in host_addresses(self.local_addr) {
+            add(
+                SocketAddr::new(ip, self.local_addr.port()),
+                CandidateKind::Host,
+            );
+        }
+        out
+    }
+
+    /// The candidates as a sender writes them: `ID@host:port,host:port,…`.
+    pub fn address_string(&self, id: &crate::crypto::SharpId) -> Option<String> {
+        let list: Vec<String> = self
+            .candidates()
+            .iter()
+            .map(|c| c.addr.to_string())
+            .collect();
+        if list.is_empty() {
+            return None;
+        }
+        Some(format!("{}@{}", id, list.join(",")))
     }
 
     /// One-line human-readable summary.
@@ -373,4 +509,143 @@ pub fn spawn_receiver_discovery(
         stun_responses: tx,
         task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nat::behaviour::{Filtering, Mapping};
+
+    fn reach(behaviour: Behaviour, upnp: Option<&str>, public: Option<&str>) -> Reachability {
+        Reachability {
+            local_addr: "0.0.0.0:5555".parse().unwrap(),
+            public_addr: public.map(|p| p.parse().unwrap()),
+            behaviour,
+            upnp_addr: upnp.map(|u| u.parse().unwrap()),
+        }
+    }
+
+    fn nat(mapping: Mapping, filtering: Filtering) -> Behaviour {
+        Behaviour {
+            mapping,
+            filtering,
+            ..Behaviour::default()
+        }
+    }
+
+    /// A mapping that changes with the destination means the address a STUN
+    /// server sees is the one *it* reaches us at and nothing more. Publishing
+    /// it would send every sender at an address that cannot work.
+    #[test]
+    fn a_symmetric_nats_mapping_is_not_published() {
+        let r = reach(
+            nat(
+                Mapping::AddressAndPortDependent,
+                Filtering::AddressDependent,
+            ),
+            None,
+            Some("203.0.113.9:50000"),
+        );
+        let kinds: Vec<CandidateKind> = r.candidates().iter().map(|c| c.kind).collect();
+        assert!(
+            !kinds.contains(&CandidateKind::ServerReflexive),
+            "{:?}",
+            r.candidates()
+        );
+        assert_eq!(r.advertised(), None);
+    }
+
+    /// A stable mapping is worth publishing even behind a filter: the sender
+    /// still has to be let in, but it is the address that will work when it
+    /// is.
+    #[test]
+    fn a_stable_mapping_is_published_even_when_filtered() {
+        for filtering in [
+            Filtering::EndpointIndependent,
+            Filtering::AddressDependent,
+            Filtering::AddressAndPortDependent,
+        ] {
+            let r = reach(
+                nat(Mapping::EndpointIndependent, filtering),
+                None,
+                Some("203.0.113.9:50000"),
+            );
+            let first = r.candidates();
+            assert_eq!(
+                first[0].kind,
+                CandidateKind::ServerReflexive,
+                "{:?}",
+                filtering
+            );
+            assert_eq!(first[0].addr, "203.0.113.9:50000".parse().unwrap());
+        }
+    }
+
+    /// The port forward comes first: it is the one that depends on neither
+    /// the other side's behaviour nor on timing.
+    #[test]
+    fn a_port_forward_outranks_everything_else() {
+        let r = reach(
+            nat(Mapping::EndpointIndependent, Filtering::AddressDependent),
+            Some("198.51.100.4:41000"),
+            Some("203.0.113.9:50000"),
+        );
+        let c = r.candidates();
+        assert_eq!(c[0].kind, CandidateKind::PortForward);
+        assert_eq!(c[0].addr, "198.51.100.4:41000".parse().unwrap());
+        assert_eq!(c[1].kind, CandidateKind::ServerReflexive);
+        assert_eq!(r.advertised(), Some("198.51.100.4:41000".parse().unwrap()));
+    }
+
+    /// The published address is what a sender types, so it has to survive
+    /// the round trip through the parser.
+    #[test]
+    fn the_published_address_parses_back() {
+        let id = crate::crypto::Identity::generate().id();
+        let r = reach(
+            nat(Mapping::EndpointIndependent, Filtering::EndpointIndependent),
+            Some("198.51.100.4:41000"),
+            Some("203.0.113.9:50000"),
+        );
+        let text = r.address_string(&id).expect("candidates to publish");
+        let (parsed_id, hosts) = crate::address::parse_peer(&text).expect("parses back");
+        assert_eq!(parsed_id, id);
+        assert_eq!(hosts.len(), r.candidates().len());
+        assert_eq!(hosts[0], "198.51.100.4:41000");
+
+        // Nothing discovered at all: no address to publish, and saying so
+        // beats printing something that cannot work.
+        let empty = reach(Behaviour::default(), None, None);
+        let host_only = empty.candidates().len();
+        assert_eq!(empty.address_string(&id).is_some(), host_only > 0);
+    }
+
+    /// Duplicates cost the sender a quarter of a second each for nothing.
+    #[test]
+    fn the_same_address_is_never_published_twice() {
+        let r = reach(
+            nat(Mapping::EndpointIndependent, Filtering::EndpointIndependent),
+            Some("203.0.113.9:50000"),
+            Some("203.0.113.9:50000"),
+        );
+        let c = r.candidates();
+        assert_eq!(c.len(), 1 + host_addresses(r.local_addr).len());
+        assert_eq!(c[0].kind, CandidateKind::PortForward);
+        assert!(c.len() <= MAX_CANDIDATES);
+    }
+
+    /// A loopback socket has nothing to offer anyone else.
+    #[test]
+    fn loopback_is_never_a_candidate() {
+        let r = Reachability {
+            local_addr: "127.0.0.1:5555".parse().unwrap(),
+            public_addr: None,
+            behaviour: Behaviour::default(),
+            upnp_addr: None,
+        };
+        assert!(r.candidates().is_empty());
+        for ip in host_addresses("0.0.0.0:1".parse().unwrap()) {
+            assert!(!ip.is_loopback());
+        }
+    }
 }

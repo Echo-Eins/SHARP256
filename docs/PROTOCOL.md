@@ -694,19 +694,64 @@ easy to capture and repeat from elsewhere as any other packet.
 ### NAT
 
 A receiver must be reachable at the address senders use. With the
-`nat-traversal` feature the receiver, in the background and without
-delaying transfers, asks public STUN servers under which address its
-transfer socket is seen, and asks the router for a UPnP-IGD port forward,
-renewed at half its lease and removed on shutdown. The result is reported
-as a `Reachability` event; the receiver prints the address to give senders
-as `ID@address`. STUN responses arrive on the transfer socket and are
-routed to the NAT task by the receiver's dispatcher.
+`nat-traversal` feature the receiver works that out in the background,
+without delaying transfers, and reports it as a `Reachability` event.
+
+**What the NAT does.** "NAT type" in the RFC 3489 sense — full cone,
+restricted, symmetric — was retired because it was never one property. The
+receiver measures the two choices a NAT really makes, separately, with the
+tests of RFC 5780 run on the transfer socket itself (the mapping of *that*
+socket is the one that matters):
+
+* *mapping behaviour* — does the external port follow the destination? A
+  mapping that does not is the same one a sender would arrive at, so
+  publishing the address is worth something. One that does means no address
+  we can learn is the address a peer would need, and only a relay is left.
+* *filtering behaviour* — which inbound packets reach a mapping we have
+  already opened? This says whether a sender has to be let in first.
+
+The tests need a server with a second address and port. One that has none
+still reports the mapped address, and two independent servers still
+cross-check the mapping between them; where neither is possible the answer
+is "unknown", never a guess. The filtering test additionally requires that
+the answer arrive *from the address it was asked to come from*: a server
+that ignores CHANGE-REQUEST answers from its primary address anyway, and
+reading that as "anything gets in" would send a peer punching at a NAT that
+will never let it through.
+
+**Port forwards.** A forward is the one way through that depends on neither
+the peer's behaviour nor on timing. All three protocols routers speak for it
+are tried: PCP (RFC 6887) and NAT-PMP (RFC 6886) first, as two small
+datagrams on UDP port 5351, then UPnP-IGD. The lease is renewed at half its
+length and given back on shutdown.
+
+**Candidates.** Every address that might work is published together, as
+`ID@host:port,host:port,…`: the port forward, the address the world sees the
+receiver at, and its addresses on the local network — candidates in the
+sense of ICE (RFC 8445), ordered so the ones that work from outside come
+first. The sender tries them a quarter of a second apart while any remain
+untried, then backs off. Nothing is risked by publishing an address that
+turns out not to work, because completing a handshake takes the receiver's
+private key: a wrong candidate costs a quarter of a second.
+
+STUN messages arrive on the transfer socket and are routed to the NAT task
+by the receiver's dispatcher, requests included — the hairpinning test works
+by watching for our own request to come back.
+
+**None of it is trusted.** STUN servers and routers are unauthenticated, and
+on a network we do not own anything may answer. All any of them can produce
+is an address that does or does not work: they decide which addresses are
+worth *trying*, never who we talk to. An address a server tells us to send
+to is screened before we send there, so clients cannot be used as
+reflectors, and PCP's nonce is checked so that another request's answer is
+not taken for ours.
 
 The sender needs no NAT handling: its outgoing datagrams create the mapping
 on its own NAT, and the receiver answers the address a handshake came from
 (and follows a mapping that changes later through address validation). Two
-peers that are both behind NATs without a port forward cannot reach each
-other; that needs a rendezvous or relay service (section 11).
+peers that are both behind NATs with no forward, or behind a NAT whose
+mapping changes per destination, cannot reach each other directly; that
+needs a rendezvous to punch through or a relay to meet at (section 11).
 
 ## 9. Security considerations
 
