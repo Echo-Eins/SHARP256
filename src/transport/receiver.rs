@@ -851,11 +851,12 @@ fn side_channel(
             return true;
         }
     }
-    // A relay's control messages. They can never be traffic: the
-    // connection id they would parse as is one no endpoint ever picks.
+    // A relay's control messages, from its control port or from a port it
+    // set aside for us. They can never be traffic: the connection id they
+    // would parse as is one no endpoint ever picks.
     if crate::relay::is_control(first) {
         let list = relays.list.read();
-        if let Some(c) = list.iter().find(|c| c.addr == from) {
+        if let Some(c) = list.iter().find(|c| c.addr.ip() == from.ip()) {
             for d in run.chunks(stride) {
                 if crate::relay::is_control(d) {
                     let _ = c.tx.try_send((d.to_vec(), from));

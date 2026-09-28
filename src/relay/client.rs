@@ -55,6 +55,8 @@ pub struct Introduction {
     /// The relay's port for this pair. Slower and not free for whoever runs
     /// the relay, but it works when nothing else does.
     pub relayed: SocketAddr,
+    /// Which side of that port we are; see [`hold`].
+    pub ticket: [u8; TOKEN_LEN],
 }
 
 /// Asks a relay to put us through to `target`.
@@ -95,16 +97,15 @@ pub async fn connect(
                     Some(peer)
                 };
                 let relayed = SocketAddr::new(relay.ip(), port);
-                // Tell the allocated port which side we are. This is also
-                // what opens our NAT towards it, and the address it sees
-                // here is very likely not the one the control port saw.
-                // It is spaced out over most of a second, so it runs on its
-                // own: the caller has candidates to be getting on with.
-                let announcer = socket.clone();
-                tokio::spawn(async move {
-                    announce(&announcer, relayed, ticket).await;
+                // Binding our side of that port is the caller's to run,
+                // with [`hold`]: it takes a round trip to the port and
+                // back, and the caller has candidates to be getting on
+                // with meanwhile.
+                return Ok(Introduction {
+                    peer,
+                    relayed,
+                    ticket,
                 });
-                return Ok(Introduction { peer, relayed });
             }
             Some(Message::Error { code }) => return Err(code.describe().to_string()),
             _ => {}
@@ -113,11 +114,57 @@ pub async fn connect(
     Err(format!("the relay {} did not answer", relay))
 }
 
+/// Binds our side of an allocated port and keeps it bound, until cancelled.
+///
+/// Says which side we are a few times — the first may be the datagram that
+/// opens our NAT rather than the one that arrives — and answers each
+/// confirmation the port sends back with an Open that carries it, which is
+/// what actually binds us: the port only believes an address once it has
+/// seen that address receive. `incoming` carries the relay's datagrams, as
+/// for [`connect`]; only those from the allocated port matter here.
+pub async fn hold(
+    socket: Arc<UdpSocket>,
+    relayed: SocketAddr,
+    ticket: [u8; TOKEN_LEN],
+    incoming: &mut mpsc::Receiver<Incoming>,
+    cancel: &CancellationToken,
+) {
+    let ask = Message::Open {
+        ticket,
+        proof: [0; TOKEN_LEN],
+    }
+    .encode();
+    let mut asked = 0u32;
+    let mut next = Instant::now();
+    loop {
+        let wait = next.saturating_duration_since(Instant::now());
+        tokio::select! {
+            _ = tokio::time::sleep(wait), if asked < REPEATS => {
+                let _ = socket.send_to(&ask, relayed).await;
+                asked += 1;
+                next = Instant::now() + REPEAT_GAP;
+            }
+            m = incoming.recv() => {
+                let Some((pkt, from)) = m else { return };
+                if from != relayed {
+                    continue;
+                }
+                if let Some(Message::Confirm { proof }) = Message::decode(&pkt) {
+                    let open = Message::Open { ticket, proof }.encode();
+                    let _ = socket.send_to(&open, relayed).await;
+                }
+            }
+            _ = cancel.cancelled() => return,
+        }
+    }
+}
+
 /// Registers with a relay and stays registered, introducing senders as they
 /// arrive. Runs until cancelled.
 ///
-/// `incoming` carries the relay's datagrams, handed over by whoever owns the
-/// socket's receive loop.
+/// `incoming` carries the relay's datagrams — from its control port and
+/// from the ports it allocates — handed over by whoever owns the socket's
+/// receive loop.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     socket: Arc<UdpSocket>,
@@ -139,20 +186,25 @@ pub async fn serve(
         tracing::warn!("relay {}: its identity is not a usable key", relay);
         return;
     };
+    let reach = crate::address::Reach::of(&socket);
     let flags = if private { super::REGISTER_PRIVATE } else { 0 };
+    let mut stamps = Stamps::default();
     let mut token = [0u8; TOKEN_LEN];
     let mut registered = false;
     let mut next_send = Instant::now();
     // What we are willing to do on this relay's say-so.
     let mut allowance = INTRODUCTION_BURST;
     let mut allowance_at = Instant::now();
-    // Introductions already acted on, so the relay's repeats are free.
-    let mut handled: std::collections::VecDeque<[u8; TOKEN_LEN]> =
+    // Introductions already acted on — their tickets and ports — so the
+    // relay's repeats cost no allowance, and its confirmations can be
+    // matched to the port they came from.
+    let mut handled: std::collections::VecDeque<([u8; TOKEN_LEN], u16)> =
         std::collections::VecDeque::new();
     // Until the relay answers, ask briskly; once registered, just keep the
     // lease and the NAT mapping alive.
     let mut retry = Duration::from_millis(500);
     let mut lease = Duration::from_secs(60);
+    let mut send_failures = 0u32;
     loop {
         let now = Instant::now();
         if now >= next_send {
@@ -162,15 +214,29 @@ pub async fn serve(
                     id,
                     token,
                     flags,
+                    stamp: stamps.next(),
                     proof: [0; PROOF_LEN],
                 },
             );
-            if socket.send_to(&msg, relay).await.is_err() {
-                return;
-            }
-            next_send = now + if registered { lease / 2 } else { retry };
-            if !registered {
-                retry = (retry * 2).min(Duration::from_secs(15));
+            match socket.send_to(&msg, relay).await {
+                Ok(_) => {
+                    send_failures = 0;
+                    next_send = now + if registered { lease / 2 } else { retry };
+                    if !registered {
+                        retry = (retry * 2).min(Duration::from_secs(15));
+                    }
+                }
+                // Not a reason to give up: the network may not be up yet,
+                // or be changing under us. The relay may be the only way
+                // anyone can reach this receiver, so keep trying — less
+                // often, and saying so once.
+                Err(e) => {
+                    send_failures = send_failures.saturating_add(1);
+                    if send_failures == 1 {
+                        tracing::warn!("relay {}: cannot send ({}); will keep trying", relay, e);
+                    }
+                    next_send = now + Duration::from_secs(2u64 << send_failures.min(4));
+                }
             }
         }
         let wait = next_send.saturating_duration_since(Instant::now());
@@ -178,37 +244,45 @@ pub async fn serve(
             m = incoming.recv() => m,
             _ = tokio::time::sleep(wait) => continue,
             _ = cancel.cancelled() => {
-                // Say so on the way out. Otherwise the relay keeps sending
-                // people to an address that no longer answers until the
-                // lease runs out, which is the difference between a sender
-                // failing over in a moment and failing over in two minutes.
                 if registered {
-                    let bye = signed(
-                        &key,
-                        Message::Bye {
-                            id,
-                            token,
-                            proof: [0; PROOF_LEN],
-                        },
-                    );
-                    let _ = socket.send_to(&bye, relay).await;
+                    goodbye(&socket, relay, &key, id, token, &mut stamps, &mut incoming).await;
                 }
                 return;
             }
         };
         let Some((pkt, from)) = msg else { return };
-        if from != relay {
+        // From the relay's host: its control port, or one of the ports it
+        // set aside for us.
+        if from.ip() != relay.ip() {
             continue;
         }
-        match Message::decode(&pkt) {
-            Some(Message::Challenge { token: t }) => {
+        let Some(msg) = Message::decode(&pkt) else {
+            continue;
+        };
+        if from != relay {
+            // An allocated port asking us to prove we receive here. Only
+            // for a port we were introduced on, and only with the ticket we
+            // were given for it.
+            if let Message::Confirm { proof } = msg {
+                if let Some((ticket, _)) = handled.iter().find(|(_, p)| *p == from.port()) {
+                    let open = Message::Open {
+                        ticket: *ticket,
+                        proof,
+                    };
+                    let _ = socket.send_to(&open.encode(), from).await;
+                }
+            }
+            continue;
+        }
+        match msg {
+            Message::Challenge { token: t } => {
                 token = t;
                 next_send = Instant::now();
             }
-            Some(Message::Registered {
+            Message::Registered {
                 lease: secs,
                 observed,
-            }) => {
+            } => {
                 if !registered {
                     tracing::info!("relay {} reached; it sees us at {}", relay, observed);
                     on_registered(observed);
@@ -217,33 +291,50 @@ pub async fn serve(
                 lease = Duration::from_secs(secs.clamp(10, 3600) as u64);
                 next_send = Instant::now() + lease / 2;
             }
-            Some(Message::Incoming { port, peer, ticket }) => {
-                // The relay repeats an introduction until we bind our side,
-                // because a lost one would otherwise fail the transfer
-                // silently. A repeat is not a new introduction, and must not
-                // spend the allowance below or start the work again.
-                if handled.contains(&ticket) {
+            Message::Incoming { port, peer, ticket } => {
+                let relayed = SocketAddr::new(relay.ip(), port);
+                // The relay repeats an introduction until our side of the
+                // port is bound, because a lost one would otherwise fail the
+                // transfer silently. A repeat means the binding has not
+                // happened yet, so it is worth saying which side we are
+                // again — that goes to the relay's own address and costs
+                // nothing — but it is not a new introduction, and must not
+                // spend the allowance below or punch again.
+                if handled.iter().any(|(t, _)| *t == ticket) {
+                    let socket = socket.clone();
+                    tokio::spawn(async move { announce(&socket, relayed, ticket).await });
                     continue;
                 }
-                // Acting on an introduction means sending a handful of
-                // datagrams at an address the relay chose, so how often we
-                // are willing to do that is our decision, not the relay's.
+                if handled.len() >= HANDLED_REMEMBERED {
+                    handled.pop_front();
+                }
+                handled.push_back((ticket, port));
+                // Pushing outwards towards the sender means sending a
+                // handful of datagrams at an address the relay chose, so
+                // how often we are willing to do that is our decision, not
+                // the relay's. Binding our side of its port is not: that
+                // goes to the relay itself, and holding it back would let
+                // anyone who can ask the relay for introductions starve the
+                // real ones.
                 let now = Instant::now();
                 allowance = (allowance
                     + now.saturating_duration_since(allowance_at).as_secs_f64()
                         * INTRODUCTION_RATE)
                     .min(INTRODUCTION_BURST);
                 allowance_at = now;
-                if allowance < 1.0 {
-                    tracing::debug!("relay {} is introducing too fast; ignoring", relay);
-                    continue;
-                }
-                allowance -= 1.0;
-                if handled.len() >= HANDLED_REMEMBERED {
-                    handled.pop_front();
-                }
-                handled.push_back(ticket);
-                let relayed = SocketAddr::new(relay.ip(), port);
+                // An unspecified peer means the relay was asked not to say
+                // where the other side is — either it asked to stay hidden,
+                // or we did — so there is nothing to punch towards and the
+                // pair meets at the relay's port.
+                let target = if peer.ip().is_unspecified() {
+                    None
+                } else if allowance >= 1.0 {
+                    allowance -= 1.0;
+                    Some(peer)
+                } else {
+                    tracing::debug!("relay {} is introducing too fast; not punching", relay);
+                    None
+                };
                 tracing::info!("relay {} is introducing {}", relay, peer);
                 let socket = socket.clone();
                 // Both jobs at once, and that is not a figure of speech.
@@ -254,25 +345,86 @@ pub async fn serve(
                 // have our first datagram leave after the sender's had
                 // already been dropped by our NAT.
                 tokio::spawn(async move {
-                    // An unspecified peer means the relay was asked not to
-                    // say where the other side is — either it asked to stay
-                    // hidden, or we did — so there is nothing to punch
-                    // towards and the pair meets at the relay's port.
-                    if peer.ip().is_unspecified() {
-                        announce(&socket, relayed, ticket).await;
-                    } else {
-                        tokio::join!(announce(&socket, relayed, ticket), punch(&socket, peer));
+                    match target.and_then(|p| reach.native(p)) {
+                        Some(peer) => {
+                            tokio::join!(announce(&socket, relayed, ticket), punch(&socket, peer));
+                        }
+                        None => announce(&socket, relayed, ticket).await,
                     }
                 });
             }
-            Some(Message::Error { code }) => {
-                // Busy is worth retrying; the rest are not about us.
-                if code == Refusal::Busy {
-                    next_send = Instant::now() + Duration::from_secs(30);
+            Message::Error { code } => {
+                match code {
+                    // Worth retrying, later.
+                    Refusal::Busy => next_send = Instant::now() + Duration::from_secs(30),
+                    // Our clock is behind what the relay last took from us.
+                    // Nothing to do but wait for it to forget.
+                    Refusal::Stale => {
+                        tracing::warn!("relay {}: {}", relay, code.describe());
+                        next_send = Instant::now() + Duration::from_secs(60);
+                    }
+                    _ => {}
                 }
                 tracing::debug!("relay {}: {}", relay, code.describe());
             }
             _ => {}
+        }
+    }
+}
+
+/// Stamps for our registrations: strictly increasing, and close to the
+/// wall clock so that a restarted receiver carries on above where it was
+/// (see `Message::Register::stamp`).
+#[derive(Default)]
+struct Stamps {
+    last: u64,
+}
+
+impl Stamps {
+    fn next(&mut self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        self.last = now.max(self.last.saturating_add(1));
+        self.last
+    }
+}
+
+/// How long leaving waits for the relay to ask for a fresh token.
+const GOODBYE_WAIT: Duration = Duration::from_millis(700);
+
+/// Tells the relay we are going. Otherwise it keeps sending people to an
+/// address that no longer answers until the lease runs out, which is the
+/// difference between a sender failing over in a moment and in two minutes.
+///
+/// The token we hold may have expired since the last keepalive; the relay
+/// then answers with a fresh one, and the goodbye is sent again with it.
+async fn goodbye(
+    socket: &UdpSocket,
+    relay: SocketAddr,
+    key: &[u8; 32],
+    id: SharpId,
+    mut token: [u8; TOKEN_LEN],
+    stamps: &mut Stamps,
+    incoming: &mut mpsc::Receiver<Incoming>,
+) {
+    for _ in 0..2 {
+        let bye = signed(
+            key,
+            Message::Bye {
+                id,
+                token,
+                stamp: stamps.next(),
+                proof: [0; PROOF_LEN],
+            },
+        );
+        if socket.send_to(&bye, relay).await.is_err() {
+            return;
+        }
+        match wait_for(incoming, relay, GOODBYE_WAIT).await {
+            Some(Message::Challenge { token: t }) => token = t,
+            _ => return,
         }
     }
 }
@@ -288,9 +440,14 @@ fn signed(key: &[u8; 32], msg: Message) -> Vec<u8> {
 }
 
 /// Says which side of an allocation we are, repeatedly: the first may be
-/// the one that opens the NAT rather than the one that arrives.
+/// the one that opens the NAT rather than the one that arrives. Each draws
+/// a confirmation from the port, which [`serve`] answers.
 async fn announce(socket: &UdpSocket, allocated: SocketAddr, ticket: [u8; TOKEN_LEN]) {
-    let msg = Message::Open { ticket }.encode();
+    let msg = Message::Open {
+        ticket,
+        proof: [0; TOKEN_LEN],
+    }
+    .encode();
     for i in 0..REPEATS {
         if socket.send_to(&msg, allocated).await.is_err() {
             return;

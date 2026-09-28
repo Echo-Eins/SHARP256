@@ -41,7 +41,17 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     max_pairs: usize,
 
-    /// Requests per second accepted from one address.
+    /// Registrations one client may hold. A client is an IPv4 address or
+    /// an IPv6 /64; raise this where many receivers share one address
+    /// behind a carrier-grade NAT.
+    #[arg(long, default_value_t = 128)]
+    registrations_per_client: usize,
+
+    /// Pairs one client may have carried at once.
+    #[arg(long, default_value_t = 16)]
+    pairs_per_client: usize,
+
+    /// Requests per second accepted from one client.
     #[arg(long, default_value_t = 10.0)]
     rate: f64,
 
@@ -83,6 +93,8 @@ async fn main() -> Result<()> {
         identity: identity.clone(),
         max_registrations: args.max_registrations,
         max_allocations: args.max_pairs,
+        registrations_per_client: args.registrations_per_client.max(1),
+        allocations_per_client: args.pairs_per_client.max(1),
         rate: args.rate,
         burst: (args.rate * 2.0).max(2.0),
         lease: Duration::from_secs(args.lease.clamp(10, 3600)),

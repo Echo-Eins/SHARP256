@@ -140,6 +140,7 @@ enum Kind {
     Open = 8,
     Punch = 9,
     Bye = 10,
+    Confirm = 11,
 }
 
 impl Kind {
@@ -155,6 +156,7 @@ impl Kind {
             8 => Kind::Open,
             9 => Kind::Punch,
             10 => Kind::Bye,
+            11 => Kind::Confirm,
             _ => return None,
         })
     }
@@ -170,6 +172,9 @@ pub enum Refusal {
     BadToken = 2,
     /// The relay is at its limit.
     Busy = 3,
+    /// The message is older than one the relay already took for the same
+    /// identity: a replay, or a clock that went backwards.
+    Stale = 4,
 }
 
 impl Refusal {
@@ -178,6 +183,7 @@ impl Refusal {
             1 => Refusal::Unknown,
             2 => Refusal::BadToken,
             3 => Refusal::Busy,
+            4 => Refusal::Stale,
             _ => return None,
         })
     }
@@ -187,6 +193,10 @@ impl Refusal {
             Refusal::Unknown => "the relay has no registration for that receiver",
             Refusal::BadToken => "the relay did not accept the token",
             Refusal::Busy => "the relay is at its limit",
+            Refusal::Stale => {
+                "the relay has already seen a newer message from this identity \
+                 (a replay, or this host's clock went backwards)"
+            }
         }
     }
 }
@@ -201,6 +211,12 @@ pub enum Message {
         token: [u8; TOKEN_LEN],
         /// See [`REGISTER_PRIVATE`].
         flags: u8,
+        /// Strictly increasing per identity. The proof binds everything in
+        /// the message to the owner, but nothing in it is fresh apart from
+        /// this: without it, a registration captured from the owner's
+        /// address could be sent again later — to move the registration
+        /// back to an old address, or to turn a private one public.
+        stamp: u64,
         /// Proof that this is the identity's owner asking.
         proof: [u8; PROOF_LEN],
     },
@@ -246,8 +262,21 @@ pub enum Message {
     /// peer's address here. The NAT it is behind is very likely the kind
     /// that hands out a different port for every destination, which is what
     /// the relay exists for in the first place.
+    ///
+    /// A side is only bound once it has shown it receives at the address
+    /// it speaks from: the first Open carries a zero `proof` and draws a
+    /// [`Message::Confirm`] back to that address, and the side repeats the
+    /// Open with what the confirmation said. A forged source address never
+    /// sees the confirmation, so it can bind nothing — and in particular
+    /// cannot bind one of the relay's own ports, which would set two
+    /// allocations forwarding a datagram to each other for ever.
     Open {
         ticket: [u8; TOKEN_LEN],
+        proof: [u8; TOKEN_LEN],
+    },
+    /// Relay → peer, from an allocated port: repeat your Open with this.
+    Confirm {
+        proof: [u8; TOKEN_LEN],
     },
     /// Peer → peer, not to the relay at all: a datagram whose only purpose
     /// is to make the sender's own NAT open a way back for the other side.
@@ -262,6 +291,9 @@ pub enum Message {
     Bye {
         id: SharpId,
         token: [u8; TOKEN_LEN],
+        /// Newer than the registration it ends; see `Register::stamp`. An
+        /// old goodbye sent again must not end a registration made since.
+        stamp: u64,
         proof: [u8; PROOF_LEN],
     },
 }
@@ -335,12 +367,14 @@ impl Message {
                 id,
                 token,
                 flags,
+                stamp,
                 proof,
             } => {
                 out.push(Kind::Register as u8);
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(token);
                 out.push(*flags);
+                out.extend_from_slice(&stamp.to_be_bytes());
                 out.extend_from_slice(proof);
             }
             Message::Challenge { token } => {
@@ -373,15 +407,26 @@ impl Message {
                 out.push(Kind::Error as u8);
                 out.push(*code as u8);
             }
-            Message::Open { ticket } => {
+            Message::Open { ticket, proof } => {
                 out.push(Kind::Open as u8);
                 out.extend_from_slice(ticket);
+                out.extend_from_slice(proof);
+            }
+            Message::Confirm { proof } => {
+                out.push(Kind::Confirm as u8);
+                out.extend_from_slice(proof);
             }
             Message::Punch => out.push(Kind::Punch as u8),
-            Message::Bye { id, token, proof } => {
+            Message::Bye {
+                id,
+                token,
+                stamp,
+                proof,
+            } => {
                 out.push(Kind::Bye as u8);
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(token);
+                out.extend_from_slice(&stamp.to_be_bytes());
                 out.extend_from_slice(proof);
             }
         }
@@ -410,6 +455,8 @@ impl Message {
                     Kind::Register => {
                         let flags = *body.get(pos)?;
                         pos += 1;
+                        let stamp = u64::from_be_bytes(body.get(pos..pos + 8)?.try_into().ok()?);
+                        pos += 8;
                         let proof: [u8; PROOF_LEN] =
                             body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
                         pos += PROOF_LEN;
@@ -417,15 +464,23 @@ impl Message {
                             id,
                             token,
                             flags,
+                            stamp,
                             proof,
                         }
                     }
                     Kind::Connect => Message::Connect { target: id, token },
                     _ => {
+                        let stamp = u64::from_be_bytes(body.get(pos..pos + 8)?.try_into().ok()?);
+                        pos += 8;
                         let proof: [u8; PROOF_LEN] =
                             body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
                         pos += PROOF_LEN;
-                        Message::Bye { id, token, proof }
+                        Message::Bye {
+                            id,
+                            token,
+                            stamp,
+                            proof,
+                        }
                     }
                 }
             }
@@ -462,9 +517,16 @@ impl Message {
                 }
             }
             Kind::Open => {
-                pos = TOKEN_LEN;
+                pos = 2 * TOKEN_LEN;
                 Message::Open {
                     ticket: body.get(0..TOKEN_LEN)?.try_into().ok()?,
+                    proof: body.get(TOKEN_LEN..2 * TOKEN_LEN)?.try_into().ok()?,
+                }
+            }
+            Kind::Confirm => {
+                pos = TOKEN_LEN;
+                Message::Confirm {
+                    proof: body.get(0..TOKEN_LEN)?.try_into().ok()?,
                 }
             }
             Kind::Punch => {
@@ -528,6 +590,7 @@ mod tests {
             id: oid,
             token: [4; TOKEN_LEN],
             flags: REGISTER_PRIVATE,
+            stamp: 77,
             proof: [0; PROOF_LEN],
         }
         .encode();
@@ -541,6 +604,7 @@ mod tests {
                 id: oid,
                 token: [4; TOKEN_LEN],
                 flags: REGISTER_PRIVATE,
+                stamp: 77,
                 proof,
             })
         );
@@ -574,12 +638,14 @@ mod tests {
             id,
             token: [0; TOKEN_LEN],
             flags: 0,
+            stamp: 0,
             proof: [0; PROOF_LEN],
         });
         roundtrip(Message::Register {
             id,
             token: [7; TOKEN_LEN],
             flags: REGISTER_PRIVATE,
+            stamp: u64::MAX,
             proof: [1; PROOF_LEN],
         });
         roundtrip(Message::Challenge {
@@ -607,16 +673,30 @@ mod tests {
             peer: "[2001:db8::2]:6000".parse().unwrap(),
             ticket: [6; TOKEN_LEN],
         });
-        for code in [Refusal::Unknown, Refusal::BadToken, Refusal::Busy] {
+        for code in [
+            Refusal::Unknown,
+            Refusal::BadToken,
+            Refusal::Busy,
+            Refusal::Stale,
+        ] {
             roundtrip(Message::Error { code });
         }
         roundtrip(Message::Open {
             ticket: [8; TOKEN_LEN],
+            proof: [0; TOKEN_LEN],
+        });
+        roundtrip(Message::Open {
+            ticket: [8; TOKEN_LEN],
+            proof: [4; TOKEN_LEN],
+        });
+        roundtrip(Message::Confirm {
+            proof: [4; TOKEN_LEN],
         });
         roundtrip(Message::Punch);
         roundtrip(Message::Bye {
             id,
             token: [2; TOKEN_LEN],
+            stamp: 1 << 40,
             proof: [3; PROOF_LEN],
         });
     }
@@ -631,6 +711,7 @@ mod tests {
             id,
             token: [1; TOKEN_LEN],
             flags: 0,
+            stamp: 9,
             proof: [1; PROOF_LEN],
         }
         .encode();

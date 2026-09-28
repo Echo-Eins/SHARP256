@@ -256,7 +256,9 @@ impl Sender {
                 };
                 let (tx, mut rx) = mpsc::channel(32);
                 inboxes.write().push((addr, tx));
-                match crate::relay::client::connect(socket, addr, target, &mut rx, &cancel).await {
+                match crate::relay::client::connect(socket.clone(), addr, target, &mut rx, &cancel)
+                    .await
+                {
                     Ok(i) => {
                         match i.peer {
                             Some(peer) => tracing::info!(
@@ -279,6 +281,11 @@ impl Sender {
                             let _ = found.send(peer);
                         }
                         let _ = found.send(i.relayed);
+                        // And bind our side of the relay's port, which
+                        // takes a round trip to it: until then it carries
+                        // nothing of ours.
+                        crate::relay::client::hold(socket, i.relayed, i.ticket, &mut rx, &cancel)
+                            .await;
                     }
                     // A relay that cannot help is not a failure: the
                     // addresses we already have may well work.
@@ -2029,12 +2036,18 @@ impl Engine {
     /// Routes a datagram by its connection id: transport packets of the
     /// session, or answers to a handshake attempt. Anything else is dropped.
     fn on_datagram(&mut self, pkt: &mut [u8], from: SocketAddr) -> Result<(), SendError> {
-        // A relay's own datagrams, handed over to whichever introduction is
+        // A relay's own datagrams — from its control port or a port it
+        // set aside for us — handed over to whichever introduction is
         // waiting for them. They can never be confused with traffic: the
         // connection id they would parse as is one no endpoint ever picks.
         #[cfg(feature = "nat-traversal")]
         if crate::relay::is_control(pkt) {
-            if let Some((_, tx)) = self.relay_inboxes.read().iter().find(|(a, _)| *a == from) {
+            if let Some((_, tx)) = self
+                .relay_inboxes
+                .read()
+                .iter()
+                .find(|(a, _)| a.ip() == from.ip())
+            {
                 let _ = tx.try_send((pkt.to_vec(), from));
             }
             return Ok(());
