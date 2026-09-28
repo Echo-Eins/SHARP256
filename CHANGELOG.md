@@ -363,8 +363,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   session. It now allows 3 s; a session really lost stalls however long
   the timeout, so the test still catches what it is for.
 - The README claimed "10 GbE and beyond"; it now gives the measured figure
-  (4.8–5.0 Gbit/s over loopback on one 4-core VM) and says that no real
-  10 GbE network was measured.
+  (4.6–5.0 Gbit/s over loopback on one 4-core VM, re-measured on this
+  release's code: seven runs of ten; the other three 3.0–3.6 Gbit/s, with
+  both the default and an IPv4-only bind) and says that no real 10 GbE
+  network was measured.
 - The first handshake packet of every transfer was silently dropped
   because the socket was used before the runtime had seen it writable,
   which cost a 250 ms retry.
