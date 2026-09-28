@@ -1146,7 +1146,10 @@ async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
     use sharp256::protocol::wire::{Data, Message};
     // The receiver's limit on separate pieces per transfer.
     const CAP: u64 = 1 << 16;
-    const PIECES: u64 = CAP + CAP / 4;
+    // Twice as many as it keeps apart, so that it reaches its limit even
+    // where some are dropped on the way: on the macOS CI runner a quarter
+    // of them were.
+    const PIECES: u64 = 2 * CAP;
 
     let tmp = tempfile::tempdir().unwrap();
     let (_src, out, state) = dirs(&tmp);
@@ -1157,62 +1160,97 @@ async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
     };
     let (mut fake, status) = FakeSender::connect_with(&r, hello).await;
     assert_eq!(status, sharp256::protocol::constants::HELLO_ACCEPTED);
-
     // One byte at every other odd offset: no two pieces touch.
-    for i in 0..PIECES {
-        fake.send(&Message::Data(Data {
-            offset: 4 * i + 1,
-            timestamp: 1,
-            payload: b"x",
-        }))
-        .await;
-        // Slowly enough that the receiver's queue drops none of them.
+    let piece = |i: u64| Data {
+        offset: 4 * i + 1,
+        timestamp: 1,
+        payload: b"x",
+    };
+    // What the receiver holds now, asked afresh: whatever it acknowledged
+    // earlier may be stale, and while a flood comes in its last word can
+    // be lost in our own full socket buffer. Anything sent is acknowledged
+    // within its ACK interval; the largest figure in the window is the
+    // latest.
+    async fn now_held(fake: &mut FakeSender, prompt: Data<'_>) -> u64 {
+        fake.send(&Message::Data(prompt)).await;
+        fake.acked_bytes(Duration::from_millis(500))
+            .await
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+    }
+
+    // The two pieces that [2, 5) is going to join, made sure of first: at
+    // the limit, data that joins nothing is refused, and one of these lost
+    // on the way would make the last check fail for the wrong reason.
+    let mut first = 0;
+    for _ in 0..20 {
+        fake.send(&Message::Data(piece(0))).await;
+        first = now_held(&mut fake, piece(1)).await;
+        if first == 2 {
+            break;
+        }
+    }
+    assert_eq!(first, 2, "the first two pieces never arrived");
+
+    for i in 2..PIECES {
+        fake.send(&Message::Data(piece(i))).await;
+        // Slowly enough that the receiver's queue drops few of them.
         if i % 256 == 255 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
-    let held = fake
-        .acked_bytes(Duration::from_secs(2))
-        .await
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    // Let the flood and its acknowledgements drain.
+    let _ = fake.acks(Duration::from_secs(1)).await;
+
+    // The start of the file is taken, since nothing precedes it; it joins
+    // the piece at 1, so the count of pieces stays where it was.
+    let with_start = now_held(
+        &mut fake,
+        Data {
+            offset: 0,
+            timestamp: 1,
+            payload: b"z",
+        },
+    )
+    .await;
+    let held = with_start - 1;
     assert!(
         held <= CAP,
         "the receiver kept {} separate pieces; the cap is {}",
         held,
         CAP
     );
-    assert!(
-        held >= CAP - CAP / 16,
-        "only {} pieces arrived, too few to reach the cap: the test proves nothing",
+    // At the limit, a piece that joins nothing is refused: [4003, 4004)
+    // is two bytes from the pieces at 4001 and 4005.
+    let lone = now_held(
+        &mut fake,
+        Data {
+            offset: 4003,
+            timestamp: 1,
+            payload: b"w",
+        },
+    )
+    .await;
+    assert_eq!(
+        lone, with_start,
+        "the receiver took a piece joining nothing with {} held: it never reached its limit",
         held
     );
-
     // Data that joins pieces already there is still taken: [2, 5) touches
     // the pieces at 1 and 5, so it grows nothing and fills a hole.
-    fake.send(&Message::Data(Data {
-        offset: 2,
-        timestamp: 1,
-        payload: b"yyy",
-    }))
+    let joined = now_held(
+        &mut fake,
+        Data {
+            offset: 2,
+            timestamp: 1,
+            payload: b"yyy",
+        },
+    )
     .await;
-    // And so is the start of the file, which nothing precedes.
-    fake.send(&Message::Data(Data {
-        offset: 0,
-        timestamp: 1,
-        payload: b"z",
-    }))
-    .await;
-    let after = fake
-        .acked_bytes(Duration::from_millis(500))
-        .await
-        .into_iter()
-        .max()
-        .unwrap_or(0);
     assert_eq!(
-        after,
-        held + 4,
+        joined,
+        lone + 3,
         "data that joins existing pieces was refused"
     );
     stop_receiver(r).await;

@@ -326,6 +326,23 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   Checked against the RFC 9001 appendix A.5 vector.
 - Found by fuzzing: a damaged resume-state file with non-ASCII bytes where a
   transfer id belongs panicked the parser.
+- Found by the first CI run on Windows: Windows answers `IPV6_V6ONLY` with a
+  single byte where socket2 reads an `int`. Debug builds hit socket2's
+  assertion on every socket; release builds read three bytes nobody wrote,
+  so whether the default `[::]` socket counted as dual-stack — and so
+  whether it reached IPv4 peers at all, and set "don't fragment" for them —
+  depended on stale memory. The option is now read into a zeroed buffer of
+  our own on Windows.
+- Also found on Windows: a directory being sent was described from the
+  copies of its entries' metadata in the directory listing, which NTFS
+  updates lazily — a directory's modification time went out stale, and a
+  file's size could have. Each entry's own metadata is read now.
+- The test that scatters one-byte pieces over a file measured the receiver
+  from acknowledgements that could be stale (its last ones lost in a full
+  socket buffer, as on macOS), and with datagrams dropped on the way the
+  receiver might not reach its limit at all. It now asks afresh after each
+  step, sends twice the limit, and checks that a piece joining nothing is
+  refused at the limit — not only that joining data is taken.
 - The README claimed "10 GbE and beyond"; it now gives the measured figure
   (4.8–5.0 Gbit/s over loopback on one 4-core VM) and says that no real
   10 GbE network was measured.

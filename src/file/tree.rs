@@ -671,19 +671,22 @@ fn scan_dir(b: &mut Builder, dir: &Path, slot: u32, skipped: &mut Vec<PathBuf>) 
                 path.display()
             ))
         })?;
-        let file_type = entry.file_type().map_err(context)?;
-        children.push((name, file_type, entry, path));
+        children.push((name, path));
     }
     children.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, file_type, entry, path) in children {
+    for (name, path) in children {
+        // The entry's own metadata, not the copy in the directory listing
+        // (`DirEntry::metadata`): on Windows that copy is what the parent
+        // directory's index says, which NTFS brings up to date lazily, so
+        // a directory's time — or even a file's size — could go out stale.
+        // Neither follows symbolic links.
+        let md = fs::symlink_metadata(&path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path.display(), e)))?;
+        let file_type = md.file_type();
         if file_type.is_symlink() || !(file_type.is_dir() || file_type.is_file()) {
             skipped.push(path);
             continue;
         }
-        // `DirEntry::metadata` does not follow symbolic links.
-        let md = entry
-            .metadata()
-            .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path.display(), e)))?;
         let err = |e: String| invalid(format!("{}: {}", path.display(), e));
         if file_type.is_dir() {
             let child = b
