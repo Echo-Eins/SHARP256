@@ -13,8 +13,19 @@ description = "SHARP-256: Swift Hash Assurance Rust Protocol - reliable, BLAKE3-
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
-# Integrity: per-packet keyed tags and whole-file hashes
+# Integrity: whole-file hashes, MACs and key derivation
 blake3 = { version = "1.5", features = ["mmap", "rayon"] }
+
+# Security: Noise IKpsk2 handshake, AEAD transport, passphrase hardening
+snow = { version = "=0.9.6", default-features = false, features = ["default-resolver", "risky-raw-split"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+aes = "0.8"
+chacha20poly1305 = { version = "0.10", default-features = false }
+chacha20 = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+argon2 = "0.5"
+subtle = "2"
+zeroize = "1"
 
 # Resume state files
 serde = { version = "1.0", features = ["derive"] }
@@ -27,7 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI and paths
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 dirs = "5.0"
 
 # Sockets: buffer sizing, path-MTU related options
@@ -68,6 +79,11 @@ path = "src/bin/sender.rs"
 [[bin]]
 name = "sharp-receiver"
 path = "src/bin/receiver.rs"
+
+# Cryptography and hashing in dependencies are painfully slow unoptimised;
+# debug builds of this crate stay debuggable while tests run at usable speed.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

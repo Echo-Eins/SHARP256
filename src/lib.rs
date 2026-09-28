@@ -1,7 +1,9 @@
 //! SHARP-256 (Swift Hash Assurance Rust Protocol): reliable, BLAKE3-verified
 //! file transfer over UDP with adaptive rate control and resumable sessions.
 
+pub mod address;
 pub mod config;
+pub mod crypto;
 pub mod file;
 pub mod progress;
 pub mod protocol;
@@ -15,6 +17,7 @@ pub mod nat;
 pub mod gui;
 
 pub use config::{AcceptPolicy, IncomingRequest, ReceiverConfig, SenderConfig, TransportConfig};
+pub use crypto::{Identity, SharpId};
 pub use progress::{EventCallback, TransferEvent, TransferStats};
 pub use transport::{Receiver, RecvError, SendError, Sender, TransferSummary};
 

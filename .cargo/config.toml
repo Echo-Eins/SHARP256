@@ -1,0 +1,4 @@
+# Resolve dependency versions that support the crate's declared rust-version
+# (honoured by Cargo 1.84 and later).
+[resolver]
+incompatible-rust-versions = "fallback"

@@ -11,18 +11,26 @@
 //!   and carry RTT samples; holes that are neither in flight nor queued are
 //!   re-queued, so the sender's bookkeeping heals itself;
 //! * RTO expiry returns stale in-flight ranges to `pending`;
-//! * after a few seconds of silence the sender re-sends HELLO, which makes a
-//!   live receiver report exactly what it holds and lets a restarted
-//!   receiver resume from its saved state;
+//! * after a few seconds of silence the sender performs a new handshake,
+//!   whose answer tells exactly what a live receiver holds and lets a
+//!   restarted receiver resume from its saved state;
 //! * the transfer completes when the receiver's whole-file BLAKE3 hash
 //!   matches the sender's own.
+//!
+//! Every datagram after the handshake is an encrypted transport packet
+//! (`crypto::transport`); the handshake authenticates the receiver by the
+//! SHARP ID the sender was given.
 
 use crate::config::{SenderConfig, TransportConfig};
+use crate::crypto::handshake::{self as hs, Initiator, COOKIE_REPLY_LEN};
+use crate::crypto::replay::ReplayWindow;
+use crate::crypto::transport::{begin_packet, peek_cid, SessionKeys, Suite};
+use crate::crypto::{CryptoError, Identity, SharpId, NO_PSK};
 use crate::file::{hash_file, hash_to_hex, sanitize_file_name, FileReader};
 use crate::progress::{emit, EventCallback, TransferEvent, TransferStats};
 use crate::protocol::constants::*;
 use crate::protocol::wire::{
-    self, Abort, Data, Header, Hello, HelloAck, Message, MsgType, Ping, Probe, TagKey,
+    self, type_byte, Abort, Hello, HelloAck, Message, MsgType, Ping, Probe, MAX_CONTROL_BODY,
 };
 use crate::protocol::RangeSet;
 use crate::state::{hex16, parse_hex16, SenderState, StateStore};
@@ -45,8 +53,14 @@ pub enum SendError {
     BadFileName(String),
     #[error("receiver rejected the transfer ({reason}): {message}")]
     Rejected { reason: String, message: String },
-    #[error("no answer from receiver within the handshake timeout")]
+    #[error(
+        "no answer from receiver within the handshake timeout (wrong address or receiver ID?)"
+    )]
     HandshakeTimeout,
+    #[error("handshake with the receiver failed: {0}")]
+    Handshake(String),
+    #[error("identity: {0}")]
+    Identity(String),
     #[error("receiver unreachable for {0:?}; transfer state kept for resume")]
     PeerUnreachable(Duration),
     #[error("whole-file hash mismatch: sender {sender}, receiver {receiver}")]
@@ -77,6 +91,7 @@ pub struct TransferSummary {
 
 pub struct Sender {
     cfg: SenderConfig,
+    identity: Identity,
     socket: Arc<UdpSocket>,
     reader: Arc<FileReader>,
     cancel: CancellationToken,
@@ -89,6 +104,15 @@ impl Sender {
         let cfg = SenderConfig {
             transport: cfg.transport.normalized(),
             ..cfg
+        };
+        let identity = match &cfg.identity {
+            Some(id) => id.clone(),
+            None => {
+                let path = Identity::default_path()
+                    .ok_or_else(|| SendError::Identity("no per-user data directory".into()))?;
+                Identity::load_or_create(&path)
+                    .map_err(|e| SendError::Identity(format!("{}: {}", path.display(), e)))?
+            }
         };
         let reader = FileReader::open(&cfg.file_path)?;
         let socket = bind_udp(cfg.bind, cfg.transport.socket_buffer_bytes)?;
@@ -115,6 +139,7 @@ impl Sender {
         };
         Ok(Self {
             cfg,
+            identity,
             socket: Arc::new(socket),
             reader: Arc::new(reader),
             cancel: CancellationToken::new(),
@@ -124,6 +149,11 @@ impl Sender {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Our identity, as the receiver will see it.
+    pub fn id(&self) -> SharpId {
+        self.identity.id()
     }
 
     /// Token that cancels the transfer when triggered.
@@ -143,7 +173,8 @@ impl Sender {
 
         let size = self.reader.size();
         let mtime = self.reader.mtime_unix();
-        let peer_str = self.cfg.peer.to_string();
+        // Resume state is kept per receiver identity, not per address.
+        let peer_str = self.cfg.receiver_id.to_string();
         // Present the id of an interrupted attempt so the receiver resumes
         // it, unless the file changed since (its data would not match).
         let transfer_id = self
@@ -153,12 +184,6 @@ impl Sender {
             .filter(|st| st.file_mtime == mtime)
             .and_then(|st| parse_hex16(&st.transfer_id))
             .unwrap_or_else(rand::random::<[u8; 16]>);
-        let conn_id = loop {
-            let c: u32 = rand::random();
-            if c != 0 {
-                break c;
-            }
-        };
 
         // Whole-file hash in the background; it is only needed at the end.
         let hash_path = self.cfg.file_path.clone();
@@ -169,10 +194,14 @@ impl Sender {
             self.cfg.transport.clone(),
             self.socket.clone(),
             self.cfg.peer,
+            Peer {
+                identity: self.identity.clone(),
+                receiver: self.cfg.receiver_id,
+                psk: self.cfg.psk.unwrap_or(NO_PSK),
+            },
             self.reader.clone(),
             file_name,
             transfer_id,
-            conn_id,
             self.cfg.events.clone(),
             self.cancel.clone(),
         );
@@ -187,11 +216,14 @@ impl Sender {
                 SendError::Io(_) => Some(ABORT_IO_ERROR),
                 SendError::Protocol(_) => Some(ABORT_PROTOCOL),
                 SendError::PeerUnreachable(_) | SendError::HandshakeTimeout => Some(ABORT_TIMEOUT),
-                // The receiver decided these itself or already knows.
+                // The receiver decided these itself, already knows, or no
+                // session exists to tell it through.
                 SendError::BadFileName(_)
                 | SendError::Rejected { .. }
                 | SendError::HashMismatch { .. }
-                | SendError::Aborted { .. } => None,
+                | SendError::Aborted { .. }
+                | SendError::Handshake(_)
+                | SendError::Identity(_) => None,
             };
             if let Some(code) = code {
                 engine.send_abort(code, &err.to_string());
@@ -224,6 +256,24 @@ impl Sender {
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
+
+/// Builds and seals a DATA packet in `out`.
+fn seal_data(
+    sec: &mut Secure,
+    out: &mut Vec<u8>,
+    flags: u8,
+    offset: u64,
+    timestamp: u32,
+    payload: &[u8],
+) -> Result<(), CryptoError> {
+    let pn = sec.next_pn;
+    sec.next_pn += 1;
+    begin_packet(out, sec.peer_cid, type_byte(MsgType::Data, flags), pn);
+    out.extend_from_slice(&offset.to_be_bytes());
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    out.extend_from_slice(payload);
+    sec.keys.send.seal(out)
+}
 
 #[derive(Debug)]
 struct Inflight {
@@ -278,6 +328,30 @@ const MAX_TAIL_PROBES: u32 = 2;
 /// Upper bound for the ACK delay a receiver may announce.
 const MAX_PEER_ACK_DELAY: Duration = Duration::from_secs(1);
 
+/// Handshake attempts kept alive at once (a response may answer any of them).
+const MAX_ATTEMPTS: usize = 4;
+/// While the receiver's user decides, ask for the decision this often.
+const DECISION_POLL: Duration = Duration::from_secs(1);
+
+/// Who we are, whom we talk to, and the shared secret.
+struct Peer {
+    identity: Identity,
+    receiver: SharpId,
+    psk: [u8; 32],
+}
+
+/// An established encrypted session with the receiver.
+struct Secure {
+    keys: SessionKeys,
+    /// Our connection id: the receiver addresses its packets to it.
+    local_cid: u64,
+    /// The receiver's connection id: our packets are addressed to it.
+    peer_cid: u64,
+    next_pn: u64,
+    replay: ReplayWindow,
+    auth_failures: u64,
+}
+
 /// Compact record of a received ACK, kept for diagnostics.
 #[derive(Debug, Clone, Copy)]
 struct AckRecord {
@@ -299,11 +373,25 @@ struct Engine {
     size: u64,
     file_name: String,
     transfer_id: [u8; 16],
-    conn_id: u32,
-    key: TagKey,
     clock: Clock,
     events: Option<EventCallback>,
     cancel: CancellationToken,
+
+    auth: Peer,
+    secure: Option<Secure>,
+    /// Handshake attempts waiting for an answer, with their send times.
+    attempts: VecDeque<(Initiator, Instant)>,
+    /// Latest cookie from the receiver (it asked us to prove our address).
+    cookie: Option<([u8; 16], Instant)>,
+    /// Answer to a handshake or to a state query, not yet acted upon.
+    answer: Option<HelloAck>,
+    /// Still negotiating: every HELLO_ACK counts, including the one the
+    /// receiver sends on its own once its user decided.
+    negotiating: bool,
+    /// Responses whose authentication failed (a different shared secret).
+    handshake_failures: u32,
+    /// Sizes acknowledged by PROBE_ACK.
+    probe_acks: Vec<u16>,
 
     chunk: u16,
     pending: RangeSet,
@@ -379,6 +467,7 @@ struct Engine {
     cache: Vec<u8>,
     read_buf: Vec<u8>,
     tx_buf: Vec<u8>,
+    ctl_buf: Vec<u8>,
 }
 
 impl Engine {
@@ -387,10 +476,10 @@ impl Engine {
         cfg: TransportConfig,
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
+        auth: Peer,
         reader: Arc<FileReader>,
         file_name: String,
         transfer_id: [u8; 16],
-        conn_id: u32,
         events: Option<EventCallback>,
         cancel: CancellationToken,
     ) -> Self {
@@ -411,11 +500,17 @@ impl Engine {
             size,
             file_name,
             transfer_id,
-            conn_id,
-            key: TagKey::derive(&transfer_id),
             clock: Clock::new(),
             events,
             cancel,
+            auth,
+            secure: None,
+            attempts: VecDeque::new(),
+            cookie: None,
+            answer: None,
+            negotiating: true,
+            handshake_failures: 0,
+            probe_acks: Vec::new(),
             chunk,
             pending: RangeSet::new(),
             inflight: BTreeMap::new(),
@@ -466,6 +561,7 @@ impl Engine {
             cache: Vec::new(),
             read_buf: Vec::new(),
             tx_buf: Vec::with_capacity(MAX_CHUNK as usize + DATA_OVERHEAD),
+            ctl_buf: Vec::with_capacity(MAX_CONTROL_DATAGRAM),
         }
     }
 
@@ -473,9 +569,34 @@ impl Engine {
         hex16(&self.transfer_id)
     }
 
-    fn send_msg(&self, header: Header, msg: &Message<'_>) -> io::Result<()> {
-        let bytes = wire::encode(&header, msg, &self.key);
-        match self.socket.try_send_to(&bytes, self.peer) {
+    fn send_datagram(&self, bytes: &[u8]) -> io::Result<()> {
+        match self.socket.try_send_to(bytes, self.peer) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Encrypts `msg` as a transport packet and sends it. Without an
+    /// established session there is nobody to send it to.
+    fn send_frame(&mut self, flags: u8, msg: &Message<'_>) -> io::Result<()> {
+        let Some(sec) = self.secure.as_mut() else {
+            return Ok(());
+        };
+        let pn = sec.next_pn;
+        sec.next_pn += 1;
+        begin_packet(
+            &mut self.ctl_buf,
+            sec.peer_cid,
+            type_byte(msg.msg_type(), flags),
+            pn,
+        );
+        wire::encode_body(msg, &mut self.ctl_buf, MAX_CONTROL_BODY);
+        sec.keys
+            .send
+            .seal(&mut self.ctl_buf)
+            .map_err(io::Error::other)?;
+        match self.socket.try_send_to(&self.ctl_buf, self.peer) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
@@ -484,15 +605,111 @@ impl Engine {
 
     /// Best-effort notice to the receiver that the transfer is over (sent
     /// twice, as nothing acknowledges it).
-    fn send_abort(&self, code: u16, reason: &str) {
-        let hdr = Header::new(MsgType::Abort, self.conn_id);
+    fn send_abort(&mut self, code: u16, reason: &str) {
         let msg = Message::Abort(Abort {
             code,
             reason: reason.to_string(),
         });
         for _ in 0..2 {
-            let _ = self.send_msg(hdr, &msg);
+            let _ = self.send_frame(0, &msg);
         }
+    }
+
+    /// Starts a new handshake attempt: a fresh ephemeral key and connection
+    /// id, carrying HELLO. The receiver answers with its current state.
+    fn send_initiation(&mut self) -> Result<(), SendError> {
+        let now = Instant::now();
+        let mut attempt = Initiator::new(&self.auth.identity, &self.auth.receiver, &self.auth.psk)
+            .map_err(|e| SendError::Handshake(e.to_string()))?;
+        let ts = self.clock.now_us().max(1);
+        let payload = wire::encode_initiation(&wire::Initiation {
+            timestamp: hs::initiation_timestamp(),
+            suites: Suite::ALL_BITS,
+            hardware_aes: Suite::hardware_aes(),
+            hello_flags: HELLO_FLAG_RESUME,
+            hello: self.hello(ts),
+        });
+        let cookie = self
+            .cookie
+            .filter(|(_, at)| now.saturating_duration_since(*at) < hs::COOKIE_LIFETIME)
+            .map(|(c, _)| c);
+        let pkt = attempt
+            .initiation(&payload, cookie.as_ref())
+            .map_err(|e| SendError::Handshake(e.to_string()))?;
+        self.send_datagram(&pkt)?;
+        if self.attempts.len() >= MAX_ATTEMPTS {
+            self.attempts.pop_front();
+        }
+        self.attempts.push_back((attempt, now));
+        tracing::debug!(
+            "handshake initiation sent to {} ({})",
+            self.peer,
+            self.auth.receiver.short()
+        );
+        Ok(())
+    }
+
+    /// A datagram addressed to one of our handshake attempts: a response or
+    /// a cookie reply.
+    fn on_handshake_reply(
+        &mut self,
+        idx: usize,
+        pkt: &[u8],
+        from: SocketAddr,
+    ) -> Result<(), SendError> {
+        if pkt.len() == COOKIE_REPLY_LEN {
+            if let Some(cookie) = self.attempts[idx].0.read_cookie_reply(pkt) {
+                tracing::debug!("receiver is under load and asked for a cookie; retrying");
+                self.cookie = Some((cookie, Instant::now()));
+                self.send_initiation()?;
+            }
+            return Ok(());
+        }
+        let (attempt, sent_at) = self.attempts.remove(idx).expect("index in range");
+        let cid = attempt.cid();
+        match attempt.read_response(pkt) {
+            Ok((receiver_cid, payload, split)) => {
+                let resp = wire::decode_response(&payload)
+                    .map_err(|e| SendError::Protocol(format!("bad handshake response: {}", e)))?;
+                let now = Instant::now();
+                self.rtt.on_sample(now.saturating_duration_since(sent_at));
+                self.note_alive(now, from);
+                if resp.ack.status == HELLO_REJECTED {
+                    return Err(SendError::Rejected {
+                        reason: reason_name(resp.ack.reason).to_string(),
+                        message: resp.ack.message,
+                    });
+                }
+                let suite = Suite::from_u8(resp.suite).ok_or_else(|| {
+                    SendError::Protocol("receiver chose an unknown cipher".into())
+                })?;
+                self.secure = Some(Secure {
+                    keys: SessionKeys::derive(&split, true, suite),
+                    local_cid: cid,
+                    peer_cid: receiver_cid,
+                    next_pn: 0,
+                    replay: ReplayWindow::new(),
+                    auth_failures: 0,
+                });
+                // Older attempts are obsolete now.
+                self.attempts.clear();
+                tracing::debug!(
+                    "session with {} established ({})",
+                    self.auth.receiver.short(),
+                    suite.name()
+                );
+                self.answer = Some(resp.ack);
+            }
+            // Not made by the receiver we talk to; ignore.
+            Err(CryptoError::Mac) | Err(CryptoError::Malformed) => {}
+            Err(e) => {
+                // The receiver authenticated our initiation but its response
+                // does not decrypt: it mixes in a different pre-shared key.
+                self.handshake_failures += 1;
+                tracing::debug!("handshake response rejected: {}", e);
+            }
+        }
+        Ok(())
     }
 
     fn hello(&self, ts: u32) -> Hello {
@@ -512,6 +729,8 @@ impl Engine {
     async fn handshake(&mut self) -> Result<HelloAck, SendError> {
         let deadline = Instant::now() + self.cfg.handshake_timeout;
         let mut delay = Duration::from_millis(250);
+        let mut next_attempt = Instant::now();
+        let mut next_poll: Option<Instant> = None;
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let socket = self.socket.clone();
         let cancel = self.cancel.clone();
@@ -519,76 +738,86 @@ impl Engine {
             if cancel.is_cancelled() {
                 return Err(SendError::Cancelled);
             }
-            let ts = self.clock.now_us().max(1);
-            let hdr = Header::new(MsgType::Hello, self.conn_id).with_flags(HELLO_FLAG_RESUME);
-            let bytes = wire::encode(&hdr, &Message::Hello(self.hello(ts)), &self.key);
-            socket.send_to(&bytes, self.peer).await?;
-            let sent_at = Instant::now();
-            let attempt_deadline = (sent_at + delay).min(deadline);
-            tracing::debug!("HELLO sent to {} (transfer {})", self.peer, self.tid_hex());
-
-            loop {
-                let now = Instant::now();
-                if now >= attempt_deadline {
-                    break;
-                }
-                let res = tokio::select! {
-                    r = socket.recv_from(&mut buf) => Some(r),
-                    _ = tokio::time::sleep(attempt_deadline - now) => None,
-                    _ = cancel.cancelled() => return Err(SendError::Cancelled),
-                };
-                let Some(r) = res else { break };
-                let (n, from) = match r {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!("recv error during handshake: {}", e);
-                        continue;
+            let now = Instant::now();
+            if let Some(ack) = self.answer.take() {
+                match ack.status {
+                    HELLO_ACCEPTED => {
+                        if ack.capabilities & !SUPPORTED_CAPS != 0 {
+                            return Err(SendError::Protocol(format!(
+                                "receiver confirmed capabilities {:#x} that were not offered",
+                                ack.capabilities & !SUPPORTED_CAPS
+                            )));
+                        }
+                        return Ok(ack);
                     }
-                };
-                let pkt = &buf[..n];
-                let Ok(hdr) = wire::parse_header(pkt) else {
-                    continue;
-                };
-                if hdr.conn_id != self.conn_id || !wire::verify_tag(pkt, &self.key) {
-                    continue;
-                }
-                match wire::decode_body(hdr.msg_type, wire::body_of(pkt)) {
-                    Ok(Message::HelloAck(ack)) => {
-                        if from != self.peer {
-                            tracing::info!("receiver answered from {} (was {})", from, self.peer);
-                            self.peer = from;
-                        }
-                        if ack.echo_ts == ts {
-                            self.rtt.on_sample(sent_at.elapsed());
-                        }
-                        self.last_rx = Instant::now();
-                        if ack.status == HELLO_ACCEPTED {
-                            if ack.capabilities & !SUPPORTED_CAPS != 0 {
-                                return Err(SendError::Protocol(format!(
-                                    "receiver confirmed capabilities {:#x} that were not offered",
-                                    ack.capabilities & !SUPPORTED_CAPS
-                                )));
-                            }
-                            return Ok(ack);
-                        }
+                    HELLO_REJECTED => {
                         return Err(SendError::Rejected {
                             reason: reason_name(ack.reason).to_string(),
                             message: ack.message,
-                        });
-                    }
-                    Ok(Message::Abort(a)) => {
-                        return Err(SendError::Aborted {
-                            code: a.code,
-                            reason: a.reason,
                         })
                     }
-                    _ => continue,
+                    _ => {
+                        // The receiver's user is deciding; keep asking.
+                        if next_poll.is_none() {
+                            tracing::info!("waiting for the receiver to accept the transfer");
+                        }
+                        next_poll.get_or_insert(now + DECISION_POLL);
+                    }
                 }
             }
-            if Instant::now() >= deadline {
-                return Err(SendError::HandshakeTimeout);
+            if now >= deadline {
+                return Err(if next_poll.is_some() {
+                    SendError::Rejected {
+                        reason: reason_name(REASON_TIMEOUT).to_string(),
+                        message: "no decision in time".into(),
+                    }
+                } else if self.handshake_failures > 0 {
+                    SendError::Handshake(
+                        "the receiver answered, but its keys do not match ours \
+                         (different shared secret?)"
+                            .into(),
+                    )
+                } else {
+                    SendError::HandshakeTimeout
+                });
             }
-            delay = (delay * 2).min(Duration::from_secs(4));
+            if self.secure.is_none() && now >= next_attempt {
+                self.send_initiation()?;
+                next_attempt = now + delay;
+                delay = (delay * 2).min(Duration::from_secs(4));
+            }
+            if let Some(at) = next_poll {
+                if now >= at {
+                    let ts = self.clock.now_us().max(1);
+                    self.probe_ts.push(ts);
+                    let hello = Message::Hello(self.hello(ts));
+                    self.send_frame(HELLO_FLAG_RESUME, &hello)?;
+                    next_poll = Some(now + DECISION_POLL);
+                }
+            }
+
+            let mut wake = deadline;
+            if self.secure.is_none() {
+                wake = wake.min(next_attempt);
+            }
+            if let Some(at) = next_poll {
+                wake = wake.min(at);
+            }
+            tokio::select! {
+                r = socket.readable() => { let _ = r; }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
+                _ = cancel.cancelled() => return Err(SendError::Cancelled),
+            }
+            loop {
+                match socket.try_recv_from(&mut buf) {
+                    Ok((n, from)) => self.on_datagram(&mut buf[..n], from)?,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        tracing::debug!("recv error during handshake: {}", e);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -672,9 +901,9 @@ impl Engine {
 
     // ----- path MTU probe --------------------------------------------------
 
-    async fn probe_mtu(&mut self) {
+    async fn probe_mtu(&mut self) -> Result<(), SendError> {
         if !self.cfg.probe_mtu {
-            return;
+            return Ok(());
         }
         let mut candidates: Vec<u16> = vec![self.chunk, DEFAULT_CHUNK, SAFE_CHUNK];
         candidates.retain(|&c| c <= self.chunk && c >= MIN_CHUNK);
@@ -682,19 +911,14 @@ impl Engine {
         candidates.dedup();
 
         let mut buf = vec![0u8; MAX_DATAGRAM];
+        let socket = self.socket.clone();
         let wait = (self.rtt.srtt() * 3).clamp(Duration::from_millis(150), Duration::from_secs(2));
         for cand in candidates {
-            let size = cand as usize + DATA_OVERHEAD;
-            let hdr = Header::new(MsgType::Probe, self.conn_id);
-            let bytes = wire::encode(
-                &hdr,
-                &Message::Probe(Probe { size: size as u16 }),
-                &self.key,
-            );
+            let size = (cand as usize + DATA_OVERHEAD) as u16;
             let mut acked = false;
             'attempts: for _ in 0..2 {
-                match self.socket.send_to(&bytes, self.peer).await {
-                    Ok(_) => {}
+                match self.send_frame(0, &Message::Probe(Probe { size })) {
+                    Ok(()) => {}
                     Err(e) if is_msgsize_error(&e) => {
                         tracing::debug!("probe {} B rejected locally (EMSGSIZE)", size);
                         break 'attempts;
@@ -706,29 +930,21 @@ impl Engine {
                 }
                 let deadline = Instant::now() + wait;
                 loop {
+                    if self.probe_acks.contains(&size) {
+                        acked = true;
+                        break 'attempts;
+                    }
                     let now = Instant::now();
                     if now >= deadline {
                         break;
                     }
                     let r = tokio::select! {
-                        r = self.socket.recv_from(&mut buf) => r,
+                        r = socket.recv_from(&mut buf) => r,
                         _ = tokio::time::sleep(deadline - now) => break,
+                        _ = self.cancel.cancelled() => return Err(SendError::Cancelled),
                     };
-                    let Ok((n, _)) = r else { continue };
-                    let pkt = &buf[..n];
-                    let Ok(hdr) = wire::parse_header(pkt) else {
-                        continue;
-                    };
-                    if hdr.conn_id != self.conn_id || !wire::verify_tag(pkt, &self.key) {
-                        continue;
-                    }
-                    if let Ok(Message::ProbeAck(p)) =
-                        wire::decode_body(hdr.msg_type, wire::body_of(pkt))
-                    {
-                        if p.size as usize == size {
-                            acked = true;
-                            break 'attempts;
-                        }
+                    if let Ok((n, from)) = r {
+                        self.on_datagram(&mut buf[..n], from)?;
                     }
                 }
             }
@@ -737,7 +953,7 @@ impl Engine {
                     tracing::info!("path MTU probe: using {} byte chunks", cand);
                 }
                 self.set_chunk(cand);
-                return;
+                return Ok(());
             }
         }
         // Nothing answered; fall back to the safe size and let the transfer
@@ -748,6 +964,7 @@ impl Engine {
             fallback
         );
         self.set_chunk(fallback);
+        Ok(())
     }
 
     // ----- main loop -------------------------------------------------------
@@ -757,16 +974,30 @@ impl Engine {
         hash_task: JoinHandle<io::Result<[u8; 32]>>,
     ) -> Result<TransferSummary, SendError> {
         let ack = self.handshake().await?;
+        self.negotiating = false;
         self.apply_hello_ack(&ack);
-        self.probe_mtu().await;
+        self.probe_mtu().await?;
         self.start = Instant::now();
         self.last_progress_at = self.start;
         self.last_progress_bytes = self.received_bytes;
+        let cipher = self
+            .secure
+            .as_ref()
+            .map(|s| s.keys.suite.name())
+            .unwrap_or("none");
+        tracing::info!(
+            "sending to {} ({}), encrypted with {}",
+            self.peer,
+            self.auth.receiver,
+            cipher
+        );
         emit(
             &self.events,
             TransferEvent::Started {
                 transfer_id: self.tid_hex(),
                 peer: self.peer.to_string(),
+                peer_id: self.auth.receiver.to_string(),
+                cipher: cipher.to_string(),
                 file_name: self.file_name.clone(),
                 file_size: self.size,
                 resumed_from: self.resumed_from,
@@ -789,12 +1020,26 @@ impl Engine {
             // 1. Input: everything that is already queued on the socket.
             loop {
                 match socket.try_recv_from(&mut buf) {
-                    Ok((n, from)) => self.on_datagram(&buf[..n], from)?,
+                    Ok((n, from)) => self.on_datagram(&mut buf[..n], from)?,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => {
                         tracing::debug!("recv error: {}", e);
                         break;
                     }
+                }
+            }
+            // An answer to a re-handshake or state query: adopt the
+            // receiver's view of what it holds.
+            if let Some(ack) = self.answer.take() {
+                match ack.status {
+                    HELLO_ACCEPTED => self.resync(&ack, Instant::now()),
+                    HELLO_REJECTED => {
+                        return Err(SendError::Rejected {
+                            reason: reason_name(ack.reason).to_string(),
+                            message: ack.message,
+                        })
+                    }
+                    _ => {}
                 }
             }
 
@@ -942,7 +1187,11 @@ impl Engine {
     }
 
     fn fill_window(&mut self, now: Instant) -> Result<SendBlock, SendError> {
-        if self.stalled || self.fin_verdict.is_some() || self.pending_fin.is_some() {
+        if self.stalled
+            || self.fin_verdict.is_some()
+            || self.pending_fin.is_some()
+            || self.secure.is_none()
+        {
             return Ok(SendBlock::Idle);
         }
         self.pacer.refill(now);
@@ -971,26 +1220,15 @@ impl Engine {
                 }
             };
             let ts = self.clock.now_us().max(1);
-            let hdr = Header::new(MsgType::Data, self.conn_id).with_flags(if retransmit {
-                DATA_FLAG_RETRANSMIT
-            } else {
-                0
-            });
+            let flags = if retransmit { DATA_FLAG_RETRANSMIT } else { 0 };
             {
+                let sec = self.secure.as_mut().expect("checked above");
                 let payload: &[u8] = match src {
                     PayloadSrc::Cache(a, b) => &self.cache[a..b],
                     PayloadSrc::Buf => &self.read_buf[..],
                 };
-                wire::encode_into(
-                    &hdr,
-                    &Message::Data(Data {
-                        offset: s,
-                        timestamp: ts,
-                        payload,
-                    }),
-                    &self.key,
-                    &mut self.tx_buf,
-                );
+                seal_data(sec, &mut self.tx_buf, flags, s, ts, payload)
+                    .map_err(|e| SendError::Protocol(e.to_string()))?;
             }
             match self.socket.try_send_to(&self.tx_buf, self.peer) {
                 Ok(_) => {}
@@ -1042,17 +1280,37 @@ impl Engine {
 
     // ----- incoming --------------------------------------------------------
 
-    fn on_datagram(&mut self, pkt: &[u8], from: SocketAddr) -> Result<(), SendError> {
-        let Ok(hdr) = wire::parse_header(pkt) else {
+    /// Routes a datagram by its connection id: transport packets of the
+    /// session, or answers to a handshake attempt. Anything else is dropped.
+    fn on_datagram(&mut self, pkt: &mut [u8], from: SocketAddr) -> Result<(), SendError> {
+        let Some(dcid) = peek_cid(pkt) else {
             return Ok(());
         };
-        if hdr.conn_id != self.conn_id || !wire::verify_tag(pkt, &self.key) {
+        if self.secure.as_ref().is_some_and(|s| s.local_cid == dcid) {
+            return self.on_transport(pkt, from);
+        }
+        if let Some(i) = self.attempts.iter().position(|(a, _)| a.cid() == dcid) {
+            return self.on_handshake_reply(i, pkt, from);
+        }
+        Ok(())
+    }
+
+    fn on_transport(&mut self, pkt: &mut [u8], from: SocketAddr) -> Result<(), SendError> {
+        let sec = self.secure.as_mut().expect("caller checked the session");
+        let (tb, pn, body) = match sec.keys.recv.open(pkt) {
+            Ok(v) => v,
+            Err(_) => {
+                sec.auth_failures += 1;
+                return Ok(());
+            }
+        };
+        if !sec.replay.accept(pn) {
             return Ok(());
         }
-        let msg = match wire::decode_body(hdr.msg_type, wire::body_of(pkt)) {
+        let msg = match wire::parse_type_byte(tb).and_then(|(t, _)| wire::decode_body(t, body)) {
             Ok(m) => m,
             Err(e) => {
-                tracing::debug!("malformed {:?} from {}: {}", hdr.msg_type, from, e);
+                tracing::debug!("malformed frame from {}: {}", from, e);
                 return Ok(());
             }
         };
@@ -1077,8 +1335,7 @@ impl Engine {
                     // Tell the receiver we are alive; it answers with PONG
                     // and keeps retrying FIN until the verdict arrives.
                     let ts = self.clock.now_us().max(1);
-                    let hdr = Header::new(MsgType::Ping, self.conn_id);
-                    let _ = self.send_msg(hdr, &Message::Ping(Ping { timestamp: ts }));
+                    let _ = self.send_frame(0, &Message::Ping(Ping { timestamp: ts }));
                 }
             }
             Message::Pong(p) => {
@@ -1087,18 +1344,11 @@ impl Engine {
                 self.update_pacer();
             }
             Message::HelloAck(ack) => {
-                // Only answers to our own resync probes matter here; late
-                // duplicates of the handshake answer are ignored.
-                if self.probe_ts.contains(&ack.echo_ts) {
+                // While negotiating every answer counts; later only answers
+                // to our own state queries do (late duplicates are ignored).
+                if self.negotiating || self.probe_ts.contains(&ack.echo_ts) {
                     self.probe_ts.clear();
-                    if ack.status == HELLO_ACCEPTED {
-                        self.resync(&ack, now);
-                    } else {
-                        return Err(SendError::Rejected {
-                            reason: reason_name(ack.reason).to_string(),
-                            message: ack.message,
-                        });
-                    }
+                    self.answer = Some(ack);
                 }
             }
             Message::Abort(a) => {
@@ -1114,7 +1364,12 @@ impl Engine {
                     self.fin_confirmed = true;
                 }
             }
-            Message::ProbeAck(_) | Message::Ping(_) => {}
+            Message::ProbeAck(p) => {
+                if self.probe_acks.len() < 16 {
+                    self.probe_acks.push(p.size);
+                }
+            }
+            Message::Ping(_) => {}
             Message::Hello(_) | Message::Data(_) | Message::FinAck(_) | Message::Probe(_) => {}
         }
         Ok(())
@@ -1129,9 +1384,8 @@ impl Engine {
         } else {
             VERDICT_MISMATCH
         };
-        let hdr = Header::new(MsgType::FinAck, self.conn_id);
-        self.send_msg(
-            hdr,
+        self.send_frame(
+            0,
             &Message::FinAck(wire::FinAck {
                 verdict,
                 file_hash: my_hash,
@@ -1440,7 +1694,11 @@ impl Engine {
     /// the RTO would, which it then postpones (RFC 8985 section 7.2): a lost
     /// tail is repaired with the current window instead of a collapsed one.
     fn maybe_send_tail_probe(&mut self, now: Instant) -> Result<(), SendError> {
-        if self.inflight.is_empty() || self.stalled || self.tail_probes >= MAX_TAIL_PROBES {
+        if self.inflight.is_empty()
+            || self.stalled
+            || self.tail_probes >= MAX_TAIL_PROBES
+            || self.secure.is_none()
+        {
             return Ok(());
         }
         let pto = (self.rtt.srtt() * 2 + self.rtt.max_ack_delay())
@@ -1460,17 +1718,19 @@ impl Engine {
         };
         self.read_buf.resize((e - s) as usize, 0);
         self.reader.read_at(s, &mut self.read_buf)?;
-        let hdr = Header::new(MsgType::Data, self.conn_id).with_flags(DATA_FLAG_RETRANSMIT);
-        wire::encode_into(
-            &hdr,
-            &Message::Data(Data {
-                offset: s,
-                timestamp: self.clock.now_us().max(1),
-                payload: &self.read_buf,
-            }),
-            &self.key,
-            &mut self.tx_buf,
-        );
+        let ts = self.clock.now_us().max(1);
+        {
+            let sec = self.secure.as_mut().expect("checked above");
+            seal_data(
+                sec,
+                &mut self.tx_buf,
+                DATA_FLAG_RETRANSMIT,
+                s,
+                ts,
+                &self.read_buf,
+            )
+            .map_err(|e| SendError::Protocol(e.to_string()))?;
+        }
         match self.socket.try_send_to(&self.tx_buf, self.peer) {
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -1558,7 +1818,7 @@ impl Engine {
                     self.log_inconsistency();
                 }
                 self.last_idle_probe = Some(now);
-                self.send_resync_probe();
+                self.send_state_query();
             }
         } else if !self.pending.is_empty() || !self.inflight.is_empty() {
             self.last_idle_probe = None;
@@ -1605,29 +1865,29 @@ impl Engine {
                 self.ping_backoff += 1;
             }
             let ts = self.clock.now_us().max(1);
-            let hdr = Header::new(MsgType::Ping, self.conn_id);
-            let _ = self.send_msg(hdr, &Message::Ping(Ping { timestamp: ts }));
-            // After a few seconds of silence also ask the receiver what it
-            // holds: a live session answers with its current state, and a
-            // restarted receiver resumes from its saved state.
+            let _ = self.send_frame(0, &Message::Ping(Ping { timestamp: ts }));
+            // After a few seconds of silence also perform a new handshake: a
+            // live session answers with its current state, and a restarted
+            // receiver (which lost the session keys) resumes from its saved
+            // state.
             let resync_after = self.cfg.stall_timeout.min(Duration::from_secs(3));
             if since_rx >= resync_after && self.fin_verdict.is_none() {
-                self.send_resync_probe();
+                self.send_initiation()?;
             }
         }
         Ok(())
     }
 
-    /// Sends HELLO; the receiver answers with its exact current state, which
-    /// `resync` then adopts.
-    fn send_resync_probe(&mut self) {
+    /// Sends HELLO over the session; the receiver answers with its exact
+    /// current state, which `resync` then adopts.
+    fn send_state_query(&mut self) {
         let ts = self.clock.now_us().max(1);
         if self.probe_ts.len() >= 16 {
             self.probe_ts.remove(0);
         }
         self.probe_ts.push(ts);
-        let hdr = Header::new(MsgType::Hello, self.conn_id).with_flags(HELLO_FLAG_RESUME);
-        let _ = self.send_msg(hdr, &Message::Hello(self.hello(ts)));
+        let hello = Message::Hello(self.hello(ts));
+        let _ = self.send_frame(HELLO_FLAG_RESUME, &hello);
     }
 
     /// Logs the evidence when the sender believes everything is delivered but
@@ -1739,6 +1999,8 @@ pub fn reason_name(code: u8) -> &'static str {
         REASON_CONN_CONFLICT => "connection id conflict",
         REASON_INTERNAL => "internal error",
         REASON_TIMEOUT => "decision timeout",
+        REASON_UNAUTHORIZED => "sender not authorized",
+        REASON_NO_SUITE => "no cipher in common",
         _ => "unknown",
     }
 }

@@ -42,6 +42,10 @@ pub enum TransferEvent {
     Started {
         transfer_id: String,
         peer: String,
+        /// Authenticated SHARP ID of the other side.
+        peer_id: String,
+        /// AEAD protecting the session.
+        cipher: String,
         file_name: String,
         file_size: u64,
         resumed_from: u64,
@@ -77,6 +81,8 @@ pub enum TransferEvent {
     IncomingRequest {
         transfer_id: String,
         peer: String,
+        /// Authenticated SHARP ID of the sender.
+        sender_id: String,
         file_name: String,
         file_size: u64,
         resumed_bytes: u64,

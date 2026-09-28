@@ -1,4 +1,5 @@
 use crate::config::SenderConfig;
+use crate::crypto::{psk_from_passphrase, Identity};
 use crate::progress::{format_bytes, format_rate, TransferEvent, TransferStats};
 use crate::transport::Sender;
 use eframe::egui;
@@ -22,6 +23,8 @@ pub struct SenderApp {
     receiver_addr: String,
     bind_addr: String,
     max_rate: String,
+    secret: String,
+    identity: Result<Identity, String>,
     state: Arc<Mutex<State>>,
     cancel: Option<CancellationToken>,
     error: Option<String>,
@@ -29,14 +32,19 @@ pub struct SenderApp {
 }
 
 impl SenderApp {
-    pub fn new(file: Option<PathBuf>, receiver: Option<SocketAddr>) -> Self {
+    pub fn new(file: Option<PathBuf>, receiver: Option<String>) -> Self {
+        let identity = Identity::default_path()
+            .ok_or_else(|| "no per-user data directory".to_string())
+            .and_then(|p| {
+                Identity::load_or_create(&p).map_err(|e| format!("{}: {}", p.display(), e))
+            });
         Self {
             file_path: file,
-            receiver_addr: receiver
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "192.168.1.100:5555".to_string()),
+            receiver_addr: receiver.unwrap_or_default(),
             bind_addr: "0.0.0.0:0".to_string(),
             max_rate: String::new(),
+            secret: String::new(),
+            identity,
             state: Arc::new(Mutex::new(State::Idle)),
             cancel: None,
             error: None,
@@ -49,10 +57,17 @@ impl SenderApp {
             self.error = Some("Select a file first".into());
             return;
         };
-        let receiver: SocketAddr = match self.receiver_addr.parse() {
-            Ok(a) => a,
+        let identity = match &self.identity {
+            Ok(id) => id.clone(),
             Err(e) => {
-                self.error = Some(format!("Invalid receiver address: {}", e));
+                self.error = Some(format!("No identity: {}", e));
+                return;
+            }
+        };
+        let (receiver_id, host) = match crate::address::parse_peer(&self.receiver_addr) {
+            Ok(v) => v,
+            Err(e) => {
+                self.error = Some(e);
                 return;
             }
         };
@@ -63,20 +78,21 @@ impl SenderApp {
                 return;
             }
         };
-        let mut cfg = SenderConfig::new(receiver, file);
-        cfg.bind = bind;
-        if !self.max_rate.trim().is_empty() {
+        let max_rate = if self.max_rate.trim().is_empty() {
+            None
+        } else {
             match crate::progress::parse_rate(&self.max_rate) {
-                Ok(bps) => cfg.transport.max_rate_bytes = Some(bps / 8),
+                Ok(bps) => Some(bps / 8),
                 Err(e) => {
                     self.error = Some(e);
                     return;
                 }
             }
-        }
+        };
+        let secret = (!self.secret.is_empty()).then(|| self.secret.clone());
         let state = self.state.clone();
         let repaint = ctx.clone();
-        cfg.events = Some(Arc::new(move |ev: TransferEvent| {
+        let events: crate::progress::EventCallback = Arc::new(move |ev: TransferEvent| {
             let mut st = state.lock();
             match ev {
                 TransferEvent::Started { .. } => *st = State::Connecting,
@@ -95,7 +111,7 @@ impl SenderApp {
                 _ => {}
             }
             repaint.request_repaint();
-        }));
+        });
 
         *self.state.lock() = State::Connecting;
         let state = self.state.clone();
@@ -111,6 +127,20 @@ impl SenderApp {
                 }
             };
             rt.block_on(async move {
+                let addr = match crate::address::resolve(&host).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        *state.lock() = State::Failed(format!("cannot resolve {}: {}", host, e));
+                        repaint.request_repaint();
+                        return;
+                    }
+                };
+                let mut cfg = SenderConfig::new(addr, receiver_id, file);
+                cfg.bind = bind;
+                cfg.identity = Some(identity);
+                cfg.transport.max_rate_bytes = max_rate;
+                cfg.psk = secret.map(|s| psk_from_passphrase(&s, &receiver_id));
+                cfg.events = Some(events);
                 let result = match Sender::new(cfg).await {
                     Ok(sender) => {
                         let token = sender.cancel_token();
@@ -148,6 +178,19 @@ impl eframe::App for SenderApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("SHARP-256 File Sender");
+            match &self.identity {
+                Ok(id) => {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("This sender: {}", id.id()));
+                        if ui.small_button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = id.id().to_string());
+                        }
+                    });
+                }
+                Err(e) => {
+                    ui.colored_label(egui::Color32::RED, format!("No identity: {}", e));
+                }
+            }
             ui.separator();
             ui.add_enabled_ui(!busy, |ui| {
                 ui.group(|ui| {
@@ -173,8 +216,16 @@ impl eframe::App for SenderApp {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Receiver address:");
-                        ui.text_edit_singleline(&mut self.receiver_addr);
+                        ui.label("Receiver (ID@host:port):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.receiver_addr)
+                                .hint_text("sh-…@192.168.1.100:5555")
+                                .desired_width(420.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Shared secret (optional):");
+                        ui.add(egui::TextEdit::singleline(&mut self.secret).password(true));
                     });
                     ui.horizontal(|ui| {
                         ui.label("Local bind address:");

@@ -1,6 +1,7 @@
 //! End-to-end tests: real sender and receiver over loopback, optionally
 //! through a UDP proxy that drops, duplicates and reorders datagrams.
 
+use sharp256::crypto::{Identity, SharpId};
 use sharp256::{
     AcceptPolicy, Receiver, ReceiverConfig, SendError, Sender, SenderConfig, TransferEvent,
     TransferSummary, TransportConfig,
@@ -63,6 +64,9 @@ fn fast_transport() -> TransportConfig {
 
 struct TestReceiver {
     addr: SocketAddr,
+    /// SHARP ID senders must use.
+    id: SharpId,
+    identity: Identity,
     cancel: CancellationToken,
     events: mpsc::UnboundedReceiver<TransferEvent>,
     task: tokio::task::JoinHandle<()>,
@@ -76,11 +80,13 @@ async fn start_receiver(
     let mut cfg = ReceiverConfig::new("127.0.0.1:0".parse().unwrap(), out.to_path_buf());
     cfg.state_dir = Some(state.to_path_buf());
     cfg.transport = fast_transport();
+    cfg.identity = Some(Identity::generate());
     let (tx, rx) = mpsc::unbounded_channel();
     cfg.events = Some(Arc::new(move |ev| {
         let _ = tx.send(ev);
     }));
     cfg_fn(&mut cfg);
+    let identity = cfg.identity.clone().expect("identity");
     let receiver = Receiver::new(cfg).await.expect("receiver");
     let addr = receiver.local_addr().unwrap();
     let cancel = receiver.cancel_token();
@@ -89,6 +95,8 @@ async fn start_receiver(
     });
     TestReceiver {
         addr,
+        id: identity.id(),
+        identity,
         cancel,
         events: rx,
         task,
@@ -100,11 +108,18 @@ async fn stop_receiver(r: TestReceiver) {
     let _ = tokio::time::timeout(Duration::from_secs(15), r.task).await;
 }
 
-fn sender_cfg(file: &Path, peer: SocketAddr, state: &Path) -> SenderConfig {
-    let mut cfg = SenderConfig::new(peer, file.to_path_buf());
+/// Identity of the test senders (stable, so that resume works across runs).
+fn sender_identity() -> Identity {
+    static ID: std::sync::OnceLock<Identity> = std::sync::OnceLock::new();
+    ID.get_or_init(Identity::generate).clone()
+}
+
+fn sender_cfg(file: &Path, peer: SocketAddr, receiver: SharpId, state: &Path) -> SenderConfig {
+    let mut cfg = SenderConfig::new(peer, receiver, file.to_path_buf());
     cfg.bind = "127.0.0.1:0".parse().unwrap();
     cfg.state_dir = Some(state.to_path_buf());
     cfg.transport = fast_transport();
+    cfg.identity = Some(sender_identity());
     cfg
 }
 
@@ -153,10 +168,12 @@ struct Impairment {
     data_loss_window: Option<(u64, u64)>,
     /// Extra one-way delay for everything travelling back to the sender.
     reverse_delay: Duration,
-    /// Drop every datagram of this message type.
-    drop_type: Option<u8>,
-    /// Drop the first `n` datagrams of this message type.
-    drop_first: Option<(u8, u32)>,
+    /// Drop every datagram of this length.
+    drop_len: Option<usize>,
+    /// Drop the first `n` datagrams of this length.
+    drop_first_len: Option<(usize, u32)>,
+    /// Flip one random bit in this fraction of datagrams.
+    corrupt: f64,
 }
 
 impl Impairment {
@@ -169,16 +186,24 @@ impl Impairment {
             seed: 1,
             data_loss_window: None,
             reverse_delay: Duration::ZERO,
-            drop_type: None,
-            drop_first: None,
+            drop_len: None,
+            drop_first_len: None,
+            corrupt: 0.0,
         }
     }
 }
 
-/// Message type byte of a SHARP-256 datagram (see docs/PROTOCOL.md).
+/// Packet types are masked on the wire (header protection), so the proxy can
+/// only tell packets apart by size: full-sized ones towards the receiver are
+/// DATA (or path probes).
 fn is_data(pkt: &[u8]) -> bool {
-    pkt.len() > 3 && pkt[0..2] == *b"SH" && pkt[3] == 3
+    pkt.len() >= 1000
 }
+
+/// Sizes of some encrypted packets: 33 bytes of packet overhead plus the
+/// frame body.
+const FIN_DONE_LEN: usize = 33 + 1;
+const FIN_ACK_LEN: usize = 33 + 1 + 32;
 
 struct Proxy {
     addr: SocketAddr,
@@ -219,11 +244,11 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
             if t_black.load(Ordering::Relaxed) {
                 continue;
             }
-            if imp.drop_type.is_some_and(|t| pkt.len() > 3 && pkt[3] == t) {
+            if imp.drop_len == Some(pkt.len()) {
                 continue;
             }
-            if let Some((t, n)) = imp.drop_first {
-                if pkt.len() > 3 && pkt[3] == t && dropped_first < n {
+            if let Some((len, n)) = imp.drop_first_len {
+                if pkt.len() == len && dropped_first < n {
                     dropped_first += 1;
                     continue;
                 }
@@ -241,6 +266,11 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
             };
             if drop_applies && rng.f64() < imp.drop {
                 continue;
+            }
+            let mut pkt = pkt;
+            if rng.f64() < imp.corrupt && !pkt.is_empty() {
+                let bit = (rng.next() % (pkt.len() as u64 * 8)) as usize;
+                pkt[bit / 8] ^= 1 << (bit % 8);
             }
             let copies = if rng.f64() < imp.dup { 2 } else { 1 };
             let mut delay = if rng.f64() < imp.reorder {
@@ -306,7 +336,7 @@ async fn transfers_of_many_sizes_are_byte_exact() {
     {
         let name = format!("f{}.bin", i);
         let path = make_file(&src, &name, size, 77 + i as u64);
-        let summary = run_sender(sender_cfg(&path, r.addr, &state))
+        let summary = run_sender(sender_cfg(&path, r.addr, r.id, &state))
             .await
             .expect("send");
         assert_eq!(summary.file_size, size as u64);
@@ -352,13 +382,14 @@ async fn survives_loss_duplication_and_reordering() {
             seed: 42,
             data_loss_window: None,
             reverse_delay: Duration::ZERO,
-            drop_type: None,
-            drop_first: None,
+            drop_len: None,
+            drop_first_len: None,
+            corrupt: 0.0,
         },
     )
     .await;
     let path = make_file(&src, "lossy.bin", 2 * 1024 * 1024 + 123, 9);
-    let summary = run_sender(sender_cfg(&path, proxy.addr, &state))
+    let summary = run_sender(sender_cfg(&path, proxy.addr, r.id, &state))
         .await
         .expect("send");
     assert!(
@@ -400,15 +431,16 @@ async fn survives_heavy_loss() {
             seed: 7,
             data_loss_window: None,
             reverse_delay: Duration::ZERO,
-            drop_type: None,
-            drop_first: None,
+            drop_len: None,
+            drop_first_len: None,
+            corrupt: 0.0,
         },
     )
     .await;
     let path = make_file(&src, "heavy.bin", 700_000, 3);
     let summary = tokio::time::timeout(
         Duration::from_secs(120),
-        run_sender(sender_cfg(&path, proxy.addr, &state)),
+        run_sender(sender_cfg(&path, proxy.addr, r.id, &state)),
     )
     .await
     .expect("finished in time")
@@ -437,9 +469,11 @@ async fn resumes_after_receiver_restart_during_outage() {
 
     let r1 = start_receiver(&out, &state, |_| {}).await;
     let proxy = start_proxy(r1.addr, Impairment::none()).await;
+    // The restarted receiver keeps its identity.
+    let identity = r1.identity.clone();
 
     // Slow the sender down so that we can interrupt in the middle.
-    let mut cfg = sender_cfg(&path, proxy.addr, &state);
+    let mut cfg = sender_cfg(&path, proxy.addr, r1.id, &state);
     cfg.transport.max_rate_bytes = Some(2_500_000); // 2.5 MB/s
     let sender_task = tokio::spawn(run_sender(cfg));
 
@@ -464,7 +498,7 @@ async fn resumes_after_receiver_restart_during_outage() {
     // Keep the outage a bit longer than the sender's stall timeout, then
     // bring up a new receiver on a new port and reconnect the proxy.
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let mut r2 = start_receiver(&out, &state, |_| {}).await;
+    let mut r2 = start_receiver(&out, &state, |c| c.identity = Some(identity.clone())).await;
     *proxy.target.lock() = r2.addr;
     proxy.blackhole.store(false, Ordering::Relaxed);
 
@@ -524,7 +558,7 @@ async fn resumes_after_sender_cancel_and_restart() {
     let path = make_file(&src, "cancel.bin", size, 11);
     let mut r = start_receiver(&out, &state, |_| {}).await;
 
-    let mut cfg = sender_cfg(&path, r.addr, &state);
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
     cfg.transport.max_rate_bytes = Some(2_000_000);
     let sender = Sender::new(cfg).await.unwrap();
     let cancel = sender.cancel_token();
@@ -541,7 +575,7 @@ async fn resumes_after_sender_cancel_and_restart() {
     // Let the receiver notice the abort and persist.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let summary = run_sender(sender_cfg(&path, r.addr, &state))
+    let summary = run_sender(sender_cfg(&path, r.addr, r.id, &state))
         .await
         .expect("second attempt");
     assert!(
@@ -578,7 +612,7 @@ async fn changed_source_is_not_resumed_onto_stale_data() {
     let mut r = start_receiver(&out, &state, |_| {}).await;
 
     // Interrupt a first attempt so that both sides keep resume state.
-    let mut cfg = sender_cfg(&path, r.addr, &state);
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
     cfg.transport.max_rate_bytes = Some(2_000_000);
     let sender = Sender::new(cfg).await.unwrap();
     let cancel = sender.cancel_token();
@@ -595,7 +629,7 @@ async fn changed_source_is_not_resumed_onto_stale_data() {
         .unwrap();
     drop(f);
 
-    let summary = run_sender(sender_cfg(&path, r.addr, &state))
+    let summary = run_sender(sender_cfg(&path, r.addr, r.id, &state))
         .await
         .expect("a changed source must be sent afresh, not fail the hash check");
     assert_eq!(
@@ -639,12 +673,12 @@ async fn lost_fin_done_falls_back_to_the_linger() {
     let proxy = start_proxy(
         r.addr,
         Impairment {
-            drop_type: Some(12), // FIN_DONE
+            drop_len: Some(FIN_DONE_LEN),
             ..Impairment::none()
         },
     )
     .await;
-    let summary = run_sender(sender_cfg(&path, proxy.addr, &state))
+    let summary = run_sender(sender_cfg(&path, proxy.addr, r.id, &state))
         .await
         .expect("transfer");
     assert_eq!(summary.file_size, 300_000);
@@ -679,12 +713,12 @@ async fn lost_verdicts_are_answered_again() {
     let proxy = start_proxy(
         r.addr,
         Impairment {
-            drop_first: Some((6, 2)), // the first two FIN_ACKs
+            drop_first_len: Some((FIN_ACK_LEN, 2)), // the first two FIN_ACKs
             ..Impairment::none()
         },
     )
     .await;
-    run_sender(sender_cfg(&path, proxy.addr, &state))
+    run_sender(sender_cfg(&path, proxy.addr, r.id, &state))
         .await
         .expect("transfer");
     let ev = wait_completed(&mut r.events, Duration::from_secs(20)).await;
@@ -724,7 +758,9 @@ async fn concurrent_transfers_to_one_receiver() {
         .collect();
     let mut tasks = Vec::new();
     for f in &files {
-        tasks.push(tokio::spawn(run_sender(sender_cfg(f, r.addr, &state))));
+        tasks.push(tokio::spawn(run_sender(sender_cfg(
+            f, r.addr, r.id, &state,
+        ))));
     }
     for t in tasks {
         t.await.unwrap().expect("send");
@@ -759,7 +795,7 @@ async fn declined_transfer_is_reported_to_sender() {
     })
     .await;
     let path = make_file(&src, "nope.bin", 10_000, 1);
-    let res = run_sender(sender_cfg(&path, r.addr, &state)).await;
+    let res = run_sender(sender_cfg(&path, r.addr, r.id, &state)).await;
     match res {
         Err(SendError::Rejected { reason, .. }) => {
             assert!(reason.contains("declined"), "{}", reason)
@@ -782,7 +818,7 @@ async fn existing_file_is_not_overwritten_by_default() {
     let mut r = start_receiver(&out, &state, |_| {}).await;
     let path = make_file(&src, "dup.bin", 50_000, 2);
     for expected in ["dup.bin", "dup (1).bin"] {
-        run_sender(sender_cfg(&path, r.addr, &state))
+        run_sender(sender_cfg(&path, r.addr, r.id, &state))
             .await
             .expect("send");
         let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
@@ -822,7 +858,7 @@ async fn burst_loss_with_hundreds_of_holes_recovers_quickly() {
     )
     .await;
     let path = make_file(&src, "holes.bin", 3 * 1024 * 1024, 21);
-    let mut cfg = sender_cfg(&path, proxy.addr, &state);
+    let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
     cfg.transport.initial_cwnd_chunks = 1024; // one huge first flight
     let started = Instant::now();
     let summary = tokio::time::timeout(Duration::from_secs(30), run_sender(cfg))
@@ -874,7 +910,7 @@ async fn bench_profile(name: &str, size: usize, imp: Impairment, cap: Option<u64
     let mut r = start_receiver(&out, &state, |_| {}).await;
     let proxy = start_proxy(r.addr, imp).await;
     let path = make_file(&src, "bench.bin", size, 99);
-    let mut cfg = sender_cfg(&path, proxy.addr, &state);
+    let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
     cfg.transport.max_rate_bytes = cap;
     let started = Instant::now();
     let summary = tokio::time::timeout(Duration::from_secs(300), run_sender(cfg))
@@ -926,20 +962,18 @@ async fn bench_link_profiles() {
     .await;
 }
 
-const FAKE_CONN: u32 = 77;
+/// A hand-driven sender: performs a real handshake, then sends single frames.
+struct FakeSender {
+    sock: UdpSocket,
+    to: SocketAddr,
+    keys: sharp256::crypto::SessionKeys,
+    peer_cid: u64,
+    next_pn: u64,
+}
 
-/// Performs a hand-made handshake for `name` and returns the socket of the
-/// "sender" together with the key of the transfer.
-async fn fake_handshake(
-    receiver: SocketAddr,
-    tid: [u8; 16],
-    name: &str,
-) -> (UdpSocket, sharp256::protocol::wire::TagKey) {
+fn fake_hello(tid: [u8; 16], name: &str) -> sharp256::protocol::wire::Hello {
     use sharp256::protocol::constants::*;
-    use sharp256::protocol::wire::{self, Header, Hello, Message, MsgType, TagKey};
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let key = TagKey::derive(&tid);
-    let hello = Hello {
+    sharp256::protocol::wire::Hello {
         transfer_id: tid,
         timestamp: 1,
         file_size: 10_000_000,
@@ -947,23 +981,70 @@ async fn fake_handshake(
         max_chunk: DEFAULT_CHUNK,
         capabilities: CAP_NONE,
         file_name: name.into(),
-    };
-    let bytes = wire::encode(
-        &Header::new(MsgType::Hello, FAKE_CONN),
-        &Message::Hello(hello),
-        &key,
-    );
-    sock.send_to(&bytes, receiver).await.unwrap();
-    let mut buf = vec![0u8; 2048];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
-        .await
-        .expect("HELLO_ACK")
-        .unwrap();
-    assert!(matches!(
-        wire::decode(&buf[..n], &key).unwrap().1,
-        Message::HelloAck(_)
-    ));
-    (sock, key)
+    }
+}
+
+/// Builds an initiation for `receiver` and returns it with its attempt.
+fn fake_initiation(
+    receiver: SharpId,
+    tid: [u8; 16],
+    name: &str,
+) -> (sharp256::crypto::handshake::Initiator, Vec<u8>) {
+    use sharp256::crypto::handshake::{initiation_timestamp, Initiator};
+    use sharp256::crypto::{Suite, NO_PSK};
+    use sharp256::protocol::wire;
+    let mut init = Initiator::new(&Identity::generate(), &receiver, &NO_PSK).unwrap();
+    let payload = wire::encode_initiation(&wire::Initiation {
+        timestamp: initiation_timestamp(),
+        suites: Suite::ALL_BITS,
+        hardware_aes: false,
+        hello_flags: 0,
+        hello: fake_hello(tid, name),
+    });
+    let pkt = init.initiation(&payload, None).unwrap();
+    (init, pkt)
+}
+
+impl FakeSender {
+    async fn connect(r: &TestReceiver, tid: [u8; 16], name: &str) -> (Self, u8) {
+        use sharp256::crypto::{SessionKeys, Suite};
+        use sharp256::protocol::wire;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (init, pkt) = fake_initiation(r.id, tid, name);
+        sock.send_to(&pkt, r.addr).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+            .await
+            .expect("handshake response")
+            .unwrap();
+        let (peer_cid, payload, split) = init.read_response(&buf[..n]).expect("valid response");
+        let resp = wire::decode_response(&payload).unwrap();
+        let suite = Suite::from_u8(resp.suite).expect("suite");
+        let s = Self {
+            sock,
+            to: r.addr,
+            keys: SessionKeys::derive(&split, true, suite),
+            peer_cid,
+            next_pn: 0,
+        };
+        (s, resp.ack.status)
+    }
+
+    async fn send(&mut self, msg: &sharp256::protocol::wire::Message<'_>) {
+        use sharp256::crypto::transport::begin_packet;
+        use sharp256::protocol::wire;
+        let mut buf = Vec::new();
+        begin_packet(
+            &mut buf,
+            self.peer_cid,
+            wire::type_byte(msg.msg_type(), 0),
+            self.next_pn,
+        );
+        self.next_pn += 1;
+        wire::encode_body(msg, &mut buf, usize::MAX);
+        self.keys.send.seal(&mut buf).unwrap();
+        self.sock.send_to(&buf, self.to).await.unwrap();
+    }
 }
 
 /// Waits for the receiver's `Failed` event and returns (error, resumable).
@@ -1000,7 +1081,8 @@ async fn idle_session_after_handshake_is_dropped() {
     })
     .await;
     // A "sender" that goes silent right after the handshake.
-    let (_sock, _key) = fake_handshake(r.addr, [0x5a; 16], "ghost.bin").await;
+    let (_sender, status) = FakeSender::connect(&r, [0x5a; 16], "ghost.bin").await;
+    assert_eq!(status, sharp256::protocol::constants::HELLO_ACCEPTED);
     let part = out.join("ghost.bin.sharp-part");
     assert!(part.exists(), "partial file is created on accept");
     // After the (shortened) handshake timeout the session is gone.
@@ -1021,22 +1103,19 @@ async fn idle_session_after_handshake_is_dropped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abort_before_data_releases_the_session_at_once() {
     use sharp256::protocol::constants::*;
-    use sharp256::protocol::wire::{self, Abort, Header, Message, MsgType};
+    use sharp256::protocol::wire::{Abort, Message};
     let tmp = tempfile::tempdir().unwrap();
     let (out, state) = (tmp.path().join("out"), tmp.path().join("state"));
     let mut r = start_receiver(&out, &state, |_| {}).await;
-    let (sock, key) = fake_handshake(r.addr, [0x6b; 16], "early.bin").await;
+    let (mut sender, _) = FakeSender::connect(&r, [0x6b; 16], "early.bin").await;
     let part = out.join("early.bin.sharp-part");
     assert!(part.exists());
-    let abort = wire::encode(
-        &Header::new(MsgType::Abort, FAKE_CONN),
-        &Message::Abort(Abort {
+    sender
+        .send(&Message::Abort(Abort {
             code: ABORT_CANCELLED,
             reason: "changed my mind".into(),
-        }),
-        &key,
-    );
-    sock.send_to(&abort, r.addr).await.unwrap();
+        }))
+        .await;
     let (error, resumable) = wait_failed(&mut r.events, Duration::from_secs(2)).await;
     assert!(error.contains("changed my mind"), "{}", error);
     assert!(!resumable);
@@ -1062,7 +1141,7 @@ async fn vanished_sender_is_reported_and_resumable() {
         cfg.transport.session_ttl = Duration::from_millis(1500);
     })
     .await;
-    let mut cfg = sender_cfg(&path, r.addr, &state);
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
     cfg.transport.max_rate_bytes = Some(2_000_000);
     let task = tokio::spawn(run_sender(cfg));
     tokio::time::sleep(Duration::from_millis(900)).await;
@@ -1074,12 +1153,298 @@ async fn vanished_sender_is_reported_and_resumable() {
     assert!(out.join("vanish.bin.sharp-part").exists());
 
     // The next attempt continues where the first one stopped.
-    let summary = run_sender(sender_cfg(&path, r.addr, &state))
+    let summary = run_sender(sender_cfg(&path, r.addr, r.id, &state))
         .await
         .expect("second attempt");
     assert!(summary.resumed_from > 0);
     let done = wait_completed(&mut r.events, Duration::from_secs(30)).await;
     if let TransferEvent::Completed { path: Some(p), .. } = done {
+        assert_same(&path, Path::new(&p));
+    }
+    stop_receiver(r).await;
+}
+
+// ---------------------------------------------------------------------------
+// Security
+// ---------------------------------------------------------------------------
+
+fn dirs(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+    let (src, out, state) = (
+        tmp.path().join("src"),
+        tmp.path().join("out"),
+        tmp.path().join("state"),
+    );
+    std::fs::create_dir_all(&src).unwrap();
+    (src, out, state)
+}
+
+/// A receiver with a list of allowed senders refuses everybody else, and
+/// says so; listed senders get through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthorized_sender_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let friend = Identity::generate();
+    let friend_id = friend.id();
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.allowed_senders = Some([friend_id].into_iter().collect());
+    })
+    .await;
+    let path = make_file(&src, "private.bin", 50_000, 61);
+    match run_sender(sender_cfg(&path, r.addr, r.id, &state)).await {
+        Err(SendError::Rejected { reason, .. }) => {
+            assert!(reason.contains("not authorized"), "{}", reason)
+        }
+        other => panic!("expected rejection, got {:?}", other.map(|_| ())),
+    }
+    assert!(!out.join("private.bin").exists());
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
+    cfg.identity = Some(friend);
+    run_sender(cfg).await.expect("allowed sender");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    }
+    stop_receiver(r).await;
+}
+
+/// Without the receiver's ID nothing gets an answer: not a sender with a
+/// wrong ID, not random probes. The receiver does not even notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strangers_get_no_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let path = make_file(&src, "x.bin", 1000, 62);
+    let mut cfg = sender_cfg(&path, r.addr, Identity::generate().id(), &state);
+    cfg.transport.handshake_timeout = Duration::from_secs(2);
+    let res = run_sender(cfg).await;
+    assert!(
+        matches!(res, Err(SendError::HandshakeTimeout)),
+        "got {:?}",
+        res.map(|_| ())
+    );
+    // Probes of every size, including ones shaped like an initiation.
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut rng = Rng(63);
+    for len in [0usize, 1, 8, 33, 64, 136, 200, 400, 1200, 1472] {
+        let junk: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        sock.send_to(&junk, r.addr).await.unwrap();
+    }
+    let mut buf = [0u8; 2048];
+    let answer = tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await;
+    assert!(answer.is_err(), "the receiver answered a stranger");
+    assert!(
+        r.events.try_recv().is_err(),
+        "the receiver reacted to a stranger"
+    );
+    stop_receiver(r).await;
+}
+
+/// Sender and receiver with different shared secrets never complete the
+/// handshake, and the sender says why; matching secrets work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatched_secret_fails_cleanly() {
+    use sharp256::crypto::psk_from_passphrase_with_cost;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let identity = Identity::generate();
+    let rid = identity.id();
+    let psk = |s: &str| psk_from_passphrase_with_cost(s, &rid, 64, 1);
+    let receiver_psk = psk("correct horse battery staple");
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.identity = Some(identity.clone());
+        cfg.psk = Some(receiver_psk);
+    })
+    .await;
+    let path = make_file(&src, "secret.bin", 100_000, 64);
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
+    cfg.psk = Some(psk("correct horse battery stapler"));
+    cfg.transport.handshake_timeout = Duration::from_secs(3);
+    match run_sender(cfg).await {
+        Err(SendError::Handshake(msg)) => assert!(msg.contains("secret"), "{}", msg),
+        other => panic!("expected a handshake failure, got {:?}", other.map(|_| ())),
+    }
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
+    cfg.psk = Some(psk("correct horse battery staple"));
+    run_sender(cfg).await.expect("same secret");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    }
+    stop_receiver(r).await;
+}
+
+/// Flipped bits anywhere in any packet are caught by the AEAD tag; the
+/// transfer repairs the damage by retransmission and stays byte-exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tampered_packets_are_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            corrupt: 0.05,
+            seed: 65,
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let path = make_file(&src, "tamper.bin", 2 * 1024 * 1024 + 5, 66);
+    let summary = run_sender(sender_cfg(&path, proxy.addr, r.id, &state))
+        .await
+        .expect("send");
+    assert!(
+        summary.retransmitted_bytes > 0,
+        "corrupted packets were resent"
+    );
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    }
+    stop_receiver(r).await;
+}
+
+/// A receiver under load first makes senders prove their address with a
+/// cookie; honest senders get through transparently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cookie_challenge_under_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.handshake_load_threshold = 0; // permanently "under load"
+    })
+    .await;
+    let path = make_file(&src, "cookie.bin", 200_000, 67);
+    run_sender(sender_cfg(&path, r.addr, r.id, &state))
+        .await
+        .expect("send through the cookie challenge");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    }
+    // Without the cookie an initiation only earns a cookie reply.
+    let (_init, pkt) = fake_initiation(r.id, [0x77; 16], "no-cookie.bin");
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(&pkt, r.addr).await.unwrap();
+    let mut buf = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .expect("cookie reply")
+        .unwrap();
+    assert_eq!(n, sharp256::crypto::handshake::COOKIE_REPLY_LEN);
+    stop_receiver(r).await;
+}
+
+/// A recorded initiation replayed later is ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replayed_initiation_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let r = start_receiver(&out, &state, |_| {}).await;
+    let (_init, pkt) = fake_initiation(r.id, [0x88; 16], "replay.bin");
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(&pkt, r.addr).await.unwrap();
+    let mut buf = [0u8; 2048];
+    tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .expect("first initiation is answered")
+        .unwrap();
+    // The eavesdropper replays it, from the same and from another address.
+    let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for s in [&sock, &other] {
+        s.send_to(&pkt, r.addr).await.unwrap();
+        let answer = tokio::time::timeout(Duration::from_millis(400), s.recv_from(&mut buf)).await;
+        assert!(answer.is_err(), "a replayed initiation was answered");
+    }
+    stop_receiver(r).await;
+}
+
+/// Only the sender that started a partial file can continue it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_requires_the_same_sender() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 4 * 1024 * 1024;
+    let path = make_file(&src, "mine.bin", size, 68);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let owner = Identity::generate();
+
+    // The owner starts and is interrupted.
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
+    cfg.identity = Some(owner.clone());
+    cfg.transport.max_rate_bytes = Some(2_000_000);
+    let sender = Sender::new(cfg).await.unwrap();
+    let cancel = sender.cancel_token();
+    let task = tokio::spawn(sender.run());
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    cancel.cancel();
+    assert!(matches!(task.await.unwrap(), Err(SendError::Cancelled)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Somebody else with the same file does not get the owner's progress
+    // (it uses its own state directory, as another machine would).
+    let other_state = tmp.path().join("other-state");
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &other_state);
+    cfg.identity = Some(Identity::generate());
+    let other = run_sender(cfg).await.expect("other sender");
+    assert_eq!(
+        other.resumed_from, 0,
+        "another sender must start from scratch"
+    );
+
+    // The owner continues where it stopped.
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &state);
+    cfg.identity = Some(owner);
+    let again = run_sender(cfg).await.expect("owner resumes");
+    assert!(again.resumed_from > 0, "the owner must resume");
+    // Both transfers complete; the interrupted first attempt was only
+    // suspended (a resumable failure).
+    let mut completed = 0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while completed < 2 {
+        match tokio::time::timeout(deadline - Instant::now(), r.events.recv()).await {
+            Ok(Some(TransferEvent::Completed { path: Some(p), .. })) => {
+                assert_same(&path, Path::new(&p));
+                completed += 1;
+            }
+            Ok(Some(TransferEvent::Failed {
+                error,
+                resumable: false,
+                ..
+            })) => panic!("receiver failed: {}", error),
+            Ok(Some(_)) => {}
+            _ => panic!("transfers did not complete"),
+        }
+    }
+    stop_receiver(r).await;
+}
+
+/// While the receiver's user decides, the sender waits; the transfer starts
+/// as soon as it is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_waits_for_the_users_decision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.accept = AcceptPolicy::Ask(Arc::new(|req, reply| {
+            assert!(req.sender_id.to_string().starts_with("sh-"));
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let _ = reply.send(true);
+            });
+        }));
+    })
+    .await;
+    let path = make_file(&src, "later.bin", 300_000, 69);
+    let started = Instant::now();
+    run_sender(sender_cfg(&path, r.addr, r.id, &state))
+        .await
+        .expect("accepted after a while");
+    assert!(started.elapsed() >= Duration::from_millis(1400));
+    let ev = wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
         assert_same(&path, Path::new(&p));
     }
     stop_receiver(r).await;

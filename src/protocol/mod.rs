@@ -5,4 +5,4 @@ pub mod range_set;
 pub mod wire;
 
 pub use range_set::{Range, RangeSet};
-pub use wire::{Header, Message, MsgType, TagKey, WireError};
+pub use wire::{Message, MsgType, WireError};

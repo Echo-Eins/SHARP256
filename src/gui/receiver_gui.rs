@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 struct Active {
     transfer_id: String,
     peer: String,
+    peer_id: String,
+    cipher: String,
     file_name: String,
     stats: Option<TransferStats>,
     stalled: bool,
@@ -37,6 +39,7 @@ struct Shared {
     history: VecDeque<Finished>,
     pending: Vec<PendingRequest>,
     listen: String,
+    receiver_id: String,
     reachability: Option<String>,
     error: Option<String>,
 }
@@ -51,6 +54,11 @@ impl ReceiverApp {
     pub fn new(mut cfg: ReceiverConfig) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             listen: cfg.bind.to_string(),
+            receiver_id: cfg
+                .identity
+                .as_ref()
+                .map(|i| i.id().to_string())
+                .unwrap_or_default(),
             ..Default::default()
         }));
         let output_dir = cfg.output_dir.display().to_string();
@@ -70,6 +78,8 @@ impl ReceiverApp {
                 TransferEvent::Started {
                     transfer_id,
                     peer,
+                    peer_id,
+                    cipher,
                     file_name,
                     ..
                 } => {
@@ -77,6 +87,8 @@ impl ReceiverApp {
                     sh.active.push(Active {
                         transfer_id,
                         peer,
+                        peer_id,
+                        cipher,
                         file_name,
                         stats: None,
                         stalled: false,
@@ -161,6 +173,7 @@ impl ReceiverApp {
                         if let Ok(addr) = receiver.local_addr() {
                             s.lock().listen = addr.to_string();
                         }
+                        s.lock().receiver_id = receiver.id().to_string();
                         let rt_token = receiver.cancel_token();
                         tokio::spawn(async move {
                             token.cancelled().await;
@@ -196,6 +209,7 @@ impl eframe::App for ReceiverApp {
                     .resizable(false)
                     .show(ctx, |ui| {
                         ui.label(format!("From: {}", r.peer));
+                        ui.label(format!("Sender ID: {}", r.sender_id));
                         ui.label(format!("File: {}", r.file_name));
                         ui.label(format!("Size: {}", format_bytes(r.file_size)));
                         if r.resumed_bytes > 0 {
@@ -231,7 +245,18 @@ impl eframe::App for ReceiverApp {
             ui.heading("SHARP-256 File Receiver");
             ui.separator();
             ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Receiver ID: {}", sh.receiver_id));
+                    if ui.small_button("Copy").clicked() {
+                        ui.output_mut(|o| o.copied_text = sh.receiver_id.clone());
+                    }
+                });
                 ui.label(format!("Listening on {}", sh.listen));
+                ui.label(format!(
+                    "Senders use: {}@<this host>:{}",
+                    sh.receiver_id,
+                    sh.listen.rsplit(':').next().unwrap_or("")
+                ));
                 ui.label(format!("Output directory: {}", self.output_dir));
                 if let Some(r) = &sh.reachability {
                     ui.label(format!("Network: {}", r));
@@ -248,6 +273,7 @@ impl eframe::App for ReceiverApp {
             for a in &sh.active {
                 ui.group(|ui| {
                     ui.label(format!("{} from {}", a.file_name, a.peer));
+                    ui.label(format!("sender {}, {}", a.peer_id, a.cipher));
                     if let Some(s) = &a.stats {
                         ui.add(
                             egui::ProgressBar::new(s.fraction())
@@ -313,6 +339,7 @@ struct View {
     active: Vec<Active>,
     history: VecDeque<Finished>,
     listen: String,
+    receiver_id: String,
     reachability: Option<String>,
     error: Option<String>,
 }
@@ -323,6 +350,7 @@ impl Shared {
             active: self.active.clone(),
             history: self.history.clone(),
             listen: self.listen.clone(),
+            receiver_id: self.receiver_id.clone(),
             reachability: self.reachability.clone(),
             error: self.error.clone(),
         }

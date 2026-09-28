@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use sharp256::crypto::{psk_from_passphrase, Identity};
 use sharp256::progress::{format_bytes, format_rate, parse_rate};
 use sharp256::{init_logging, system_info, Sender, SenderConfig, TransferEvent};
 use std::net::SocketAddr;
@@ -14,8 +15,8 @@ struct Args {
     /// File to send (omit to open the GUI, if built with it)
     file: Option<PathBuf>,
 
-    /// Receiver address (IP:port)
-    receiver: Option<SocketAddr>,
+    /// Receiver as <ID>@<host>:<port> (the receiver prints it at startup)
+    receiver: Option<String>,
 
     /// Local bind address
     #[arg(short, long, default_value = "0.0.0.0:0")]
@@ -38,6 +39,18 @@ struct Args {
     #[arg(long)]
     max_rate: Option<String>,
 
+    /// Shared secret the receiver also uses (or set SHARP256_SECRET)
+    #[arg(long, env = "SHARP256_SECRET", hide_env_values = true)]
+    secret: Option<String>,
+
+    /// Identity key file (default: per-user data directory)
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// Print this machine's SHARP ID and exit
+    #[arg(long)]
+    id: bool,
+
     /// Directory for resume state (default: per-user data directory)
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -51,42 +64,65 @@ struct Args {
     headless: bool,
 }
 
+fn load_identity(path: &Option<PathBuf>) -> Result<Identity> {
+    let path = match path {
+        Some(p) => p.clone(),
+        None => Identity::default_path().context("no per-user data directory")?,
+    };
+    Identity::load_or_create(&path).with_context(|| format!("identity {}", path.display()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
 
-    match (&args.file, args.receiver) {
-        (Some(file), Some(receiver)) => run_headless(&args, file.clone(), receiver).await,
+    if args.id {
+        println!("{}", load_identity(&args.identity)?.id());
+        return Ok(());
+    }
+    match (&args.file, &args.receiver) {
+        (Some(file), Some(receiver)) => run_headless(&args, file.clone(), receiver.clone()).await,
         _ if args.headless => {
             anyhow::bail!("headless mode needs both <FILE> and <RECEIVER>")
         }
         _ => {
             #[cfg(feature = "gui")]
             {
-                sharp256::gui::run_sender_gui(args.file.clone(), args.receiver)
+                sharp256::gui::run_sender_gui(args.file.clone(), args.receiver.clone())
             }
             #[cfg(not(feature = "gui"))]
             {
-                anyhow::bail!("usage: sharp-sender <FILE> <RECEIVER_IP:PORT>")
+                anyhow::bail!("usage: sharp-sender <FILE> <ID>@<HOST>:<PORT>")
             }
         }
     }
 }
 
-async fn run_headless(args: &Args, file: PathBuf, receiver: SocketAddr) -> Result<()> {
+async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()> {
     if !file.is_file() {
         anyhow::bail!("not a file: {}", file.display());
     }
+    let (receiver_id, host) =
+        sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?;
+    let addr = sharp256::address::resolve(&host)
+        .await
+        .with_context(|| format!("cannot resolve {}", host))?;
+    let identity = load_identity(&args.identity)?;
     let size = std::fs::metadata(&file)?.len();
     println!("{}", system_info());
     println!("File:      {} ({})", file.display(), format_bytes(size));
-    println!("Receiver:  {}", receiver);
+    println!("Receiver:  {} ({})", addr, receiver_id);
+    println!("Sender ID: {}", identity.id());
 
-    let mut cfg = SenderConfig::new(receiver, file);
+    let mut cfg = SenderConfig::new(addr, receiver_id, file);
     cfg.bind = args.bind;
     let _ = args.no_nat;
     cfg.state_dir = args.state_dir.clone();
+    cfg.identity = Some(identity);
+    if let Some(secret) = &args.secret {
+        cfg.psk = Some(psk_from_passphrase(secret, &receiver_id));
+    }
     if let Some(c) = args.chunk_size {
         cfg.transport.max_chunk = c;
     }
@@ -102,11 +138,15 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: SocketAddr) -> Resul
     cfg.events = Some(Arc::new(move |ev: TransferEvent| match ev {
         TransferEvent::Started {
             peer,
+            cipher,
             chunk_size,
             resumed_from,
             ..
         } => {
-            println!("Connected to {} (chunk {} B)", peer, chunk_size);
+            println!(
+                "Connected to {} (encrypted, {}; chunk {} B)",
+                peer, cipher, chunk_size
+            );
             if resumed_from > 0 {
                 println!(
                     "Resuming: {} already at receiver",

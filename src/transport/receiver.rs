@@ -1,22 +1,36 @@
 //! Receiving side: one `Receiver` serves many concurrent transfers.
 //!
 //! The socket is read by a single dispatcher task that drains all queued
-//! datagrams and routes them by connection id to per-transfer session tasks.
+//! datagrams. Transport packets are routed by their connection id to
+//! per-transfer session tasks. Anything else must be a handshake initiation
+//! made by someone who knows this receiver's ID (its mac1 proves it);
+//! everything that is not is dropped without an answer, so the receiver is
+//! invisible to scanners. Initiations are rate limited per source, answered
+//! with cookies when the receiver is under load, checked for replays, and
+//! then authorised by the sender's identity.
+//!
 //! A session:
 //!
-//! * validates HELLO, decides (policy) and answers HELLO_ACK with accurate
-//!   resume information computed from what is already durable on disk;
-//! * verifies every DATA packet's tag and hands the payload, without copying
-//!   it again, to a coalescing writer thread at its absolute offset; received
-//!   bytes are tracked in a `RangeSet`;
+//! * decides on the transfer (policy, or the application's decision, during
+//!   which the sender is told "pending") and answers the handshake with
+//!   accurate resume information computed from what is already durable;
+//! * decrypts every transport packet and hands DATA payloads, without
+//!   copying them again, to a coalescing writer thread at their absolute
+//!   offsets; received bytes are tracked in a `RangeSet`;
 //! * sends selective ACKs whose hole list always describes the acknowledged
 //!   interval completely (the interval is shortened when the list is full);
 //! * persists durable progress periodically (after fsync) for resume;
 //! * when every byte is present, closes, hashes and renames the file in a
 //!   background task while it keeps answering the sender, then exchanges
-//!   FIN / FIN_ACK.
+//!   FIN / FIN_ACK / FIN_DONE.
 
 use crate::config::{AcceptPolicy, IncomingRequest, ReceiverConfig, TransportConfig};
+use crate::crypto::handshake::{self as hs, CookieJar, HandshakeLimiter, ReplayGuard, Responder};
+use crate::crypto::replay::ReplayWindow;
+use crate::crypto::transport::{
+    begin_packet, peek_cid, SessionKeys, Suite, HEADER_LEN, OVERHEAD, TAG_LEN,
+};
+use crate::crypto::{Identity, SharpId, NO_PSK};
 use crate::file::{
     available_space, hash_file, hash_to_hex, part_path_for, rename_with_retry, sanitize_file_name,
     unique_path, FileWriter,
@@ -24,11 +38,13 @@ use crate::file::{
 use crate::progress::{emit, EventCallback, TransferEvent, TransferStats};
 use crate::protocol::constants::*;
 use crate::protocol::wire::{
-    self, Ack, Fin, Header, Hello, HelloAck, Message, MsgType, Pong, ProbeAck, TagKey,
+    self, parse_type_byte, type_byte, Ack, Fin, Hello, HelloAck, Message, MsgType, Pong, ProbeAck,
+    MAX_CONTROL_BODY,
 };
 use crate::protocol::RangeSet;
 use crate::state::{hex16, ReceiverState, StateStore};
 use crate::transport::socket::bind_udp;
+use rand::RngCore;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -37,13 +53,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecvError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("identity: {0}")]
+    Identity(String),
 }
 
 /// Resume state older than this is deleted when a receiver starts.
@@ -53,6 +71,22 @@ const STATE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 const SESSION_QUEUE: usize = 16_384;
 /// Messages a session handles per wakeup before it checks its timers.
 const SESSION_BATCH: usize = 256;
+/// Senders whose last initiation timestamp is remembered (replay guard).
+const REPLAY_GUARD_CAPACITY: usize = 100_000;
+
+/// A transfer is identified by who sends it and its transfer id.
+type TransferKey = (SharpId, [u8; 16]);
+
+/// An authenticated initiation routed to the session it belongs to.
+struct Handshake {
+    incoming: hs::Incoming,
+    init: wire::Initiation,
+    suite: Suite,
+    /// Connection id the dispatcher assigned to the session for it.
+    cid: u64,
+    from: SocketAddr,
+    at: Instant,
+}
 
 /// Messages delivered to a session task.
 enum Incoming {
@@ -61,6 +95,7 @@ enum Incoming {
         from: SocketAddr,
         at: Instant,
     },
+    Handshake(Box<Handshake>),
     /// The writer finished an fsync requested for persistence.
     FlushDone(io::Result<()>),
     /// Background close + hash + rename finished.
@@ -69,7 +104,8 @@ enum Incoming {
 
 struct SessionHandle {
     tx: mpsc::Sender<Incoming>,
-    transfer_id: [u8; 16],
+    /// The session's current connection id.
+    cid: u64,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -78,6 +114,7 @@ struct Shared {
     socket: Arc<UdpSocket>,
     store: Option<StateStore>,
     cancel: CancellationToken,
+    identity: Identity,
 }
 
 pub struct Receiver {
@@ -90,10 +127,20 @@ impl Receiver {
             transport: cfg.transport.normalized(),
             ..cfg
         };
+        let identity = match &cfg.identity {
+            Some(id) => id.clone(),
+            None => {
+                let path = Identity::default_path()
+                    .ok_or_else(|| RecvError::Identity("no per-user data directory".into()))?;
+                Identity::load_or_create(&path)
+                    .map_err(|e| RecvError::Identity(format!("{}: {}", path.display(), e)))?
+            }
+        };
         std::fs::create_dir_all(&cfg.output_dir)?;
         let socket = bind_udp(cfg.bind, cfg.transport.socket_buffer_bytes)?;
         tracing::info!(
-            "receiver listening on {}, output {}",
+            "receiver {} listening on {}, output {}",
+            identity.id(),
             socket.local_addr()?,
             cfg.output_dir.display()
         );
@@ -118,12 +165,18 @@ impl Receiver {
                 socket: Arc::new(socket),
                 store,
                 cancel: CancellationToken::new(),
+                identity,
             }),
         })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.shared.socket.local_addr()
+    }
+
+    /// Our identity: senders need it to reach us.
+    pub fn id(&self) -> SharpId {
+        self.shared.identity.id()
     }
 
     /// Token that stops the receiver (sessions persist their state first).
@@ -160,10 +213,9 @@ impl Receiver {
 
         let socket = shared.socket.clone();
         let cancel = shared.cancel.clone();
-        let mut sessions: HashMap<u32, SessionHandle> = HashMap::new();
-        let (done_tx, mut done_rx) = mpsc::channel::<u32>(256);
+        let (done_tx, mut done_rx) = mpsc::channel::<TransferKey>(256);
+        let mut d = Dispatcher::new(shared.clone(), done_tx);
         let mut buf = vec![0u8; MAX_DATAGRAM];
-        let mut dropped: u64 = 0;
 
         loop {
             tokio::select! {
@@ -189,35 +241,15 @@ impl Receiver {
                                 continue;
                             }
                         }
-                        let Ok(hdr) = wire::parse_header(pkt) else { continue };
-                        let now = Instant::now();
-                        if hdr.msg_type == MsgType::Hello {
-                            handle_hello(&shared, &mut sessions, &done_tx, pkt, hdr, from, now);
-                            continue;
-                        }
-                        if let Some(s) = sessions.get(&hdr.conn_id) {
-                            let msg = Incoming::Packet { data: pkt.to_vec(), from, at: now };
-                            if s.tx.try_send(msg).is_err() {
-                                dropped += 1;
-                                if dropped.is_power_of_two() {
-                                    tracing::debug!("session queue full: {} datagrams dropped so far", dropped);
-                                }
-                            }
-                        }
+                        d.on_datagram(pkt, from, Instant::now());
                     }
                 }
-                Some(conn) = done_rx.recv() => {
-                    // Only forget the mapping if it still belongs to the task
-                    // that finished (a conn id may have been re-mapped).
-                    if sessions.get(&conn).is_some_and(|s| s.task.is_finished()) {
-                        sessions.remove(&conn);
-                    }
-                }
+                Some(key) = done_rx.recv() => d.forget(&key),
                 _ = cancel.cancelled() => {
-                    tracing::info!("receiver shutting down; {} active session(s)", sessions.len());
+                    tracing::info!("receiver shutting down; {} active session(s)", d.sessions.len());
                     // Sessions observe the same token; wait until each one has
                     // flushed its file and persisted its resume state.
-                    let handles: Vec<_> = sessions.drain().map(|(_, s)| s.task).collect();
+                    let handles: Vec<_> = d.sessions.drain().map(|(_, s)| s.task).collect();
                     for h in handles {
                         let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
                     }
@@ -234,133 +266,254 @@ impl Receiver {
     }
 }
 
-fn handle_hello(
-    shared: &Arc<Shared>,
-    sessions: &mut HashMap<u32, SessionHandle>,
-    done_tx: &mpsc::Sender<u32>,
-    pkt: &[u8],
-    hdr: Header,
-    from: SocketAddr,
-    now: Instant,
-) {
-    let Some(tid) = wire::peek_hello_transfer_id(pkt) else {
-        return;
-    };
-    let key = TagKey::derive(&tid);
-    if !wire::verify_tag(pkt, &key) {
-        return;
+// ---------------------------------------------------------------------------
+// Dispatcher
+// ---------------------------------------------------------------------------
+
+struct Dispatcher {
+    shared: Arc<Shared>,
+    responder: Responder,
+    cookies: CookieJar,
+    limiter: HandshakeLimiter,
+    replays: ReplayGuard,
+    sessions: HashMap<TransferKey, SessionHandle>,
+    by_cid: HashMap<u64, TransferKey>,
+    done_tx: mpsc::Sender<TransferKey>,
+    dropped: u64,
+}
+
+impl Dispatcher {
+    fn new(shared: Arc<Shared>, done_tx: mpsc::Sender<TransferKey>) -> Self {
+        let cfg = &shared.cfg;
+        let responder = Responder::new(shared.identity.clone(), cfg.psk.unwrap_or(NO_PSK));
+        let cookies = CookieJar::new(&shared.identity.id());
+        let limiter = HandshakeLimiter::new(
+            cfg.handshake_rate,
+            cfg.handshake_burst,
+            cfg.handshake_load_threshold,
+        );
+        Self {
+            shared,
+            responder,
+            cookies,
+            limiter,
+            replays: ReplayGuard::new(REPLAY_GUARD_CAPACITY),
+            sessions: HashMap::new(),
+            by_cid: HashMap::new(),
+            done_tx,
+            dropped: 0,
+        }
     }
-    let hello = match wire::decode_body(MsgType::Hello, wire::body_of(pkt)) {
-        Ok(Message::Hello(h)) => h,
-        _ => return,
-    };
-    let forward = |s: &SessionHandle| {
-        let _ = s.tx.try_send(Incoming::Packet {
-            data: pkt.to_vec(),
+
+    fn on_datagram(&mut self, pkt: &[u8], from: SocketAddr, now: Instant) {
+        if let Some(cid) = peek_cid(pkt) {
+            if let Some(key) = self.by_cid.get(&cid) {
+                if pkt.len() < OVERHEAD {
+                    return;
+                }
+                if let Some(s) = self.sessions.get(key) {
+                    let msg = Incoming::Packet {
+                        data: pkt.to_vec(),
+                        from,
+                        at: now,
+                    };
+                    if s.tx.try_send(msg).is_err() {
+                        self.dropped += 1;
+                        if self.dropped.is_power_of_two() {
+                            tracing::debug!(
+                                "session queue full: {} datagrams dropped so far",
+                                self.dropped
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        // Not for a known connection: an initiation by someone who knows our
+        // ID, or nothing we ever answer.
+        if self.responder.is_initiation(pkt) {
+            self.on_initiation(pkt, from, now);
+        }
+    }
+
+    fn on_initiation(&mut self, pkt: &[u8], from: SocketAddr, now: Instant) {
+        let under_load = self.limiter.note_initiation(now);
+        if under_load && !self.cookies.mac2_ok(pkt, from, now) {
+            // Make the sender prove it receives at its address before we
+            // spend public-key operations on it.
+            if let Some(reply) = self.cookies.reply(pkt, from, now) {
+                let _ = self.shared.socket.try_send_to(&reply, from);
+            }
+            return;
+        }
+        if !self.limiter.allow(from.ip(), now) {
+            return;
+        }
+        let incoming = match self.responder.read_initiation(pkt) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::debug!("initiation from {} rejected: {}", from, e);
+                return;
+            }
+        };
+        let init = match wire::decode_initiation(&incoming.payload) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::debug!("malformed initiation payload from {}: {}", from, e);
+                return;
+            }
+        };
+        if !self.replays.accept(&incoming.sender, init.timestamp) {
+            tracing::debug!("replayed initiation from {} ignored", from);
+            return;
+        }
+        let sender = incoming.sender;
+        if let Some(allowed) = &self.shared.cfg.allowed_senders {
+            if !allowed.contains(&sender) {
+                tracing::info!(
+                    "transfer from {} ({}) refused: sender not allowed",
+                    from,
+                    sender
+                );
+                self.reject(
+                    incoming,
+                    &init,
+                    from,
+                    REASON_UNAUTHORIZED,
+                    "sender not authorized",
+                );
+                return;
+            }
+        }
+        let Some(suite) = Suite::choose(init.suites, init.hardware_aes) else {
+            self.reject(
+                incoming,
+                &init,
+                from,
+                REASON_NO_SUITE,
+                "no cipher in common",
+            );
+            return;
+        };
+        let key = (sender, init.hello.transfer_id);
+        let cid = self.new_cid();
+        let handshake = Box::new(Handshake {
+            incoming,
+            init,
+            suite,
+            cid,
             from,
             at: now,
         });
-    };
 
-    // Same connection id: duplicate or resync of a known transfer.
-    if let Some(s) = sessions.get(&hdr.conn_id) {
-        if s.transfer_id == tid && !s.task.is_finished() {
-            forward(s);
-            return;
+        // A new handshake of a transfer we already serve (the sender lost the
+        // session after an outage, or restarted): move the session over.
+        if let Some(s) = self.sessions.get_mut(&key) {
+            if !s.task.is_finished() {
+                self.by_cid.remove(&s.cid);
+                s.cid = cid;
+                self.by_cid.insert(cid, key);
+                let _ = s.tx.try_send(Incoming::Handshake(handshake));
+                return;
+            }
+            let old = self.sessions.remove(&key).expect("present");
+            self.by_cid.remove(&old.cid);
         }
-        if s.transfer_id != tid && !s.task.is_finished() {
-            reject(
-                shared,
-                &key,
-                hdr.conn_id,
+
+        self.prune();
+        if self.sessions.len() >= self.shared.cfg.max_sessions {
+            let Handshake { incoming, init, .. } = *handshake;
+            self.reject(
+                incoming,
+                &init,
                 from,
-                &hello,
-                REASON_CONN_CONFLICT,
-                "connection id in use",
+                REASON_BUSY,
+                "too many concurrent transfers",
             );
             return;
         }
-        sessions.remove(&hdr.conn_id);
-    }
-    // Same transfer under a new connection id (sender restarted): re-map.
-    if let Some(old_conn) = sessions
-        .iter()
-        .find(|(_, s)| s.transfer_id == tid && !s.task.is_finished())
-        .map(|(&c, _)| c)
-    {
-        let handle = sessions.remove(&old_conn).expect("present");
-        forward(&handle);
-        sessions.insert(hdr.conn_id, handle);
-        return;
-    }
-    sessions.retain(|_, s| !s.task.is_finished());
-    if sessions.len() >= shared.cfg.max_sessions {
-        reject(
-            shared,
-            &key,
-            hdr.conn_id,
-            from,
-            &hello,
-            REASON_BUSY,
-            "too many concurrent transfers",
-        );
-        return;
+        let (tx, rx) = mpsc::channel::<Incoming>(SESSION_QUEUE);
+        let _ = tx.try_send(Incoming::Handshake(handshake));
+        let shared = self.shared.clone();
+        let done_tx = self.done_tx.clone();
+        let session_tx = tx.clone();
+        let task = tokio::spawn(async move {
+            let session = Session::new(shared, key, from, session_tx);
+            let key = session.run(rx).await;
+            let _ = done_tx.send(key).await;
+        });
+        self.by_cid.insert(cid, key);
+        self.sessions.insert(key, SessionHandle { tx, cid, task });
     }
 
-    let (tx, rx) = mpsc::channel::<Incoming>(SESSION_QUEUE);
-    let _ = tx.try_send(Incoming::Packet {
-        data: pkt.to_vec(),
-        from,
-        at: now,
-    });
-    let shared_for_task = shared.clone();
-    let done_tx = done_tx.clone();
-    let conn_id = hdr.conn_id;
-    let session_tx = tx.clone();
-    let task = tokio::spawn(async move {
-        let session = Session::new(shared_for_task, conn_id, tid, key, from, session_tx);
-        let final_conn = session.run(rx).await;
-        let _ = done_tx.send(final_conn).await;
-    });
-    sessions.insert(
-        hdr.conn_id,
-        SessionHandle {
-            tx,
-            transfer_id: tid,
-            task,
-        },
-    );
+    /// Answers an authenticated initiation with a rejection; no session is
+    /// created.
+    fn reject(
+        &self,
+        incoming: hs::Incoming,
+        init: &wire::Initiation,
+        to: SocketAddr,
+        reason: u8,
+        message: &str,
+    ) {
+        let payload = wire::encode_response(&wire::Response {
+            suite: 0,
+            ack_flags: 0,
+            ack: rejection(init.hello.timestamp, reason, message),
+        });
+        if let Ok((pkt, _)) = incoming.respond(self.new_cid(), &payload) {
+            let _ = self.shared.socket.try_send_to(&pkt, to);
+        }
+    }
+
+    fn new_cid(&self) -> u64 {
+        loop {
+            let c = rand::rngs::OsRng.next_u64();
+            if c != 0 && !self.by_cid.contains_key(&c) {
+                return c;
+            }
+        }
+    }
+
+    /// Drops the routing of a session whose task ended.
+    fn forget(&mut self, key: &TransferKey) {
+        if self.sessions.get(key).is_some_and(|s| s.task.is_finished()) {
+            if let Some(s) = self.sessions.remove(key) {
+                self.by_cid.remove(&s.cid);
+            }
+        }
+    }
+
+    fn prune(&mut self) {
+        let finished: Vec<TransferKey> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.task.is_finished())
+            .map(|(k, _)| *k)
+            .collect();
+        for k in finished {
+            if let Some(s) = self.sessions.remove(&k) {
+                self.by_cid.remove(&s.cid);
+            }
+        }
+    }
 }
 
-fn reject(
-    shared: &Shared,
-    key: &TagKey,
-    conn_id: u32,
-    to: SocketAddr,
-    hello: &Hello,
-    reason: u8,
-    message: &str,
-) {
-    let ack = HelloAck {
+fn rejection(echo_ts: u32, reason: u8, message: &str) -> HelloAck {
+    HelloAck {
         status: HELLO_REJECTED,
         reason,
         max_chunk: 0,
         capabilities: 0,
-        echo_ts: hello.timestamp,
+        echo_ts,
         max_ack_delay_us: 0,
         rwnd: 0,
         resume_upto: 0,
         known_end: 0,
         holes: Vec::new(),
         message: message.to_string(),
-    };
-    let bytes = wire::encode(
-        &Header::new(MsgType::HelloAck, conn_id),
-        &Message::HelloAck(ack),
-        key,
-    );
-    let _ = shared.socket.try_send_to(&bytes, to);
-    tracing::info!("rejected transfer from {}: {}", to, message);
+    }
 }
 
 /// Closes the writer (fsync), hashes the partial file and moves it to its
@@ -406,12 +559,24 @@ async fn finish_file(
     Ok((hash, target))
 }
 
+/// Resolves when the application decided, or never without a pending
+/// decision.
+async fn decided(rx: &mut Option<oneshot::Receiver<bool>>) -> bool {
+    match rx {
+        Some(r) => r.await.unwrap_or(false),
+        None => std::future::pending().await,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
 enum Phase {
-    Handshake,
+    /// Waiting for the application to accept or decline.
+    Pending {
+        deadline: Instant,
+    },
     Receiving,
     /// All bytes present; closing, hashing and renaming in the background.
     Verifying,
@@ -424,16 +589,29 @@ enum Phase {
     },
 }
 
+/// Keys and packet state of the session's current handshake.
+struct Secure {
+    keys: SessionKeys,
+    /// Our connection id: the sender addresses its packets to it.
+    local_cid: u64,
+    /// The sender's connection id: our packets are addressed to it.
+    peer_cid: u64,
+    next_pn: u64,
+    replay: ReplayWindow,
+    auth_failures: u64,
+}
+
 struct Session {
     shared: Arc<Shared>,
     cfg: TransportConfig,
     events: Option<EventCallback>,
     self_tx: mpsc::Sender<Incoming>,
 
-    conn_id: u32,
     transfer_id: [u8; 16],
-    key: TagKey,
+    sender: SharpId,
     peer: SocketAddr,
+    secure: Option<Secure>,
+    tx_buf: Vec<u8>,
 
     file_name: String,
     file_size: u64,
@@ -472,9 +650,7 @@ struct Session {
 impl Session {
     fn new(
         shared: Arc<Shared>,
-        conn_id: u32,
-        transfer_id: [u8; 16],
-        key: TagKey,
+        key: TransferKey,
         peer: SocketAddr,
         self_tx: mpsc::Sender<Incoming>,
     ) -> Self {
@@ -486,10 +662,11 @@ impl Session {
             cfg,
             events,
             self_tx,
-            conn_id,
-            transfer_id,
-            key,
+            transfer_id: key.1,
+            sender: key.0,
             peer,
+            secure: None,
+            tx_buf: Vec::with_capacity(MAX_CONTROL_DATAGRAM),
             file_name: String::new(),
             file_size: 0,
             file_mtime: 0,
@@ -517,7 +694,7 @@ impl Session {
             retransmitted_bytes: 0,
             writer_full_drops: 0,
             got_data: false,
-            phase: Phase::Handshake,
+            phase: Phase::Receiving,
         }
     }
 
@@ -525,53 +702,49 @@ impl Session {
         hex16(&self.transfer_id)
     }
 
-    fn send(&self, msg_type: MsgType, flags: u16, msg: &Message<'_>) {
-        let hdr = Header::new(msg_type, self.conn_id).with_flags(flags);
-        let bytes = wire::encode(&hdr, msg, &self.key);
-        if let Err(e) = self.shared.socket.try_send_to(&bytes, self.peer) {
+    fn key(&self) -> TransferKey {
+        (self.sender, self.transfer_id)
+    }
+
+    /// Encrypts `msg` as a transport packet to the sender.
+    fn send(&mut self, flags: u8, msg: &Message<'_>) {
+        let Some(sec) = self.secure.as_mut() else {
+            return;
+        };
+        let pn = sec.next_pn;
+        sec.next_pn += 1;
+        begin_packet(
+            &mut self.tx_buf,
+            sec.peer_cid,
+            type_byte(msg.msg_type(), flags),
+            pn,
+        );
+        wire::encode_body(msg, &mut self.tx_buf, MAX_CONTROL_BODY);
+        if sec.keys.send.seal(&mut self.tx_buf).is_err() {
+            return;
+        }
+        if let Err(e) = self.shared.socket.try_send_to(&self.tx_buf, self.peer) {
             if e.kind() != io::ErrorKind::WouldBlock {
-                tracing::debug!("send {:?} failed: {}", msg_type, e);
+                tracing::debug!("send {:?} failed: {}", msg.msg_type(), e);
             }
         }
     }
 
     // ----- lifecycle -------------------------------------------------------
 
-    /// Runs the session; returns the connection id it ended with.
-    async fn run(mut self, mut rx: mpsc::Receiver<Incoming>) -> u32 {
-        // Wait for the first HELLO (already queued by the dispatcher).
+    /// Runs the session; returns its key when it ends.
+    async fn run(mut self, mut rx: mpsc::Receiver<Incoming>) -> TransferKey {
+        // The session was created for its first handshake.
         let first = loop {
             match rx.recv().await {
-                Some(Incoming::Packet { data, from, at }) => {
-                    if let Some(h) = self.parse_hello(&data) {
-                        self.peer = from;
-                        self.last_rx = at;
-                        break h;
-                    }
-                }
+                Some(Incoming::Handshake(h)) => break h,
                 Some(_) => {}
-                None => return self.conn_id,
+                None => return self.key(),
             }
         };
-        if !self.open(&first).await {
-            return self.conn_id;
-        }
-        self.phase = Phase::Receiving;
-        self.answer_hello(&first);
-        emit(
-            &self.events,
-            TransferEvent::Started {
-                transfer_id: self.tid_hex(),
-                peer: self.peer.to_string(),
-                file_name: self.file_name.clone(),
-                file_size: self.file_size,
-                resumed_from: self.resumed_from,
-                chunk_size: self.max_chunk,
-            },
-        );
-        if self.received.total() >= self.file_size {
-            self.begin_finishing();
-        }
+        let Some(mut decision) = self.start(*first) else {
+            return self.key();
+        };
 
         let cancel = self.shared.cancel.clone();
         let mut tick = tokio::time::interval(Duration::from_millis(10));
@@ -585,17 +758,23 @@ impl Session {
                 msg = rx.recv() => {
                     let Some(msg) = msg else {
                         self.stop(&mut rx, "dispatcher dropped the session").await;
-                        return self.conn_id;
+                        return self.key();
                     };
                     if self.handle(msg).await.is_break() {
-                        return self.conn_id;
+                        return self.key();
                     }
                     // Drain what is already queued before looking at timers.
                     for _ in 0..SESSION_BATCH {
                         let Ok(msg) = rx.try_recv() else { break };
                         if self.handle(msg).await.is_break() {
-                            return self.conn_id;
+                            return self.key();
                         }
+                    }
+                }
+                accepted = decided(&mut decision) => {
+                    decision = None;
+                    if self.on_decision(accepted).is_break() {
+                        return self.key();
                     }
                 }
                 _ = tokio::time::sleep(ack_wait.unwrap_or(Duration::from_secs(3600))), if ack_wait.is_some() => {
@@ -603,7 +782,7 @@ impl Session {
                 }
                 _ = tick.tick() => {
                     if self.housekeeping(Instant::now()).await.is_break() {
-                        return self.conn_id;
+                        return self.key();
                     }
                 }
                 _ = progress.tick() => {
@@ -611,7 +790,7 @@ impl Session {
                 }
                 _ = cancel.cancelled() => {
                     self.stop(&mut rx, "receiver shutting down").await;
-                    return self.conn_id;
+                    return self.key();
                 }
             }
         }
@@ -642,13 +821,21 @@ impl Session {
                 let hash = *hash;
                 self.complete(hash, false);
             }
-            Phase::Handshake | Phase::Receiving => self.suspend(why).await,
+            Phase::Pending { .. } => self.emit_failed(why.to_string(), false),
+            Phase::Receiving => self.suspend(why).await,
         }
     }
 
     async fn handle(&mut self, msg: Incoming) -> ControlFlow<()> {
         match msg {
             Incoming::Packet { data, from, at } => self.on_packet(data, from, at).await,
+            Incoming::Handshake(h) => {
+                // The sender performed a new handshake (after an outage or a
+                // restart): answer with our current state under new keys.
+                self.last_rx = h.at;
+                self.respond(*h);
+                ControlFlow::Continue(())
+            }
             Incoming::FlushDone(result) => {
                 self.on_flush_done(result);
                 ControlFlow::Continue(())
@@ -657,23 +844,123 @@ impl Session {
         }
     }
 
-    fn parse_hello(&self, data: &[u8]) -> Option<Hello> {
-        let hdr = wire::parse_header(data).ok()?;
-        if hdr.msg_type != MsgType::Hello || !wire::verify_tag(data, &self.key) {
+    /// Decides on the transfer and answers its first handshake. Returns the
+    /// pending decision (if the application has to decide), or `None` when
+    /// the transfer was rejected.
+    fn start(&mut self, h: Handshake) -> Option<Option<oneshot::Receiver<bool>>> {
+        self.peer = h.from;
+        self.last_rx = h.at;
+        let hello = h.init.hello.clone();
+        if let Err((reason, message)) = self.prepare(&hello) {
+            self.reject_handshake(h, reason, &message);
             return None;
         }
-        match wire::decode_body(MsgType::Hello, wire::body_of(data)) {
-            Ok(Message::Hello(h)) if h.transfer_id == self.transfer_id => Some(h),
-            _ => None,
+        emit(
+            &self.events,
+            TransferEvent::IncomingRequest {
+                transfer_id: self.tid_hex(),
+                peer: self.peer.to_string(),
+                sender_id: self.sender.to_string(),
+                file_name: self.file_name.clone(),
+                file_size: self.file_size,
+                resumed_bytes: self.received.total(),
+            },
+        );
+        match self.shared.cfg.accept.clone() {
+            AcceptPolicy::AcceptAll => {
+                if let Err(message) = self.create_file() {
+                    self.reject_handshake(h, REASON_INTERNAL, &message);
+                    return None;
+                }
+                self.phase = Phase::Receiving;
+                self.respond(h);
+                self.on_accepted();
+                Some(None)
+            }
+            AcceptPolicy::Ask(cb) => {
+                let (tx, rx) = oneshot::channel();
+                cb(
+                    IncomingRequest {
+                        transfer_id: self.tid_hex(),
+                        peer: self.peer,
+                        sender_id: self.sender,
+                        file_name: self.file_name.clone(),
+                        file_size: self.file_size,
+                        resumed_bytes: self.received.total(),
+                    },
+                    tx,
+                );
+                self.phase = Phase::Pending {
+                    deadline: Instant::now() + self.cfg.handshake_timeout,
+                };
+                self.respond(h);
+                Some(Some(rx))
+            }
         }
     }
 
-    /// Validates the request, resolves resume state, opens the file. Sends a
-    /// rejection and returns false if the transfer cannot start.
-    async fn open(&mut self, hello: &Hello) -> bool {
+    /// The application accepted or declined a pending transfer.
+    fn on_decision(&mut self, accepted: bool) -> ControlFlow<()> {
+        if !matches!(self.phase, Phase::Pending { .. }) {
+            return ControlFlow::Continue(());
+        }
+        if !accepted {
+            self.send_rejection(REASON_DECLINED, "declined by user");
+            self.emit_failed("declined by user".into(), false);
+            return ControlFlow::Break(());
+        }
+        if let Err(message) = self.create_file() {
+            self.send_rejection(REASON_INTERNAL, &message);
+            self.report_failure(message, false);
+            return ControlFlow::Break(());
+        }
+        self.phase = Phase::Receiving;
+        // Tell the sender right away instead of at its next poll.
+        let (ack, flags) = self.current_ack(0, SUPPORTED_CAPS);
+        self.send(flags, &Message::HelloAck(ack));
+        self.on_accepted();
+        ControlFlow::Continue(())
+    }
+
+    fn on_accepted(&mut self) {
+        let cipher = self
+            .secure
+            .as_ref()
+            .map(|s| s.keys.suite.name())
+            .unwrap_or("none");
+        tracing::info!(
+            "transfer {} from {} ({}): {} ({} bytes) -> {}, {}",
+            self.tid_hex(),
+            self.peer,
+            self.sender,
+            self.file_name,
+            self.file_size,
+            self.final_path.display(),
+            cipher
+        );
+        emit(
+            &self.events,
+            TransferEvent::Started {
+                transfer_id: self.tid_hex(),
+                peer: self.peer.to_string(),
+                peer_id: self.sender.to_string(),
+                cipher: cipher.to_string(),
+                file_name: self.file_name.clone(),
+                file_size: self.file_size,
+                resumed_from: self.resumed_from,
+                chunk_size: self.max_chunk,
+            },
+        );
+        if self.received.total() >= self.file_size {
+            self.begin_finishing();
+        }
+    }
+
+    /// Validates the request and resolves resume state and paths. The file
+    /// itself is created by [`Session::create_file`] once accepted.
+    fn prepare(&mut self, hello: &Hello) -> Result<(), (u8, String)> {
         let Some(name) = sanitize_file_name(&hello.file_name) else {
-            self.reject(hello, REASON_BAD_FILE_NAME, "file name is not acceptable");
-            return false;
+            return Err((REASON_BAD_FILE_NAME, "file name is not acceptable".into()));
         };
         self.file_name = name.clone();
         self.file_size = hello.file_size;
@@ -683,16 +970,21 @@ impl Session {
 
         // Resume: by transfer id first, then by file identity (name, size and
         // source modification time, so that a changed source starts afresh
-        // instead of failing the whole-file check at the very end).
+        // instead of failing the whole-file check at the very end). Only the
+        // sender that started a partial file may continue it.
         let tid_hex = self.tid_hex();
+        let sender = self.sender.to_string();
         let saved = self.shared.store.as_ref().and_then(|st| {
             st.load_receiver(&tid_hex)
                 .filter(|s| {
-                    s.file_size == hello.file_size
+                    s.sender == sender
+                        && s.file_size == hello.file_size
                         && s.file_mtime == hello.file_mtime
                         && s.part_path.exists()
                 })
-                .or_else(|| st.find_receiver_by_file(&name, hello.file_size, hello.file_mtime))
+                .or_else(|| {
+                    st.find_receiver_by_file(&sender, &name, hello.file_size, hello.file_mtime)
+                })
         });
         let mut durable = RangeSet::new();
         if let Some(saved) = &saved {
@@ -734,117 +1026,52 @@ impl Session {
         let needed = hello.file_size.saturating_sub(durable.total());
         match available_space(&out_dir) {
             Ok(avail) if avail < needed.saturating_add(1 << 20) => {
-                self.reject(
-                    hello,
+                return Err((
                     REASON_DISK_SPACE,
-                    &format!("need {} bytes, {} available", needed, avail),
-                );
-                return false;
+                    format!("need {} bytes, {} available", needed, avail),
+                ));
             }
             Ok(_) => {}
             Err(e) => tracing::warn!("cannot query free space: {}", e),
         }
-
-        emit(
-            &self.events,
-            TransferEvent::IncomingRequest {
-                transfer_id: tid_hex.clone(),
-                peer: self.peer.to_string(),
-                file_name: name.clone(),
-                file_size: hello.file_size,
-                resumed_bytes: durable.total(),
-            },
-        );
-        if let AcceptPolicy::Ask(cb) = &self.shared.cfg.accept {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            cb(
-                IncomingRequest {
-                    transfer_id: tid_hex.clone(),
-                    peer: self.peer,
-                    file_name: name.clone(),
-                    file_size: hello.file_size,
-                    resumed_bytes: durable.total(),
-                },
-                tx,
-            );
-            let wait = self
-                .cfg
-                .handshake_timeout
-                .saturating_sub(Duration::from_secs(2));
-            match tokio::time::timeout(wait, rx).await {
-                Ok(Ok(true)) => {}
-                Ok(_) => {
-                    self.reject(hello, REASON_DECLINED, "declined by user");
-                    return false;
-                }
-                Err(_) => {
-                    self.reject(hello, REASON_TIMEOUT, "no decision in time");
-                    return false;
-                }
-            }
-        }
-
-        match FileWriter::open(
-            &self.part_path,
-            hello.file_size,
-            self.cfg.writer_capacity_bytes,
-        ) {
-            Ok(w) => self.writer = Some(w),
-            Err(e) => {
-                self.reject(
-                    hello,
-                    REASON_INTERNAL,
-                    &format!("cannot open output file: {}", e),
-                );
-                return false;
-            }
-        }
         self.received = durable;
         self.highest = self.received.last_end().unwrap_or(0);
         self.resumed_from = self.received.total();
+        Ok(())
+    }
+
+    /// Opens (creates or reopens) the partial file.
+    fn create_file(&mut self) -> Result<(), String> {
+        let writer = FileWriter::open(
+            &self.part_path,
+            self.file_size,
+            self.cfg.writer_capacity_bytes,
+        )
+        .map_err(|e| format!("cannot open output file: {}", e))?;
+        self.writer = Some(writer);
         self.persist_state_now();
-        tracing::info!(
-            "transfer {} from {}: {} ({} bytes) -> {}",
-            tid_hex,
-            self.peer,
-            name,
-            hello.file_size,
-            self.final_path.display()
-        );
-        true
+        Ok(())
     }
 
-    fn reject(&self, hello: &Hello, reason: u8, message: &str) {
-        reject(
-            &self.shared,
-            &self.key,
-            self.conn_id,
-            self.peer,
-            hello,
-            reason,
-            message,
-        );
-    }
-
-    /// Holes in `[from, to)`, complete for the (possibly shortened)
-    /// interval they describe; see [`wire::describe_holes`].
-    fn describe(&self, from: u64, to: u64) -> (Vec<(u64, u64)>, u64) {
-        wire::describe_holes(&self.received, from, to)
-    }
-
-    fn rwnd(&self) -> u64 {
-        match &self.writer {
-            Some(w) => w.available(),
-            None if matches!(self.phase, Phase::Receiving | Phase::Handshake) => {
-                self.cfg.writer_capacity_bytes
-            }
-            None => 0,
+    /// The HELLO_ACK describing our current state.
+    fn current_ack(&self, echo_ts: u32, offered_caps: u32) -> (HelloAck, u8) {
+        let max_ack_delay_us = self.cfg.ack_interval.as_micros().min(u32::MAX as u128) as u32;
+        if matches!(self.phase, Phase::Pending { .. }) {
+            let ack = HelloAck {
+                status: HELLO_PENDING,
+                reason: REASON_NONE,
+                max_chunk: self.max_chunk,
+                capabilities: offered_caps & SUPPORTED_CAPS,
+                echo_ts,
+                max_ack_delay_us,
+                rwnd: 0,
+                resume_upto: 0,
+                known_end: 0,
+                holes: Vec::new(),
+                message: String::new(),
+            };
+            return (ack, 0);
         }
-    }
-
-    /// Builds a HELLO_ACK from the current state (fresh on every HELLO, so a
-    /// re-synchronising sender learns exactly what is still missing).
-    fn answer_hello(&self, hello: &Hello) {
         let contiguous = self.received.contiguous_from(0);
         let last = self.received.last_end().unwrap_or(0).max(contiguous);
         let (holes, known_end) = self.describe(contiguous, last);
@@ -852,9 +1079,9 @@ impl Session {
             status: HELLO_ACCEPTED,
             reason: REASON_NONE,
             max_chunk: self.max_chunk,
-            capabilities: hello.capabilities & SUPPORTED_CAPS,
-            echo_ts: hello.timestamp,
-            max_ack_delay_us: self.cfg.ack_interval.as_micros().min(u32::MAX as u128) as u32,
+            capabilities: offered_caps & SUPPORTED_CAPS,
+            echo_ts,
+            max_ack_delay_us,
             rwnd: self.rwnd(),
             resume_upto: contiguous,
             known_end,
@@ -866,25 +1093,113 @@ impl Session {
         } else {
             0
         };
-        self.send(MsgType::HelloAck, flags, &Message::HelloAck(ack));
+        (ack, flags)
+    }
+
+    /// Answers a handshake with our current state and switches to its keys.
+    fn respond(&mut self, h: Handshake) {
+        let hello = &h.init.hello;
+        let (ack, ack_flags) = self.current_ack(hello.timestamp, hello.capabilities);
+        let payload = wire::encode_response(&wire::Response {
+            suite: h.suite as u8,
+            ack_flags,
+            ack,
+        });
+        let sender_cid = h.incoming.sender_cid;
+        match h.incoming.respond(h.cid, &payload) {
+            Ok((pkt, split)) => {
+                self.secure = Some(Secure {
+                    keys: SessionKeys::derive(&split, false, h.suite),
+                    local_cid: h.cid,
+                    peer_cid: sender_cid,
+                    next_pn: 0,
+                    replay: ReplayWindow::new(),
+                    auth_failures: 0,
+                });
+                self.peer = h.from;
+                if let Err(e) = self.shared.socket.try_send_to(&pkt, h.from) {
+                    tracing::debug!("sending handshake response failed: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("cannot answer handshake: {}", e),
+        }
+    }
+
+    /// Rejects the transfer in the handshake response (no session keys).
+    fn reject_handshake(&mut self, h: Handshake, reason: u8, message: &str) {
+        tracing::info!("rejected transfer from {}: {}", h.from, message);
+        let payload = wire::encode_response(&wire::Response {
+            suite: 0,
+            ack_flags: 0,
+            ack: rejection(h.init.hello.timestamp, reason, message),
+        });
+        if let Ok((pkt, _)) = h.incoming.respond(h.cid, &payload) {
+            let _ = self.shared.socket.try_send_to(&pkt, h.from);
+        }
+    }
+
+    /// Rejects the transfer over the established session.
+    fn send_rejection(&mut self, reason: u8, message: &str) {
+        tracing::info!("rejected transfer {}: {}", self.tid_hex(), message);
+        let ack = rejection(0, reason, message);
+        for _ in 0..2 {
+            self.send(0, &Message::HelloAck(ack.clone()));
+        }
+    }
+
+    /// Holes in `[from, to)`, complete for the (possibly shortened)
+    /// interval they describe; see [`wire::describe_holes`].
+    fn describe(&self, from: u64, to: u64) -> (Vec<(u64, u64)>, u64) {
+        wire::describe_holes(&self.received, from, to)
+    }
+
+    fn rwnd(&self) -> u64 {
+        match &self.writer {
+            Some(w) => w.available(),
+            None if matches!(self.phase, Phase::Receiving | Phase::Pending { .. }) => {
+                self.cfg.writer_capacity_bytes
+            }
+            None => 0,
+        }
+    }
+
+    /// Answers a HELLO frame (a state query or a decision poll).
+    fn answer_hello(&mut self, hello: &Hello) {
+        let (ack, flags) = self.current_ack(hello.timestamp, hello.capabilities);
+        self.send(flags, &Message::HelloAck(ack));
     }
 
     // ----- packets ---------------------------------------------------------
 
-    async fn on_packet(&mut self, data: Vec<u8>, from: SocketAddr, at: Instant) -> ControlFlow<()> {
-        let Ok(hdr) = wire::parse_header(&data) else {
+    async fn on_packet(
+        &mut self,
+        mut data: Vec<u8>,
+        from: SocketAddr,
+        at: Instant,
+    ) -> ControlFlow<()> {
+        let Some(sec) = self.secure.as_mut() else {
             return ControlFlow::Continue(());
         };
-        if !wire::verify_tag(&data, &self.key) {
+        // Packets for a connection id we replaced are stale.
+        if peek_cid(&data) != Some(sec.local_cid) {
             return ControlFlow::Continue(());
         }
-        let decoded = match wire::decode_body(hdr.msg_type, wire::body_of(&data)) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!("malformed {:?}: {}", hdr.msg_type, e);
+        let tb = match sec.keys.recv.open(&mut data) {
+            Ok((tb, pn, _)) => {
+                if !sec.replay.accept(pn) {
+                    return ControlFlow::Continue(());
+                }
+                tb
+            }
+            Err(_) => {
+                sec.auth_failures += 1;
                 return ControlFlow::Continue(());
             }
         };
+        let Ok((msg_type, flags)) = parse_type_byte(tb) else {
+            return ControlFlow::Continue(());
+        };
+        let body_end = data.len() - TAG_LEN;
         self.last_rx = at;
         if self.stalled {
             self.stalled = false;
@@ -899,22 +1214,31 @@ impl Session {
             tracing::info!("sender address changed {} -> {}", self.peer, from);
             self.peer = from;
         }
-        if hdr.conn_id != self.conn_id {
-            self.conn_id = hdr.conn_id;
-        }
 
-        // DATA: take the datagram by value so the payload goes to the writer
-        // without another copy.
-        if let Message::Data(d) = &decoded {
-            let (offset, ts, len) = (d.offset, d.timestamp, d.payload.len());
-            drop(decoded);
-            if hdr.flags & DATA_FLAG_RETRANSMIT != 0 {
+        // DATA: hand the datagram over by value so the payload goes to the
+        // writer without another copy.
+        if msg_type == MsgType::Data {
+            let body = &data[HEADER_LEN..body_end];
+            if body.len() < DATA_FIXED_LEN {
+                return ControlFlow::Continue(());
+            }
+            let offset = u64::from_be_bytes(body[..8].try_into().unwrap());
+            let ts = u32::from_be_bytes(body[8..12].try_into().unwrap());
+            let len = body.len() - DATA_FIXED_LEN;
+            if flags & DATA_FLAG_RETRANSMIT != 0 {
                 self.retransmitted_bytes += len as u64;
             }
             self.on_data(offset, ts, data, HEADER_LEN + DATA_FIXED_LEN, len, at);
             return ControlFlow::Continue(());
         }
 
+        let decoded = match wire::decode_body(msg_type, &data[HEADER_LEN..body_end]) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("malformed {:?}: {}", msg_type, e);
+                return ControlFlow::Continue(());
+            }
+        };
         match decoded {
             Message::Hello(h) => {
                 if h.transfer_id == self.transfer_id {
@@ -922,27 +1246,18 @@ impl Session {
                 }
             }
             Message::Ping(p) => {
-                self.send(MsgType::Pong, 0, &Message::Pong(Pong { echo: p.timestamp }));
+                self.send(0, &Message::Pong(Pong { echo: p.timestamp }));
             }
             Message::Probe(_) => {
-                self.send(
-                    MsgType::ProbeAck,
-                    0,
-                    &Message::ProbeAck(ProbeAck {
-                        size: data.len() as u16,
-                    }),
-                );
+                let size = data.len().min(u16::MAX as usize) as u16;
+                self.send(0, &Message::ProbeAck(ProbeAck { size }));
             }
             Message::FinAck(f) => {
                 if let Phase::Finishing { hash, .. } = &self.phase {
                     let hash = *hash;
                     // Lets the sender exit now instead of lingering for a
                     // repeated FIN; if this is lost, it lingers as before.
-                    self.send(
-                        MsgType::FinDone,
-                        0,
-                        &Message::FinDone(wire::FinDone { verdict: f.verdict }),
-                    );
+                    self.send(0, &Message::FinDone(wire::FinDone { verdict: f.verdict }));
                     if f.verdict == VERDICT_OK {
                         self.complete(hash, true);
                     } else {
@@ -958,14 +1273,21 @@ impl Session {
                     a.reason,
                     a.code
                 );
-                if matches!(self.phase, Phase::Receiving) {
-                    let why = format!("aborted by sender: {}", a.reason);
-                    if self.got_data {
-                        self.suspend(&why).await;
-                    } else {
-                        self.abandon_idle(&why).await;
+                let why = format!("aborted by sender: {}", a.reason);
+                match self.phase {
+                    Phase::Receiving => {
+                        if self.got_data {
+                            self.suspend(&why).await;
+                        } else {
+                            self.abandon_idle(&why).await;
+                        }
+                        return ControlFlow::Break(());
                     }
-                    return ControlFlow::Break(());
+                    Phase::Pending { .. } => {
+                        self.emit_failed(why, false);
+                        return ControlFlow::Break(());
+                    }
+                    Phase::Verifying | Phase::Finishing { .. } => {}
                 }
             }
             Message::Data(_)
@@ -1088,7 +1410,7 @@ impl Session {
             rwnd: self.rwnd(),
             holes,
         };
-        self.send(MsgType::Ack, 0, &Message::Ack(ack));
+        self.send(0, &Message::Ack(ack));
         self.pkts_since_ack = 0;
         self.last_ack_at = now;
         self.immediate_ack_at = None;
@@ -1109,6 +1431,7 @@ impl Session {
             part_path: self.part_path.clone(),
             final_path: self.final_path.clone(),
             peer: self.peer.to_string(),
+            sender: self.sender.to_string(),
             durable: durable.to_vec(),
             updated_unix: 0,
         }
@@ -1194,11 +1517,19 @@ impl Session {
                 if now >= *next_fin_at {
                     *fin_delay = (*fin_delay * 2).min(Duration::from_secs(3));
                     *next_fin_at = now + *fin_delay;
-                    self.send(MsgType::Fin, 0, &Message::Fin(Fin { file_hash: hash }));
+                    self.send(0, &Message::Fin(Fin { file_hash: hash }));
                 }
                 return ControlFlow::Continue(());
             }
-            Phase::Verifying | Phase::Handshake => return ControlFlow::Continue(()),
+            Phase::Pending { deadline } => {
+                if now >= *deadline {
+                    self.send_rejection(REASON_TIMEOUT, "no decision in time");
+                    self.emit_failed("no decision in time".into(), false);
+                    return ControlFlow::Break(());
+                }
+                return ControlFlow::Continue(());
+            }
+            Phase::Verifying => return ControlFlow::Continue(()),
         }
 
         if since_rx >= self.cfg.stall_timeout && !self.stalled {
@@ -1291,7 +1622,7 @@ impl Session {
                     self.final_path.display(),
                     hash_to_hex(&hash)
                 );
-                self.send(MsgType::Fin, 0, &Message::Fin(Fin { file_hash: hash }));
+                self.send(0, &Message::Fin(Fin { file_hash: hash }));
                 self.phase = Phase::Finishing {
                     hash,
                     next_fin_at: now + Duration::from_millis(200),
@@ -1302,7 +1633,6 @@ impl Session {
             }
             Err(msg) => {
                 self.send(
-                    MsgType::Abort,
                     0,
                     &Message::Abort(wire::Abort {
                         code: ABORT_IO_ERROR,

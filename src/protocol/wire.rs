@@ -1,27 +1,20 @@
-//! Wire encoding of SHARP-256 protocol version 2.
+//! Frames of SHARP-256 protocol version 3 and the handshake payloads.
 //!
-//! Every datagram is `header (12) | body | tag (16)`:
+//! Every transport packet (see [`crate::crypto::transport`]) carries exactly
+//! one frame. The frame type and four flag bits travel in the packet's
+//! masked type byte; the body is encrypted. All integers are big-endian.
 //!
-//! ```text
-//!  0      2      3      4        6        8          12
-//!  +------+------+------+--------+--------+----------+
-//!  | 'SH' | ver  | type | flags  | rsvd   | conn_id  |  body ...  | tag[16] |
-//!  +------+------+------+--------+--------+----------+
-//! ```
-//!
-//! All integers are big-endian. The tag is a keyed BLAKE3 hash (truncated to
-//! 128 bits) over header and body, keyed by a key derived from the 128-bit
-//! transfer id negotiated in HELLO. It lets both peers reject corrupted
-//! datagrams and datagrams that do not belong to the session before acting
-//! on them. It is not a confidentiality mechanism.
-//!
-//! DATA packets are self-describing: they carry the absolute file offset of
+//! DATA frames are self-describing: they carry the absolute file offset of
 //! the payload, so the receiver never has to reconstruct positions from any
-//! mutable state (batch sizes, packet counts, chunk sizes). Chunk sizes may
-//! even change mid-transfer without affecting correctness.
+//! mutable state. Chunk sizes may even change mid-transfer.
+//!
+//! The two handshake messages carry the transfer negotiation as their
+//! encrypted payload: the initiation holds a HELLO, the response a
+//! HELLO_ACK (see [`Initiation`] and [`Response`]).
 
+use crate::crypto::handshake::RESPONSE_OVERHEAD;
+use crate::crypto::transport::OVERHEAD as TRANSPORT_OVERHEAD;
 use crate::protocol::constants::*;
-use std::fmt;
 
 pub type Range = (u64, u64);
 
@@ -62,75 +55,35 @@ impl MsgType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Header {
-    pub msg_type: MsgType,
-    pub flags: u16,
-    pub conn_id: u32,
+/// Packs a frame type and its flags into a packet's type byte.
+pub fn type_byte(t: MsgType, flags: u8) -> u8 {
+    ((flags & 0x0f) << 4) | (t as u8)
 }
 
-impl Header {
-    pub fn new(msg_type: MsgType, conn_id: u32) -> Self {
-        Self {
-            msg_type,
-            flags: 0,
-            conn_id,
-        }
-    }
-    pub fn with_flags(mut self, flags: u16) -> Self {
-        self.flags = flags;
-        self
-    }
+/// Splits a type byte into frame type and flags.
+pub fn parse_type_byte(b: u8) -> Result<(MsgType, u8), WireError> {
+    let t = MsgType::from_u8(b & 0x0f).ok_or(WireError::UnknownType(b & 0x0f))?;
+    Ok((t, b >> 4))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    #[error("datagram too short")]
+    #[error("frame too short")]
     TooShort,
-    #[error("bad magic number")]
-    BadMagic,
-    #[error("unsupported protocol version {0}")]
-    Version(u8),
-    #[error("unknown message type {0}")]
+    #[error("unknown frame type {0}")]
     UnknownType(u8),
-    #[error("malformed {0} message")]
+    #[error("malformed {0}")]
     Malformed(&'static str),
-    #[error("integrity tag mismatch")]
-    BadTag,
     #[error("text field is not valid UTF-8")]
     Utf8,
-}
-
-/// Key used for per-datagram integrity tags, derived from the transfer id.
-#[derive(Clone, Copy)]
-pub struct TagKey([u8; 32]);
-
-const TAG_CONTEXT: &str = "sharp256 v2 2026-09 datagram integrity tag";
-
-impl TagKey {
-    pub fn derive(transfer_id: &[u8; 16]) -> Self {
-        Self(blake3::derive_key(TAG_CONTEXT, transfer_id))
-    }
-
-    fn tag(&self, data: &[u8]) -> [u8; TAG_LEN] {
-        let hash = blake3::keyed_hash(&self.0, data);
-        let mut tag = [0u8; TAG_LEN];
-        tag.copy_from_slice(&hash.as_bytes()[..TAG_LEN]);
-        tag
-    }
-}
-
-impl fmt::Debug for TagKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("TagKey(..)")
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 
-/// Sender -> receiver: open a transfer.
+/// Sender -> receiver: open a transfer (in the initiation), or ask for the
+/// receiver's current state (as a frame).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub transfer_id: [u8; 16],
@@ -145,7 +98,8 @@ pub struct Hello {
     pub file_name: String,
 }
 
-/// Receiver -> sender: accept or reject, with resume information.
+/// Receiver -> sender: accept, reject or "still deciding", with resume
+/// information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloAck {
     pub status: u8,
@@ -185,7 +139,7 @@ pub struct Data<'a> {
 pub struct Ack {
     /// All bytes below this offset have been received.
     pub contiguous_upto: u64,
-    /// End of the highest received range; `holes` are gaps below it.
+    /// End of the interval `holes` describes completely.
     pub highest: u64,
     /// Total unique bytes received so far (progress for the sender).
     pub received_bytes: u64,
@@ -219,7 +173,8 @@ pub struct Pong {
     pub echo: u32,
 }
 
-/// Path-MTU probe: the encoder pads the datagram to exactly `size` bytes.
+/// Path-MTU probe: the encoder pads the frame so that the whole datagram is
+/// exactly `size` bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Probe {
     pub size: u16,
@@ -284,6 +239,9 @@ impl<'a> Message<'a> {
 
 struct Writer<'b> {
     buf: &'b mut Vec<u8>,
+    start: usize,
+    /// Longest body the caller can fit; text fields are shortened to it.
+    limit: usize,
 }
 
 impl Writer<'_> {
@@ -305,18 +263,18 @@ impl Writer<'_> {
     fn bytes(&mut self, v: &[u8]) {
         self.buf.extend_from_slice(v);
     }
-    /// Length-prefixed text, shortened (at a character boundary) so that the
-    /// datagram including its tag stays within [`MAX_CONTROL_DATAGRAM`].
-    fn text(&mut self, s: &str) {
-        let b = s.as_bytes();
-        let room = (MAX_CONTROL_DATAGRAM - TAG_LEN).saturating_sub(self.buf.len() + 1);
-        let mut n = b.len().min(MAX_TEXT_LEN).min(room);
+    /// Length-prefixed text, shortened at a character boundary to at most
+    /// `max` bytes and to the room left in the body.
+    fn text(&mut self, s: &str, max: usize) {
+        let used = self.buf.len() - self.start;
+        let room = self.limit.saturating_sub(used + 1);
+        let mut n = s.len().min(max).min(room).min(u8::MAX as usize);
         // Never cut a UTF-8 sequence in half.
         while n > 0 && !s.is_char_boundary(n) {
             n -= 1;
         }
         self.u8(n as u8);
-        self.bytes(&b[..n]);
+        self.bytes(&s.as_bytes()[..n]);
     }
     fn varint(&mut self, mut v: u64) {
         loop {
@@ -389,31 +347,20 @@ pub fn describe_holes(
     (candidates, to)
 }
 
-/// Encodes a complete datagram: header, body and integrity tag.
-pub fn encode(header: &Header, msg: &Message<'_>, key: &TagKey) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_into(header, msg, key, &mut out);
-    out
-}
+/// Longest frame body that keeps a transport packet within
+/// [`MAX_CONTROL_DATAGRAM`].
+pub const MAX_CONTROL_BODY: usize = MAX_CONTROL_DATAGRAM - TRANSPORT_OVERHEAD;
 
-/// Like [`encode`], but writes into `out` (which is cleared first) so that
-/// hot paths can reuse one buffer instead of allocating per datagram.
-pub fn encode_into(header: &Header, msg: &Message<'_>, key: &TagKey, out: &mut Vec<u8>) {
-    let body_hint = match msg {
-        Message::Data(d) => DATA_FIXED_LEN + d.payload.len(),
-        Message::Probe(p) => (p.size as usize).saturating_sub(HEADER_LEN + TAG_LEN),
-        _ => 128,
+/// Appends the body of `msg` to `out`. `limit` bounds the body's length:
+/// text fields are shortened to fit it, and a PROBE is padded to exactly the
+/// body length that makes the datagram `size` bytes long.
+pub fn encode_body(msg: &Message<'_>, out: &mut Vec<u8>, limit: usize) {
+    let start = out.len();
+    let mut w = Writer {
+        buf: out,
+        start,
+        limit,
     };
-    out.clear();
-    out.reserve(HEADER_LEN + body_hint + TAG_LEN);
-    let mut w = Writer { buf: out };
-    w.bytes(&MAGIC);
-    w.u8(PROTOCOL_VERSION);
-    w.u8(msg.msg_type() as u8);
-    w.u16(header.flags);
-    w.u16(0);
-    w.u32(header.conn_id);
-
     match msg {
         Message::Hello(h) => {
             w.bytes(&h.transfer_id);
@@ -422,14 +369,7 @@ pub fn encode_into(header: &Header, msg: &Message<'_>, key: &TagKey, out: &mut V
             w.i64(h.file_mtime);
             w.u16(h.max_chunk);
             w.u32(h.capabilities);
-            let name = h.file_name.as_bytes();
-            let n = name.len().min(MAX_FILE_NAME_LEN);
-            let mut n = n;
-            while n > 0 && !h.file_name.is_char_boundary(n) {
-                n -= 1;
-            }
-            w.u8(n as u8);
-            w.bytes(&name[..n]);
+            w.text(&h.file_name, MAX_FILE_NAME_LEN);
         }
         Message::HelloAck(a) => {
             w.u8(a.status);
@@ -442,7 +382,7 @@ pub fn encode_into(header: &Header, msg: &Message<'_>, key: &TagKey, out: &mut V
             w.u64(a.resume_upto);
             w.u64(a.known_end);
             w.holes(a.resume_upto, &a.holes);
-            w.text(&a.message);
+            w.text(&a.message, MAX_TEXT_LEN);
         }
         Message::Data(d) => {
             w.u64(d.offset);
@@ -467,20 +407,16 @@ pub fn encode_into(header: &Header, msg: &Message<'_>, key: &TagKey, out: &mut V
         Message::Pong(p) => w.u32(p.echo),
         Message::Probe(p) => {
             w.u16(p.size);
-            let target = (p.size as usize).max(HEADER_LEN + 2 + TAG_LEN);
-            let pad = target - HEADER_LEN - 2 - TAG_LEN;
-            w.buf.resize(w.buf.len() + pad, 0);
+            let body = (p.size as usize).saturating_sub(TRANSPORT_OVERHEAD).max(2);
+            w.buf.resize(w.start + body, 0);
         }
         Message::ProbeAck(p) => w.u16(p.size),
         Message::Abort(a) => {
             w.u16(a.code);
-            w.text(&a.reason);
+            w.text(&a.reason, MAX_TEXT_LEN);
         }
         Message::FinDone(f) => w.u8(f.verdict),
     }
-
-    let tag = key.tag(w.buf.as_slice());
-    w.bytes(&tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -585,54 +521,8 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parses and validates the fixed header. Does not check the tag.
-pub fn parse_header(buf: &[u8]) -> Result<Header, WireError> {
-    if buf.len() < HEADER_LEN + TAG_LEN {
-        return Err(WireError::TooShort);
-    }
-    if buf[0..2] != MAGIC {
-        return Err(WireError::BadMagic);
-    }
-    if buf[2] != PROTOCOL_VERSION {
-        return Err(WireError::Version(buf[2]));
-    }
-    let msg_type = MsgType::from_u8(buf[3]).ok_or(WireError::UnknownType(buf[3]))?;
-    let flags = u16::from_be_bytes([buf[4], buf[5]]);
-    let conn_id = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    Ok(Header {
-        msg_type,
-        flags,
-        conn_id,
-    })
-}
-
-/// Verifies the trailing integrity tag in constant time.
-pub fn verify_tag(buf: &[u8], key: &TagKey) -> bool {
-    if buf.len() < HEADER_LEN + TAG_LEN {
-        return false;
-    }
-    let (data, tag) = buf.split_at(buf.len() - TAG_LEN);
-    let expected = key.tag(data);
-    let mut diff = 0u8;
-    for (a, b) in expected.iter().zip(tag.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
-/// Returns the transfer id of an (unverified) HELLO datagram so the receiver
-/// can derive the key needed to verify it.
-pub fn peek_hello_transfer_id(buf: &[u8]) -> Option<[u8; 16]> {
-    if buf.len() < HEADER_LEN + 16 + TAG_LEN || buf[3] != MsgType::Hello as u8 {
-        return None;
-    }
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&buf[HEADER_LEN..HEADER_LEN + 16]);
-    Some(id)
-}
-
-/// Decodes the body of a datagram whose header was already parsed and whose
-/// tag was already verified. `body` excludes header and tag.
+/// Decodes a frame body. Trailing bytes after the known fields of a control
+/// frame are ignored (they are where later versions append fields).
 pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<Message<'_>, WireError> {
     let mut r = Reader::new(body);
     let msg = match msg_type {
@@ -672,7 +562,7 @@ pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<Message<'_>, WireEr
             }
             let holes = r.holes(resume_upto, known_end, "hello_ack")?;
             let message = r.text(MAX_TEXT_LEN)?;
-            if status != HELLO_ACCEPTED && status != HELLO_REJECTED {
+            if !matches!(status, HELLO_ACCEPTED | HELLO_REJECTED | HELLO_PENDING) {
                 return Err(WireError::Malformed("hello_ack"));
             }
             Message::HelloAck(HelloAck {
@@ -744,51 +634,126 @@ pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<Message<'_>, WireEr
     Ok(msg)
 }
 
-/// Full decode: header, tag verification, body.
-pub fn decode<'a>(buf: &'a [u8], key: &TagKey) -> Result<(Header, Message<'a>), WireError> {
-    let header = parse_header(buf)?;
-    if !verify_tag(buf, key) {
-        return Err(WireError::BadTag);
-    }
-    let body = &buf[HEADER_LEN..buf.len() - TAG_LEN];
-    let msg = decode_body(header.msg_type, body)?;
-    Ok((header, msg))
+// ---------------------------------------------------------------------------
+// Handshake payloads
+// ---------------------------------------------------------------------------
+
+/// Payload of a handshake initiation (encrypted by Noise).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Initiation {
+    /// Strictly increasing per sender; see `crypto::handshake`.
+    pub timestamp: u64,
+    /// Bit set of [`crate::crypto::Suite`] values the sender supports.
+    pub suites: u8,
+    /// The sender has AES instructions.
+    pub hardware_aes: bool,
+    /// HELLO frame flags.
+    pub hello_flags: u8,
+    pub hello: Hello,
 }
 
-/// Returns the body slice of a datagram (header and tag stripped).
-pub fn body_of(buf: &[u8]) -> &[u8] {
-    &buf[HEADER_LEN..buf.len() - TAG_LEN]
+/// Payload of a handshake response (encrypted by Noise).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Response {
+    /// Chosen [`crate::crypto::Suite`] (0 when the transfer is rejected).
+    pub suite: u8,
+    /// HELLO_ACK frame flags.
+    pub ack_flags: u8,
+    pub ack: HelloAck,
+}
+
+pub fn encode_initiation(p: &Initiation) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + p.hello.file_name.len());
+    out.extend_from_slice(&p.timestamp.to_be_bytes());
+    out.push(p.suites);
+    out.push(p.hardware_aes as u8);
+    out.push(p.hello_flags);
+    encode_body(&Message::Hello(p.hello.clone()), &mut out, usize::MAX);
+    out
+}
+
+pub fn decode_initiation(buf: &[u8]) -> Result<Initiation, WireError> {
+    let mut r = Reader::new(buf);
+    let timestamp = r.u64()?;
+    let suites = r.u8()?;
+    let hardware_aes = r.u8()? & 1 == 1;
+    let hello_flags = r.u8()? & 0x0f;
+    let hello = match decode_body(MsgType::Hello, &buf[r.pos..])? {
+        Message::Hello(h) => h,
+        _ => unreachable!("decode_body returns the requested type"),
+    };
+    Ok(Initiation {
+        timestamp,
+        suites,
+        hardware_aes,
+        hello_flags,
+        hello,
+    })
+}
+
+/// Longest response payload that keeps the response datagram within
+/// [`MAX_CONTROL_DATAGRAM`].
+pub const MAX_RESPONSE_PAYLOAD: usize = MAX_CONTROL_DATAGRAM - RESPONSE_OVERHEAD;
+
+pub fn encode_response(p: &Response) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96);
+    out.push(p.suite);
+    out.push(p.ack_flags);
+    encode_body(
+        &Message::HelloAck(p.ack.clone()),
+        &mut out,
+        MAX_RESPONSE_PAYLOAD - 2,
+    );
+    out
+}
+
+pub fn decode_response(buf: &[u8]) -> Result<Response, WireError> {
+    let mut r = Reader::new(buf);
+    let suite = r.u8()?;
+    let ack_flags = r.u8()? & 0x0f;
+    let ack = match decode_body(MsgType::HelloAck, &buf[r.pos..])? {
+        Message::HelloAck(a) => a,
+        _ => unreachable!("decode_body returns the requested type"),
+    };
+    Ok(Response {
+        suite,
+        ack_flags,
+        ack,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::RangeSet;
 
-    fn key() -> TagKey {
-        TagKey::derive(&[7u8; 16])
+    fn body(msg: &Message<'_>) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_body(msg, &mut out, MAX_CONTROL_BODY);
+        out
     }
 
     fn roundtrip(msg: Message<'_>) -> Vec<u8> {
-        let hdr = Header::new(msg.msg_type(), 0xDEADBEEF).with_flags(0x0102);
-        let bytes = encode(&hdr, &msg, &key());
-        let (h2, m2) = decode(&bytes, &key()).expect("decode");
-        assert_eq!(h2, hdr);
-        assert_eq!(m2, msg);
-        bytes
+        let b = body(&msg);
+        let back = decode_body(msg.msg_type(), &b).expect("decode");
+        assert_eq!(back, msg);
+        b
     }
 
-    #[test]
-    fn roundtrip_all_messages() {
-        roundtrip(Message::Hello(Hello {
+    fn hello() -> Hello {
+        Hello {
             transfer_id: [1; 16],
             timestamp: 42,
             file_size: 1 << 40,
             file_mtime: -5,
-            max_chunk: 1432,
+            max_chunk: 1427,
             capabilities: 0,
             file_name: "отчёт-2026.bin".to_string(),
-        }));
-        roundtrip(Message::HelloAck(HelloAck {
+        }
+    }
+
+    fn hello_ack(holes: Vec<Range>, known_end: u64, message: &str) -> HelloAck {
+        HelloAck {
             status: HELLO_ACCEPTED,
             reason: REASON_NONE,
             max_chunk: 1200,
@@ -797,17 +762,39 @@ mod tests {
             max_ack_delay_us: 20_000,
             rwnd: 1 << 26,
             resume_upto: 1000,
-            known_end: 5000,
-            holes: vec![(1000, 1500), (2000, 2100)],
-            message: String::new(),
-        }));
-        let payload = vec![0xAB; 1432];
-        let bytes = roundtrip(Message::Data(Data {
+            known_end,
+            holes,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn type_byte_packs_type_and_flags() {
+        for t in 1..=12u8 {
+            let mt = MsgType::from_u8(t).unwrap();
+            for flags in 0..16u8 {
+                assert_eq!(parse_type_byte(type_byte(mt, flags)).unwrap(), (mt, flags));
+            }
+        }
+        assert_eq!(parse_type_byte(0), Err(WireError::UnknownType(0)));
+        assert_eq!(parse_type_byte(0x0d), Err(WireError::UnknownType(13)));
+    }
+
+    #[test]
+    fn roundtrip_all_frames() {
+        roundtrip(Message::Hello(hello()));
+        roundtrip(Message::HelloAck(hello_ack(
+            vec![(1000, 1500), (2000, 2100)],
+            5000,
+            "",
+        )));
+        let payload = vec![0xAB; 1427];
+        let b = roundtrip(Message::Data(Data {
             offset: 123_456_789,
             timestamp: 999,
             payload: &payload,
         }));
-        assert_eq!(bytes.len(), DATA_OVERHEAD + 1432);
+        assert_eq!(b.len() + TRANSPORT_OVERHEAD, DATA_OVERHEAD + 1427);
         roundtrip(Message::Ack(Ack {
             contiguous_upto: 10,
             highest: 100,
@@ -835,66 +822,18 @@ mod tests {
     }
 
     #[test]
-    fn probe_is_padded_to_requested_size() {
-        for size in [64u16, 1200, 1472, 8000] {
-            let bytes = roundtrip(Message::Probe(Probe { size }));
-            assert_eq!(bytes.len(), size as usize);
+    fn probe_fills_the_datagram_to_its_size() {
+        for size in [64u16, 1232, 1472, 8972] {
+            let msg = Message::Probe(Probe { size });
+            let mut b = Vec::new();
+            encode_body(&msg, &mut b, usize::MAX);
+            assert_eq!(b.len() + TRANSPORT_OVERHEAD, size as usize);
+            assert_eq!(decode_body(MsgType::Probe, &b).unwrap(), msg);
         }
     }
 
     #[test]
-    fn empty_data_payload_is_valid() {
-        roundtrip(Message::Data(Data {
-            offset: 0,
-            timestamp: 0,
-            payload: &[],
-        }));
-    }
-
-    #[test]
-    fn rejects_corruption_and_wrong_key() {
-        let payload = vec![1u8; 100];
-        let hdr = Header::new(MsgType::Data, 1);
-        let bytes = encode(
-            &hdr,
-            &Message::Data(Data {
-                offset: 5,
-                timestamp: 6,
-                payload: &payload,
-            }),
-            &key(),
-        );
-        // wrong key
-        let other = TagKey::derive(&[8u8; 16]);
-        assert_eq!(decode(&bytes, &other).unwrap_err(), WireError::BadTag);
-        // flipped payload byte
-        let mut bad = bytes.clone();
-        bad[HEADER_LEN + DATA_FIXED_LEN + 10] ^= 1;
-        assert_eq!(decode(&bad, &key()).unwrap_err(), WireError::BadTag);
-        // flipped header byte (conn id)
-        let mut bad = bytes.clone();
-        bad[9] ^= 1;
-        assert_eq!(decode(&bad, &key()).unwrap_err(), WireError::BadTag);
-        // truncated
-        assert_eq!(
-            decode(&bytes[..20], &key()).unwrap_err(),
-            WireError::TooShort
-        );
-        // bad magic / version / type are rejected before the tag is checked
-        let mut bad = bytes.clone();
-        bad[0] = b'X';
-        assert_eq!(parse_header(&bad).unwrap_err(), WireError::BadMagic);
-        let mut bad = bytes.clone();
-        bad[2] = 1;
-        assert_eq!(parse_header(&bad).unwrap_err(), WireError::Version(1));
-        let mut bad = bytes.clone();
-        bad[3] = 200;
-        assert_eq!(parse_header(&bad).unwrap_err(), WireError::UnknownType(200));
-    }
-
-    #[test]
     fn malformed_bodies_are_rejected_not_panicking() {
-        // Random-ish garbage of every length for every type must never panic.
         for t in 1u8..=12 {
             let msg_type = MsgType::from_u8(t).unwrap();
             for len in 0..80usize {
@@ -903,13 +842,13 @@ mod tests {
             }
         }
         // Hole list with a bogus count.
-        let mut body = vec![0u8; 8 + 8 + 8 + 4 + 4 + 8];
-        body.extend_from_slice(&u16::MAX.to_be_bytes());
+        let mut b = vec![0u8; 8 + 8 + 8 + 4 + 4 + 8];
+        b.extend_from_slice(&u16::MAX.to_be_bytes());
         assert!(matches!(
-            decode_body(MsgType::Ack, &body),
+            decode_body(MsgType::Ack, &b),
             Err(WireError::Malformed("ack"))
         ));
-        // Holes beyond the described interval, and adjacent holes, are rejected.
+        // Holes beyond the described interval, and adjacent holes.
         for holes in [vec![(10, 20), (150, 160)], vec![(10, 20), (20, 30)]] {
             let ack = Ack {
                 contiguous_upto: 0,
@@ -920,21 +859,25 @@ mod tests {
                 rwnd: 0,
                 holes,
             };
-            let bytes = encode(&Header::new(MsgType::Ack, 1), &Message::Ack(ack), &key());
+            let b = body(&Message::Ack(ack));
             assert!(matches!(
-                decode(&bytes, &key()),
+                decode_body(MsgType::Ack, &b),
                 Err(WireError::Malformed("ack"))
             ));
         }
         // Over-long varint.
-        let mut body = vec![0u8; 8 + 8 + 8 + 4 + 4 + 8];
-        body[8..16].copy_from_slice(&100u64.to_be_bytes()); // highest
-        body.extend_from_slice(&1u16.to_be_bytes());
-        body.extend_from_slice(&[0xff; 11]);
+        let mut b = vec![0u8; 8 + 8 + 8 + 4 + 4 + 8];
+        b[8..16].copy_from_slice(&100u64.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&[0xff; 11]);
         assert!(matches!(
-            decode_body(MsgType::Ack, &body),
+            decode_body(MsgType::Ack, &b),
             Err(WireError::Malformed("ack"))
         ));
+        // Unknown HELLO_ACK status.
+        let mut b = body(&Message::HelloAck(hello_ack(vec![], 1000, "")));
+        b[0] = 9;
+        assert!(decode_body(MsgType::HelloAck, &b).is_err());
     }
 
     #[test]
@@ -951,7 +894,12 @@ mod tests {
             u64::MAX,
         ] {
             let mut buf = Vec::new();
-            Writer { buf: &mut buf }.varint(v);
+            Writer {
+                buf: &mut buf,
+                start: 0,
+                limit: usize::MAX,
+            }
+            .varint(v);
             assert_eq!(buf.len(), varint_len(v), "len of {}", v);
             let mut r = Reader::new(&buf);
             assert_eq!(r.varint("t").unwrap(), v);
@@ -972,20 +920,21 @@ mod tests {
         }));
     }
 
+    fn fragmented(n: u64) -> RangeSet {
+        let mut rs = RangeSet::new();
+        for i in 0..n {
+            rs.insert(i * 2864, i * 2864 + 1432); // every other chunk missing
+        }
+        rs
+    }
+
     #[test]
     fn describe_holes_is_complete_and_bounded() {
-        use crate::protocol::RangeSet;
-        // Few holes: everything is described.
         let rs = RangeSet::from_ranges([(0, 100), (200, 300), (400, 500)]);
         let (holes, end) = describe_holes(&rs, 100, 500);
         assert_eq!(holes, vec![(100, 200), (300, 400)]);
         assert_eq!(end, 500);
-        // Thousands of holes: the interval is cut so that the list is
-        // complete for it and fits the byte budget.
-        let mut rs = RangeSet::new();
-        for i in 0..3000u64 {
-            rs.insert(i * 2864, i * 2864 + 1432); // every other chunk missing
-        }
+        let rs = fragmented(3000);
         let top = rs.last_end().unwrap();
         let (holes, end) = describe_holes(&rs, 1432, top);
         assert!(holes.len() > 200, "only {} holes fit", holes.len());
@@ -1005,7 +954,6 @@ mod tests {
         for (s, e) in described.iter() {
             assert!(rs.contains(s, e), "undescribed gap {}..{}", s, e);
         }
-        // Encoded ACK stays within the safe datagram size.
         let ack = Ack {
             contiguous_upto: 1432,
             highest: end,
@@ -1015,78 +963,58 @@ mod tests {
             rwnd: 0,
             holes,
         };
-        let bytes = encode(
-            &Header::new(MsgType::Ack, 1),
-            &Message::Ack(ack.clone()),
-            &key(),
+        let b = roundtrip(Message::Ack(ack));
+        assert!(
+            b.len() + TRANSPORT_OVERHEAD <= MAX_CONTROL_DATAGRAM,
+            "{} bytes",
+            b.len()
         );
-        assert!(bytes.len() <= UDP_PAYLOAD_SAFE, "{} bytes", bytes.len());
-        assert_eq!(decode(&bytes, &key()).unwrap().1, Message::Ack(ack));
     }
 
     #[test]
-    fn control_messages_never_exceed_the_control_datagram() {
-        use crate::protocol::RangeSet;
-        let mut rs = RangeSet::new();
-        for i in 0..5000u64 {
-            rs.insert(i * 3000 + (i % 7) * 100, i * 3000 + 1432);
-        }
-        let top = rs.last_end().unwrap();
-        let (holes, end) = describe_holes(&rs, 0, top);
-        let ack = HelloAck {
-            status: HELLO_ACCEPTED,
-            reason: REASON_NONE,
-            max_chunk: 1432,
-            capabilities: 0,
-            echo_ts: 1,
-            max_ack_delay_us: 20_000,
-            rwnd: 1,
-            resume_upto: 0,
-            known_end: end,
-            holes,
-            message: "ж".repeat(200), // 400 bytes, more than fits
+    fn handshake_payloads_roundtrip_and_fit() {
+        let init = Initiation {
+            timestamp: 1_700_000_000_123_456_789,
+            suites: 3,
+            hardware_aes: true,
+            hello_flags: HELLO_FLAG_RESUME,
+            hello: hello(),
         };
-        let bytes = encode(
-            &Header::new(MsgType::HelloAck, 1),
-            &Message::HelloAck(ack.clone()),
-            &key(),
-        );
-        assert!(bytes.len() <= MAX_CONTROL_DATAGRAM, "{} bytes", bytes.len());
-        let Ok((_, Message::HelloAck(back))) = decode(&bytes, &key()) else {
-            panic!("hello_ack must decode");
+        assert_eq!(decode_initiation(&encode_initiation(&init)).unwrap(), init);
+
+        // A response with the fullest possible hole list and a long message
+        // still fits the control datagram bound; holes are never cut.
+        let rs = fragmented(5000);
+        let (holes, end) = describe_holes(&rs, 1000, rs.last_end().unwrap());
+        let resp = Response {
+            suite: 1,
+            ack_flags: HELLO_ACK_FLAG_RESUMED,
+            ack: hello_ack(holes.clone(), end, &"ж".repeat(200)),
         };
-        assert_eq!(back.holes, ack.holes, "holes are never shortened");
-        assert!(back.message.chars().all(|c| c == 'ж'));
-        assert!(back.message.len() < ack.message.len());
+        let enc = encode_response(&resp);
+        assert!(enc.len() <= MAX_RESPONSE_PAYLOAD, "{} bytes", enc.len());
+        let back = decode_response(&enc).unwrap();
+        assert_eq!(back.ack.holes, holes);
+        assert!(back.ack.message.chars().all(|c| c == 'ж'));
+        assert!(back.ack.message.len() < 400);
+        // Without holes, a reject message survives in full.
+        let reject = Response {
+            suite: 0,
+            ack_flags: 0,
+            ack: HelloAck {
+                status: HELLO_REJECTED,
+                reason: REASON_UNAUTHORIZED,
+                ..hello_ack(vec![], 1000, "not on the list of allowed senders")
+            },
+        };
+        assert_eq!(decode_response(&encode_response(&reject)).unwrap(), reject);
     }
 
     #[test]
     fn trailing_bytes_in_control_bodies_are_ignored() {
-        // Extension rule: new fields are appended to control messages, and
-        // an older decoder must accept and ignore them.
         let msgs = [
-            Message::Hello(Hello {
-                transfer_id: [1; 16],
-                timestamp: 2,
-                file_size: 3,
-                file_mtime: 4,
-                max_chunk: 1432,
-                capabilities: 5,
-                file_name: "x".into(),
-            }),
-            Message::HelloAck(HelloAck {
-                status: HELLO_ACCEPTED,
-                reason: REASON_NONE,
-                max_chunk: 1432,
-                capabilities: 0,
-                echo_ts: 6,
-                max_ack_delay_us: 7,
-                rwnd: 7,
-                resume_upto: 8,
-                known_end: 20,
-                holes: vec![(10, 12)],
-                message: "ok".into(),
-            }),
+            Message::Hello(hello()),
+            Message::HelloAck(hello_ack(vec![(1000, 1200)], 2000, "ok")),
             Message::Ack(Ack {
                 contiguous_upto: 1,
                 highest: 9,
@@ -1113,56 +1041,23 @@ mod tests {
             }),
         ];
         for msg in msgs {
-            let bytes = encode(&Header::new(msg.msg_type(), 1), &msg, &key());
-            let mut body = body_of(&bytes).to_vec();
-            body.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-            assert_eq!(decode_body(msg.msg_type(), &body).unwrap(), msg);
+            let mut b = body(&msg);
+            b.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            assert_eq!(decode_body(msg.msg_type(), &b).unwrap(), msg);
         }
-    }
-
-    #[test]
-    fn peek_transfer_id_from_hello() {
-        let hello = Hello {
-            transfer_id: [0x42; 16],
-            timestamp: 0,
-            file_size: 1,
-            file_mtime: 0,
-            max_chunk: 1432,
-            capabilities: 0,
-            file_name: "a".into(),
-        };
-        let bytes = encode(
-            &Header::new(MsgType::Hello, 9),
-            &Message::Hello(hello),
-            &key(),
-        );
-        assert_eq!(peek_hello_transfer_id(&bytes), Some([0x42; 16]));
-        assert_eq!(peek_hello_transfer_id(&bytes[..10]), None);
     }
 
     #[test]
     fn file_name_is_cut_at_char_boundary() {
-        let name: String = "ж".repeat(200); // 400 bytes
-        let hello = Hello {
-            transfer_id: [0; 16],
-            timestamp: 0,
-            file_size: 1,
-            file_mtime: 0,
-            max_chunk: 1432,
-            capabilities: 0,
-            file_name: name,
+        let h = Hello {
+            file_name: "ж".repeat(200), // 400 bytes
+            ..hello()
         };
-        let bytes = encode(
-            &Header::new(MsgType::Hello, 9),
-            &Message::Hello(hello),
-            &key(),
-        );
-        let (_, msg) = decode(&bytes, &key()).unwrap();
-        if let Message::Hello(h) = msg {
-            assert!(h.file_name.len() <= MAX_FILE_NAME_LEN);
-            assert!(h.file_name.chars().all(|c| c == 'ж'));
-        } else {
+        let b = body(&Message::Hello(h));
+        let Message::Hello(back) = decode_body(MsgType::Hello, &b).unwrap() else {
             panic!("expected hello");
-        }
+        };
+        assert!(back.file_name.len() <= MAX_FILE_NAME_LEN);
+        assert!(back.file_name.chars().all(|c| c == 'ж'));
     }
 }

@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const STATE_FORMAT_VERSION: u32 = 2;
+pub const STATE_FORMAT_VERSION: u32 = 3;
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -49,6 +49,9 @@ pub struct ReceiverState {
     pub part_path: PathBuf,
     pub final_path: PathBuf,
     pub peer: String,
+    /// SHARP ID of the sender; only the same sender may resume the transfer.
+    #[serde(default)]
+    pub sender: String,
     /// Byte ranges that are written and fsynced.
     pub durable: Vec<(u64, u64)>,
     pub updated_unix: u64,
@@ -128,10 +131,12 @@ impl StateStore {
         let _ = fs::remove_file(self.receiver_path(transfer_id));
     }
 
-    /// Finds the most recent receiver state for a file of this name, size and
-    /// source modification time whose partial file still exists.
+    /// Finds the most recent receiver state of `sender` for a file of this
+    /// name, size and source modification time whose partial file still
+    /// exists.
     pub fn find_receiver_by_file(
         &self,
+        sender: &str,
         file_name: &str,
         file_size: u64,
         file_mtime: i64,
@@ -150,6 +155,7 @@ impl StateStore {
                 continue;
             };
             if st.format != STATE_FORMAT_VERSION
+                || st.sender != sender
                 || st.file_name != file_name
                 || st.file_size != file_size
                 || st.file_mtime != file_mtime
@@ -257,6 +263,7 @@ mod tests {
             part_path: part.clone(),
             final_path: dir.path().join("f.bin"),
             peer: "127.0.0.1:1".into(),
+            sender: "sh-a".into(),
             durable: vec![(0, 100), (200, 300)],
             updated_unix: 0,
         };
@@ -266,18 +273,22 @@ mod tests {
         assert_eq!(loaded.format, STATE_FORMAT_VERSION);
         assert_eq!(loaded.file_mtime, 1_700_000_000);
         assert!(store
-            .find_receiver_by_file("f.bin", 1000, 1_700_000_000)
+            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_000)
             .is_some());
         assert!(store
-            .find_receiver_by_file("f.bin", 999, 1_700_000_000)
+            .find_receiver_by_file("sh-a", "f.bin", 999, 1_700_000_000)
             .is_none());
         // The source changed since the partial file was started.
         assert!(store
-            .find_receiver_by_file("f.bin", 1000, 1_700_000_001)
+            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_001)
+            .is_none());
+        // Another sender never resumes this partial file.
+        assert!(store
+            .find_receiver_by_file("sh-b", "f.bin", 1000, 1_700_000_000)
             .is_none());
         fs::remove_file(&part).unwrap();
         assert!(store
-            .find_receiver_by_file("f.bin", 1000, 1_700_000_000)
+            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_000)
             .is_none());
         store.remove_receiver(&st.transfer_id);
         assert!(store.load_receiver(&st.transfer_id).is_none());
@@ -301,6 +312,7 @@ mod tests {
                 part_path,
                 final_path: dir.path().join("old.bin"),
                 peer: "127.0.0.1:1".into(),
+                sender: String::new(),
                 durable: vec![(0, 7)],
                 updated_unix: 1, // long ago
             };

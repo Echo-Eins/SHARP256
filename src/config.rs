@@ -1,7 +1,9 @@
 //! Configuration for the sender and receiver engines.
 
+use crate::crypto::{Identity, SharpId};
 use crate::progress::EventCallback;
 use crate::protocol::constants::*;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -112,6 +114,8 @@ impl std::fmt::Debug for AcceptPolicy {
 pub struct IncomingRequest {
     pub transfer_id: String,
     pub peer: SocketAddr,
+    /// Authenticated identity of the sender.
+    pub sender_id: SharpId,
     pub file_name: String,
     pub file_size: u64,
     /// Bytes already stored from an earlier attempt (resume).
@@ -122,10 +126,18 @@ pub struct IncomingRequest {
 pub struct SenderConfig {
     pub bind: SocketAddr,
     pub peer: SocketAddr,
+    /// Identity of the receiver. Only the holder of its private key can
+    /// answer the handshake, so this authenticates the receiver.
+    pub receiver_id: SharpId,
     pub file_path: PathBuf,
     pub transport: TransportConfig,
     /// Directory for resume state; `None` = per-user data directory.
     pub state_dir: Option<PathBuf>,
+    /// Our identity; `None` = load (or create) the per-user identity file.
+    pub identity: Option<Identity>,
+    /// Pre-shared key (see `crypto::psk_from_passphrase`), if the receiver
+    /// requires one.
+    pub psk: Option<[u8; 32]>,
     pub events: Option<EventCallback>,
 }
 
@@ -134,22 +146,28 @@ impl std::fmt::Debug for SenderConfig {
         f.debug_struct("SenderConfig")
             .field("bind", &self.bind)
             .field("peer", &self.peer)
+            .field("receiver_id", &self.receiver_id)
             .field("file_path", &self.file_path)
             .field("transport", &self.transport)
             .field("state_dir", &self.state_dir)
+            .field("identity", &self.identity)
+            .field("psk", &self.psk.is_some())
             .field("events", &self.events.is_some())
             .finish()
     }
 }
 
 impl SenderConfig {
-    pub fn new(peer: SocketAddr, file_path: PathBuf) -> Self {
+    pub fn new(peer: SocketAddr, receiver_id: SharpId, file_path: PathBuf) -> Self {
         Self {
             bind: "0.0.0.0:0".parse().unwrap(),
             peer,
+            receiver_id,
             file_path,
             transport: TransportConfig::default(),
             state_dir: None,
+            identity: None,
+            psk: None,
             events: None,
         }
     }
@@ -169,6 +187,19 @@ pub struct ReceiverConfig {
     /// forward (UPnP) in the background. Requires the `nat-traversal` feature.
     pub nat_traversal: bool,
     pub accept: AcceptPolicy,
+    /// Our identity; `None` = load (or create) the per-user identity file.
+    pub identity: Option<Identity>,
+    /// Pre-shared key every sender must also use, if any.
+    pub psk: Option<[u8; 32]>,
+    /// Senders allowed to start transfers; `None` admits any sender that
+    /// knows this receiver's ID.
+    pub allowed_senders: Option<HashSet<SharpId>>,
+    /// Handshakes per second (and burst) accepted from one source address.
+    pub handshake_rate: f64,
+    pub handshake_burst: f64,
+    /// Handshakes per second (all sources) beyond which senders must first
+    /// prove their address with a cookie.
+    pub handshake_load_threshold: u32,
     pub events: Option<EventCallback>,
 }
 
@@ -183,6 +214,11 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("state_dir", &self.state_dir)
             .field("nat_traversal", &self.nat_traversal)
             .field("accept", &self.accept)
+            .field("identity", &self.identity)
+            .field("psk", &self.psk.is_some())
+            .field("allowed_senders", &self.allowed_senders)
+            .field("handshake_rate", &self.handshake_rate)
+            .field("handshake_load_threshold", &self.handshake_load_threshold)
             .field("events", &self.events.is_some())
             .finish()
     }
@@ -199,6 +235,12 @@ impl ReceiverConfig {
             state_dir: None,
             nat_traversal: false,
             accept: AcceptPolicy::AcceptAll,
+            identity: None,
+            psk: None,
+            allowed_senders: None,
+            handshake_rate: 20.0,
+            handshake_burst: 40.0,
+            handshake_load_threshold: 200,
             events: None,
         }
     }

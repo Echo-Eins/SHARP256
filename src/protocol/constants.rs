@@ -1,22 +1,20 @@
-//! Protocol-wide constants for SHARP-256 wire protocol version 2.
+//! Protocol-wide constants for SHARP-256 wire protocol version 3.
 //!
 //! Sizes are chosen so that every control message fits into a single
 //! 1200-byte datagram, which crosses any IPv4/IPv6 path without
 //! fragmentation (the same floor QUIC uses).
 
-/// First two bytes of every datagram: "SH".
-pub const MAGIC: [u8; 2] = *b"SH";
-/// Wire protocol version implemented by this crate.
-pub const PROTOCOL_VERSION: u8 = 2;
+use crate::crypto::transport::OVERHEAD as TRANSPORT_OVERHEAD;
 
-/// Fixed header size: magic(2) version(1) type(1) flags(2) reserved(2) conn_id(4).
-pub const HEADER_LEN: usize = 12;
-/// Integrity tag appended to every datagram (truncated keyed BLAKE3).
-pub const TAG_LEN: usize = 16;
-/// Fixed part of a DATA message after the header: offset(8) timestamp(4).
+/// Wire protocol version implemented by this crate. It is bound into the
+/// handshake (Noise prologue and MAC labels), not sent in the clear.
+pub const PROTOCOL_VERSION: u8 = 3;
+
+/// Fixed part of a DATA frame body: offset(8) timestamp(4).
 pub const DATA_FIXED_LEN: usize = 12;
-/// Total per-packet overhead of a DATA datagram at the UDP payload level.
-pub const DATA_OVERHEAD: usize = HEADER_LEN + DATA_FIXED_LEN + TAG_LEN;
+/// Total per-packet overhead of a DATA datagram at the UDP payload level:
+/// connection id, masked type and packet number, frame header, AEAD tag.
+pub const DATA_OVERHEAD: usize = TRANSPORT_OVERHEAD + DATA_FIXED_LEN;
 
 /// UDP payload that fits a 1500-byte Ethernet MTU over IPv4 (1500 - 20 - 8).
 pub const UDP_PAYLOAD_IPV4_1500: usize = 1472;
@@ -24,15 +22,17 @@ pub const UDP_PAYLOAD_IPV4_1500: usize = 1472;
 pub const UDP_PAYLOAD_IPV6_1500: usize = 1452;
 /// UDP payload that is safe on every path (IPv6 minimum MTU 1280 - 40 - 8).
 pub const UDP_PAYLOAD_SAFE: usize = 1232;
+/// UDP payload of a 9000-byte jumbo frame over IPv4.
+pub const UDP_PAYLOAD_JUMBO: usize = 8972;
 
-/// Default DATA chunk (file bytes per packet): 1472 - 40 bytes of overhead.
+/// Default DATA chunk (file bytes per packet) for a 1500-byte MTU.
 pub const DEFAULT_CHUNK: u16 = (UDP_PAYLOAD_IPV4_1500 - DATA_OVERHEAD) as u16;
 /// Chunk that is safe without path-MTU probing.
 pub const SAFE_CHUNK: u16 = (UDP_PAYLOAD_SAFE - DATA_OVERHEAD) as u16;
 /// Smallest chunk we ever negotiate.
 pub const MIN_CHUNK: u16 = 512;
-/// Largest chunk we ever negotiate (jumbo frames minus headers).
-pub const MAX_CHUNK: u16 = 8960;
+/// Largest chunk we ever negotiate (jumbo frames).
+pub const MAX_CHUNK: u16 = (UDP_PAYLOAD_JUMBO - DATA_OVERHEAD) as u16;
 
 /// Largest datagram we accept from the network.
 pub const MAX_DATAGRAM: usize = 65535;
@@ -42,8 +42,9 @@ pub const MAX_DATAGRAM: usize = 65535;
 pub const MAX_CONTROL_DATAGRAM: usize = 1200;
 
 /// Byte budget for the varint-encoded hole list of one ACK or HELLO_ACK, so
-/// that the message always fits into a control datagram (ACK: 12 + 40 + 2 +
-/// 1024 + 16 = 1094 bytes). A typical hole costs 3-4 bytes, so ~250-300
+/// that the message always fits into a control datagram (ACK: 33 + 40 + 2 +
+/// 1024 = 1099 bytes; a handshake response carrying HELLO_ACK: 96 + 1 + 44 +
+/// 2 + 1024 + 1 = 1168 bytes). A typical hole costs 3-4 bytes, so ~250-300
 /// holes fit.
 pub const HOLES_BYTE_BUDGET: usize = 1024;
 /// Upper bound on the number of holes a decoder accepts in one message.
@@ -61,9 +62,11 @@ pub const BLOCK_SIZE: u64 = 256 * 1024;
 /// Whole-file hash length (BLAKE3-256).
 pub const FILE_HASH_LEN: usize = 32;
 
-/// HELLO status codes.
+/// HELLO_ACK status codes.
 pub const HELLO_ACCEPTED: u8 = 1;
 pub const HELLO_REJECTED: u8 = 2;
+/// The receiver's user has not decided yet; the sender keeps asking.
+pub const HELLO_PENDING: u8 = 3;
 
 /// HELLO_ACK reject reasons.
 pub const REASON_NONE: u8 = 0;
@@ -74,28 +77,32 @@ pub const REASON_DECLINED: u8 = 4;
 pub const REASON_CONN_CONFLICT: u8 = 5;
 pub const REASON_INTERNAL: u8 = 6;
 pub const REASON_TIMEOUT: u8 = 7;
+/// The sender's identity is not on the receiver's list of allowed senders.
+pub const REASON_UNAUTHORIZED: u8 = 8;
+/// No AEAD suite in common.
+pub const REASON_NO_SUITE: u8 = 9;
 
 /// FIN_ACK verdicts.
 pub const VERDICT_OK: u8 = 1;
 pub const VERDICT_MISMATCH: u8 = 2;
 
-/// ABORT codes (1 is reserved: a peer that does not know a connection has
-/// no key to tag an answer with).
+/// ABORT codes (1 is reserved).
 pub const ABORT_CANCELLED: u16 = 2;
 pub const ABORT_IO_ERROR: u16 = 3;
 pub const ABORT_TIMEOUT: u16 = 4;
 pub const ABORT_PROTOCOL: u16 = 5;
 
-/// HELLO flags.
-pub const HELLO_FLAG_RESUME: u16 = 0x0001;
-/// HELLO_ACK flags.
-pub const HELLO_ACK_FLAG_RESUMED: u16 = 0x0001;
-/// DATA flags.
-pub const DATA_FLAG_RETRANSMIT: u16 = 0x0001;
+/// Frame flags (4 bits, meaning depends on the frame type).
+/// HELLO: the sender is willing to resume.
+pub const HELLO_FLAG_RESUME: u8 = 0x1;
+/// HELLO_ACK: the receiver already stores part of the file.
+pub const HELLO_ACK_FLAG_RESUMED: u8 = 0x1;
+/// DATA: the range was sent before (statistics only).
+pub const DATA_FLAG_RETRANSMIT: u8 = 0x1;
 
-/// Capability bits offered in HELLO and confirmed in HELLO_ACK. None are
-/// defined in version 2; unknown bits are ignored by the receiver (it never
-/// confirms them), so new features can be introduced without a new version.
+/// Capability bits offered in HELLO and confirmed in HELLO_ACK. Unknown bits
+/// are ignored by the receiver (it never confirms them), so new features can
+/// be introduced without a new version.
 pub const CAP_NONE: u32 = 0;
 /// Capabilities this implementation supports.
 pub const SUPPORTED_CAPS: u32 = CAP_NONE;
