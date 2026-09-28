@@ -80,6 +80,10 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
+/// Who we are, for a relay that puts through only senders on its list: our
+/// identity, and the relay's, against which ownership of ours is proven.
+pub type SenderAuth<'a> = Option<(&'a Identity, SharpId)>;
+
 /// Asks a relay to put us through to `target`.
 ///
 /// Runs alongside the connectivity checks rather than before them, as ICE
@@ -89,20 +93,42 @@ impl std::fmt::Display for ConnectError {
 /// datagrams, handed over by whoever owns the socket's receive loop — the
 /// engine is reading it at the same time, so reading it here too would have
 /// the two stealing each other's packets.
+///
+/// We say who we are only to a relay that asks, by refusing us as a
+/// stranger, and only when we know the relay's identity (`auth`): a relay
+/// that serves anyone learns nothing about the sender, and one that wants
+/// to know gets a proof it can check, made as a receiver's registration
+/// is.
 pub async fn connect(
     socket: Arc<UdpSocket>,
     relay: SocketAddr,
     target: SharpId,
     incoming: &mut mpsc::Receiver<Incoming>,
     cancel: &CancellationToken,
+    auth: SenderAuth<'_>,
 ) -> Result<Introduction, ConnectError> {
     let mut token = [0u8; TOKEN_LEN];
-    for _ in 0..TRIES {
+    // Set once the relay has refused us as a stranger.
+    let mut identify: Option<(SharpId, [u8; 32])> = None;
+    // Two more than the plain exchange needs, for the round that tells us
+    // to identify ourselves and the one that fetches a token for it.
+    for _ in 0..TRIES + 2 {
         if cancel.is_cancelled() {
             return Err(ConnectError::Cancelled);
         }
-        let ask = Message::Connect { target, token };
-        if let Err(e) = socket.send_to(&ask.encode(), relay).await {
+        let ask = match identify {
+            Some((id, key)) => signed(
+                &key,
+                Message::ConnectAs {
+                    target,
+                    token,
+                    id,
+                    proof: [0; PROOF_LEN],
+                },
+            ),
+            None => Message::Connect { target, token }.encode(),
+        };
+        if let Err(e) = socket.send_to(&ask, relay).await {
             return Err(ConnectError::NoAnswer(format!(
                 "cannot reach the relay {}: {}",
                 relay, e
@@ -130,6 +156,26 @@ pub async fn connect(
                     relayed,
                     ticket,
                 });
+            }
+            // A relay that serves only senders on its list: say who we
+            // are, if we can prove it to this relay.
+            Some(Message::Error {
+                code: Refusal::Forbidden,
+            }) if identify.is_none() => {
+                let proven = auth.and_then(|(identity, relay_id)| {
+                    let id = identity.id();
+                    super::auth_key(identity, &relay_id, &id, &relay_id).map(|k| (id, k))
+                });
+                match proven {
+                    Some(p) => identify = Some(p),
+                    None => {
+                        return Err(ConnectError::Refused(format!(
+                            "{} (it has to be given as <relay ID>@<host>:<port> for the \
+                             sender to prove who it is)",
+                            Refusal::Forbidden.describe()
+                        )))
+                    }
+                }
             }
             Some(Message::Error { code }) => {
                 return Err(ConnectError::Refused(code.describe().to_string()))
@@ -474,6 +520,18 @@ pub async fn serve(
                     Refusal::Stale => {
                         tracing::warn!("relay {}: {}", relay, code.describe());
                         next_send = Instant::now() + Duration::from_secs(60);
+                    }
+                    // Not on the relay's list. Its operator may add us, so
+                    // ask again now and then, not in a tight loop.
+                    Refusal::Forbidden => {
+                        if registered || unanswered == 0 {
+                            tracing::warn!(
+                                "relay {} serves only receivers on its list, and not this one",
+                                relay
+                            );
+                        }
+                        registered = false;
+                        next_send = Instant::now() + Duration::from_secs(600);
                     }
                     _ => {}
                 }

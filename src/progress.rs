@@ -179,6 +179,42 @@ pub fn format_bytes(b: u64) -> String {
     }
 }
 
+/// Parses a byte count such as `10G`, `512M`, `1.5T` or a plain number.
+/// `K`, `M`, `G` and `T` are powers of 1000; `Ki`, `Mi`, `Gi` and `Ti` are
+/// powers of 1024. A trailing `B` is allowed (`10GB`, `4GiB`).
+pub fn parse_bytes(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let t = t
+        .strip_suffix('B')
+        .or_else(|| t.strip_suffix('b'))
+        .unwrap_or(t);
+    let (num, mult) = if let Some(n) = t.strip_suffix("Ki").or_else(|| t.strip_suffix("ki")) {
+        (n, 1024f64)
+    } else if let Some(n) = t.strip_suffix("Mi").or_else(|| t.strip_suffix("mi")) {
+        (n, 1024f64.powi(2))
+    } else if let Some(n) = t.strip_suffix("Gi").or_else(|| t.strip_suffix("gi")) {
+        (n, 1024f64.powi(3))
+    } else if let Some(n) = t.strip_suffix("Ti").or_else(|| t.strip_suffix("ti")) {
+        (n, 1024f64.powi(4))
+    } else {
+        match t.chars().last() {
+            Some('k' | 'K') => (&t[..t.len() - 1], 1e3),
+            Some('m' | 'M') => (&t[..t.len() - 1], 1e6),
+            Some('g' | 'G') => (&t[..t.len() - 1], 1e9),
+            Some('t' | 'T') => (&t[..t.len() - 1], 1e12),
+            _ => (t, 1.0),
+        }
+    };
+    let v: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("cannot parse size '{}'", s))?;
+    if v.is_nan() || v < 0.0 || !v.is_finite() {
+        return Err(format!("'{}' is not a size", s));
+    }
+    Ok((v * mult) as u64)
+}
+
 /// Parses a bit rate such as `10M`, `800k`, `1.5G` or a plain number (bits
 /// per second).
 pub fn parse_rate(s: &str) -> Result<u64, String> {
@@ -213,6 +249,14 @@ mod tests {
         assert_eq!(parse_rate("800k").unwrap(), 800_000);
         assert_eq!(parse_rate("42").unwrap(), 42);
         assert!(parse_rate("x").is_err());
+        assert_eq!(parse_bytes("10G").unwrap(), 10_000_000_000);
+        assert_eq!(parse_bytes("4GiB").unwrap(), 4 << 30);
+        assert_eq!(parse_bytes("512Mi").unwrap(), 512 << 20);
+        assert_eq!(parse_bytes("1.5k").unwrap(), 1500);
+        assert_eq!(parse_bytes("0").unwrap(), 0);
+        assert_eq!(parse_bytes("7").unwrap(), 7);
+        assert!(parse_bytes("-1G").is_err());
+        assert!(parse_bytes("lots").is_err());
         assert_eq!(format_rate(1.5e9), "1.50 Gbit/s");
         assert_eq!(format_bytes(1536), "1.50 KiB");
         assert_eq!(format_bytes(12), "12 B");

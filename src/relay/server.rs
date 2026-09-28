@@ -75,6 +75,19 @@ pub struct Config {
     pub burst: f64,
     pub lease: Duration,
     pub idle: Duration,
+    /// Identities that may register here; `None` lets any identity that
+    /// proves itself register. A relay run for one's own receivers should
+    /// list them: otherwise anyone may make it their rendezvous, and have
+    /// their transfers carried on its bandwidth.
+    pub allowed_receivers: Option<std::collections::HashSet<SharpId>>,
+    /// Identities that may ask to be put through; `None` lets anyone ask —
+    /// a sender needs no identity of its own then, and with registrations
+    /// limited, nobody can be put through to anyone but those listed.
+    /// With a list, a sender has to say who it is and prove it
+    /// (`Message::ConnectAs`).
+    pub allowed_senders: Option<std::collections::HashSet<SharpId>>,
+    /// Limits on what is carried.
+    pub quotas: Quotas,
 }
 
 impl std::fmt::Debug for Config {
@@ -89,6 +102,15 @@ impl std::fmt::Debug for Config {
             .field("rate", &self.rate)
             .field("lease", &self.lease)
             .field("idle", &self.idle)
+            .field(
+                "allowed_receivers",
+                &self.allowed_receivers.as_ref().map(|l| l.len()),
+            )
+            .field(
+                "allowed_senders",
+                &self.allowed_senders.as_ref().map(|l| l.len()),
+            )
+            .field("quotas", &self.quotas)
             .finish()
     }
 }
@@ -106,6 +128,9 @@ impl Default for Config {
             burst: 20.0,
             lease: DEFAULT_LEASE,
             idle: DEFAULT_IDLE,
+            allowed_receivers: None,
+            allowed_senders: None,
+            quotas: Quotas::default(),
         }
     }
 }
@@ -280,6 +305,172 @@ impl RateLimiter {
     }
 }
 
+/// Limits on what a relay carries, so that whoever can reach it cannot
+/// simply have its bandwidth. Zero means no limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quotas {
+    /// Bytes per second carried from one client (an IPv4 address, or an
+    /// IPv6 /64: see `address::client_key`).
+    pub client_rate: u64,
+    /// Bytes one client may have carried in any hour or so: a bucket of
+    /// this size, refilled at this much per hour.
+    pub client_hourly: u64,
+    /// Bytes per second carried for everybody together — what the relay's
+    /// own link can spare.
+    pub total_rate: u64,
+    /// Bytes one pair may carry in all before its port is closed.
+    pub pair_bytes: u64,
+}
+
+impl Default for Quotas {
+    /// 100 Mbit/s per client, the rest open. A relay is the path of last
+    /// resort, and its operator's bandwidth is what it spends; the operator
+    /// sets the rest (see `sharp-relay --help`).
+    fn default() -> Self {
+        Self {
+            client_rate: 100_000_000 / 8,
+            client_hourly: 0,
+            total_rate: 0,
+            pair_bytes: 0,
+        }
+    }
+}
+
+/// A token bucket over bytes.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    rate: f64,
+    cap: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    /// Full, refilling at `rate` bytes per second up to `cap`.
+    fn new(rate: f64, cap: f64, now: Instant) -> Self {
+        Self {
+            tokens: cap,
+            rate,
+            cap,
+            at: now,
+        }
+    }
+
+    /// A bucket for a rate limit: a quarter of a second's worth of burst,
+    /// and never less than a few jumbo datagrams.
+    fn for_rate(bytes_per_sec: u64, now: Instant) -> Self {
+        let rate = bytes_per_sec as f64;
+        Self::new(rate, (rate / 4.0).max(64.0 * 1024.0), now)
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let dt = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + dt * self.rate).min(self.cap);
+        self.at = now;
+    }
+
+    fn full(&self, now: Instant) -> bool {
+        let dt = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens + dt * self.rate >= self.cap
+    }
+}
+
+/// What one client has had carried.
+struct ClientMeter {
+    rate: Option<Bucket>,
+    hourly: Option<Bucket>,
+}
+
+/// Clients whose use is tracked at once. Past this, a client whose budget
+/// has refilled completely is forgotten (nothing is lost by that); if none
+/// has, a new client is refused rather than let the table grow — or let one
+/// who spent its budget be forgotten, and so start afresh.
+const MAX_METERED: usize = 65_536;
+
+/// The relay's account of what it carries, shared by every pair.
+pub(crate) struct Meter {
+    quotas: Quotas,
+    total: Option<Bucket>,
+    clients: HashMap<std::net::IpAddr, ClientMeter>,
+    last_full_prune: Option<Instant>,
+    /// Datagrams not carried because of a limit, since the start.
+    pub(crate) refused: u64,
+}
+
+impl Meter {
+    pub(crate) fn new(quotas: Quotas) -> Self {
+        let now = Instant::now();
+        Self {
+            quotas,
+            total: (quotas.total_rate > 0).then(|| Bucket::for_rate(quotas.total_rate, now)),
+            clients: HashMap::new(),
+            last_full_prune: None,
+            refused: 0,
+        }
+    }
+
+    /// Whether `bytes` more from `from` may be carried now; if so, they are
+    /// counted. All limits or none: a datagram refused by one limit costs
+    /// nothing against the others.
+    pub(crate) fn allow(&mut self, from: SocketAddr, bytes: usize, now: Instant) -> bool {
+        let q = self.quotas;
+        let key = client_key(from);
+        if (q.client_rate > 0 || q.client_hourly > 0)
+            && !self.clients.contains_key(&key)
+            && self.clients.len() >= MAX_METERED
+        {
+            let due = self
+                .last_full_prune
+                .is_none_or(|t| now.saturating_duration_since(t) >= FULL_PRUNE_EVERY);
+            if due {
+                self.last_full_prune = Some(now);
+                self.clients.retain(|_, c| {
+                    !(c.rate.is_none_or(|b| b.full(now)) && c.hourly.is_none_or(|b| b.full(now)))
+                });
+            }
+            if self.clients.len() >= MAX_METERED {
+                self.refused += 1;
+                return false;
+            }
+        }
+        let n = bytes as f64;
+        let client = if q.client_rate > 0 || q.client_hourly > 0 {
+            Some(self.clients.entry(key).or_insert_with(|| ClientMeter {
+                rate: (q.client_rate > 0).then(|| Bucket::for_rate(q.client_rate, now)),
+                hourly: (q.client_hourly > 0).then(|| {
+                    let h = q.client_hourly as f64;
+                    Bucket::new(h / 3600.0, h, now)
+                }),
+            }))
+        } else {
+            None
+        };
+        let mut buckets: Vec<&mut Bucket> = Vec::with_capacity(3);
+        if let Some(t) = self.total.as_mut() {
+            buckets.push(t);
+        }
+        if let Some(c) = client {
+            if let Some(b) = c.rate.as_mut() {
+                buckets.push(b);
+            }
+            if let Some(b) = c.hourly.as_mut() {
+                buckets.push(b);
+            }
+        }
+        for b in buckets.iter_mut() {
+            b.refill(now);
+        }
+        if buckets.iter().any(|b| b.tokens < n) {
+            self.refused += 1;
+            return false;
+        }
+        for b in buckets {
+            b.tokens -= n;
+        }
+        true
+    }
+}
+
 struct Registration {
     addr: SocketAddr,
     expires: Instant,
@@ -351,6 +542,9 @@ pub struct Relay {
     /// other and bouncing a datagram between them for ever.
     ports: Arc<parking_lot::Mutex<std::collections::HashSet<u16>>>,
     limiter: RateLimiter,
+    /// What has been carried, per client and in all; every pair counts
+    /// against it.
+    meter: Arc<parking_lot::Mutex<Meter>>,
     last_prune: Instant,
     /// The newest stamp of identities that were registered and are not any
     /// more, and until when it matters (see [`STAMP_MEMORY`]). Without it,
@@ -368,6 +562,7 @@ impl Relay {
         let socket = crate::transport::socket::bind_udp(cfg.bind, CONTROL_BUFFER)?;
         let now = Instant::now();
         let (cfg_rate, cfg_burst) = (cfg.rate, cfg.burst);
+        let meter = Arc::new(parking_lot::Mutex::new(Meter::new(cfg.quotas)));
         Ok(Self {
             socket: Arc::new(socket),
             identity: cfg.identity.clone(),
@@ -378,6 +573,7 @@ impl Relay {
             allocations: Vec::new(),
             ports: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             limiter: RateLimiter::new(cfg_rate, cfg_burst),
+            meter,
             last_prune: now,
             forgotten: HashMap::new(),
         })
@@ -495,6 +691,26 @@ impl Relay {
                     .await;
                     return;
                 }
+                // And a proven identity that is not one this relay serves
+                // gets told so. Only after the proof: whether an identity
+                // is on the list is nothing to tell someone who does not
+                // hold it.
+                if self
+                    .cfg
+                    .allowed_receivers
+                    .as_ref()
+                    .is_some_and(|l| !l.contains(&id))
+                {
+                    tracing::info!("relay: {} is not on the list of receivers", id.short());
+                    self.reply(
+                        from,
+                        Message::Error {
+                            code: Refusal::Forbidden,
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 // Only something newer than what we already took from this
                 // identity. The proof ties the message to its owner but not
                 // to a moment; the stamp does, and without it a registration
@@ -581,97 +797,55 @@ impl Relay {
                     self.reply(from, Message::Challenge { token }).await;
                     return;
                 }
-                let Some(reg) = self.registrations.get(&target).filter(|r| r.fresh(now)) else {
+                // A relay with a list of senders has to know who is asking.
+                if self.cfg.allowed_senders.is_some() {
                     self.reply(
                         from,
                         Message::Error {
-                            code: Refusal::Unknown,
+                            code: Refusal::Forbidden,
                         },
                     )
                     .await;
                     return;
-                };
-                let receiver = reg.addr;
-                // An owner that asked to stay hidden is not described to
-                // the caller; there is then no direct path to try and the
-                // pair meets at the relay's port.
-                let disclose = !reg.private;
-                // The same pair asking again means our answer went missing,
-                // not that they want a second port. That has to be settled
-                // before the limits: a sender that already holds its whole
-                // share would otherwise be refused the very port it has.
-                let granted = match self.existing(from, receiver, disclose) {
-                    Some(granted) => Some(granted),
-                    None => {
-                        let share = self.cfg.allocations_per_client.max(1);
-                        let client = client_key(from);
-                        let mine = self
-                            .allocations
-                            .iter()
-                            .filter(|a| a.requested_by == client && !a.task.is_finished())
-                            .count();
-                        let live = self
-                            .allocations
-                            .iter()
-                            .filter(|a| !a.task.is_finished())
-                            .count();
-                        if live >= self.cfg.max_allocations || mine >= share {
-                            if mine >= share {
-                                tracing::info!("relay: {} already holds {} ports", client, mine);
-                            }
-                            self.reply(
-                                from,
-                                Message::Error {
-                                    code: Refusal::Busy,
-                                },
-                            )
-                            .await;
-                            return;
-                        }
-                        self.allocate(from, receiver, disclose).await
-                    }
-                };
-                match granted {
-                    Some((port, sender_ticket, receiver_ticket)) => {
-                        // Each side is told where the other appears to be,
-                        // so they can try a direct path first and leave the
-                        // relay carrying nothing.
-                        self.reply(
-                            from,
-                            Message::Allocated {
-                                port,
-                                peer: shown(receiver, disclose),
-                                ticket: sender_ticket,
-                            },
-                        )
-                        .await;
-                        self.reply(
-                            receiver,
-                            Message::Incoming {
-                                port,
-                                peer: shown(from, disclose),
-                                ticket: receiver_ticket,
-                            },
-                        )
-                        .await;
-                        tracing::info!(
-                            "relay: port {} carries {} <-> {} ({})",
-                            port,
-                            from,
-                            receiver,
-                            target.short()
-                        );
-                    }
-                    None => {
-                        self.reply(
-                            from,
-                            Message::Error {
-                                code: Refusal::Busy,
-                            },
-                        )
-                        .await
-                    }
                 }
+                self.put_through(target, from, now).await;
+            }
+            Message::ConnectAs {
+                target, token, id, ..
+            } => {
+                if !self.tokens.accepts(&token, from, now) {
+                    let token = self.tokens.issue(from, now);
+                    self.reply(from, Message::Challenge { token }).await;
+                    return;
+                }
+                if !self.owns(&id, raw) {
+                    tracing::debug!("relay: {} cannot prove it owns {}", from, id.short());
+                    self.reply(
+                        from,
+                        Message::Error {
+                            code: Refusal::BadToken,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                if self
+                    .cfg
+                    .allowed_senders
+                    .as_ref()
+                    .is_some_and(|l| !l.contains(&id))
+                {
+                    tracing::info!("relay: {} is not on the list of senders", id.short());
+                    self.reply(
+                        from,
+                        Message::Error {
+                            code: Refusal::Forbidden,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                self.put_through(target, from, now).await;
             }
             Message::Bye {
                 id, token, stamp, ..
@@ -714,6 +888,103 @@ impl Relay {
             | Message::Open { .. }
             | Message::Confirm { .. }
             | Message::Punch => {}
+        }
+    }
+
+    /// Puts a sender at `from` through to `target`: allocates a port for
+    /// the pair (or hands back the one it already has) and introduces the
+    /// two.
+    async fn put_through(&mut self, target: SharpId, from: SocketAddr, now: Instant) {
+        let Some(reg) = self.registrations.get(&target).filter(|r| r.fresh(now)) else {
+            self.reply(
+                from,
+                Message::Error {
+                    code: Refusal::Unknown,
+                },
+            )
+            .await;
+            return;
+        };
+        let receiver = reg.addr;
+        // An owner that asked to stay hidden is not described to
+        // the caller; there is then no direct path to try and the
+        // pair meets at the relay's port.
+        let disclose = !reg.private;
+        // The same pair asking again means our answer went missing,
+        // not that they want a second port. That has to be settled
+        // before the limits: a sender that already holds its whole
+        // share would otherwise be refused the very port it has.
+        let granted = match self.existing(from, receiver, disclose) {
+            Some(granted) => Some(granted),
+            None => {
+                let share = self.cfg.allocations_per_client.max(1);
+                let client = client_key(from);
+                let mine = self
+                    .allocations
+                    .iter()
+                    .filter(|a| a.requested_by == client && !a.task.is_finished())
+                    .count();
+                let live = self
+                    .allocations
+                    .iter()
+                    .filter(|a| !a.task.is_finished())
+                    .count();
+                if live >= self.cfg.max_allocations || mine >= share {
+                    if mine >= share {
+                        tracing::info!("relay: {} already holds {} ports", client, mine);
+                    }
+                    self.reply(
+                        from,
+                        Message::Error {
+                            code: Refusal::Busy,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                self.allocate(from, receiver, disclose).await
+            }
+        };
+        match granted {
+            Some((port, sender_ticket, receiver_ticket)) => {
+                // Each side is told where the other appears to be,
+                // so they can try a direct path first and leave the
+                // relay carrying nothing.
+                self.reply(
+                    from,
+                    Message::Allocated {
+                        port,
+                        peer: shown(receiver, disclose),
+                        ticket: sender_ticket,
+                    },
+                )
+                .await;
+                self.reply(
+                    receiver,
+                    Message::Incoming {
+                        port,
+                        peer: shown(from, disclose),
+                        ticket: receiver_ticket,
+                    },
+                )
+                .await;
+                tracing::info!(
+                    "relay: port {} carries {} <-> {} ({})",
+                    port,
+                    from,
+                    receiver,
+                    target.short()
+                );
+            }
+            None => {
+                self.reply(
+                    from,
+                    Message::Error {
+                        code: Refusal::Busy,
+                    },
+                )
+                .await
+            }
         }
     }
 
@@ -768,6 +1039,8 @@ impl Relay {
             sender_shown: shown(sender, disclose),
             receiver_control: receiver,
             idle: self.cfg.idle,
+            meter: self.meter.clone(),
+            pair_bytes: self.cfg.quotas.pair_bytes,
             cancel: self.cancel.clone(),
         }));
         self.allocations.push(Allocation {
@@ -860,6 +1133,10 @@ struct Carried {
     /// whichever address presents the ticket.
     receiver_control: SocketAddr,
     idle: Duration,
+    /// The relay's account of what it carries, and what this pair may carry
+    /// in all (0: no limit).
+    meter: Arc<parking_lot::Mutex<Meter>>,
+    pair_bytes: u64,
     cancel: CancellationToken,
 }
 
@@ -874,6 +1151,28 @@ const INTRODUCE_TIMES: u32 = 8;
 /// unconnected UDP socket when an ICMP port-unreachable comes back, so a
 /// single peer going quiet would otherwise kill the pair.
 const MAX_ERRORS: u32 = 16;
+
+/// What one pair carried, and what it was refused, told when it ends.
+struct Tally {
+    port: u16,
+    carried: u64,
+    refused: u64,
+}
+
+impl Drop for Tally {
+    fn drop(&mut self) {
+        if self.refused > 0 {
+            tracing::info!(
+                "relay: port {} carried {} bytes and refused {} datagram(s) over its limits",
+                self.port,
+                self.carried,
+                self.refused
+            );
+        } else {
+            tracing::debug!("relay: port {} carried {} bytes", self.port, self.carried);
+        }
+    }
+}
 
 /// Copies datagrams between the two sides of one allocation.
 ///
@@ -892,8 +1191,16 @@ async fn carry(c: Carried) {
         sender_shown,
         receiver_control,
         idle,
+        meter,
+        pair_bytes,
         cancel,
     } = c;
+    // Said once, when the pair ends, however it ends.
+    let mut tally = Tally {
+        port,
+        carried: 0,
+        refused: 0,
+    };
     let mut a: Option<SocketAddr> = None;
     let mut b: Option<SocketAddr> = None;
     let mut buf = vec![0u8; BUF_LEN];
@@ -999,7 +1306,25 @@ async fn carry(c: Carried) {
                     continue;
                 };
                 if let Some(to) = to {
-                    last = Instant::now();
+                    let now = Instant::now();
+                    // Within the client's and the relay's limits, or not
+                    // carried at all: a policed datagram is lost like any
+                    // other, and the transfer's own congestion control
+                    // slows it to what the relay will carry.
+                    if !meter.lock().allow(from, n, now) {
+                        tally.refused += 1;
+                        continue;
+                    }
+                    tally.carried += n as u64;
+                    if pair_bytes > 0 && tally.carried > pair_bytes {
+                        tracing::info!(
+                            "relay: port {} has carried the {} bytes a pair may; closing it",
+                            port,
+                            pair_bytes
+                        );
+                        return;
+                    }
+                    last = now;
                     let _ = sock.send_to(pkt, to).await;
                 }
             }
@@ -2079,5 +2404,206 @@ mod wire_tests {
             "the relay carried a datagram back to where it came from"
         );
         cancel.cancel();
+    }
+
+    /// A relay run for one's own receivers registers those and nobody else
+    /// — and says so only to an identity that has proven itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_with_a_list_registers_only_those_on_it() {
+        let ours = Identity::generate();
+        let stranger = Identity::generate();
+        let (relay, relay_id, cancel) = start_relay_with(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_receivers: Some([ours.id()].into_iter().collect()),
+            ..Config::default()
+        })
+        .await;
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            register(&a, relay, &relay_id, &ours, 0).await,
+            Some(Message::Registered { .. })
+        ));
+        assert_eq!(
+            register(&b, relay, &relay_id, &stranger, 0).await,
+            Some(Message::Error {
+                code: Refusal::Forbidden
+            })
+        );
+        // Without the proof, not even that much is said.
+        let unproven = with_token(&b, relay, |token| Message::Register {
+            id: ours.id(),
+            token,
+            flags: 0,
+            stamp: stamp(),
+            proof: [0; crate::relay::PROOF_LEN],
+        })
+        .await;
+        assert_eq!(
+            unproven,
+            Some(Message::Error {
+                code: Refusal::BadToken
+            })
+        );
+        cancel.cancel();
+    }
+
+    /// A relay with a list of senders turns a stranger's plain request
+    /// away, puts through a listed sender that proves who it is, and not
+    /// one that only says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_with_a_list_of_senders_wants_to_know_who_asks() {
+        let receiver = Identity::generate();
+        let listed = Identity::generate();
+        let other = Identity::generate();
+        let (relay, relay_id, cancel) = start_relay_with(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_senders: Some([listed.id()].into_iter().collect()),
+            ..Config::default()
+        })
+        .await;
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            register(&rc, relay, &relay_id, &receiver, 0).await,
+            Some(Message::Registered { .. })
+        ));
+        let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let plain = with_token(&sc, relay, |token| Message::Connect {
+            target: receiver.id(),
+            token,
+        })
+        .await;
+        assert_eq!(
+            plain,
+            Some(Message::Error {
+                code: Refusal::Forbidden
+            })
+        );
+        let token = token_for(&sc, relay, receiver.id()).await;
+        let as_who = |who: &Identity, prover: &Identity| {
+            let key = crate::relay::auth_key(prover, &relay_id, &prover.id(), &relay_id).unwrap();
+            signed(
+                &key,
+                Message::ConnectAs {
+                    target: receiver.id(),
+                    token,
+                    id: who.id(),
+                    proof: [0; crate::relay::PROOF_LEN],
+                },
+            )
+        };
+        // Someone else claiming the listed identity cannot make its proof.
+        sc.send_to(&as_who(&listed, &other), relay).await.unwrap();
+        assert_eq!(
+            recv_message(&sc, Duration::from_secs(2)).await,
+            Some(Message::Error {
+                code: Refusal::BadToken
+            })
+        );
+        // Proven, but not listed.
+        sc.send_to(&as_who(&other, &other), relay).await.unwrap();
+        assert_eq!(
+            recv_message(&sc, Duration::from_secs(2)).await,
+            Some(Message::Error {
+                code: Refusal::Forbidden
+            })
+        );
+        // Proven and listed.
+        sc.send_to(&as_who(&listed, &listed), relay).await.unwrap();
+        assert!(matches!(
+            recv_message(&sc, Duration::from_secs(2)).await,
+            Some(Message::Allocated { .. })
+        ));
+        cancel.cancel();
+    }
+
+    fn at(t0: Instant, ms: u64) -> Instant {
+        t0 + Duration::from_millis(ms)
+    }
+
+    /// A client gets its rate and no more; what it did not spend comes
+    /// back with time; another client is counted on its own.
+    #[test]
+    fn a_client_is_carried_at_its_rate() {
+        let mut m = Meter::new(Quotas {
+            client_rate: 1_000_000,
+            ..Quotas::default()
+        });
+        let a: SocketAddr = "198.51.100.1:1000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.2:1000".parse().unwrap();
+        let t0 = Instant::now();
+        // The burst is a quarter of a second's worth.
+        let mut carried = 0;
+        while m.allow(a, 1000, t0) {
+            carried += 1000;
+        }
+        assert_eq!(carried, 250_000);
+        assert!(m.allow(b, 1000, t0), "another client pays for the first");
+        // A tenth of a second later, a tenth of a second's worth.
+        let mut later = 0;
+        while m.allow(a, 1000, at(t0, 100)) {
+            later += 1000;
+        }
+        assert_eq!(later, 100_000);
+        // The same client from another port, or elsewhere in its IPv6 /64,
+        // is the same client.
+        assert!(!m.allow("198.51.100.1:2000".parse().unwrap(), 1000, at(t0, 100)));
+        assert!(m.refused >= 2);
+    }
+
+    /// The hourly quota is a bucket of the whole hour's allowance.
+    #[test]
+    fn an_hourly_quota_runs_out_and_comes_back() {
+        let mut m = Meter::new(Quotas {
+            client_rate: 0,
+            client_hourly: 3_600_000,
+            ..Quotas::default()
+        });
+        let a: SocketAddr = "[2001:db8::1]:1000".parse().unwrap();
+        let same_64: SocketAddr = "[2001:db8::ffff]:1".parse().unwrap();
+        let t0 = Instant::now();
+        assert!(m.allow(a, 3_000_000, t0));
+        assert!(!m.allow(same_64, 1_000_000, t0), "one /64 is one client");
+        assert!(m.allow(same_64, 600_000, t0));
+        assert!(!m.allow(a, 1, t0));
+        // A thousand bytes a second come back.
+        assert!(m.allow(a, 10_000, at(t0, 10_000)));
+    }
+
+    /// The relay's own limit counts everybody together, and a datagram one
+    /// limit refuses costs nothing against the others.
+    #[test]
+    fn the_total_limit_counts_everybody_and_refusals_cost_nothing() {
+        let mut m = Meter::new(Quotas {
+            client_rate: 400_000,
+            total_rate: 400_000,
+            ..Quotas::default()
+        });
+        let t0 = Instant::now();
+        let a: SocketAddr = "198.51.100.1:1".parse().unwrap();
+        let b: SocketAddr = "198.51.100.2:1".parse().unwrap();
+        // The total burst (100 KB) is shared.
+        assert!(m.allow(a, 60_000, t0));
+        assert!(!m.allow(b, 60_000, t0), "over the total");
+        // b's refusal took nothing from b's own budget.
+        assert!(m.allow(b, 40_000, t0));
+        assert!(!m.allow(a, 1, t0));
+    }
+
+    /// No limits configured: nothing is tracked, and everything passes.
+    #[test]
+    fn without_limits_nothing_is_tracked() {
+        let mut m = Meter::new(Quotas {
+            client_rate: 0,
+            client_hourly: 0,
+            total_rate: 0,
+            pair_bytes: 0,
+        });
+        let t0 = Instant::now();
+        for i in 0..1000u32 {
+            let from = SocketAddr::new(std::net::Ipv4Addr::from(0xc633_6400 + i).into(), 1);
+            assert!(m.allow(from, 1 << 20, t0));
+        }
+        assert!(m.clients.is_empty());
     }
 }

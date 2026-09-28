@@ -14,7 +14,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sharp256::crypto::Identity;
+use sharp256::crypto::identity::load_id_list;
+use sharp256::crypto::{Identity, SharpId};
+use sharp256::progress::{format_bytes, format_rate, parse_bytes, parse_rate};
+use sharp256::relay::server::Quotas;
 use sharp256::relay::server::{Config, Relay};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -65,6 +68,46 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     idle: u64,
 
+    /// Let only this receiver register (repeatable). Without any, every
+    /// receiver that proves its identity may make this relay its
+    /// rendezvous and have its transfers carried on this host's bandwidth.
+    #[arg(long = "allow-receiver", value_name = "ID")]
+    allow_receivers: Vec<SharpId>,
+
+    /// Let only the receivers listed in this file register (one ID per
+    /// line; # starts a comment).
+    #[arg(long, value_name = "FILE")]
+    allowed_receivers: Option<PathBuf>,
+
+    /// Put through only this sender (repeatable). A sender then has to
+    /// prove who it is, which it does when given the relay as
+    /// <relay ID>@<host>:<port>.
+    #[arg(long = "allow-sender", value_name = "ID")]
+    allow_senders: Vec<SharpId>,
+
+    /// Put through only the senders listed in this file.
+    #[arg(long, value_name = "FILE")]
+    allowed_senders: Option<PathBuf>,
+
+    /// Most one client (an IPv4 address or an IPv6 /64) may have carried,
+    /// in bits per second, e.g. 100M; 0 for no limit.
+    #[arg(long, value_name = "RATE", default_value = "100M")]
+    client_rate: String,
+
+    /// Most one client may have carried per hour, e.g. 20G; 0 for no limit.
+    #[arg(long, value_name = "BYTES", default_value = "0")]
+    client_quota: String,
+
+    /// Most everybody together may have carried, in bits per second, e.g.
+    /// 900M for a gigabit uplink; 0 for no limit.
+    #[arg(long, value_name = "RATE", default_value = "0")]
+    total_rate: String,
+
+    /// Most one pair may carry in all before its port is closed, e.g. 50G;
+    /// 0 for no limit.
+    #[arg(long, value_name = "BYTES", default_value = "0")]
+    pair_bytes: String,
+
     /// Identity file. A relay has a long-term key of its own, which is how
     /// a receiver registering here proves it owns the identity it claims:
     /// the two work out a shared secret from their keys alone. Created on
@@ -90,6 +133,33 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_create(&path)
         .with_context(|| format!("cannot use identity file {}", path.display()))?;
 
+    let rate = |s: &str| -> Result<u64> {
+        if s.trim() == "0" {
+            return Ok(0);
+        }
+        parse_rate(s)
+            .map(|bps| bps / 8)
+            .map_err(|e| anyhow::anyhow!(e))
+    };
+    let bytes = |s: &str| parse_bytes(s).map_err(|e| anyhow::anyhow!(e));
+    let quotas = Quotas {
+        client_rate: rate(&args.client_rate)?,
+        client_hourly: bytes(&args.client_quota)?,
+        total_rate: rate(&args.total_rate)?,
+        pair_bytes: bytes(&args.pair_bytes)?,
+    };
+    let list = |ids: &[SharpId],
+                file: &Option<PathBuf>|
+     -> Result<Option<std::collections::HashSet<SharpId>>> {
+        let mut set: std::collections::HashSet<SharpId> = ids.iter().copied().collect();
+        if let Some(path) = file {
+            set.extend(load_id_list(path).with_context(|| format!("{}", path.display()))?);
+        }
+        Ok((!set.is_empty() || file.is_some()).then_some(set))
+    };
+    let allowed_receivers = list(&args.allow_receivers, &args.allowed_receivers)?;
+    let allowed_senders = list(&args.allow_senders, &args.allowed_senders)?;
+
     let cfg = Config {
         bind: args.bind,
         identity: identity.clone(),
@@ -101,6 +171,9 @@ async fn main() -> Result<()> {
         burst: (args.rate * 2.0).max(2.0),
         lease: Duration::from_secs(args.lease.clamp(10, 3600)),
         idle: Duration::from_secs(args.idle.clamp(5, 3600)),
+        allowed_receivers: allowed_receivers.clone(),
+        allowed_senders: allowed_senders.clone(),
+        quotas,
     };
 
     let cancel = CancellationToken::new();
@@ -119,7 +192,42 @@ async fn main() -> Result<()> {
         addr.to_string()
     };
     println!("Receivers: --relay {}@{}", identity.id(), public);
-    println!("Senders:   --relay {}", public);
+    match &allowed_senders {
+        None => println!("Senders:   --relay {}", public),
+        Some(_) => println!("Senders:   --relay {}@{}", identity.id(), public),
+    }
+    match &allowed_receivers {
+        Some(l) => println!("Serving:   {} listed receiver(s)", l.len()),
+        None => println!(
+            "Serving:   ANY receiver that proves its identity. Anyone may use this relay as \
+             their rendezvous and have transfers carried on this host's bandwidth; limit it \
+             with --allow-receiver or --allowed-receivers"
+        ),
+    }
+    if let Some(l) = &allowed_senders {
+        println!("Senders:   {} listed sender(s) only", l.len());
+    }
+    let show_rate = |b: u64| {
+        if b == 0 {
+            "no limit".to_string()
+        } else {
+            format_rate(b as f64 * 8.0)
+        }
+    };
+    let show_bytes = |b: u64| {
+        if b == 0 {
+            "no limit".to_string()
+        } else {
+            format_bytes(b)
+        }
+    };
+    println!(
+        "Limits:    {} per client, {} per client per hour, {} in all, {} per pair",
+        show_rate(quotas.client_rate),
+        show_bytes(quotas.client_hourly),
+        show_rate(quotas.total_rate),
+        show_bytes(quotas.pair_bytes)
+    );
 
     let stopper = cancel.clone();
     tokio::spawn(async move {

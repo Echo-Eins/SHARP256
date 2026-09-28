@@ -141,6 +141,7 @@ enum Kind {
     Punch = 9,
     Bye = 10,
     Confirm = 11,
+    ConnectAs = 12,
 }
 
 impl Kind {
@@ -157,6 +158,7 @@ impl Kind {
             9 => Kind::Punch,
             10 => Kind::Bye,
             11 => Kind::Confirm,
+            12 => Kind::ConnectAs,
             _ => return None,
         })
     }
@@ -175,6 +177,9 @@ pub enum Refusal {
     /// The message is older than one the relay already took for the same
     /// identity: a replay, or a clock that went backwards.
     Stale = 4,
+    /// The relay serves only identities on its list, and this one is not,
+    /// or did not say who it is.
+    Forbidden = 5,
 }
 
 impl Refusal {
@@ -184,6 +189,7 @@ impl Refusal {
             2 => Refusal::BadToken,
             3 => Refusal::Busy,
             4 => Refusal::Stale,
+            5 => Refusal::Forbidden,
             _ => return None,
         })
     }
@@ -197,6 +203,7 @@ impl Refusal {
                 "the relay has already seen a newer message from this identity \
                  (a replay, or this host's clock went backwards)"
             }
+            Refusal::Forbidden => "the relay serves only identities on its list, and not this one",
         }
     }
 }
@@ -235,6 +242,16 @@ pub enum Message {
     Connect {
         target: SharpId,
         token: [u8; TOKEN_LEN],
+    },
+    /// Sender → relay: the same, saying who is asking and proving it, for a
+    /// relay that serves only identities on its list. The proof is made as
+    /// a registration's is, over this message, so it cannot be moved onto
+    /// another.
+    ConnectAs {
+        target: SharpId,
+        token: [u8; TOKEN_LEN],
+        id: SharpId,
+        proof: [u8; PROOF_LEN],
     },
     /// Relay → sender: a port has been set aside for the pair, and the
     /// receiver appears to be at this address — worth trying directly
@@ -391,6 +408,18 @@ impl Message {
                 out.extend_from_slice(target.as_bytes());
                 out.extend_from_slice(token);
             }
+            Message::ConnectAs {
+                target,
+                token,
+                id,
+                proof,
+            } => {
+                out.push(Kind::ConnectAs as u8);
+                out.extend_from_slice(target.as_bytes());
+                out.extend_from_slice(token);
+                out.extend_from_slice(id.as_bytes());
+                out.extend_from_slice(proof);
+            }
             Message::Allocated { port, peer, ticket } => {
                 out.push(Kind::Allocated as u8);
                 out.extend_from_slice(&port.to_be_bytes());
@@ -482,6 +511,21 @@ impl Message {
                             proof,
                         }
                     }
+                }
+            }
+            Kind::ConnectAs => {
+                let target: [u8; 32] = body.get(0..32)?.try_into().ok()?;
+                let token: [u8; TOKEN_LEN] = body.get(32..32 + TOKEN_LEN)?.try_into().ok()?;
+                pos = 32 + TOKEN_LEN;
+                let id: [u8; 32] = body.get(pos..pos + 32)?.try_into().ok()?;
+                pos += 32;
+                let proof: [u8; PROOF_LEN] = body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
+                pos += PROOF_LEN;
+                Message::ConnectAs {
+                    target: SharpId::from_public(target),
+                    token,
+                    id: SharpId::from_public(id),
+                    proof,
                 }
             }
             Kind::Challenge => {
@@ -663,6 +707,12 @@ mod tests {
             target: id,
             token: [3; TOKEN_LEN],
         });
+        roundtrip(Message::ConnectAs {
+            target: id,
+            token: [3; TOKEN_LEN],
+            id: Identity::generate().id(),
+            proof: [9; PROOF_LEN],
+        });
         roundtrip(Message::Allocated {
             port: 50001,
             peer: "198.51.100.9:6000".parse().unwrap(),
@@ -678,6 +728,7 @@ mod tests {
             Refusal::BadToken,
             Refusal::Busy,
             Refusal::Stale,
+            Refusal::Forbidden,
         ] {
             roundtrip(Message::Error { code });
         }

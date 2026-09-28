@@ -222,11 +222,11 @@ impl Sender {
         let inboxes: RelayInboxes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let reach = crate::address::Reach::of(&self.socket.udp());
         for name in &self.cfg.relays {
-            // A sender claims no identity of its own here, so it needs
-            // none of the relay's: the address alone is enough, and an
-            // identity written with it is simply ignored.
-            let host = match crate::relay::parse_relay(name) {
-                Ok((_, host)) => host,
+            // A sender claims no identity of its own unless the relay
+            // insists, so the address alone is enough; the relay's identity,
+            // when written with it, is what our proof would be made against.
+            let (relay_id, host) = match crate::relay::parse_relay(name) {
+                Ok(parsed) => parsed,
                 Err(e) => {
                     tracing::warn!("relay \"{}\": {}", name, e);
                     continue;
@@ -237,7 +237,11 @@ impl Sender {
             let cancel = self.cancel.clone();
             let found = found_tx.clone();
             let inboxes = inboxes.clone();
+            let identity = self.identity.clone();
             tokio::spawn(async move {
+                // Only for a relay that asks, and only if we know its
+                // identity to prove ours against.
+                let auth = relay_id.map(|r| (&identity, r));
                 // A name is resolved like the receiver's own: as a hint.
                 let resolved = tokio::select! {
                     r = tokio::time::timeout(
@@ -276,6 +280,7 @@ impl Sender {
                         target,
                         &mut rx,
                         &cancel,
+                        auth,
                     )
                     .await
                     {

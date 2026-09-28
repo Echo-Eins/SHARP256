@@ -3540,3 +3540,147 @@ async fn keepalives_keep_a_receiver_behind_a_forgetful_nat_reachable() {
     cancel.cancel();
     relay_task.abort();
 }
+
+// ----- Relay access and quotas ---------------------------------------------
+
+/// Starts a relay with `cfg` (bound to loopback) and a receiver that only
+/// the relay can reach — behind a mapping that turns everything else away —
+/// registered with it. Returns the relay's address and identity, the
+/// receiver, and what to stop afterwards.
+#[cfg(feature = "nat-traversal")]
+async fn relay_only_receiver(
+    cfg: sharp256::relay::server::Config,
+    out: &Path,
+    state: &Path,
+) -> (
+    SocketAddr,
+    SharpId,
+    TestReceiver,
+    CancellationToken,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    use sharp256::relay::server::Relay;
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(cfg, cancel.clone())
+        .await
+        .expect("the relay binds");
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_id = relay.id();
+    let relay_task = tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+    let (mapping, _refused, mapping_task) = one_way_mapping(relay_addr).await;
+    let r = start_receiver(out, state, |cfg| {
+        cfg.relays = vec![format!("{}@{}", relay_id, mapping)];
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    (
+        relay_addr,
+        relay_id,
+        r,
+        cancel,
+        vec![relay_task, mapping_task],
+    )
+}
+
+/// A relay polices what it carries: a client gets the rate it is allowed
+/// and no more, and the transfer still completes, its congestion control
+/// settling on what the relay lets through.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_carries_a_client_at_its_rate_and_no_faster() {
+    use sharp256::relay::server::{Config, Quotas};
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 3 << 20;
+    let file = make_file(&src, "policed.bin", size, 0x9011);
+    let rate = 1_000_000;
+    let (relay_addr, _relay_id, mut r, cancel, tasks) = relay_only_receiver(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            quotas: Quotas {
+                client_rate: rate,
+                ..Quotas::default()
+            },
+            ..Config::default()
+        },
+        &out,
+        &state,
+    )
+    .await;
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let mut cfg = sender_cfg(&file, dead_addr, r.id, &state);
+    cfg.relays = vec![relay_addr.to_string()];
+    let started = Instant::now();
+    let summary = tokio::time::timeout(Duration::from_secs(90), run_sender(cfg))
+        .await
+        .expect("the policed transfer finishes")
+        .expect("and completes");
+    let took = started.elapsed();
+    assert_eq!(summary.file_size, size as u64);
+    // Three megabytes at one megabyte a second, less the quarter-second
+    // burst: no less than about two and a half seconds.
+    assert!(
+        took >= Duration::from_millis(2300),
+        "carried {} bytes in {:?}: faster than the relay allows",
+        size,
+        took
+    );
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("policed.bin"));
+    stop_receiver(r).await;
+    cancel.cancel();
+    for t in tasks {
+        t.abort();
+    }
+}
+
+/// A relay that puts through only listed senders: one given the relay with
+/// its identity proves who it is and gets through; one given the address
+/// alone cannot, and is turned away.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_puts_through_only_the_senders_it_lists() {
+    use sharp256::relay::server::Config;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let file = make_file(&src, "listed.bin", 256 << 10, 0x5e);
+    let (relay_addr, relay_id, mut r, cancel, tasks) = relay_only_receiver(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_senders: Some([sender_identity().id()].into_iter().collect()),
+            ..Config::default()
+        },
+        &out,
+        &state,
+    )
+    .await;
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+
+    let mut anonymous = sender_cfg(&file, dead_addr, r.id, &state);
+    anonymous.relays = vec![relay_addr.to_string()];
+    anonymous.transport.handshake_timeout = Duration::from_secs(3);
+    let refused = tokio::time::timeout(Duration::from_secs(30), run_sender(anonymous))
+        .await
+        .expect("gives up in time");
+    assert!(refused.is_err(), "put through without saying who it is");
+
+    let mut named = sender_cfg(&file, dead_addr, r.id, &state);
+    named.relays = vec![format!("{}@{}", relay_id, relay_addr)];
+    tokio::time::timeout(Duration::from_secs(30), run_sender(named))
+        .await
+        .expect("in time")
+        .expect("a listed sender that proves itself is put through");
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("listed.bin"));
+    stop_receiver(r).await;
+    cancel.cancel();
+    for t in tasks {
+        t.abort();
+    }
+}
