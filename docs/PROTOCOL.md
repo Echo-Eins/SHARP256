@@ -66,8 +66,8 @@ WireGuard uses) with the prologue `SHARP-256 v3`, wrapped with connection
 ids and two MACs:
 
 ```
-initiation  S → R   sender_cid[8] | e[32] | enc(s)[48] | enc(payload)[n+16] | mac1[16] | mac2[16]
-response    R → S   sender_cid[8] | receiver_cid[8] | e[32] | enc(payload)[n+16] | mac1[16] | mac2[16]
+initiation  S → R   sender_cid[8] | e[32] | enc(s)[48] | enc(sender_cid[8] | payload)[n+24] | mac1[16] | mac2[16]
+response    R → S   sender_cid[8] | receiver_cid[8] | e[32] | enc(receiver_cid[8] | payload)[n+24] | mac1[16] | mac2[16]
 cookie      R → S   sender_cid[8] | nonce[24] | enc(cookie)[16] | tag[16]
 ```
 
@@ -77,11 +77,26 @@ cookie      R → S   sender_cid[8] | nonce[24] | enc(cookie)[16] | tag[16]
   keys, so every session has fresh keys (forward secrecy). The PSK is mixed
   in after the key exchange (`psk2`), which also protects recorded traffic
   against a future break of X25519 when a secret is used.
-* Connection ids are random, non-zero 64-bit values chosen by the side
-  that *receives* with them: the sender chooses `sender_cid` per attempt,
-  the receiver `receiver_cid` per session. Every later datagram starts with
-  the id of its recipient, which is all the receiver needs to find the
-  session.
+* Connection ids are random 64-bit values chosen by the side that
+  *receives* with them: the sender chooses `sender_cid` per attempt, the
+  receiver `receiver_cid` per session. Every later datagram starts with the
+  id of its recipient, which is all the receiver needs to find the session.
+  Zero, the relay magic (section 8) and any id whose second four bytes are
+  the STUN magic cookie `0x2112A442` are never chosen, so a transport packet
+  can never be mistaken for a relay control message or for STUN on a socket
+  that carries both.
+* Each side's id travels twice: in the clear, where the other side's
+  dispatcher needs it, and **sealed** as the first eight bytes of the Noise
+  payload. The clear copy is covered only by mac1, whose key anybody can
+  derive from a public key, so a copy raced ahead with the id changed would
+  otherwise misaddress the session. The receiver refuses an initiation
+  whose two copies differ (before its replay guard takes it into account);
+  the sender takes the receiver's id only from the sealed copy.
+* Static keys that are small-order points (the eight low-order points of
+  Curve25519 and its twist, in every encoding) have no private half: every
+  Diffie-Hellman with them is the same constant. They are refused wherever
+  an identity comes in — when an ID is parsed, as a receiver key before a
+  handshake starts, as a sender key in an initiation, and by relays.
 * `mac1 = BLAKE3-keyed(K1, datagram up to mac1)[0..16]` with
   `K1 = BLAKE3-derive_key("sharp256 v3 mac1", recipient_public_key)`. A
   receiver checks mac1 of every datagram that belongs to no session before
@@ -111,17 +126,34 @@ A receiver processes a datagram that belongs to no session as follows:
    mac2 computed from the cookie. Spoofed floods thus cost one MAC per
    datagram and never produce amplification (the reply is smaller than
    the initiation).
-3. **Rate limit.** Each source address may start `handshake_rate`
-   handshakes per second (burst `handshake_burst`); excess is dropped.
-4. **Noise.** The initiation must decrypt under the receiver's static key.
-5. **Replay.** The initiation payload starts with a timestamp (nanoseconds
-   since the Unix epoch, strictly increasing per process). The receiver
-   remembers the latest timestamp per sender identity (up to 100 000
-   senders) and drops initiations that are not newer. A recorded
-   initiation therefore cannot be replayed, and it could not complete the
-   handshake anyway without the sender's keys.
-6. **Authorisation.** A sender that is not on the allow-list receives an
-   authenticated rejection (reason 8) and nothing else.
+3. **Rate limit.** Each client — an IPv4 address or an IPv6 /64, the block
+   one subscriber can send from at no cost — may start `handshake_rate`
+   handshakes per second (burst `handshake_burst`); excess is dropped. The
+   table is bounded (65 536 clients); full, it makes room at most four times
+   a second and otherwise refuses newcomers.
+4. **Noise.** The initiation must decrypt under the receiver's static key,
+   its sealed connection id must match the clear one, and the sender's
+   static key must not be a small-order point.
+5. **Authorisation.** A sender that is not on the allow-list receives an
+   authenticated rejection (reason 8) and nothing else. This comes before
+   the replay guard, so that strangers' identities — which cost nothing to
+   make — never enter it.
+6. **Replay.** The initiation payload starts with a timestamp (nanoseconds
+   since the Unix epoch, strictly increasing per process, and kept across
+   runs in the sender's state directory so that a clock set back does not
+   get it silently refused). The receiver remembers the latest timestamp
+   per sender identity (up to 100 000 senders) and drops initiations that
+   are not newer. When full it forgets the oldest sender that has **no
+   transfer in progress**: a live sender is never pushed out, so a captured
+   initiation of a running transfer can never be taken again.
+7. **Declined.** A transfer the receiver's user declined is remembered for
+   two minutes; handshakes for it that were already on their way get the
+   same refusal (reason 5) instead of a new question.
+
+A handshake response goes to an address nobody has proven yet, so it is
+held to three times the size of the initiation that drew it (RFC 9000's
+anti-amplification factor): the HELLO_ACK hole list is shortened to fit,
+which only makes the sender resend more.
 
 The PSK is verified by the sender when it reads the response: a receiver
 with a different secret produces a response that fails to decrypt, which
@@ -160,9 +192,24 @@ usage limits of AES-GCM.
 ### Attempts and retries
 
 Every handshake attempt uses a new ephemeral key and a new `sender_cid`.
-The sender retries with exponential backoff (250 ms, doubling to 4 s) until
-`handshake_timeout`; a response may answer any of its last four attempts.
-The session starts when a response authenticates.
+The sender goes round its candidate addresses 250 ms apart, then retries
+with exponential backoff (250 ms, doubling to 4 s) until
+`handshake_timeout`; a single address counts as a complete round. It keeps
+its last four attempts, but **only the newest may be adopted**: the
+receiver's replay guard keeps the newest initiation it saw, and adopting an
+older answer would leave the two sides with different keys. An answer to a
+superseded attempt proves its address answers — the next attempt goes
+straight back there — and gives a round-trip sample, and no retry is sent
+sooner than 1.5 round trips after the last: on a path slower than the retry
+interval, every answer would otherwise arrive after a newer attempt had
+replaced the one it answered.
+
+A datagram addressed to an attempt is **authenticated before anything is
+used up**: the Noise state restores itself after a failed read, so junk
+sent to an attempt's (cleartext) connection id leaves it ready for the real
+answer. A cookie reply counts only when it comes from the address the
+initiation went to. The session starts when a response authenticates.
+Send errors never end a handshake; its deadline does.
 
 ## 3. Transport packets
 
@@ -340,11 +387,25 @@ exactly the DATA size of each candidate chunk — the negotiated chunk, 1427
 MTU) — are sent largest first, each up to twice, waiting
 `clamp(3·SRTT, 150 ms, 2 s)`; the first size echoed by PROBE_ACK is used.
 If nothing answers, the sender uses 1187 and lets the transfer itself find
-out whether the path works. Sockets are "don't fragment" where the OS
-supports it, so oversized datagrams fail (locally with `EMSGSIZE` or on the
-path) instead of being fragmented. An `EMSGSIZE` during the transfer drops
-the chunk to 1187. DATA packets are self-describing, so the chunk size may
-change at any time without the receiver noticing.
+out whether the path works. DATA packets are self-describing, so the chunk
+size may change at any time without the receiver noticing.
+
+The path MTU is learned **only from acknowledged PROBEs** (RFC 8899,
+datagram PLPMTUD). Sockets set "don't fragment" but run in probe mode
+(`IP_PMTUDISC_PROBE` on Linux, `IP_MTU_DISCOVER = PROBE` on Windows where
+available): the kernel ignores what ICMP says about the path, so a forged
+"fragmentation needed" can neither shrink a transfer nor make the kernel
+refuse its control messages. `EMSGSIZE` then only ever means the local
+interface, and costs one step down — to 1187, then by halves to 512 — per
+size refused: batches built at a larger size than the current one fail
+without stepping down again, so one event is one step. A real drop of the
+path MTU shows up the way RFC 8899 (section 4.3) describes: full-size
+packets are lost over two retransmission timeouts in a row while the
+receiver's small ones keep arriving. The sender then steps down the same
+way, and 30 s later (60 s, …) sends one PROBE of the previous size; only
+its PROBE_ACK, sent under the session keys, brings the size back. No send
+error of any kind ends a transfer: the batch goes back into `pending`, the
+sender waits 100 ms, and the liveness rules (below) decide.
 
 ### Data transmission (sender)
 
@@ -371,6 +432,21 @@ stays a hole and is retransmitted — and the shrinking `rwnd` slows the
 sender down. `rwnd` is the writer's free space minus the datagrams still
 queued for the session, so a receiver whose processing falls behind asks
 for less.
+
+Two limits hold whatever a sender does with the window it is given:
+
+* **Pieces.** A session keeps at most 65 536 separate received ranges.
+  Past that, only DATA that extends or joins what is already there (or
+  starts the file) is taken; the lowest hole always does, so an honest
+  transfer slows and never stops, while a sender scattering one-byte
+  pieces cannot make the receiver keep, persist and describe one entry per
+  byte. The sender likewise queues at most 65 536 ranges on the receiver's
+  word alone (holes it reports that were never in flight).
+* **Memory.** `memory_budget` (512 MiB by default) bounds all sessions
+  together: a quarter for datagrams queued to sessions, counted across all
+  of them; the rest shared by the sessions that are receiving, and each
+  one's `rwnd` and admission are held to its share
+  (`min(writer capacity, ¾·budget / receiving)`).
 
 The receiver sends an ACK after each batch of received datagrams that
 brings at least 8 new DATA packets, at least every `ack_interval` (20 ms)
@@ -492,13 +568,24 @@ the session keys, resumes from its saved state. Whichever HELLO_ACK
 answers, the sender rebuilds `pending` from it, forgets its in-flight
 bookkeeping, keeps its probed chunk size and restarts slow start. After
 `stall_timeout` of silence the transfer is *stalled*: data stops, PING
-continues every 1, 2, then 4 s. After `give_up_timeout` the sender sends
+continues every 1, 2, then 4 s. While stalled, the re-handshakes take turns
+among every address the receiver is known by — its last one first, then
+the others it published and those relays turned up — since a silent
+receiver may simply have moved. After `give_up_timeout` the sender sends
 ABORT (timeout), saves its state and exits with a resumable error.
 
-Either peer follows the other's address change (NAT rebinding, roaming):
-it always answers the address the latest authentic packet came from. Since
-packets are authenticated, an attacker cannot redirect a session by
-spoofing its source address.
+A re-handshake may be answered with PENDING, by a receiver that restarted
+and is asking its user again: the sender then stops sending data and asks
+for the decision every second (HELLO), for at most `handshake_timeout`,
+and takes the receiver's decision whenever it arrives. A BUSY answer in
+the middle of a transfer is waited out like silence, and the resume state
+is kept.
+
+Either peer follows the other's address change (NAT rebinding, roaming),
+but only once the new address has proven itself (section 8, *Address
+validation*): an authentic packet from a new address is a claim, not a
+move, because an attacker can repeat a captured packet from a forged
+source.
 
 **Durable state.** The receiver records `(transfer_id, sender ID, name,
 size, source mtime or manifest hash, partial and final path, durable
@@ -675,18 +762,32 @@ eight unpredictable bytes to the new one. Only a peer holding the session
 keys can produce the matching PATH_RESPONSE, and only delivery at the
 challenged address can return it, so the pair of frames proves both. The
 claim is accepted — and the session's traffic moves — the moment the token
-comes back **from the address it was sent to**. A challenge is repeated up
-to four times and then abandoned, leaving the proven address in place.
+comes back **from the address it was sent to**.
+
+* Up to four claims are tested side by side, so someone racing copies from
+  forged addresses cannot crowd out the peer's real move; a new claim
+  replaces a given-up one first, then the oldest.
+* A challenge is repeated with exponential backoff, starting from the
+  measured round trip (never from a timeout an outage has backed off) and
+  capped at 8 s, six times in all; then the claim is given up and the proven
+  address keeps the traffic. The token of a given-up claim is still honoured
+  for 30 s, and a claim that speaks again is re-tested with the same token,
+  so an answer that is merely slower than the challenges still counts. On
+  a path with a round trip over a second, a NAT rebinding used to be
+  abandoned and restarted with a new token for ever.
+* Challenges to an unproven address are held to three times the bytes
+  received from it (RFC 9000's anti-amplification limit); more traffic from
+  it raises the allowance.
 
 This follows QUIC (RFC 9000 section 8) and is needed for the same reason:
 authentication proves who made a packet, not where it was sent from. An
 attacker on the path can copy an authentic packet and re-send it with a
 forged source address; without validation both ends would aim their traffic
 at whatever address it chose, and on the sending side that is the whole
-file. Nothing but the challenge is ever sent to an unproven address, so the
-mechanism cannot be used for amplification either: the one small frame it
-costs answers a packet at least as large. A repeated PATH_RESPONSE is
-caught by the packet-number window, and a token is used once.
+file. Nothing but challenges — and a handshake response, itself held to
+three times the initiation — is ever sent to an unproven address. A
+repeated PATH_RESPONSE is caught by the packet-number window, and a token
+proves its claim once.
 
 Handshakes are treated the same way, since a handshake message is just as
 easy to capture and repeat from elsewhere as any other packet.
@@ -695,7 +796,16 @@ easy to capture and repeat from elsewhere as any other packet.
 
 A receiver must be reachable at the address senders use. With the
 `nat-traversal` feature the receiver works that out in the background,
-without delaying transfers, and reports it as a `Reachability` event.
+without delaying transfers, and reports it as a `Reachability` event: the
+address tests and the port-forward request run side by side, the result
+is reported as soon as the tests are done, and again when a forward is
+granted, so a router that is slow to answer holds nothing up.
+
+Addresses are compared and screened in their canonical form (an IPv4 peer
+on a dual-stack socket appears as `::ffff:a.b.c.d` and is the same peer as
+`a.b.c.d`), and written the way the socket sends to them. A dual-stack
+socket runs the tests over IPv4, where the NATs are; its IPv6 addresses are
+published as host candidates.
 
 **What the NAT does.** "NAT type" in the RFC 3489 sense — full cone,
 restricted, symmetric — was retired because it was never one property. The
@@ -722,8 +832,20 @@ will never let it through.
 **Port forwards.** A forward is the one way through that depends on neither
 the peer's behaviour nor on timing. All three protocols routers speak for it
 are tried: PCP (RFC 6887) and NAT-PMP (RFC 6886) first, as two small
-datagrams on UDP port 5351, then UPnP-IGD. The lease is renewed at half its
-length and given back on shutdown.
+datagrams on UDP port 5351 — every router candidate asked from every
+interface at once, any extra grant given back — then UPnP-IGD. The lease is
+renewed at half its length (each renewal bounded and interruptible) and
+given back on shutdown. A router that reports a private or carrier-grade
+NAT address as its own is itself behind another NAT: its forward is not
+published, and the summary says so.
+
+UPnP has no authentication at all — anything on the local network may
+answer the search, and the answer names a URL to fetch and post to — so
+its client is deliberately narrow: a device is believed only if it is on
+one of our IPv4 subnets and only about itself (the description and control
+URLs must be on the address that answered), every HTTP exchange has a 3 s
+deadline and the whole attempt 10 s, and a description over 64 KiB or a
+SOAP answer over 16 KiB is an error.
 
 **Candidates.** Every address that might work is published together, as
 `ID@host:port,host:port,…`: the port forward, the address the world sees the
@@ -744,7 +866,9 @@ is an address that does or does not work: they decide which addresses are
 worth *trying*, never who we talk to. An address a server tells us to send
 to is screened before we send there, so clients cannot be used as
 reflectors, and PCP's nonce is checked so that another request's answer is
-not taken for ours.
+not taken for ours. A plain STUN answer counts only from the server it was
+sent to (the transaction id travels in the clear), and a STUN error answer
+ends the test instead of passing for silence.
 
 The sender needs no NAT handling: its outgoing datagrams create the mapping
 on its own NAT, and the receiver answers the address a handshake came from
@@ -770,14 +894,47 @@ relay does two things at once:
    and opens the way back through its own NAT — the relay cannot assume
    either address, because the NAT it exists to get around is precisely the
    kind that uses a different port here than it did for the control
-   exchange. Once both have presented tickets, datagrams are copied between
+   exchange. A side is bound only once its address has shown it receives
+   there: the first `Open` draws a `Confirm` back to that address, carrying
+   a keyed hash of the ticket and the address, and only an `Open` repeating
+   it binds the side. A forged source never sees the confirmation — and
+   none of the relay's own ports ever answers one, which is what makes it
+   impossible to set two allocations forwarding a datagram to each other
+   for ever. Once both sides are bound, datagrams are copied between
    exactly those two addresses.
 
 The sender takes both as candidates, after its own: the direct one first,
 the relayed one last, so a relay is only used when it has to be.
 
 A relay is written `ID@host:port` for a receiver and `host:port` for a
-sender, because only the receiver claims an identity there.
+sender, because only the receiver claims an identity there. Names are
+resolved in the background, to the first address the socket can reach; a
+receiver keeps retrying one that does not resolve yet, and keeps
+re-registering through send errors, since the relay may be the only way
+anyone can reach it.
+
+Relay control messages begin with the eight bytes `SHRELAY1` (the one
+connection id no endpoint picks) and a kind byte; an address is
+`family:u8 (4|6) port:u16 ip[4|16]`. Anything that is not exactly one of
+these, with nothing left over, is ignored.
+
+| kind | message | direction | body |
+|---|---|---|---|
+| 1 | Register | receiver → relay | `id[32] token[16] flags:u8 stamp:u64 proof[16]` (flag 0x01: private) |
+| 2 | Challenge | relay → peer | `token[16]` |
+| 3 | Registered | relay → receiver | `lease:u32 observed:addr` |
+| 4 | Connect | sender → relay | `target[32] token[16]` |
+| 5 | Allocated | relay → sender | `port:u16 peer:addr ticket[16]` (peer unspecified: private) |
+| 6 | Incoming | relay → receiver | `port:u16 peer:addr ticket[16]` |
+| 7 | Error | relay → peer | `code:u8` (1 unknown, 2 bad token or proof, 3 busy, 4 stale) |
+| 8 | Open | peer → allocated port | `ticket[16] proof[16]` (proof zero: asking) |
+| 9 | Punch | peer → peer | — |
+| 10 | Bye | receiver → relay | `id[32] token[16] stamp:u64 proof[16]` |
+| 11 | Confirm | allocated port → peer | `proof[16]` |
+
+`proof` in Register and Bye is `BLAKE3-keyed(K, message up to it)[0..16]`
+with `K = BLAKE3-derive_key("sharp256 relay v1 registration",
+DH(receiver, relay) || receiver_id || relay_id)`.
 
 **Registering is the owner's to do.** A receiver proves it holds the private
 key for the identity it registers: the two sides already know each other's
@@ -790,7 +947,20 @@ forward secrecy and nothing fresh in it, which is exactly why transfers use
 the Noise handshake instead; it is the right tool for proving to somebody
 who knows your public key that you hold the private one. Without it, anyone
 who knew a published ID could register it and have senders put through to
-them — the handshake would fail, but the transfer would fail with it.
+them — the handshake would fail, but the transfer would fail with it. A
+small-order point as the identity is refused: the exchange with it is the
+same for every secret, so its "proof" is one anybody can make.
+
+Registrations and goodbyes also carry a **stamp** that must increase per
+identity (the owner uses the wall clock in nanoseconds, never repeating
+itself). The proof binds a message to its owner, but only the stamp binds
+it to a moment: without it, a registration captured from the owner's
+address could be sent again while its token lived — to move the
+registration back to an old address, or to make a private one public —
+and an old goodbye could end a registration made since. The relay keeps
+each identity's newest stamp, and for four minutes after a registration
+ends (as long as any captured token could still be good); a message not
+newer is answered `Stale` (refusal 4).
 
 **The relay is trusted with nothing else.** It carries sealed transport
 packets, so it cannot read them, cannot alter one without the AEAD rejecting
@@ -803,18 +973,28 @@ refusing to carry the traffic.
 A registration is also accepted only once it echoes a token derived from the
 address the relay saw, so a forged source address cannot point the relay's
 traffic at somebody who never asked for it. The token is a keyed hash of
-that address, so no table of pending registrations exists to fill up.
-Registrations and ports each have a share per source address, an idle pair
-is reclaimed, and a receiver says goodbye on the way out so that senders are
-not sent to a dead address for the rest of the lease.
+that address, so no table of pending registrations exists to fill up; its
+secret is replaced every 120 s on the clock, and a token is good for at
+most two such periods however long the relay goes unasked. Registrations,
+ports and the request rate each have a share per client — an IPv4 address
+or an IPv6 /64 — an idle pair is reclaimed, and a receiver says goodbye on
+the way out so that senders are not sent to a dead address for the rest of
+the lease (a goodbye whose token went stale draws a fresh one and is sent
+again). The relay's sockets ignore ICMP errors, and its control loop waits
+out receive errors instead of stopping.
 
 **Hiding where a receiver is.** By default the relay tells each side where
 the other appears to be, which is what lets them meet directly and leaves
 the relay carrying nothing. A receiver that would rather not be described
 registers as private: the relay then tells neither side anything about the
-other, there is no direct path to try, and everything goes through the
-relay. It costs the relay's bandwidth and gives up the direct path, and it
-is the only arrangement in which a relay actually hides anyone.
+other — in its first introduction and every repeat — there is no direct
+path to try, and everything goes through the relay. Such a receiver
+publishes nothing of its own either: no NAT discovery, no port forward, no
+direct candidates. It is written as its ID alone, and a sender given that
+and `--relay` reaches it through the relay. It costs the relay's bandwidth
+and gives up the direct path, and it is the only arrangement in which a
+relay actually hides anyone — from those who do not already know where it
+is.
 
 This is also the honest answer to hiding one's own address from a peer: run
 the traffic through a relay you control. Forging a source address is not an
@@ -927,7 +1107,7 @@ Extensions planned on this basis:
 
 | setting | default | meaning |
 |---------|---------|---------|
-| `max_chunk` | 1427 B | largest payload bytes per DATA packet (512–8927) |
+| `max_chunk` | 1427 B | largest payload bytes per DATA packet (512–8927); lowered on `EMSGSIZE` or a detected MTU black hole, raised again only by an acknowledged PROBE |
 | `probe_mtu` | on | probe the path before sending data |
 | `initial_cwnd_chunks` | 32 | initial congestion window |
 | `max_cwnd_bytes` | 256 MiB | upper bound of the congestion window |
@@ -943,5 +1123,20 @@ Extensions planned on this basis:
 | `writer_capacity_bytes` | 64 MiB | receiver write buffer (source of `rwnd`) |
 | `session_ttl` | 10 min | silence after which a receiver session is suspended |
 | `max_sessions` | 16 | concurrent transfers per receiver |
-| `handshake_rate` / `handshake_burst` | 20/s / 40 | handshakes per source address |
+| `max_sessions_per_sender` | 8 | concurrent transfers one sender identity may hold |
+| `memory_budget` | 512 MiB | data not yet on disk, all transfers together (¼ queued datagrams, ¾ unwritten data) |
+| `handshake_rate` / `handshake_burst` | 20/s / 40 | handshakes per client (IPv4 address or IPv6 /64) |
 | `handshake_load_threshold` | 200/s | handshakes (all sources) beyond which cookies are required |
+
+Fixed limits: 65 536 received ranges per transfer, 65 536 ranges queued by
+the sender on the receiver's word, four concurrent address claims per
+session (six challenges each, tokens honoured 30 s after giving up), a
+handshake answer at most three times the initiation, 65 536 clients in the
+handshake limiter.
+
+The relay (`sharp-relay`): 4096 registrations and 256 carried pairs, of
+which one client may hold 128 and 16 (`--registrations-per-client`,
+`--pairs-per-client`); 10 requests per second per client, burst 20;
+registration lease 120 s; an idle pair is released after 60 s; address
+tokens good for 120–240 s; stamps remembered 240 s after a registration
+ends.

@@ -36,9 +36,14 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   source address. A session therefore treats an unproven address as a claim:
   it keeps sending to the address already proven and asks the new one to
   echo eight unpredictable bytes. Only the holder of the session keys can
-  answer, and only delivery at that address can return it. Nothing else is
-  sent there meanwhile, so the mechanism cannot amplify either. A captured
-  packet can no longer aim a transfer at a third party.
+  answer, and only delivery at that address can return it. A captured
+  packet can no longer aim a transfer at a third party. Up to four claims
+  are tested side by side, so forged-source copies cannot crowd out the
+  peer's real move; challenges back off from the measured round trip, a
+  given-up claim's token keeps counting for 30 s (on paths slower than a
+  second a rebinding used to be abandoned and retried with a new token for
+  ever), and everything sent to an unproven address — challenges and the
+  handshake answer alike — is held to three times what it sent (RFC 9000).
 - Name resolution is a hint, not an authority: a name resolves to all of its
   addresses (families interleaved) and handshake attempts rotate through
   them, with the handshake deciding which one is the receiver. A poisoned
@@ -49,10 +54,43 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - ACKs describing more bytes than the file holds are dropped unread: the
   staleness counter only grows, so believing one would have stalled the
   transfer for good.
-- A datagram refused for its size steps the packet size down towards the
-  minimum instead of failing the transfer. The ICMP message behind such a
-  refusal is unauthenticated, so a forged one now costs throughput at worst;
-  the size only ever grows again on an authenticated PROBE_ACK.
+- The path MTU is taken only from acknowledged PROBEs (RFC 8899): sockets
+  run in probe mode, so the kernel ignores ICMP about the path and a forged
+  "fragmentation needed" can neither shrink a transfer nor get its control
+  messages refused. A real drop shows up as full-size packets lost while
+  small ones arrive, and costs one step down; the old size is probed again
+  later. EMSGSIZE from the interface is one step per event, not one per
+  batch in the pipeline.
+- No send error ends a transfer: a network gone for a moment (a Wi-Fi
+  hand-over, ENETUNREACH) is waited out by the liveness rules and the resume
+  state is kept; segmentation offload is turned off only by an error that
+  means the driver cannot segment.
+- Connection ids are sealed inside the Noise payloads as well as sent in the
+  clear, so a copy raced ahead with a changed id cannot misaddress a
+  session; a datagram addressed to a handshake attempt is authenticated
+  before the attempt is used up, so junk from anyone on the path no longer
+  stops a handshake; no connection id can look like STUN or a relay message.
+- Small-order X25519 points are refused as identities everywhere: when an ID
+  is parsed, in the handshake in both directions, and by relays.
+- The handshake no longer fails on paths slower than its retry interval:
+  a single address counts as a complete round, and retries wait at least one
+  and a half measured round trips. Send errors never end a handshake, and
+  the newest initiation timestamp is kept across runs so that a clock set
+  back does not get a sender silently refused.
+- Resource bounds that hold whatever peers do: at most 65 536 received
+  pieces per transfer (a sender scattering one-byte pieces used to grow the
+  receiver's bookkeeping without limit), at most 65 536 pieces queued on the
+  receiver's word by the sender, and one `memory_budget` (512 MiB) for data
+  not yet on disk across all transfers together — a quarter for queued
+  datagrams, the rest shared by the transfers receiving, counted globally.
+  The handshake limiter counts an IPv6 /64 as one client and its table is
+  bounded; the replay guard never forgets a sender with a transfer in
+  progress and never hears of senders refused by the allow-list.
+- After a receiver restarts and asks its user again, the sender waits for
+  the decision and hears it; a declined transfer is remembered, so the user
+  is asked once, not every few seconds for ever. BUSY in the middle of a
+  transfer is waited out and keeps the resume state; while the receiver is
+  silent, re-handshakes take turns among all its known addresses.
 - The session limit is shared rather than first-come-first-served: one
   sender identity may hold only a configured number of concurrent transfers
   (`max_sessions_per_sender`, 8 of 16 by default), so it cannot take every
@@ -88,8 +126,19 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   quarter of a second.
 - None of this is trusted: STUN servers and routers are unauthenticated and
   only ever produce addresses worth *trying*. Addresses a server tells us to
-  send to are screened first, so clients cannot be used as reflectors, and
-  PCP's nonce is checked so another request's answer is not taken for ours.
+  send to are screened first, in canonical form, so clients cannot be used
+  as reflectors; PCP's nonce is checked so another request's answer is not
+  taken for ours; a plain STUN answer counts only from the server asked.
+- UPnP-IGD is spoken by a small client of our own instead of the igd crate:
+  a device is believed only on one of our subnets and only about itself,
+  every step has a deadline and every answer a size limit. PCP and NAT-PMP
+  ask every router candidate from every interface at once, the address
+  tests and the port-forward request run side by side, and the address is
+  reported as soon as the tests are done. A router behind another NAT is
+  recognised and its forward not published.
+- Addresses are compared in canonical form and written the way the socket
+  sends to them, so dual-stack sockets work with IPv4 peers and relays, and
+  candidates a socket cannot reach are skipped.
 - `sharp-relay`: a meeting point for the case nothing on either side can
   fix — both peers behind NATs that give out a different port per
   destination, where no address either can publish is the one the other
@@ -115,10 +164,22 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   for a receiver; a sender, which claims no identity there, may write the
   address alone.
 - A receiver may register as private (`--relay-private`), and the relay then
-  tells neither side where the other is. There is no direct path to try and
-  everything goes through the relay: it costs its bandwidth and gives up the
-  direct path, and it is the only arrangement in which a relay actually
-  hides anyone.
+  tells neither side where the other is — in repeats of the introduction
+  too. Such a receiver publishes nothing of its own either (no NAT
+  discovery, no port forward, no direct candidates) and is written as its
+  ID alone; a sender given that and `--relay` reaches it through the relay.
+  It costs the relay's bandwidth and gives up the direct path, and it is
+  the only arrangement in which a relay actually hides anyone.
+- Relay registrations and goodbyes carry a stamp that must increase per
+  identity, remembered after a registration ends, so a captured one cannot
+  be sent again; address tokens expire on the clock; an allocated port binds
+  a side only once its address answers a confirmation, which rules out
+  loops between the relay's own ports; limits count per client (an IPv4
+  address or an IPv6 /64) with configurable shares; relay sockets ignore
+  ICMP errors and the control loop never stops on receive errors; a
+  goodbye with a stale token is asked again. Relay names resolve in the
+  background on both sides, the receiver keeps registering through send
+  errors, and it waits for its goodbyes on shutdown.
 
 ### Directories
 - A directory is sent as one stream: a manifest (structure, sizes, Unix

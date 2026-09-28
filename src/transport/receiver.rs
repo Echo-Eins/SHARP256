@@ -176,6 +176,10 @@ struct Shared {
     queued_total: AtomicU64,
     /// Sessions receiving file data now, which share the rest of it.
     receiving: std::sync::atomic::AtomicUsize,
+    /// File data not yet on disk, all sessions together, as each last
+    /// published it (see [`Unwritten`]); held to three quarters of the
+    /// budget.
+    unwritten_total: AtomicU64,
 }
 
 impl Shared {
@@ -201,12 +205,76 @@ impl Shared {
             });
     }
 
+    fn unwritten_budget(&self) -> u64 {
+        self.cfg.memory_budget / 4 * 3
+    }
+
     /// What one receiving session may hold of file data not yet written:
     /// its part of three quarters of the budget, and never more than its
     /// writer takes.
     fn write_share(&self) -> u64 {
         let receiving = self.receiving.load(Ordering::Acquire).max(1) as u64;
         (self.cfg.memory_budget / 4 * 3 / receiving).min(self.cfg.transport.writer_capacity_bytes)
+    }
+}
+
+/// One session's part of [`Shared::unwritten_total`]: what it last said it
+/// holds, taken back out when it ends.
+///
+/// Shares alone bound each session to its part of the budget at the moment
+/// it takes data; sessions that start while others are still full would
+/// otherwise add their shares on top. The total is what makes the bound
+/// hold for all of them at every moment.
+struct Unwritten {
+    shared: Arc<Shared>,
+    published: u64,
+}
+
+impl Unwritten {
+    fn new(shared: &Arc<Shared>) -> Self {
+        Self {
+            shared: shared.clone(),
+            published: 0,
+        }
+    }
+
+    /// Records that this session now holds `now` bytes not yet on disk.
+    fn publish(&mut self, now: u64) {
+        if now >= self.published {
+            self.shared
+                .unwritten_total
+                .fetch_add(now - self.published, Ordering::AcqRel);
+        } else {
+            self.shared
+                .unwritten_total
+                .fetch_sub(self.published - now, Ordering::AcqRel);
+        }
+        self.published = now;
+    }
+
+    /// How much more this session could take before all sessions together
+    /// reach the budget.
+    fn room(&self) -> u64 {
+        self.shared
+            .unwritten_budget()
+            .saturating_sub(self.shared.unwritten_total.load(Ordering::Acquire))
+    }
+
+    /// Whether this session may hold `now` bytes, with what everybody else
+    /// holds.
+    fn fits(&self, now: u64) -> bool {
+        let others = self
+            .shared
+            .unwritten_total
+            .load(Ordering::Acquire)
+            .saturating_sub(self.published);
+        others + now <= self.shared.unwritten_budget()
+    }
+}
+
+impl Drop for Unwritten {
+    fn drop(&mut self) {
+        self.publish(0);
     }
 }
 
@@ -283,6 +351,7 @@ impl Receiver {
                 declined: parking_lot::Mutex::new(HashMap::new()),
                 queued_total: AtomicU64::new(0),
                 receiving: std::sync::atomic::AtomicUsize::new(0),
+                unwritten_total: AtomicU64::new(0),
             }),
         })
     }
@@ -1274,6 +1343,8 @@ struct Session {
     /// Counts us among the sessions sharing the memory budget while we
     /// receive file data.
     receiving: Option<Receiving>,
+    /// Our part of the file data not yet on disk, all sessions together.
+    unwritten: Unwritten,
 
     transfer_id: [u8; 16],
     sender: SharpId,
@@ -1336,6 +1407,7 @@ impl Session {
         let events = shared.cfg.events.clone();
         Self {
             receiving: None,
+            unwritten: Unwritten::new(&shared),
             shared,
             cfg,
             events,
@@ -2059,6 +2131,7 @@ impl Session {
             return w
                 .available()
                 .min(share)
+                .min(self.unwritten.room())
                 .saturating_sub(self.queued.load(Ordering::Relaxed));
         }
         if !matches!(self.phase, Phase::Receiving | Phase::Pending { .. }) {
@@ -2324,6 +2397,7 @@ impl Session {
     /// writer refuse it after all, it is not received.
     fn commit(&mut self, buf: Vec<u8>, pieces: Pieces) {
         if pieces.list.is_empty() {
+            self.publish_unwritten();
             return;
         }
         let refused = match &self.writer {
@@ -2336,6 +2410,16 @@ impl Session {
             }
             self.writer_full_drops += list.len() as u64;
         }
+        self.publish_unwritten();
+    }
+
+    /// Tells the receiver-wide count what we hold that is not on disk yet:
+    /// what the writer has queued, or the directory data held back for the
+    /// manifest.
+    fn publish_unwritten(&mut self) {
+        let writer = self.writer.as_ref().map_or(0, |w| w.queued_bytes());
+        let early = self.tree.as_ref().map_or(0, |t| t.early_bytes);
+        self.unwritten.publish(writer + early);
     }
 
     async fn on_control(&mut self, c: Control) -> ControlFlow<()> {
@@ -2522,8 +2606,10 @@ impl Session {
             // Within the writer's capacity, and within this session's share
             // of the memory budget: a sender that ignores the window it is
             // given gets no more room for doing so.
+            let holding = writer.queued_bytes() + pieces.bytes + need;
             if writer.available() < pieces.bytes + need
-                || writer.queued_bytes() + pieces.bytes + need > self.shared.write_share()
+                || holding > self.shared.write_share()
+                || !self.unwritten.fits(holding)
             {
                 self.writer_full_drops += 1;
                 return false;
@@ -2545,7 +2631,10 @@ impl Session {
                 .writer_capacity_bytes
                 .min(EARLY_MAX_BYTES)
                 .min(self.shared.write_share());
-            if tree.early_bytes + need > cap || tree.early.len() + missing.len() > EARLY_MAX_ITEMS {
+            if tree.early_bytes + need > cap
+                || tree.early.len() + missing.len() > EARLY_MAX_ITEMS
+                || !self.unwritten.fits(tree.early_bytes + need)
+            {
                 self.writer_full_drops += 1;
                 return false;
             }
@@ -2685,6 +2774,9 @@ impl Session {
     // ----- housekeeping ----------------------------------------------------
 
     async fn housekeeping(&mut self, now: Instant) -> ControlFlow<()> {
+        // The writer drains in the background; say so, or the count would
+        // only ever go down when more data arrives.
+        self.publish_unwritten();
         let since_rx = now.saturating_duration_since(self.last_rx);
         self.poll_path(now);
         if let Some((kind, error)) = self.writer.as_ref().and_then(|w| w.error()) {
