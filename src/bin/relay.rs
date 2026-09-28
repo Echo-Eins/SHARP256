@@ -108,6 +108,23 @@ struct Args {
     #[arg(long, value_name = "BYTES", default_value = "0")]
     pair_bytes: String,
 
+    /// Also serve STUN (RFC 8489, with the behaviour tests of RFC 5780) on
+    /// this address: repeat it. The first address of each family is the
+    /// primary; a second of the same family is the alternate that the
+    /// "does my NAT filter by address?" tests need. Give this host's own
+    /// addresses — the server answers from them, and only from them.
+    #[arg(long = "stun", value_name = "IP")]
+    stun: Vec<std::net::IpAddr>,
+
+    /// The STUN port clients ask.
+    #[arg(long, default_value_t = 3478)]
+    stun_port: u16,
+
+    /// The STUN port the "change port" tests answer from (default: one
+    /// above).
+    #[arg(long, default_value_t = 0)]
+    stun_alt_port: u16,
+
     /// Identity file. A relay has a long-term key of its own, which is how
     /// a receiver registering here proves it owns the identity it claims:
     /// the two work out a shared secret from their keys alone. Created on
@@ -177,12 +194,46 @@ async fn main() -> Result<()> {
     };
 
     let cancel = CancellationToken::new();
+    let stun = if args.stun.is_empty() {
+        None
+    } else {
+        let mut families: Vec<sharp256::nat::stunserver::FamilyConfig> = Vec::new();
+        for ip in &args.stun {
+            match families
+                .iter_mut()
+                .find(|f| f.primary.is_ipv4() == ip.is_ipv4())
+            {
+                Some(f) if f.alternate.is_none() && f.primary != *ip => f.alternate = Some(*ip),
+                Some(_) => {}
+                None => families.push(sharp256::nat::stunserver::FamilyConfig {
+                    primary: *ip,
+                    alternate: None,
+                }),
+            }
+        }
+        let server = sharp256::nat::stunserver::StunServer::bind(
+            sharp256::nat::stunserver::Config {
+                families,
+                port: args.stun_port,
+                alternate_port: args.stun_alt_port,
+                ..Default::default()
+            },
+            cancel.clone(),
+        )
+        .await
+        .context("cannot serve STUN on the addresses given")?;
+        Some(server)
+    };
     let relay = Relay::bind(cfg, cancel.clone())
         .await
         .with_context(|| format!("cannot listen on {}", args.bind))?;
     let addr = relay.local_addr()?;
     println!("{}", sharp256::system_info());
     println!("Relay listening on {}", addr);
+    if let Some(s) = &stun {
+        let list: Vec<String> = s.addresses.iter().map(|a| a.to_string()).collect();
+        println!("STUN:      {}", list.join(" "));
+    }
     // A receiver has to know which relay it is registering with; a sender
     // claims no identity of its own and so needs only the address. A
     // wildcard is no address anyone else can use.

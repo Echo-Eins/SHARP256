@@ -248,7 +248,7 @@ use crate::address::client_key;
 const FULL_PRUNE_EVERY: Duration = Duration::from_millis(250);
 
 /// A token bucket per client (see [`client_key`]).
-struct RateLimiter {
+pub(crate) struct RateLimiter {
     per_ip: HashMap<std::net::IpAddr, (f64, Instant)>,
     rate: f64,
     burst: f64,
@@ -256,7 +256,7 @@ struct RateLimiter {
 }
 
 impl RateLimiter {
-    fn new(rate: f64, burst: f64) -> Self {
+    pub(crate) fn new(rate: f64, burst: f64) -> Self {
         Self {
             per_ip: HashMap::new(),
             rate,
@@ -266,7 +266,7 @@ impl RateLimiter {
     }
 
     /// Takes a token for `from`; false when it has had too many.
-    fn allow(&mut self, from: SocketAddr, now: Instant) -> bool {
+    pub(crate) fn allow(&mut self, from: SocketAddr, now: Instant) -> bool {
         let (rate, burst) = (self.rate, self.burst);
         let key = client_key(from);
         if self.per_ip.len() >= MAX_TRACKED_ADDRESSES && !self.per_ip.contains_key(&key) {

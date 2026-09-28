@@ -60,6 +60,13 @@ struct Args {
     #[arg(long, value_name = "SECONDS", default_value_t = 15)]
     keepalive: u64,
 
+    /// A STUN server (host:port) that tells this receiver how it is seen
+    /// from outside; repeat it for several. A `sharp-relay --stun` is one,
+    /// and only a server with two addresses can measure everything a NAT
+    /// does. Default: well-known public ones.
+    #[arg(long = "stun", value_name = "HOST:PORT")]
+    stun: Vec<String>,
+
     /// Replace existing files with the same name instead of writing "name (1)"
     #[arg(long)]
     overwrite: bool,
@@ -129,6 +136,7 @@ async fn main() -> Result<()> {
     cfg.relay_private = args.relay_private;
     cfg.publish_lan_addresses = !args.no_lan_addresses;
     cfg.nat_keepalive = std::time::Duration::from_secs(args.keepalive.clamp(1, 3600));
+    cfg.stun_servers = args.stun.clone();
     cfg.state_dir = args.state_dir.clone();
     if let Some(c) = args.chunk_size {
         cfg.transport.max_chunk = c;

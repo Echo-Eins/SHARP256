@@ -407,9 +407,15 @@ impl Receiver {
             let id = shared.identity.id();
             crate::nat::spawn_receiver_discovery(
                 shared.socket.udp(),
-                crate::nat::NatConfig {
-                    publish_lan_addresses: shared.cfg.publish_lan_addresses,
-                    ..crate::nat::NatConfig::default()
+                {
+                    let mut c = crate::nat::NatConfig {
+                        publish_lan_addresses: shared.cfg.publish_lan_addresses,
+                        ..crate::nat::NatConfig::default()
+                    };
+                    if !shared.cfg.stun_servers.is_empty() {
+                        c.stun_servers = shared.cfg.stun_servers.clone();
+                    }
+                    c
                 },
                 keepalive.clone(),
                 shared.cancel.clone(),

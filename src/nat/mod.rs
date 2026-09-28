@@ -30,6 +30,7 @@ pub mod behaviour;
 pub mod keepalive;
 pub mod portmap;
 pub mod stun;
+pub mod stunserver;
 pub mod upnp;
 
 use self::behaviour::{Behaviour, Reachable};

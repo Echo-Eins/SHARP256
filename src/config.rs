@@ -273,6 +273,11 @@ pub struct ReceiverConfig {
     /// the receiver sends less often once it has measured that its NAT
     /// keeps mappings longer, and more often when it sees one lapse.
     pub nat_keepalive: Duration,
+    /// STUN servers (`host:port`) that tell this receiver how it is seen
+    /// from outside and what its NAT does. Empty: the built-in public ones.
+    /// A relay run with `--stun` is one, and the only kind that can carry
+    /// out every behaviour test.
+    pub stun_servers: Vec<String>,
     pub accept: AcceptPolicy,
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
@@ -306,6 +311,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("relay_private", &self.relay_private)
             .field("publish_lan_addresses", &self.publish_lan_addresses)
             .field("nat_keepalive", &self.nat_keepalive)
+            .field("stun_servers", &self.stun_servers)
             .field("accept", &self.accept)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
@@ -361,6 +367,7 @@ impl ReceiverConfig {
             relay_private: false,
             publish_lan_addresses: true,
             nat_keepalive: Duration::from_secs(15),
+            stun_servers: Vec::new(),
             accept: AcceptPolicy::AcceptAll,
             identity: None,
             psk: None,
