@@ -11,6 +11,23 @@ pub fn canonical(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Who a request counts against, for rate limits and shares: an IPv4
+/// address, or an IPv6 /64 — the block one subscriber is usually handed,
+/// and so what one of them can send from at no cost. Keying on whole IPv6
+/// addresses would let one subscriber count as eighteen quintillion
+/// clients. The canonical form comes first, so an IPv4 client reaching a
+/// dual-stack socket is the same client either way.
+pub fn client_key(addr: SocketAddr) -> IpAddr {
+    match canonical(addr).ip() {
+        IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[8..].fill(0);
+            IpAddr::V6(o.into())
+        }
+        v4 => v4,
+    }
+}
+
 /// Which addresses a socket can send to, and how it writes them.
 ///
 /// An IPv4 socket reaches only IPv4. An IPv6 socket bound to the wildcard

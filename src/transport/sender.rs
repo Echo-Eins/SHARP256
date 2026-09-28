@@ -437,8 +437,16 @@ impl Sender {
             if let Err(e) = store.save_stamp(hs::last_initiation_timestamp()) {
                 tracing::debug!("could not save the handshake timestamp: {}", e);
             }
-            match &result {
-                Err(SendError::PeerUnreachable(_)) | Err(SendError::Cancelled) => {
+            // Kept whenever the transfer could still be finished: the
+            // receiver went away, the user stopped it, or the receiver was
+            // too busy to take it now.
+            let resumable = match &result {
+                Err(SendError::PeerUnreachable(_)) | Err(SendError::Cancelled) => true,
+                Err(SendError::Rejected { reason, .. }) => reason == reason_name(REASON_BUSY),
+                _ => false,
+            };
+            match resumable {
+                true => {
                     let st = SenderState {
                         format: 0,
                         transfer_id: hex16(&transfer_id),
@@ -453,7 +461,7 @@ impl Sender {
                         tracing::warn!("could not save sender state: {}", e);
                     }
                 }
-                _ => store.remove_sender(&self.cfg.file_path, size, &peer_str),
+                false => store.remove_sender(&self.cfg.file_path, size, &peer_str),
             }
         }
         result
@@ -702,6 +710,10 @@ struct Engine {
     /// Retransmission timeouts in a row that looked like a path losing
     /// only full-size packets.
     mtu_suspect: u32,
+    /// Since when the receiver's user has been deciding, again, whether to
+    /// take the transfer (see `run`).
+    awaiting_decision: Option<Instant>,
+    last_decision_poll: Option<Instant>,
     /// When to try a larger chunk again, and which.
     mtu_raise: Option<(Instant, u16)>,
     socket: Arc<BatchSocket>,
@@ -876,6 +888,8 @@ impl Engine {
             reach: crate::address::Reach::of(&socket.udp()),
             send_failures: 0,
             mtu_suspect: 0,
+            awaiting_decision: None,
+            last_decision_poll: None,
             mtu_raise: None,
             socket,
             peer,
@@ -1057,7 +1071,23 @@ impl Engine {
     /// handshake can tell which one is really the receiver.
     fn next_target(&mut self) -> Option<SocketAddr> {
         if self.secure.is_some() {
-            return Some(self.peer);
+            // A receiver that has gone silent may simply have moved — its
+            // address changed, or it is only reachable through a relay now —
+            // so while it is silent the re-handshakes take turns among
+            // everything it is known by, its last address first. The
+            // answer, if any, says which one it is.
+            if !self.stalled || self.candidates.is_empty() {
+                return Some(self.peer);
+            }
+            let others: Vec<SocketAddr> = self
+                .candidates
+                .iter()
+                .copied()
+                .filter(|c| *c != self.peer)
+                .collect();
+            let i = self.next_candidate % (others.len() + 1);
+            self.next_candidate = self.next_candidate.wrapping_add(1);
+            return Some(if i == 0 { self.peer } else { others[i - 1] });
         }
         // An address that already answered beats carrying on round the ring.
         if let Some(known) = self.answered_at.take() {
@@ -1286,6 +1316,17 @@ impl Engine {
         let cid = attempt.cid();
         let resp = wire::decode_response(&payload)
             .map_err(|e| SendError::Protocol(format!("bad handshake response: {}", e)))?;
+        // Busy is a state, not a verdict. In the middle of a transfer it
+        // means the receiver has no room for the session right now — after
+        // it restarted, say — and the transfer should wait and ask again,
+        // as for any silence, rather than end and throw its state away.
+        if resp.ack.status == HELLO_REJECTED
+            && resp.ack.reason == REASON_BUSY
+            && self.secure.is_some()
+        {
+            tracing::info!("the receiver has no room for the transfer right now; waiting");
+            return Ok(());
+        }
         if resp.ack.status == HELLO_REJECTED {
             return Err(SendError::Rejected {
                 reason: reason_name(resp.ack.reason).to_string(),
@@ -1319,7 +1360,7 @@ impl Engine {
         // captured and repeated with a forged source. Until that address
         // answers a challenge, the file keeps going to the proven one.
         self.path.reset();
-        self.note_alive(now, from);
+        self.note_alive(now, from, pkt.len());
         tracing::debug!(
             "session with {} established ({})",
             self.auth.receiver.short(),
@@ -1674,14 +1715,30 @@ impl Engine {
             // receiver's view of what it holds.
             if let Some(ack) = self.answer.take() {
                 match ack.status {
-                    HELLO_ACCEPTED => self.resync(&ack, Instant::now()),
+                    HELLO_ACCEPTED => {
+                        if self.awaiting_decision.take().is_some() {
+                            tracing::info!("the receiver accepted the transfer again");
+                        }
+                        self.resync(&ack, Instant::now())
+                    }
                     HELLO_REJECTED => {
                         return Err(SendError::Rejected {
                             reason: reason_name(ack.reason).to_string(),
                             message: ack.message,
                         })
                     }
-                    _ => {}
+                    // A receiver that lost the session — it restarted — asks
+                    // its user again. Ignoring that used to leave us sending
+                    // into a session that took nothing, re-handshaking, and
+                    // having it ask again: a prompt every few seconds, for
+                    // ever, and never the user's answer. So wait for the
+                    // decision, asking for it as during the first handshake.
+                    _ => {
+                        if self.awaiting_decision.is_none() {
+                            tracing::info!("the receiver is asking its user again; waiting");
+                            self.awaiting_decision = Some(Instant::now());
+                        }
+                    }
                 }
             }
 
@@ -1843,10 +1900,13 @@ impl Engine {
         if let Some(block) = self.flush_ready()? {
             return Ok(block);
         }
+        // Nothing to send while the receiver's user decides: the session
+        // would take none of it.
         if self.stalled
             || self.fin_verdict.is_some()
             || self.pending_fin.is_some()
             || self.secure.is_none()
+            || self.awaiting_decision.is_some()
         {
             return Ok(SendBlock::Idle);
         }
@@ -2212,6 +2272,7 @@ impl Engine {
     }
 
     fn on_transport(&mut self, pkt: &mut [u8], from: SocketAddr) -> Result<(), SendError> {
+        let len = pkt.len();
         let sec = self.secure.as_mut().expect("caller checked the session");
         let (tb, pn, body) = match sec.keys.recv.open(pkt) {
             Ok(v) => v,
@@ -2231,7 +2292,7 @@ impl Engine {
             }
         };
         let now = Instant::now();
-        self.note_alive(now, from);
+        self.note_alive(now, from, len);
         match msg {
             Message::Ack(ack) => self.on_ack(ack, now),
             Message::Fin(fin) => {
@@ -2261,8 +2322,13 @@ impl Engine {
             }
             Message::HelloAck(ack) => {
                 // While negotiating every answer counts; later only answers
-                // to our own state queries do (late duplicates are ignored).
-                if self.negotiating || self.probe_ts.contains(&ack.echo_ts) {
+                // to our own state queries do (late duplicates are ignored)
+                // — and, while the receiver's user is deciding, the decision
+                // it sends of its own accord.
+                if self.negotiating
+                    || self.awaiting_decision.is_some()
+                    || self.probe_ts.contains(&ack.echo_ts)
+                {
                     self.probe_ts.clear();
                     self.answer = Some(ack);
                 }
@@ -2356,10 +2422,10 @@ impl Engine {
     /// repeating one captured packet from a forged source address would have
     /// a multi-gigabit weapon pointed wherever it likes. It has to answer a
     /// challenge at the new address first (see [`crate::transport::path`]).
-    fn note_alive(&mut self, now: Instant, from: SocketAddr) {
+    fn note_alive(&mut self, now: Instant, from: SocketAddr, len: usize) {
         self.last_rx = now;
         self.ping_backoff = 0;
-        if let Some(c) = self.path.on_authentic(from, self.peer, now) {
+        if let Some(c) = self.path.on_authentic(from, self.peer, now, len) {
             tracing::info!(
                 "receiver claims address {} (was {}); validating it",
                 c.to,
@@ -2755,8 +2821,27 @@ impl Engine {
     // ----- timers ----------------------------------------------------------
 
     fn housekeeping(&mut self, now: Instant) -> Result<(), SendError> {
-        // Repeat an unanswered address challenge, or drop the claim.
-        if let Some(c) = self.path.poll(now, self.rtt.rto()) {
+        // Waiting for the receiver's user: ask for the decision now and
+        // then, for as long as a first handshake would wait for one.
+        if let Some(since) = self.awaiting_decision {
+            if now.saturating_duration_since(since) >= self.cfg.handshake_timeout {
+                return Err(SendError::Rejected {
+                    reason: reason_name(REASON_TIMEOUT).to_string(),
+                    message: "no decision in time".into(),
+                });
+            }
+            let due = self
+                .last_decision_poll
+                .is_none_or(|t| now.saturating_duration_since(t) >= DECISION_POLL);
+            if due {
+                self.last_decision_poll = Some(now);
+                self.send_state_query();
+            }
+        }
+        // Repeat unanswered address challenges, or give claims up. Paced by
+        // the round trip itself, not by a timeout that an outage may have
+        // backed off to half a minute.
+        for c in self.path.poll(now, self.rtt.pto()) {
             let _ = self.send_frame_to(
                 c.to,
                 0,

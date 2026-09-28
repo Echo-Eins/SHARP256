@@ -2946,3 +2946,146 @@ async fn a_path_that_silently_stops_carrying_full_packets_is_stepped_down_from()
     assert_same(&file, &out.join("black-hole.bin"));
     stop_receiver(r).await;
 }
+
+/// A NAT in front of the sender, `one_way` of delay each way, that gives
+/// the sender a new outside port at `rebind_at` and drops the old mapping.
+async fn rebinding_nat(
+    target: SocketAddr,
+    one_way: Duration,
+    rebind_at: Duration,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let inside = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let before = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let after = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = inside.local_addr().unwrap();
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        let mut client = None;
+        let (mut bi, mut bb, mut ba) = (vec![0u8; 65536], vec![0u8; 65536], vec![0u8; 65536]);
+        let delayed = |sock: Arc<UdpSocket>, pkt: Vec<u8>, to: SocketAddr| {
+            tokio::spawn(async move {
+                tokio::time::sleep(one_way).await;
+                let _ = sock.send_to(&pkt, to).await;
+            });
+        };
+        loop {
+            let rebound = started.elapsed() >= rebind_at;
+            tokio::select! {
+                r = inside.recv_from(&mut bi) => {
+                    let Ok((n, from)) = r else { continue };
+                    client = Some(from);
+                    let out = if rebound { after.clone() } else { before.clone() };
+                    delayed(out, bi[..n].to_vec(), target);
+                }
+                r = before.recv_from(&mut bb) => {
+                    let Ok((n, _)) = r else { continue };
+                    // The old mapping is gone once the NAT has rebound.
+                    if let (false, Some(c)) = (rebound, client) {
+                        delayed(inside.clone(), bb[..n].to_vec(), c);
+                    }
+                }
+                r = after.recv_from(&mut ba) => {
+                    let Ok((n, _)) = r else { continue };
+                    if let Some(c) = client {
+                        delayed(inside.clone(), ba[..n].to_vec(), c);
+                    }
+                }
+            }
+        }
+    });
+    (addr, task)
+}
+
+/// The sender's NAT gives it a new port in the middle of a transfer over a
+/// path with a round trip of over a second. The receiver challenges the new
+/// address before following it — but its challenges used to give up after
+/// a second, and every new attempt drew a new token, so the answer, which
+/// takes longer than that to come back, never matched anything: the
+/// transfer went on sending its ACKs to the dead mapping for ever.
+/// Challenges now back off with the round trip, and a slow answer to any
+/// of them still counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebinding_nat_is_followed_on_a_slow_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 1 << 20;
+    let file = make_file(&src, "rebind.bin", size, 0x2EB1);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let (nat, task) =
+        rebinding_nat(r.addr, Duration::from_millis(550), Duration::from_secs(3)).await;
+    let mut cfg = sender_cfg(&file, nat, r.id, &state);
+    // Long enough that the sender does not simply start over.
+    cfg.transport.stall_timeout = Duration::from_secs(30);
+    cfg.transport.probe_mtu = false;
+    cfg.transport.max_rate_bytes = Some(128 << 10);
+    let summary = tokio::time::timeout(Duration::from_secs(90), run_sender(cfg))
+        .await
+        .expect("the transfer follows the new mapping and finishes")
+        .expect("the transfer completes");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("rebind.bin"));
+    task.abort();
+    stop_receiver(r).await;
+}
+
+/// A receiver restarts in the middle of a transfer, and its new instance
+/// asks its user whether to take it — who answers `decide`. Returns how many
+/// times the user was asked, and how the sender finished.
+async fn restart_into_a_decision(decide: bool) -> (u64, Result<TransferSummary, SendError>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let first = start_receiver(&out, &state, |_| {}).await;
+    let identity = first.identity.clone();
+    let proxy = start_proxy(first.addr, Impairment::none()).await;
+    let file = make_file(&src, "restart.bin", 8 << 20, 0xDEC1);
+    let mut cfg = sender_cfg(&file, proxy.addr, first.id, &state);
+    cfg.transport.max_rate_bytes = Some(2 << 20);
+    let sender = tokio::spawn(run_sender(cfg));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    stop_receiver(first).await;
+
+    let asked = Arc::new(AtomicU64::new(0));
+    let count = asked.clone();
+    let second = start_receiver(&out, &state, move |cfg| {
+        cfg.identity = Some(identity.clone());
+        let count = count.clone();
+        cfg.accept = AcceptPolicy::Ask(Arc::new(move |_req, reply| {
+            count.fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(decide);
+        }));
+    })
+    .await;
+    *proxy.target.lock() = second.addr;
+    let result = tokio::time::timeout(Duration::from_secs(40), sender)
+        .await
+        .expect("the sender finishes")
+        .unwrap();
+    stop_receiver(second).await;
+    (asked.load(Ordering::Relaxed), result)
+}
+
+/// The receiver restarted and its user declined: the sender used to ignore
+/// the refusal, keep re-handshaking into a session that took nothing, and
+/// have the user asked again every few seconds for as long as it ran. Now
+/// the user is asked once, and the sender stops with their answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_receiver_that_declines_is_asked_once_and_heard() {
+    let (asked, result) = restart_into_a_decision(false).await;
+    assert!(
+        matches!(result, Err(SendError::Rejected { .. })),
+        "the refusal was not heard: {:?}",
+        result.map(|s| s.file_size)
+    );
+    assert_eq!(asked, 1, "the user was asked {} times", asked);
+}
+
+/// And when the user accepts, the transfer carries on from where the
+/// restarted receiver's state says it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_receiver_that_accepts_carries_on() {
+    let (asked, result) = restart_into_a_decision(true).await;
+    let summary = result.expect("the transfer completes after the user accepts");
+    assert_eq!(summary.file_size, 8 << 20);
+    assert_eq!(asked, 1, "the user was asked {} times", asked);
+}

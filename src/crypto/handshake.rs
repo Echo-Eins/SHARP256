@@ -532,6 +532,23 @@ impl ReplayGuard {
     }
 
     pub fn accept(&mut self, sender: &SharpId, timestamp: u64) -> bool {
+        self.accept_keeping(sender, timestamp, |_| false)
+    }
+
+    /// [`ReplayGuard::accept`], never forgetting a sender for which `keep`
+    /// is true to make room.
+    ///
+    /// The guard is bounded, and identities cost nothing to make, so anyone
+    /// can push old entries out by presenting enough new ones. For a sender
+    /// with a transfer in progress that must not work: forgetting it would
+    /// let a captured initiation of the live transfer be taken again, and
+    /// the session be switched to a handshake its sender never finished.
+    pub fn accept_keeping(
+        &mut self,
+        sender: &SharpId,
+        timestamp: u64,
+        keep: impl Fn(&SharpId) -> bool,
+    ) -> bool {
         if let Some(slot) = self.last.get_mut(sender) {
             if timestamp <= *slot {
                 return false;
@@ -542,8 +559,18 @@ impl ReplayGuard {
         if self.last.len() >= self.capacity {
             // `order` holds exactly the live keys (each pushed once when
             // first inserted, popped only here), so its front is present.
-            if let Some(old) = self.order.pop_front() {
+            // Kept senders go to the back; there are only ever as many of
+            // them as sessions, so a victim turns up at once.
+            for _ in 0..self.order.len() {
+                let Some(old) = self.order.pop_front() else {
+                    break;
+                };
+                if keep(&old) {
+                    self.order.push_back(old);
+                    continue;
+                }
                 self.last.remove(&old);
+                break;
             }
         }
         self.last.insert(*sender, timestamp);
@@ -562,7 +589,11 @@ pub struct HandshakeLimiter {
     window_count: u32,
     load_threshold: u32,
     last_prune: Instant,
+    last_full_prune: Instant,
 }
+
+/// Clients the handshake limiter tracks at once.
+const MAX_LIMITED_CLIENTS: usize = 65_536;
 
 impl HandshakeLimiter {
     /// `rate`/`burst`: initiations per second and burst per source address;
@@ -578,6 +609,7 @@ impl HandshakeLimiter {
             window_count: 0,
             load_threshold,
             last_prune: now,
+            last_full_prune: now,
         }
     }
 
@@ -591,16 +623,34 @@ impl HandshakeLimiter {
         self.window_count > self.load_threshold
     }
 
-    /// Takes a token for `ip`; false if it exceeded its rate.
-    pub fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
-        if now.saturating_duration_since(self.last_prune) >= Duration::from_secs(10) {
-            let (rate, burst) = (self.rate, self.burst);
-            self.per_ip.retain(|_, (tokens, at)| {
+    /// Takes a token for the client `from` counts as (see
+    /// [`crate::address::client_key`]); false if it exceeded its rate.
+    pub fn allow(&mut self, from: SocketAddr, now: Instant) -> bool {
+        let key = crate::address::client_key(from);
+        let (rate, burst) = (self.rate, self.burst);
+        let prune = |m: &mut HashMap<IpAddr, (f64, Instant)>| {
+            m.retain(|_, (tokens, at)| {
                 *tokens + now.saturating_duration_since(*at).as_secs_f64() * rate < burst
             });
+        };
+        if now.saturating_duration_since(self.last_prune) >= Duration::from_secs(10) {
+            prune(&mut self.per_ip);
             self.last_prune = now;
         }
-        let (tokens, at) = self.per_ip.entry(ip).or_insert((self.burst, now));
+        // Bounded: a spray of forged source addresses would otherwise grow
+        // the table by an entry per packet until the next prune. Full, it
+        // makes room at most four times a second, and otherwise refuses
+        // newcomers rather than grow.
+        if self.per_ip.len() >= MAX_LIMITED_CLIENTS && !self.per_ip.contains_key(&key) {
+            if now.saturating_duration_since(self.last_full_prune) >= Duration::from_millis(250) {
+                self.last_full_prune = now;
+                prune(&mut self.per_ip);
+            }
+            if self.per_ip.len() >= MAX_LIMITED_CLIENTS {
+                return false;
+            }
+        }
+        let (tokens, at) = self.per_ip.entry(key).or_insert((self.burst, now));
         *tokens = (*tokens + now.saturating_duration_since(*at).as_secs_f64() * self.rate)
             .min(self.burst);
         *at = now;
@@ -832,14 +882,50 @@ mod tests {
 
         let now = Instant::now();
         let mut l = HandshakeLimiter::new(1.0, 3.0, 5);
-        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        let ip: SocketAddr = "198.51.100.1:1000".parse().unwrap();
         assert!(l.allow(ip, now) && l.allow(ip, now) && l.allow(ip, now));
         assert!(!l.allow(ip, now));
         assert!(l.allow(ip, now + Duration::from_millis(1100)));
-        let other: IpAddr = "198.51.100.2".parse().unwrap();
+        let other: SocketAddr = "198.51.100.2:1000".parse().unwrap();
         assert!(l.allow(other, now));
         let loaded = (0..6).map(|_| l.note_initiation(now)).last().unwrap();
         assert!(loaded);
         assert!(!l.note_initiation(now + Duration::from_secs(2)));
+    }
+
+    /// Identities cost nothing to make, so a stranger can fill the replay
+    /// guard with new ones. Whoever has a transfer in progress is never
+    /// pushed out for them: forgetting a live sender would let a captured
+    /// initiation of its transfer be taken again.
+    #[test]
+    fn a_live_sender_is_never_pushed_out_of_the_replay_guard() {
+        let mut g = ReplayGuard::new(4);
+        let live = Identity::generate().id();
+        assert!(g.accept(&live, 100));
+        for _ in 0..1000 {
+            let stranger = Identity::generate().id();
+            assert!(g.accept_keeping(&stranger, 1, |id| *id == live));
+        }
+        assert!(!g.accept_keeping(&live, 100, |id| *id == live));
+        assert!(g.accept_keeping(&live, 101, |id| *id == live));
+    }
+
+    /// One IPv6 subscriber is one client for the handshake limit, whatever
+    /// address in its /64 it sends from; and a spray of new sources cannot
+    /// grow the limiter's table without bound.
+    #[test]
+    fn the_handshake_limit_counts_a_slash_64_once_and_stays_bounded() {
+        let now = Instant::now();
+        let mut l = HandshakeLimiter::new(1.0, 2.0, 5);
+        let a: SocketAddr = "[2001:db8:1:2::1]:1".parse().unwrap();
+        let b: SocketAddr = "[2001:db8:1:2:ffff::7]:2".parse().unwrap();
+        assert!(l.allow(a, now) && l.allow(b, now));
+        assert!(!l.allow("[2001:db8:1:2:1234::1]:3".parse().unwrap(), now));
+        let mut l = HandshakeLimiter::new(1.0, 2.0, 5);
+        for i in 0..(MAX_LIMITED_CLIENTS as u32 + 1000) {
+            let ip = std::net::Ipv4Addr::from(0x0A00_0000 + i);
+            l.allow(SocketAddr::new(ip.into(), 9), now);
+        }
+        assert!(l.per_ip.len() <= MAX_LIMITED_CLIENTS);
     }
 }

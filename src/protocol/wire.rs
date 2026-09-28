@@ -369,6 +369,18 @@ pub fn describe_holes(
     from: u64,
     to: u64,
 ) -> (Vec<Range>, u64) {
+    describe_holes_within(received, from, to, HOLES_BYTE_BUDGET)
+}
+
+/// [`describe_holes`] within a smaller byte budget, for a message that must
+/// stay small: a handshake answer goes to an address nobody has proven yet.
+pub fn describe_holes_within(
+    received: &crate::protocol::RangeSet,
+    from: u64,
+    to: u64,
+    budget: usize,
+) -> (Vec<Range>, u64) {
+    let budget = budget.min(HOLES_BYTE_BUDGET);
     if from >= to {
         return (Vec::new(), from.max(to));
     }
@@ -377,7 +389,7 @@ pub fn describe_holes(
     let mut prev = from;
     for (i, &h) in candidates.iter().enumerate() {
         let len = hole_encoded_len(prev, h);
-        if i >= MAX_HOLES_DECODE || used + len > HOLES_BYTE_BUDGET {
+        if i >= MAX_HOLES_DECODE || used + len > budget {
             return (candidates[..i].to_vec(), h.0);
         }
         used += len;

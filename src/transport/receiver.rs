@@ -94,8 +94,15 @@ const REPLAY_GUARD_CAPACITY: usize = 100_000;
 /// bytes and datagrams, until the manifest is complete.
 const EARLY_MAX_BYTES: u64 = 16 << 20;
 const EARLY_MAX_ITEMS: usize = 16_384;
-/// How long an unanswered address challenge waits before it is repeated.
+/// How long an unanswered address challenge first waits before it is
+/// repeated; each repeat waits twice as long as the last.
 const PATH_RETRY: Duration = Duration::from_millis(250);
+/// Bytes sent to an address nobody has proven, per byte it sent (RFC 9000
+/// section 8).
+const AMPLIFICATION_FACTOR: usize = 3;
+/// Everything in a handshake answer but its hole list: the packet overhead
+/// and the fixed fields of the response and its HELLO_ACK, with room over.
+const RESPONSE_FIXED: usize = hs::RESPONSE_OVERHEAD + 64;
 /// Separate pieces of a file one session may hold. Each costs an entry to
 /// keep, to persist for resume and to walk when describing holes, and a
 /// sender that scattered one-byte pieces across a large file could
@@ -117,6 +124,9 @@ struct Handshake {
     cid: u64,
     from: SocketAddr,
     at: Instant,
+    /// Size of the initiation: what the address it came from has sent us,
+    /// and so what it may be sent back before it is proven.
+    len: usize,
 }
 
 /// Datagrams from one receive buffer for a session: `buf` holds datagrams of
@@ -157,7 +167,15 @@ struct Shared {
     store: Option<StateStore>,
     cancel: CancellationToken,
     identity: Identity,
+    /// Transfers this receiver's user declined, and when. A sender whose
+    /// handshake was already on its way when the user said no must get the
+    /// same answer, not a fresh question.
+    declined: parking_lot::Mutex<HashMap<TransferKey, Instant>>,
 }
+
+/// How long a declined transfer is remembered, and how many are.
+const DECLINE_MEMORY: Duration = Duration::from_secs(120);
+const DECLINES_REMEMBERED: usize = 1024;
 
 pub struct Receiver {
     shared: Arc<Shared>,
@@ -209,6 +227,7 @@ impl Receiver {
                 store,
                 cancel: CancellationToken::new(),
                 identity,
+                declined: parking_lot::Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -494,7 +513,7 @@ impl Dispatcher {
             }
             return;
         }
-        if !self.limiter.allow(from.ip(), now) {
+        if !self.limiter.allow(from, now) {
             return;
         }
         let incoming = match self.responder.read_initiation(pkt) {
@@ -511,11 +530,10 @@ impl Dispatcher {
                 return;
             }
         };
-        if !self.replays.accept(&incoming.sender, init.timestamp) {
-            tracing::debug!("replayed initiation from {} ignored", from);
-            return;
-        }
         let sender = incoming.sender;
+        // Whom we refuse anyway is settled before the replay guard hears of
+        // them: identities cost nothing to make, and a stranger's entries
+        // there would otherwise push out those of the senders we serve.
         if let Some(allowed) = &self.shared.cfg.allowed_senders {
             if !allowed.contains(&sender) {
                 tracing::info!(
@@ -533,6 +551,25 @@ impl Dispatcher {
                 return;
             }
         }
+        // And whoever has a transfer in progress is never pushed out.
+        let sessions = &self.sessions;
+        if !self.replays.accept_keeping(&sender, init.timestamp, |id| {
+            sessions.keys().any(|(s, _)| s == id)
+        }) {
+            tracing::debug!("replayed initiation from {} ignored", from);
+            return;
+        }
+        // The user already said no to this one.
+        let key = (sender, init.hello.transfer_id);
+        {
+            let mut declined = self.shared.declined.lock();
+            declined.retain(|_, at| now.saturating_duration_since(*at) < DECLINE_MEMORY);
+            if declined.contains_key(&key) {
+                drop(declined);
+                self.reject(incoming, &init, from, REASON_DECLINED, "declined by user");
+                return;
+            }
+        }
         let Some(suite) = Suite::choose(init.suites, init.hardware_aes) else {
             self.reject(
                 incoming,
@@ -543,7 +580,6 @@ impl Dispatcher {
             );
             return;
         };
-        let key = (sender, init.hello.transfer_id);
         let cid = self.new_cid();
         let handshake = Box::new(Handshake {
             incoming,
@@ -552,16 +588,22 @@ impl Dispatcher {
             cid,
             from,
             at: now,
+            len: pkt.len(),
         });
 
         // A new handshake of a transfer we already serve (the sender lost the
         // session after an outage, or restarted): move the session over.
         if let Some(s) = self.sessions.get_mut(&key) {
             if !s.task.is_finished() {
-                self.by_cid.remove(&s.cid);
-                s.cid = cid;
-                self.by_cid.insert(cid, key);
-                let _ = s.tx.try_send(Incoming::Handshake(handshake));
+                // Routed to the new connection id only once the session
+                // has the handshake: if its queue is full, moving the
+                // routing anyway left it deaf to both ids until the next
+                // handshake. Dropped instead, the handshake is repeated.
+                if s.tx.try_send(Incoming::Handshake(handshake)).is_ok() {
+                    self.by_cid.remove(&s.cid);
+                    s.cid = cid;
+                    self.by_cid.insert(cid, key);
+                }
                 return;
             }
             let old = self.sessions.remove(&key).expect("present");
@@ -1493,6 +1535,17 @@ impl Session {
             return ControlFlow::Continue(());
         }
         if !accepted {
+            {
+                let mut declined = self.shared.declined.lock();
+                if declined.len() >= DECLINES_REMEMBERED {
+                    if let Some(oldest) =
+                        declined.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k)
+                    {
+                        declined.remove(&oldest);
+                    }
+                }
+                declined.insert(self.key(), Instant::now());
+            }
             self.send_rejection(REASON_DECLINED, "declined by user");
             self.emit_failed("declined by user".into(), false);
             return ControlFlow::Break(());
@@ -1504,7 +1557,7 @@ impl Session {
         }
         self.phase = Phase::Receiving;
         // Tell the sender right away instead of at its next poll.
-        let (ack, flags) = self.current_ack(0, SUPPORTED_CAPS);
+        let (ack, flags) = self.current_ack(0, SUPPORTED_CAPS, HOLES_BYTE_BUDGET);
         self.send(flags, &Message::HelloAck(ack));
         self.on_accepted();
         ControlFlow::Continue(())
@@ -1786,8 +1839,10 @@ impl Session {
         Ok(())
     }
 
-    /// The HELLO_ACK describing our current state.
-    fn current_ack(&self, echo_ts: u32, offered_caps: u32) -> (HelloAck, u8) {
+    /// The HELLO_ACK describing our current state, its hole list held to
+    /// `budget` bytes. Fewer holes is always safe: the ACK then describes a
+    /// shorter stretch of the file, and the sender resends past its end.
+    fn current_ack(&self, echo_ts: u32, offered_caps: u32, budget: usize) -> (HelloAck, u8) {
         let max_ack_delay_us = self.cfg.ack_interval.as_micros().min(u32::MAX as u128) as u32;
         if matches!(self.phase, Phase::Pending { .. }) {
             let ack = HelloAck {
@@ -1807,7 +1862,8 @@ impl Session {
         }
         let contiguous = self.received.contiguous_from(0);
         let last = self.received.last_end().unwrap_or(0).max(contiguous);
-        let (holes, known_end) = self.describe(contiguous, last);
+        let (holes, known_end) =
+            wire::describe_holes_within(&self.received, contiguous, last, budget);
         let ack = HelloAck {
             status: HELLO_ACCEPTED,
             reason: REASON_NONE,
@@ -1832,7 +1888,13 @@ impl Session {
     /// Answers a handshake with our current state and switches to its keys.
     fn respond(&mut self, h: Handshake) {
         let hello = &h.init.hello;
-        let (ack, ack_flags) = self.current_ack(hello.timestamp, hello.capabilities);
+        // The answer goes to wherever the initiation came from, which
+        // nobody has proven: a copy of an initiation sent from a forged
+        // address would otherwise draw an answer five times its size at
+        // whoever owns that address. Held to three times the initiation,
+        // as for everything else sent to an unproven address.
+        let budget = (AMPLIFICATION_FACTOR * h.len).saturating_sub(RESPONSE_FIXED);
+        let (ack, ack_flags) = self.current_ack(hello.timestamp, hello.capabilities, budget);
         let payload = wire::encode_response(&wire::Response {
             suite: h.suite as u8,
             ack_flags,
@@ -1863,7 +1925,12 @@ impl Session {
                 // challenge is sent under them.
                 self.path.reset();
                 if h.from != self.peer {
-                    if let Some(c) = self.path.on_authentic(h.from, self.peer, h.at) {
+                    // What the answer used of the address's allowance is
+                    // not there to spend again on challenges.
+                    let credit = h
+                        .len
+                        .saturating_sub(pkt.len().div_ceil(AMPLIFICATION_FACTOR));
+                    if let Some(c) = self.path.on_authentic(h.from, self.peer, h.at, credit) {
                         tracing::info!(
                             "handshake from {} while the session is at {}; validating it",
                             c.to,
@@ -1933,7 +2000,7 @@ impl Session {
 
     /// Answers a HELLO frame (a state query or a decision poll).
     fn answer_hello(&mut self, hello: &Hello) {
-        let (ack, flags) = self.current_ack(hello.timestamp, hello.capabilities);
+        let (ack, flags) = self.current_ack(hello.timestamp, hello.capabilities, HOLES_BYTE_BUDGET);
         self.send(flags, &Message::HelloAck(ack));
     }
 
@@ -2107,7 +2174,7 @@ impl Session {
         let Ok((msg_type, flags)) = parse_type_byte(tb) else {
             return Ok(());
         };
-        self.note_alive(from, at);
+        self.note_alive(from, at, range.len());
         let body = range.start + HEADER_LEN..range.end - TAG_LEN;
         if msg_type != MsgType::Data {
             controls.push(Control {
@@ -2138,7 +2205,7 @@ impl Session {
     /// [`crate::transport::path`] — an attacker that repeats a captured
     /// packet with a forged source address must not be able to point our
     /// ACKs (and, on the sending side, the data stream) at a third party.
-    fn note_alive(&mut self, from: SocketAddr, at: Instant) {
+    fn note_alive(&mut self, from: SocketAddr, at: Instant, len: usize) {
         self.last_rx = at;
         if self.stalled {
             self.stalled = false;
@@ -2149,7 +2216,7 @@ impl Session {
                 },
             );
         }
-        if let Some(c) = self.path.on_authentic(from, self.peer, at) {
+        if let Some(c) = self.path.on_authentic(from, self.peer, at, len) {
             tracing::info!(
                 "sender claims address {} (was {}); validating it",
                 c.to,
@@ -2163,9 +2230,9 @@ impl Session {
         }
     }
 
-    /// Repeats an unanswered address challenge, or gives the claim up.
+    /// Repeats unanswered address challenges, or gives claims up.
     fn poll_path(&mut self, now: Instant) {
-        if let Some(c) = self.path.poll(now, PATH_RETRY) {
+        for c in self.path.poll(now, PATH_RETRY) {
             self.send_to(
                 c.to,
                 0,

@@ -215,22 +215,7 @@ fn random_token() -> [u8; TOKEN_LEN] {
 /// built.
 const MAX_TRACKED_ADDRESSES: usize = 65_536;
 
-/// Who a request counts against: an IPv4 address, or an IPv6 /64.
-///
-/// Keying on whole IPv6 addresses would let one subscriber, who is usually
-/// handed a /64 and can send from any address in it for free, count as
-/// eighteen quintillion clients. The canonical form comes first, so an IPv4
-/// client reaching a dual-stack relay is the same client either way.
-fn client_key(addr: SocketAddr) -> std::net::IpAddr {
-    match crate::address::canonical(addr).ip() {
-        std::net::IpAddr::V6(v6) => {
-            let mut o = v6.octets();
-            o[8..].fill(0);
-            std::net::IpAddr::V6(o.into())
-        }
-        v4 => v4,
-    }
-}
+use crate::address::client_key;
 
 /// How often a full rate limiter may walk its table looking for room. A
 /// spray of forged sources keeps it full; walking the whole table for every

@@ -190,6 +190,14 @@ impl RttEstimator {
         scaled.min(self.max_rto)
     }
 
+    /// The timeout without any backoff: how long an answer should take on
+    /// this path as it is measured now.
+    pub fn pto(&self) -> Duration {
+        let base =
+            self.srtt() + (self.rttvar * 4).max(Duration::from_millis(1)) + self.max_ack_delay;
+        base.clamp(self.min_rto, self.max_rto)
+    }
+
     pub fn backoff(&mut self) {
         self.backoff = (self.backoff + 1).min(6);
     }
