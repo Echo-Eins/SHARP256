@@ -2274,3 +2274,41 @@ async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
     relay_task.abort();
     stop_receiver(r).await;
 }
+
+/// A relay is a fallback, not a toll gate. Configuring one — even several
+/// that do not answer at all — must not slow down a transfer whose direct
+/// path works, because the introduction runs alongside the connectivity
+/// checks instead of before them.
+///
+/// Asking the relays first, and waiting for each in turn, cost roughly two
+/// and a quarter seconds per relay before a single packet went to the
+/// receiver.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_relays_do_not_slow_down_a_direct_transfer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let file = make_file(&src, "direct.bin", 256 << 10, 0xD1EC);
+    let r = start_receiver(&out, &state, |_| {}).await;
+
+    // Three addresses with nothing behind them.
+    let mut dead = Vec::new();
+    for _ in 0..3 {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        dead.push(s.local_addr().unwrap().to_string());
+    }
+
+    let mut cfg = sender_cfg(&file, r.addr, r.id, &state);
+    cfg.relays = dead;
+    let started = Instant::now();
+    let summary = run_sender(cfg).await.expect("the direct path is used");
+    let elapsed = started.elapsed();
+    assert_eq!(summary.file_size, (256 << 10) as u64);
+    assert_same(&file, &out.join("direct.bin"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "three unanswering relays cost {:?}; they should cost nothing",
+        elapsed
+    );
+    stop_receiver(r).await;
+}

@@ -185,6 +185,11 @@ struct Registration {
 struct Allocation {
     port: u16,
     task: tokio::task::JoinHandle<()>,
+    /// Who asked for it. A global limit alone would be
+    /// first-come-first-served, so one client could take every port and
+    /// shut everybody else out — the same mistake as an unshared session
+    /// limit, and just as easy to make.
+    requested_by: std::net::IpAddr,
 }
 
 /// Which side of an allocation a ticket names, and where that side is.
@@ -321,7 +326,21 @@ impl Relay {
                     return;
                 };
                 let receiver = reg.addr;
-                if self.allocations.len() >= self.cfg.max_allocations {
+                let share = (self.cfg.max_allocations / 4).max(2);
+                let mine = self
+                    .allocations
+                    .iter()
+                    .filter(|a| a.requested_by == from.ip())
+                    .count();
+                if self.allocations.len() >= self.cfg.max_allocations || mine >= share {
+                    if mine >= share {
+                        tracing::info!(
+                            "relay: {} already holds {} of {} ports",
+                            from.ip(),
+                            mine,
+                            self.cfg.max_allocations
+                        );
+                    }
                     self.reply(
                         from,
                         Message::Error {
@@ -416,7 +435,11 @@ impl Relay {
             self.cancel.clone(),
         ));
         let _ = now;
-        self.allocations.push(Allocation { port, task });
+        self.allocations.push(Allocation {
+            port,
+            task,
+            requested_by: sender.ip(),
+        });
         Some((port, sender_ticket, receiver_ticket))
     }
 

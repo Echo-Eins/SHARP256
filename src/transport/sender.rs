@@ -50,6 +50,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -193,44 +194,54 @@ impl Sender {
         &self.source
     }
 
-    /// Asks each configured relay to put us through to the receiver, and
-    /// returns the addresses that buys us.
+    /// Starts asking each configured relay to put us through, in the
+    /// background.
     ///
-    /// This runs on the transfer socket before anything else does, which is
-    /// the point: the way back through our own NAT belongs to this socket,
-    /// so an introduction arranged from any other one would describe a path
-    /// that does not exist.
+    /// The introductions run *alongside* the connectivity checks rather than
+    /// before them, as ICE gathers candidates while it is already checking
+    /// others (RFC 8445 section 6.1.4.2). Doing it the other way round made
+    /// every transfer wait on the relay — including the ones on a local
+    /// network that never needed it.
+    ///
+    /// Returns an inbox per relay, for the engine to route the relay's
+    /// datagrams into, and a channel the addresses arrive on.
     #[cfg(feature = "nat-traversal")]
-    async fn relay_candidates(&self) -> Vec<SocketAddr> {
-        let mut out = Vec::new();
-        if self.cfg.relays.is_empty() {
-            return out;
-        }
-        let socket = self.socket.udp();
+    fn spawn_relay_introductions(&self) -> (Vec<RelayInbox>, mpsc::UnboundedReceiver<SocketAddr>) {
+        let (found_tx, found_rx) = mpsc::unbounded_channel();
+        let mut inboxes = Vec::new();
         for name in &self.cfg.relays {
             let Ok(addr) = name.parse::<SocketAddr>() else {
                 tracing::warn!("relay \"{}\" is not a <host>:<port> address", name);
                 continue;
             };
-            match crate::relay::client::connect(&socket, addr, &self.cfg.receiver_id, &self.cancel)
-                .await
-            {
-                Ok(i) => {
-                    tracing::info!(
-                        "relay {} says the receiver is at {}, and will carry the transfer on {}",
-                        addr,
-                        i.peer,
-                        i.relayed
-                    );
-                    out.push(i.peer);
-                    out.push(i.relayed);
+            let (tx, mut rx) = mpsc::channel(32);
+            let socket = self.socket.udp();
+            let target = self.cfg.receiver_id;
+            let cancel = self.cancel.clone();
+            let found = found_tx.clone();
+            tokio::spawn(async move {
+                match crate::relay::client::connect(socket, addr, target, &mut rx, &cancel).await {
+                    Ok(i) => {
+                        tracing::info!(
+                            "relay {} says the receiver is at {}, and will carry the transfer \
+                             on {}",
+                            addr,
+                            i.peer,
+                            i.relayed
+                        );
+                        // Where the receiver appears to be first: if that
+                        // works the relay carries nothing.
+                        let _ = found.send(i.peer);
+                        let _ = found.send(i.relayed);
+                    }
+                    // A relay that cannot help is not a failure: the
+                    // addresses we already have may well work.
+                    Err(e) => tracing::info!("relay {}: {}", addr, e),
                 }
-                // A relay that cannot help is not a failure: the addresses
-                // we already have may well work.
-                Err(e) => tracing::info!("relay {}: {}", addr, e),
-            }
+            });
+            inboxes.push((addr, tx));
         }
-        out
+        (inboxes, found_rx)
     }
 
     /// Runs the transfer to completion.
@@ -281,23 +292,20 @@ impl Sender {
                 candidates.push(*a);
             }
         }
-        // A relay adds two more: where it sees the receiver, which both ends
-        // now push towards at once and which therefore often works directly,
-        // and the relay's own port, which works whenever anything does. They
-        // go last, so a direct path is always preferred and the relay
-        // carries nothing unless it has to.
+        // Relays add more as they answer, while the addresses above are
+        // already being tried.
         #[cfg(feature = "nat-traversal")]
-        for a in self.relay_candidates().await {
-            if !candidates.contains(&a) {
-                candidates.push(a);
-            }
-        }
+        let (relay_inboxes, found_rx) = self.spawn_relay_introductions();
+        #[cfg(not(feature = "nat-traversal"))]
+        let (relay_inboxes, found_rx) = (Vec::new(), mpsc::unbounded_channel().1);
 
         let mut engine = Engine::new(
             self.cfg.transport.clone(),
             self.socket.clone(),
             self.cfg.peer,
             candidates,
+            relay_inboxes,
+            found_rx,
             Peer {
                 identity: self.identity.clone(),
                 receiver: self.cfg.receiver_id,
@@ -526,6 +534,13 @@ const MAX_ATTEMPTS: usize = 4;
 const DECISION_POLL: Duration = Duration::from_secs(1);
 /// Gap between initiations while candidate addresses are still untried.
 const CANDIDATE_PROBE: Duration = Duration::from_millis(250);
+/// Most addresses one transfer will ever try. Each costs a quarter of a
+/// second of setup, so a peer (or a relay) cannot make us spend the whole
+/// handshake budget walking a list.
+const MAX_CANDIDATES: usize = 12;
+
+/// A relay we are talking to, and the inbox its datagrams go into.
+type RelayInbox = (SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>);
 
 /// Who we are, whom we talk to, and the shared secret.
 struct Peer {
@@ -586,6 +601,12 @@ struct Engine {
     /// through them until one answers.
     candidates: Vec<SocketAddr>,
     next_candidate: usize,
+    /// Relays being asked for an introduction, and the inbox each one's
+    /// datagrams are routed into. The engine owns the socket's receive
+    /// loop, so it has to hand them over.
+    relay_inboxes: Vec<RelayInbox>,
+    /// Addresses the introductions turn up, as they turn up.
+    found_rx: mpsc::UnboundedReceiver<SocketAddr>,
     /// A candidate that answered an attempt we could not adopt. Worth going
     /// straight back to rather than finishing the round.
     answered_at: Option<SocketAddr>,
@@ -702,6 +723,8 @@ impl Engine {
         socket: Arc<BatchSocket>,
         peer: SocketAddr,
         candidates: Vec<SocketAddr>,
+        relay_inboxes: Vec<RelayInbox>,
+        found_rx: mpsc::UnboundedReceiver<SocketAddr>,
         auth: Peer,
         reader: Arc<Source>,
         file_name: String,
@@ -736,6 +759,8 @@ impl Engine {
             cookie: None,
             candidates,
             next_candidate: 0,
+            relay_inboxes,
+            found_rx,
             answered_at: None,
             probes_sent: 0,
             answer: None,
@@ -914,6 +939,22 @@ impl Engine {
     /// simply dead should not hold up the ones behind it.
     fn candidates_left(&self) -> bool {
         self.secure.is_none() && self.probes_sent < self.candidates.len()
+    }
+
+    /// Takes in addresses a relay introduction has turned up. They arrive
+    /// while the handshake is already trying the ones we started with, so
+    /// they simply join the ring — and because they are untried, probing
+    /// goes back to being brisk until they have had their turn.
+    fn take_new_candidates(&mut self) {
+        while let Ok(addr) = self.found_rx.try_recv() {
+            if self.candidates.len() >= MAX_CANDIDATES {
+                return;
+            }
+            if !self.candidates.contains(&addr) {
+                tracing::debug!("another address to try: {}", addr);
+                self.candidates.push(addr);
+            }
+        }
     }
 
     /// Starts a new handshake attempt: a fresh ephemeral key and connection
@@ -1104,6 +1145,7 @@ impl Engine {
                 return Err(SendError::Cancelled);
             }
             let now = Instant::now();
+            self.take_new_candidates();
             if let Some(ack) = self.answer.take() {
                 match ack.status {
                     HELLO_ACCEPTED => {
@@ -1851,6 +1893,16 @@ impl Engine {
     /// Routes a datagram by its connection id: transport packets of the
     /// session, or answers to a handshake attempt. Anything else is dropped.
     fn on_datagram(&mut self, pkt: &mut [u8], from: SocketAddr) -> Result<(), SendError> {
+        // A relay's own datagrams, handed over to whichever introduction is
+        // waiting for them. They can never be confused with traffic: the
+        // connection id they would parse as is one no endpoint ever picks.
+        #[cfg(feature = "nat-traversal")]
+        if !self.relay_inboxes.is_empty() && crate::relay::is_control(pkt) {
+            if let Some((_, tx)) = self.relay_inboxes.iter().find(|(a, _)| *a == from) {
+                let _ = tx.try_send((pkt.to_vec(), from));
+            }
+            return Ok(());
+        }
         let Some(dcid) = peek_cid(pkt) else {
             return Ok(());
         };

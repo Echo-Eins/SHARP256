@@ -35,6 +35,12 @@ const TRIES: u32 = 3;
 const REPEATS: u32 = 4;
 /// Gap between those.
 const REPEAT_GAP: Duration = Duration::from_millis(150);
+/// Introductions acted on per second, and the burst. A relay is not
+/// trusted, and acting on an introduction means sending a handful of
+/// datagrams at an address it chose; without a bound of our own, a hostile
+/// one could have us do that as fast as it liked.
+const INTRODUCTION_RATE: f64 = 1.0;
+const INTRODUCTION_BURST: f64 = 4.0;
 
 /// What a relay introduction is worth: two more addresses to try.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,13 +55,18 @@ pub struct Introduction {
 
 /// Asks a relay to put us through to `target`.
 ///
-/// Runs on the transfer socket before the transfer starts, so it may read
-/// from it directly; anything that is not an answer from this relay is
-/// ignored.
+/// Runs alongside the connectivity checks rather than before them, as ICE
+/// gathers candidates while it is already checking others (RFC 8445 section
+/// 6.1.4.2): a relay that is slow, or simply not needed because the direct
+/// path works, must not hold a transfer up. `incoming` carries this relay's
+/// datagrams, handed over by whoever owns the socket's receive loop — the
+/// engine is reading it at the same time, so reading it here too would have
+/// the two stealing each other's packets.
 pub async fn connect(
-    socket: &UdpSocket,
+    socket: Arc<UdpSocket>,
     relay: SocketAddr,
-    target: &SharpId,
+    target: SharpId,
+    incoming: &mut mpsc::Receiver<Incoming>,
     cancel: &CancellationToken,
 ) -> Result<Introduction, String> {
     let mut token = [0u8; TOKEN_LEN];
@@ -63,14 +74,11 @@ pub async fn connect(
         if cancel.is_cancelled() {
             return Err("cancelled".into());
         }
-        let ask = Message::Connect {
-            target: *target,
-            token,
-        };
+        let ask = Message::Connect { target, token };
         if let Err(e) = socket.send_to(&ask.encode(), relay).await {
             return Err(format!("cannot reach the relay {}: {}", relay, e));
         }
-        match wait_for(socket, relay, REPLY_WAIT).await {
+        match wait_for(incoming, relay, REPLY_WAIT).await {
             // The relay wants us to prove we receive where we say we do.
             Some(Message::Challenge { token: t }) => token = t,
             Some(Message::Allocated { port, peer, ticket }) => {
@@ -78,7 +86,12 @@ pub async fn connect(
                 // Tell the allocated port which side we are. This is also
                 // what opens our NAT towards it, and the address it sees
                 // here is very likely not the one the control port saw.
-                announce(socket, relayed, ticket).await;
+                // It is spaced out over most of a second, so it runs on its
+                // own: the caller has candidates to be getting on with.
+                let announcer = socket.clone();
+                tokio::spawn(async move {
+                    announce(&announcer, relayed, ticket).await;
+                });
                 return Ok(Introduction { peer, relayed });
             }
             Some(Message::Error { code }) => return Err(code.describe().to_string()),
@@ -104,6 +117,9 @@ pub async fn serve(
     let mut token = [0u8; TOKEN_LEN];
     let mut registered = false;
     let mut next_send = Instant::now();
+    // What we are willing to do on this relay's say-so.
+    let mut allowance = INTRODUCTION_BURST;
+    let mut allowance_at = Instant::now();
     // Until the relay answers, ask briskly; once registered, just keep the
     // lease and the NAT mapping alive.
     let mut retry = Duration::from_millis(500);
@@ -148,6 +164,20 @@ pub async fn serve(
                 next_send = Instant::now() + lease / 2;
             }
             Some(Message::Incoming { port, peer, ticket }) => {
+                // Acting on an introduction means sending a handful of
+                // datagrams at an address the relay chose, so how often we
+                // are willing to do that is our decision, not the relay's.
+                let now = Instant::now();
+                allowance = (allowance
+                    + now.saturating_duration_since(allowance_at).as_secs_f64()
+                        * INTRODUCTION_RATE)
+                    .min(INTRODUCTION_BURST);
+                allowance_at = now;
+                if allowance < 1.0 {
+                    tracing::debug!("relay {} is introducing too fast; ignoring", relay);
+                    continue;
+                }
+                allowance -= 1.0;
                 let relayed = SocketAddr::new(relay.ip(), port);
                 tracing::info!("relay {} is introducing {}", relay, peer);
                 let socket = socket.clone();
@@ -213,22 +243,22 @@ async fn punch(socket: &UdpSocket, peer: SocketAddr) {
 }
 
 /// Reads until a relay message from `relay` arrives, or the time is up.
-async fn wait_for(socket: &UdpSocket, relay: SocketAddr, within: Duration) -> Option<Message> {
+async fn wait_for(
+    incoming: &mut mpsc::Receiver<Incoming>,
+    relay: SocketAddr,
+    within: Duration,
+) -> Option<Message> {
     let deadline = Instant::now() + within;
-    let mut buf = vec![0u8; super::MAX_MESSAGE.max(2048)];
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return None;
         }
-        let (n, from) = tokio::time::timeout(left, socket.recv_from(&mut buf))
-            .await
-            .ok()?
-            .ok()?;
+        let (pkt, from) = tokio::time::timeout(left, incoming.recv()).await.ok()??;
         if from != relay {
             continue;
         }
-        if let Some(m) = Message::decode(&buf[..n]) {
+        if let Some(m) = Message::decode(&pkt) {
             return Some(m);
         }
     }
