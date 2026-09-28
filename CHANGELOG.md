@@ -340,6 +340,13 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   `RENAME_NOREPLACE` on Linux, `renamex_np` with `RENAME_EXCL` on macOS,
   `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows, a hard link
   elsewhere — and the next free name is tried.
+- Found by the first end-to-end run on Windows: a socket bound to an explicit
+  IPv6 address (`[::1]`, say) had `IPV6_V6ONLY` switched off, which such a
+  socket cannot use anyway; quinn-udp then set IPv4 options on it, and
+  Windows refused them — every IPv6 transfer from or to an explicit IPv6
+  address failed with WSAEINVAL. An explicit IPv6 address is now bound
+  IPv6-only (a mapped IPv4 one still not), and only a wildcard counts as
+  dual-stack.
 - Also found on Windows: a directory being sent was described from the
   copies of its entries' metadata in the directory listing, which NTFS
   updates lazily — a directory's modification time went out stale, and a

@@ -56,10 +56,14 @@ fn bind_socket(addr: SocketAddr, buffer_bytes: usize, dual_stack: bool) -> io::R
                 ),
             )
         })?;
-    } else if addr.is_ipv6() {
-        // An address bound explicitly speaks its own family; a mapped one
-        // speaks IPv4 through this IPv6 socket, where the system allows.
-        let _ = socket.set_only_v6(false);
+    } else if let SocketAddr::V6(v6) = addr {
+        // An address bound explicitly speaks its own family — for a mapped
+        // one that is IPv4, through this IPv6 socket where the system
+        // allows. Said outright rather than left at the system's default,
+        // because what the socket claims is acted on: quinn-udp sets IPv4
+        // options on any IPv6 socket without IPV6_V6ONLY, and Windows
+        // refuses them (WSAEINVAL) on one bound to an IPv6 address.
+        let _ = socket.set_only_v6(v6.ip().to_ipv4_mapped().is_none());
     }
     set_buffer_sizes(&socket, buffer_bytes);
     socket.bind(&addr.into())?;
@@ -81,7 +85,9 @@ fn bind_socket(addr: SocketAddr, buffer_bytes: usize, dual_stack: bool) -> io::R
 /// other three bytes of the answer unwritten — "dual-stack" would then
 /// depend on whatever they held.
 pub(crate) fn speaks_both_families(socket: &UdpSocket) -> bool {
-    socket.local_addr().is_ok_and(|a| a.is_ipv6()) && v6_only(socket).is_ok_and(|only| !only)
+    let wildcard_v6 =
+        matches!(socket.local_addr(), Ok(SocketAddr::V6(a)) if a.ip().is_unspecified());
+    wildcard_v6 && v6_only(socket).is_ok_and(|only| !only)
 }
 
 #[cfg(not(windows))]
@@ -238,7 +244,8 @@ pub struct DontFragment {
 pub fn set_dont_fragment(socket: &UdpSocket) -> DontFragment {
     let local = socket.local_addr().ok();
     let is_v6 = local.is_some_and(|a| a.is_ipv6());
-    let speaks_v4 = !is_v6 || speaks_both_families(socket);
+    let mapped = matches!(local, Some(SocketAddr::V6(a)) if a.ip().to_ipv4_mapped().is_some());
+    let speaks_v4 = !is_v6 || mapped || speaks_both_families(socket);
     #[allow(unused_mut)]
     let mut out = DontFragment::default();
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -493,6 +500,14 @@ mod tests {
         let local = any.local_addr().unwrap();
         if local.is_ipv6() {
             assert!(speaks_both_families(&any));
+            // An IPv6 address speaks IPv6 alone, and says so.
+            let lo = bind_udp("[::1]:0".parse().unwrap(), 1 << 16).unwrap();
+            assert_eq!(v6_only(&lo).ok(), Some(true));
+            assert!(!speaks_both_families(&lo));
+            // A mapped one speaks IPv4, through an IPv6 socket.
+            if let Ok(m) = bind_udp("[::ffff:127.0.0.1]:0".parse().unwrap(), 1 << 16) {
+                assert_eq!(v6_only(&m).ok(), Some(false));
+            }
         } else {
             no_ipv6_here();
             assert!(local.ip().is_unspecified() && local.is_ipv4(), "{}", local);
