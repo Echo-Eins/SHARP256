@@ -603,7 +603,9 @@ struct Engine {
     next_candidate: usize,
     /// Relays being asked for an introduction, and the inbox each one's
     /// datagrams are routed into. The engine owns the socket's receive
-    /// loop, so it has to hand them over.
+    /// loop, so it has to hand them over. Always empty without the
+    /// `nat-traversal` feature, which is the only thing that fills it.
+    #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
     relay_inboxes: Vec<RelayInbox>,
     /// Addresses the introductions turn up, as they turn up.
     found_rx: mpsc::UnboundedReceiver<SocketAddr>,
