@@ -357,6 +357,11 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   receiver might not reach its limit at all. It now asks afresh after each
   step, sends twice the limit, and checks that a piece joining nothing is
   refused at the limit — not only that joining data is taken.
+- The test that both sides settle on the newest handshake ran its session
+  over a path with a 400 or 700 ms round trip under the usual 800 ms test
+  stall timeout, so a busy CI runner could read a slow pause as a lost
+  session. It now allows 3 s; a session really lost stalls however long
+  the timeout, so the test still catches what it is for.
 - The README claimed "10 GbE and beyond"; it now gives the measured figure
   (4.8–5.0 Gbit/s over loopback on one 4-core VM) and says that no real
   10 GbE network was measured.

@@ -2304,6 +2304,13 @@ async fn the_newest_handshake_wins_on_both_sides() {
     cfg.events = Some(Arc::new(move |ev| {
         let _ = tx.send(ev);
     }));
+    // Whichever handshake wins, the session then runs over a path with a
+    // round trip of 400 or 700 ms, and the usual test stall timeout of
+    // 800 ms leaves a busy CI runner no room: a pause that is merely slow
+    // reads as a stall. A session that is really lost stalls however long
+    // the timeout — nothing gets through until a new handshake — so a
+    // longer one still catches what this test is after.
+    cfg.transport.stall_timeout = Duration::from_secs(3);
 
     let summary = run_sender(cfg).await.expect("the transfer completes");
     assert_eq!(summary.file_size, size as u64);
