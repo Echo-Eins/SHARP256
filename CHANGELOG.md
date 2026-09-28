@@ -145,8 +145,9 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   would need. It introduces the two so they can punch through directly, and
   allocates a UDP port for the pair when that is not enough. Either end
   names one with `--relay host:port`.
-- The relay is trusted with nothing: it carries sealed transport packets, so
-  it cannot read, alter or inject one, and it cannot impersonate a peer
+- The relay is trusted with no part of the transfer: it carries sealed
+  transport packets, so it cannot read, alter or inject one, and it cannot
+  impersonate a peer
   because completing a handshake takes that peer's private key. A receiver
   still admits or refuses a sender by its identity. Registering an identity
   that is not yours therefore buys only a failed handshake; what is guarded
@@ -180,6 +181,93 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   goodbye with a stale token is asked again. Relay names resolve in the
   background on both sides, the receiver keeps registering through send
   errors, and it waits for its goodbyes on shutdown.
+- What a relay does see is stated plainly now (`docs/THREAT_MODEL.md`, Н1
+  and Н4б): which identity is registered where, who asks for whom, when and
+  how much — and its control messages travel in the clear, so an observer
+  on the path sees the same.
+
+### Relay access and quotas
+- A relay carries traffic on its operator's bandwidth, so the operator
+  decides who may use it. `--allow-receiver ID` / `--allowed-receivers FILE`
+  limit who may register (refused with the new `Forbidden`, and only after
+  the registration's proof has been checked, so the list is not disclosed);
+  `--allow-sender ID` / `--allowed-senders FILE` limit whom it puts through.
+  Such a relay answers an anonymous `Connect` with `Forbidden`, and a sender
+  that was given the relay as `ID@host:port` asks again with the new
+  `ConnectAs`, proving its identity with a MAC made as a registration's is.
+  A sender never names itself to a relay that does not ask. An open relay
+  says so when it starts.
+- Quotas: a rate per client (an IPv4 address or an IPv6 /64; 100 Mbit/s by
+  default, `--client-rate`), a volume per client per hour
+  (`--client-quota`), a total rate (`--total-rate`) and a volume per pair
+  (`--pair-bytes`). Metering is all-or-nothing — a datagram refused by one
+  limit spends nothing from the others — and the bounded table of clients
+  forgets only clients whose allowance has fully recovered, so being pushed
+  out of it never refills one. Datagrams over a limit are dropped, and the
+  transfer's congestion control slows to what the relay allows (measured:
+  8.1 Mbit/s through a relay set to 8 Mbit/s).
+- The relay binds `[::]:5560` by default and carries pairs across address
+  families; its allocated ports bind the address of its control socket.
+
+### Keeping NAT mappings alive
+- A NAT forgets an idle mapping — many within thirty seconds — and the
+  receiver's published address then leads nowhere. The mapping behind a
+  published address is now refreshed with STUN Binding Indications every
+  15 s (RFC 8445 section 11; `--keepalive`) and checked with a request
+  every minute. Against an RFC 5780 server the NAT's mapping lifetime is
+  measured in the background with RESPONSE-PORT (section 4.6), and the
+  interval becomes half of it, between 5 and 60 s. A mapping seen to change
+  anyway halves the interval, and the new address is reported at once.
+- One policy per socket: relay registrations are refreshed at the same
+  interval (not merely within the lease), a relay that reports a new
+  address shortens it for everyone, and a relay that stays silent for a
+  whole lease is registered with again, on its next address if it has one.
+
+### IPv6
+- IPv6 and IPv4 by default: receiver, sender and relay bind one dual-stack
+  socket (`[::]`, `IPV6_V6ONLY` off) and fall back to IPv4 on the same port
+  where the system has no IPv6. An explicit address is bound as given; a
+  taken port is an error, never a fallback.
+- Name resolution follows Happy Eyeballs v2 (RFC 8305): A and AAAA are asked
+  for separately and at once (`getaddrinfo` per family, on Windows too), an
+  A answer waits at most 50 ms for AAAA, addresses are sorted by RFC 6724
+  (usable destinations, scope, label, precedence) and interleaved by family,
+  and a new attempt starts every 250 ms without waiting for the last to
+  fail. Names resolve while the handshake already runs on the literal
+  candidates; a name with no address and nothing else to try fails at once
+  with the resolver's answer.
+- NAT64: on an IPv6-only host the prefix is discovered from
+  `ipv4only.arpa` (RFC 7050, RFC 6052 prefix lengths, cached five minutes),
+  and IPv4 literals and candidates are tried through it as well.
+- Addresses are classified by RFC 6890; host candidates follow RFC 8445
+  section 5.1.1.1: never loopback or IPv6 link-local, never a deprecated,
+  tentative or duplicate IPv6 address, and where temporary addresses
+  (RFC 8981) exist, the temporary one stands for its interface and /64
+  instead of the stable one. Link-local literals keep their zone
+  (`[fe80::1%eth0]:5555`); every other address loses zone and flow label.
+- "Don't fragment" for every family on every platform: `IPV6_DONTFRAG` and
+  `IPV6_PMTUDISC_PROBE` next to `IP_PMTUDISC_PROBE` on Linux, `IP_DONTFRAG` /
+  `IPV6_DONTFRAG` on macOS and the BSDs, `IP_DONTFRAGMENT` / `IPV6_DONTFRAG`
+  on Windows. The log says what the system accepted.
+- Packets sized for the family: over IPv6 the default chunk starts at 1407
+  bytes instead of 1427 (the header is 20 bytes longer), 1407 is also a
+  probe candidate and the first step down — which suits PPPoE links too.
+- `--no-lan-addresses`: publish only globally routable addresses, so that
+  whoever is given the receiver's address learns nothing about the local
+  network.
+
+### Fuzzing and CI
+- Ten cargo-fuzz targets (`fuzz/`) cover everything read from others:
+  transport frames, handshake payloads, whole datagrams, manifests, relay
+  messages, STUN, PCP/NAT-PMP, UPnP, addresses and text. Decoded messages
+  must survive encoding again. The same entry points (`src/fuzz.rs`) run on
+  mutated seeds and on every input that ever crashed one in each
+  `cargo test`.
+- GitHub Actions: formatting and clippy for every feature set (and for
+  FreeBSD), all tests on Linux, macOS and Windows with IPv6 required
+  (`SHARP_REQUIRE_IPV6`: an IPv6 test that cannot run fails instead of
+  skipping), the minimum Rust version, the network-namespace tests, and a
+  minute of fuzzing per target.
 
 ### Directories
 - A directory is sent as one stream: a manifest (structure, sizes, Unix
@@ -229,6 +317,18 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   unsupported request.
 
 ### Fixed
+- Found by fuzzing: ChaCha20 header protection panicked when a packet's
+  sample named the keystream block at counter `u32::MAX` — the stream
+  cipher refused to go on, and the mask is computed before the AEAD check.
+  Anyone who knew a session's connection id (an on-path observer, a relay)
+  could take that side of the session down with one packet; one's own
+  packets did it once in 2^32. The block is now computed directly.
+  Checked against the RFC 9001 appendix A.5 vector.
+- Found by fuzzing: a damaged resume-state file with non-ASCII bytes where a
+  transfer id belongs panicked the parser.
+- The README claimed "10 GbE and beyond"; it now gives the measured figure
+  (4.8–5.0 Gbit/s over loopback on one 4-core VM) and says that no real
+  10 GbE network was measured.
 - The first handshake packet of every transfer was silently dropped
   because the socket was used before the runtime had seen it writable,
   which cost a 250 ms retry.

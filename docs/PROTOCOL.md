@@ -381,23 +381,35 @@ part of the tail, which is correct and only slightly wasteful. `rwnd` is
 the receiver's free buffer space in bytes.
 
 The chunk (payload bytes per DATA packet) is `min(sender max, receiver
-max)`, at least 512. The sender then probes the path: PROBE packets of
-exactly the DATA size of each candidate chunk — the negotiated chunk, 1427
-(fits a 1500-byte MTU over IPv4) and 1187 (fits the 1280-byte IPv6 minimum
-MTU) — are sent largest first, each up to twice, waiting
-`clamp(3·SRTT, 150 ms, 2 s)`; the first size echoed by PROBE_ACK is used.
+max)`, at least 512. Where the sender's maximum is left at its default and
+the receiver is reached over IPv6, whose header is 20 bytes longer than
+IPv4's, the sender starts from 1407 instead of 1427. It then probes the
+path: PROBE packets of exactly the DATA size of each candidate chunk — the
+negotiated chunk, 1427 (fits a 1500-byte MTU over IPv4), 1407 (fits 1500
+over IPv6, and 1492 over IPv4 — the PPPoE links DSL runs on) and 1187 (fits
+the 1280-byte IPv6 minimum MTU) — are sent largest first, each up to twice,
+waiting `clamp(3·SRTT, 150 ms, 2 s)`; the first size echoed by PROBE_ACK is
+used.
 If nothing answers, the sender uses 1187 and lets the transfer itself find
 out whether the path works. DATA packets are self-describing, so the chunk
 size may change at any time without the receiver noticing.
 
 The path MTU is learned **only from acknowledged PROBEs** (RFC 8899,
-datagram PLPMTUD). Sockets set "don't fragment" but run in probe mode
-(`IP_PMTUDISC_PROBE` on Linux, `IP_MTU_DISCOVER = PROBE` on Windows where
-available): the kernel ignores what ICMP says about the path, so a forged
-"fragmentation needed" can neither shrink a transfer nor make the kernel
-refuse its control messages. `EMSGSIZE` then only ever means the local
-interface, and costs one step down — to 1187, then by halves to 512 — per
-size refused: batches built at a larger size than the current one fail
+datagram PLPMTUD). Sockets set "don't fragment" for every address family
+they speak but run in probe mode where the system has one: on Linux
+`IP_PMTUDISC_PROBE` and `IPV6_PMTUDISC_PROBE`, plus `IPV6_DONTFRAG`
+(RFC 3542), since Linux in probe mode still fragments an IPv6 datagram
+larger than the interface; on macOS and the BSDs `IP_DONTFRAG` and
+`IPV6_DONTFRAG`; on Windows `IP_DONTFRAGMENT` and `IPV6_DONTFRAG`, with
+`IP_MTU_DISCOVER = PROBE` where available. A dual-stack socket gets the IPv4
+options too, for IPv4 peers reached through mapped addresses, where the
+system accepts them on an IPv6 socket (Linux and Windows do; macOS and
+FreeBSD may not, and those datagrams may then be fragmented on the way —
+a cost in efficiency, not correctness). The kernel ignores what ICMP says
+about the path, so a forged "fragmentation needed" can neither shrink a
+transfer nor make the kernel refuse its control messages. `EMSGSIZE` then
+only ever means the local interface, and costs one step down — from 1427
+to 1407, else to 1187, then by halves to 512 — per size refused: batches built at a larger size than the current one fail
 without stepping down again, so one event is one step. A real drop of the
 path MTU shows up the way RFC 8899 (section 4.3) describes: full-size
 packets are lost over two retransmission timeouts in a row while the
@@ -737,19 +749,59 @@ against the manifest.
 
 ## 8. Reachability, addresses and NAT
 
+### Sockets and address families
+
+Every endpoint binds one dual-stack socket by default (`[::]` with
+`IPV6_V6ONLY` off, RFC 3493): the receiver `[::]:5555`, the sender
+`[::]:0`, the relay `[::]:5560`. It speaks IPv6 natively and IPv4 through
+mapped addresses (`::ffff:a.b.c.d`). Where the system has no IPv6 — switched
+off in the kernel, or no address — the wildcard falls back to IPv4 on the
+same port; an explicit address is bound as given or not at all, and a port
+already taken is an error, never a fallback.
+
+Addresses are compared, screened and remembered in canonical form: a mapped
+address is the IPv4 address it maps, the flow label is zeroed, and the zone
+(scope id) is kept only for link-local addresses, where it is part of the
+address. Every address is classified by the special-purpose registries
+(RFC 6890): loopback, private, shared (CGN), link-local, documentation,
+multicast, reserved, global. What a *stranger* suggests — a relay's
+introduction, a STUN server's other address — is sent to only if it is a
+unicast address the socket can reach; a name the *user* gave may point
+anywhere, including home.
+
 ### Finding the receiver
 
-`ID@host:port` is resolved to *every* address the name has, with the
-address families interleaved. Name resolution is a hint and nothing more:
-DNS and mDNS answers are unauthenticated and among the easiest records on a
-network to forge. Handshake attempts therefore rotate through all of the
-addresses (at most 8) until one answers, and completing a handshake takes
-the receiver's private key — so an address that is not the receiver simply
+`ID@host:port,host:port,…` names every candidate; each may be a literal
+(IPv6 in brackets, with a zone for link-local: `[fe80::1%eth0]:5555`) or a
+name. Names are resolved in the background, alongside the handshake
+attempts to the literals, as Happy Eyeballs v2 (RFC 8305) prescribes: A and
+AAAA are asked for separately and at once; an A answer waits at most 50 ms
+for the AAAA one (the resolution delay), after which addresses are used as
+they come. The addresses are sorted by the default address selection rules
+of RFC 6724 (rules 1, 2, 5, 6 and 8: usable destinations first, matching
+scope, matching label, precedence, smaller scope) and then interleaved by
+family, and a new attempt starts every 250 ms (the connection attempt
+delay) without waiting for the previous one to fail — so a broken IPv6
+path costs a quarter of a second, not a timeout. A name that yields no
+address at all, with nothing else left to try, ends the transfer at once
+with the resolver's answer rather than after `handshake_timeout`.
+
+On an IPv6-only network with NAT64 and DNS64, an IPv4 literal — and any
+IPv4 candidate — is unreachable as it stands. When the host has no IPv4
+route, the NAT64 prefix is discovered by resolving `ipv4only.arpa`
+(RFC 7050; the answers are checked against the well-known IPv4 addresses and
+the prefix lengths of RFC 6052, cached for five minutes), and the IPv6
+address synthesised from it is tried as well (RFC 8305 section 7). Only
+global IPv4 addresses are translated.
+
+Name resolution is a hint and nothing more: DNS and mDNS answers are
+unauthenticated and among the easiest records on a network to forge.
+Handshake attempts therefore rotate through all of the addresses (at most
+8 per name) until one answers, and completing a handshake takes the
+receiver's private key — so an address that is not the receiver simply
 never answers, and a forged or stale record costs time rather than safety.
-It also means a host whose first address is unreachable, the usual case
-being a broken IPv6 path, no longer strands the transfer. The address that
-answers an attempt sent to it is proven reachable by that round trip and
-becomes the session's address.
+The address that answers an attempt sent to it is proven reachable by that
+round trip and becomes the session's address.
 
 ### Address validation
 
@@ -805,7 +857,9 @@ Addresses are compared and screened in their canonical form (an IPv4 peer
 on a dual-stack socket appears as `::ffff:a.b.c.d` and is the same peer as
 `a.b.c.d`), and written the way the socket sends to them. A dual-stack
 socket runs the tests over IPv4, where the NATs are; its IPv6 addresses are
-published as host candidates.
+published as host candidates. NAT66 and NPTv6 are not detected: behind them
+an IPv6 host candidate leads nowhere, and the sender simply moves on to the
+next candidate.
 
 **What the NAT does.** "NAT type" in the RFC 3489 sense — full cone,
 restricted, symmetric — was retired because it was never one property. The
@@ -851,10 +905,42 @@ SOAP answer over 16 KiB is an error.
 `ID@host:port,host:port,…`: the port forward, the address the world sees the
 receiver at, and its addresses on the local network — candidates in the
 sense of ICE (RFC 8445), ordered so the ones that work from outside come
-first. The sender tries them a quarter of a second apart while any remain
-untried, then backs off. Nothing is risked by publishing an address that
-turns out not to work, because completing a handshake takes the receiver's
-private key: a wrong candidate costs a quarter of a second.
+first (global IPv6, global IPv4, then private ones). The sender tries them a
+quarter of a second apart while any remain untried, then backs off. Nothing
+is risked by publishing an address that turns out not to work, because
+completing a handshake takes the receiver's private key: a wrong candidate
+costs a quarter of a second.
+
+Host candidates follow ICE's rules (RFC 8445 section 5.1.1.1): never
+loopback, IPv6 link-local (a peer cannot know which of its interfaces the
+zone would be), deprecated site-local or IPv4-compatible addresses. An IPv6
+address the system itself no longer prefers or has not finished checking —
+deprecated, tentative, failed duplicate address detection — is left out.
+Where the system uses temporary addresses (RFC 8981), one address stands for
+each interface and /64, and it is the temporary one: publishing the stable
+address beside it would give away exactly what the temporary one hides.
+With `publish_lan_addresses` off (`--no-lan-addresses`) only globally
+routable addresses are published. The host's addresses are looked at again
+every five minutes, since interfaces come and go and temporary addresses
+are replaced.
+
+**Keeping the mapping.** A NAT forgets an idle UDP mapping, and from then on
+a published address leads nowhere. RFC 4787 asks NATs to keep one for at
+least two minutes, but plenty keep one for thirty seconds or less. So the
+mapping behind a published address is refreshed with a STUN Binding
+Indication (RFC 8489: no answer, no state on the server) every 15 s — RFC
+8445's default for ICE keepalives — and checked with a Binding request every
+60 s. Where the server has shown itself an RFC 5780 one, the NAT's mapping
+lifetime is measured in the background with RESPONSE-PORT (RFC 5780
+section 4.6): a socket of its own makes a mapping and falls silent for 15,
+30, 60 or 120 s, then another socket asks the server to answer to that
+mapping; the answer arrives only if the mapping is still there. The interval
+is then half the measured lifetime, between 5 and 60 s. A mapping seen to
+have changed anyway — the STUN check or a relay reports a new address —
+halves the interval (not below the floor), and the new address is reported
+at once. Every wait is jittered by a tenth either way. One policy serves
+the STUN keepalives and every relay registration of the socket, because they
+all rest on the same mapping.
 
 STUN messages arrive on the transfer socket and are routed to the NAT task
 by the receiver's dispatcher, requests included — the hairpinning test works
@@ -878,11 +964,17 @@ on its own NAT, and the receiver answers the address a handshake came from
 different port per destination cannot reach each other however hard either
 tries: no address either can publish is the address the other would need.
 For that case there is a relay (`sharp-relay`), which either side names as
-`--relay host:port`.
+`--relay [ID@]host:port`.
 
 A receiver registers its identity with the relay, over its transfer socket,
-and keeps the registration alive. A sender asks to be put through, and the
-relay does two things at once:
+and keeps the registration alive — refreshed at the keepalive interval of
+the socket's NAT mapping (above), not merely within the relay's lease, since
+a mapping forgotten between refreshes leaves the relay introducing senders
+to an address that leads nowhere. A relay that sees the receiver at a new
+address after a refresh has shown the mapping lapsed, and the refreshes get
+closer together; a relay that stays silent for a whole lease has forgotten
+the receiver, and registering starts over. A sender asks to be put through,
+and the relay does two things at once:
 
 1. **Introduces them.** It tells each end where the other appears to be, and
    they push outwards simultaneously — the receiver with a few small
@@ -906,12 +998,17 @@ relay does two things at once:
 The sender takes both as candidates, after its own: the direct one first,
 the relayed one last, so a relay is only used when it has to be.
 
-A relay is written `ID@host:port` for a receiver and `host:port` for a
-sender, because only the receiver claims an identity there. Names are
-resolved in the background, to the first address the socket can reach; a
-receiver keeps retrying one that does not resolve yet, and keeps
-re-registering through send errors, since the relay may be the only way
-anyone can reach it.
+A relay is written `ID@host:port` for a receiver, which must prove its
+identity against the relay's key, and `host:port` for a sender, which then
+never names itself; a sender given the relay's ID too names itself only to a
+relay that refuses strangers (below). Names are resolved in the background
+to every address the socket can reach, in the order of section 8, and a
+receiver moves on to the next address after two unanswered attempts, so a
+relay whose IPv6 path is broken is still reached over IPv4. A receiver
+keeps retrying a name that does not resolve yet, and keeps re-registering
+through send errors, since the relay may be the only way anyone can reach
+it. A dual-stack relay carries a pair across the families: a sender over
+IPv6 and a receiver over IPv4 meet on one allocated port.
 
 Relay control messages begin with the eight bytes `SHRELAY1` (the one
 connection id no endpoint picks) and a kind byte; an address is
@@ -931,10 +1028,15 @@ these, with nothing left over, is ignored.
 | 9 | Punch | peer → peer | — |
 | 10 | Bye | receiver → relay | `id[32] token[16] stamp:u64 proof[16]` |
 | 11 | Confirm | allocated port → peer | `proof[16]` |
+| 12 | ConnectAs | sender → relay | `target[32] token[16] id[32] proof[16]` |
 
-`proof` in Register and Bye is `BLAKE3-keyed(K, message up to it)[0..16]`
-with `K = BLAKE3-derive_key("sharp256 relay v1 registration",
-DH(receiver, relay) || receiver_id || relay_id)`.
+Refusal 5 is *forbidden*: the relay serves only identities on its list.
+
+`proof` in Register, Bye and ConnectAs is
+`BLAKE3-keyed(K, message up to it)[0..16]` with
+`K = BLAKE3-derive_key("sharp256 relay v1 registration",
+DH(peer, relay) || peer_id || relay_id)`, the peer being the receiver or
+the sender that sends the message.
 
 **Registering is the owner's to do.** A receiver proves it holds the private
 key for the identity it registers: the two sides already know each other's
@@ -962,13 +1064,43 @@ each identity's newest stamp, and for four minutes after a registration
 ends (as long as any captured token could still be good); a message not
 newer is answered `Stale` (refusal 4).
 
-**The relay is trusted with nothing else.** It carries sealed transport
-packets, so it cannot read them, cannot alter one without the AEAD rejecting
-it, and cannot inject one without the peers' keys; it cannot impersonate a
-peer, because completing a handshake takes that peer's private key; and it
-decides nothing about who may send to whom, since the receiver still admits
-or refuses a sender by its identity. The worst a hostile relay achieves is
-refusing to carry the traffic.
+**The relay is trusted with metadata, not with the transfer.** It carries
+sealed transport packets, so it cannot read them, cannot alter one without
+the AEAD rejecting it, and cannot inject one without the peers' keys; it
+cannot impersonate a peer, because completing a handshake takes that peer's
+private key; and it decides nothing about who may send to whom, since the
+receiver still admits or refuses a sender by its identity. A hostile relay
+can refuse to carry the traffic, and it sees what it is there to see: which
+identity is registered at which address, who asks for whom, when, and how
+many bytes each pair moves. The control messages are not encrypted, so an
+observer on the path to the relay sees the same; relay replies are not
+authenticated either. Choosing a relay is choosing whom to trust with that.
+
+**Who may use a relay, and how much.** A relay carries traffic on its
+operator's bandwidth, so access is the operator's to decide. By default a
+relay serves anyone and says so when it starts. A list of receivers limits
+who may register: `Forbidden` is sent only after the registration's proof
+has been checked, so the list is not disclosed to anyone who asks. A list of
+senders limits whom it puts through: an anonymous `Connect` is answered
+`Forbidden`, and a sender that knows the relay's identity then asks again
+with `ConnectAs`, proving its own identity with a MAC made as a
+registration's is, over the whole message. A sender that does not know the
+relay's identity cannot prove anything and reports the refusal. `ConnectAs`
+carries no stamp: repeated from the address it came from while its token
+lives, it asks again for what the sender asked for, and from anywhere else
+the token does not match. A forged `Forbidden` makes a sender that knows the
+relay's identity name itself in the clear — which is why receivers hand
+senders the relay's address without its ID.
+
+Quotas bound what is carried, on the all-or-nothing principle — a datagram
+refused by one limit spends nothing from the others: a rate per client (an
+IPv4 address or an IPv6 /64; 100 Mbit/s by default), a volume per client per
+hour, a total rate for the relay, and a volume per pair after which its port
+is closed. The rates are token buckets holding a quarter of a second of
+their rate (at least 64 KiB); a datagram over any limit is dropped, which the transfer's
+congestion control answers by slowing down to what is allowed. The table of
+clients is bounded and forgets only clients whose allowance has fully
+recovered, so being pushed out of it never refills an allowance.
 
 A registration is also accepted only once it echoes a token derived from the
 address the relay saw, so a forged source address cannot point the relay's
@@ -1035,8 +1167,13 @@ one would have made every honest ACK afterwards look outdated and stalled
 the transfer permanently.
 
 **Not protected.** An observer still sees that two addresses exchange UDP
-traffic, its volume and timing, and the connection ids (random, changing
-with every handshake). The receiver's IP address and port are, as for any
+traffic, its timing and its volume — which gives away the file's size to
+within a few per cent — and the connection ids (random, changing with every
+handshake, but constant within a session, so a peer that moves to another
+network mid-session can be linked to its old address). Anyone who already
+knows a receiver's ID can tell whether a handshake is addressed to it (mac1
+is computed from the ID); nobody else can. Relay control messages are in
+the clear (section 8). The receiver's IP address and port are, as for any
 server, reachable — only the answer is withheld from strangers. Anyone who
 knows a receiver's ID (and its secret, if one is set) can offer transfers
 unless the receiver uses an allow-list or asks its user. IDs must be
@@ -1078,6 +1215,13 @@ substituted ID. Identity files are protected only by file permissions.
   otherwise a small buffer is reported with the `sysctl` command that raises
   it. On Windows, `SIO_UDP_CONNRESET` is disabled so that an ICMP "port
   unreachable" does not break the receive loop.
+* **Untrusted input is fuzzed.** Every parser of what arrives from others —
+  transport frames, handshake payloads, whole datagrams, manifests, relay
+  messages, STUN, PCP and NAT-PMP, UPnP's HTTP and XML, addresses and text —
+  has a cargo-fuzz target (`fuzz/`, libFuzzer with AddressSanitizer) that
+  also checks that whatever decodes survives encoding again. The same entry
+  points (`src/fuzz.rs`) run on thousands of mutated seeds, and on every
+  input that ever crashed one, in each `cargo test`.
 
 ## 11. Versioning and extensibility
 
@@ -1100,7 +1244,9 @@ Extensions planned on this basis:
 |-----------|-----------|
 | Block-hash manifest (BLAKE3 per 256 KiB) | capability bit; verifies resumed data and localises corruption before the final check |
 | Per-file resume of directories whose contents changed | capability bit; compare per-entry metadata instead of the whole manifest |
-| Rendezvous / relay for peers that are both behind NAT | separate service; the transfer protocol is unchanged |
+| Encrypted relay control messages | new relay message kinds; the transfer protocol is unchanged |
+| New connection ids on migration (as RFC 9000 section 9.5) | capability bit |
+| IPv6 firewall pinholes (PCP, UPnP IGDv2) | receiver-local; no wire change |
 | Delivery-rate based slow-start exit | sender-local; no wire change |
 
 ## 12. Defaults
@@ -1127,6 +1273,9 @@ Extensions planned on this basis:
 | `memory_budget` | 512 MiB | data not yet on disk, all transfers together (¼ queued datagrams, ¾ unwritten data) |
 | `handshake_rate` / `handshake_burst` | 20/s / 40 | handshakes per client (IPv4 address or IPv6 /64) |
 | `handshake_load_threshold` | 200/s | handshakes (all sources) beyond which cookies are required |
+| `bind` | `[::]:5555` (receiver), `[::]:0` (sender) | dual-stack; IPv4 where the system has no IPv6 |
+| `publish_lan_addresses` | on | publish local-network addresses as candidates |
+| `nat_keepalive` | 15 s | initial interval of NAT mapping keepalives (then half the measured lifetime, 5–60 s) |
 
 Fixed limits: 65 536 received ranges per transfer, 65 536 ranges queued by
 the sender on the receiver's word, four concurrent address claims per
@@ -1139,4 +1288,8 @@ which one client may hold 128 and 16 (`--registrations-per-client`,
 `--pairs-per-client`); 10 requests per second per client, burst 20;
 registration lease 120 s; an idle pair is released after 60 s; address
 tokens good for 120–240 s; stamps remembered 240 s after a registration
-ends.
+ends; bound to `[::]:5560`; open to every receiver and sender unless given
+lists (`--allow-receiver`, `--allowed-receivers`, `--allow-sender`,
+`--allowed-senders`); 100 Mbit/s per client (`--client-rate`), with no
+hourly volume, total rate or per-pair volume limit unless set
+(`--client-quota`, `--total-rate`, `--pair-bytes`).
