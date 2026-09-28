@@ -99,11 +99,10 @@ impl Reach {
                 mapped: false,
             };
         };
-        let dual = local.is_ipv6()
-            && socket2::SockRef::from(socket)
-                .only_v6()
-                .is_ok_and(|only| !only);
-        Self::with(local, dual)
+        Self::with(
+            local,
+            crate::transport::socket::speaks_both_families(socket),
+        )
     }
 
     fn with(local: SocketAddr, dual: bool) -> Self {

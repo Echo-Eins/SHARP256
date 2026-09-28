@@ -71,6 +71,50 @@ fn bind_socket(addr: SocketAddr, buffer_bytes: usize, dual_stack: bool) -> io::R
     Ok(udp)
 }
 
+/// Whether `socket` is an IPv6 socket that speaks IPv4 as well — bound to
+/// a wildcard with `IPV6_V6ONLY` off.
+///
+/// Asked of the system rather than remembered, since sockets arrive here
+/// from more than one place. Not through socket2 on Windows: Windows
+/// answers this option with a single byte where socket2 expects an `int`,
+/// which trips socket2's debug assertion and, in a release build, leaves the
+/// other three bytes of the answer unwritten — "dual-stack" would then
+/// depend on whatever they held.
+pub(crate) fn speaks_both_families(socket: &UdpSocket) -> bool {
+    socket.local_addr().is_ok_and(|a| a.is_ipv6()) && v6_only(socket).is_ok_and(|only| !only)
+}
+
+#[cfg(not(windows))]
+fn v6_only(socket: &UdpSocket) -> io::Result<bool> {
+    socket2::SockRef::from(socket).only_v6()
+}
+
+#[cfg(windows)]
+fn v6_only(socket: &UdpSocket) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use winapi::shared::ws2def::IPPROTO_IPV6;
+    use winapi::shared::ws2ipdef::IPV6_V6ONLY;
+    use winapi::um::winsock2::{getsockopt, SOCKET, SOCKET_ERROR};
+    // Zeroed, so that however many of its bytes the answer fills, the rest
+    // read as zero.
+    let mut value: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as i32;
+    // SAFETY: getsockopt on a socket we own, into a buffer of `len` bytes.
+    let r = unsafe {
+        getsockopt(
+            socket.as_raw_socket() as SOCKET,
+            IPPROTO_IPV6 as i32,
+            IPV6_V6ONLY,
+            &mut value as *mut u32 as *mut i8,
+            &mut len,
+        )
+    };
+    if r == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value != 0)
+}
+
 /// Whether an error from making or binding an IPv6 socket means this host
 /// cannot do IPv6 (or dual-stack) at all, rather than that something is
 /// wrong with the address asked for.
@@ -194,11 +238,7 @@ pub struct DontFragment {
 pub fn set_dont_fragment(socket: &UdpSocket) -> DontFragment {
     let local = socket.local_addr().ok();
     let is_v6 = local.is_some_and(|a| a.is_ipv6());
-    let dual = is_v6
-        && socket2::SockRef::from(socket)
-            .only_v6()
-            .is_ok_and(|only| !only);
-    let speaks_v4 = !is_v6 || dual;
+    let speaks_v4 = !is_v6 || speaks_both_families(socket);
     #[allow(unused_mut)]
     let mut out = DontFragment::default();
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -452,7 +492,7 @@ mod tests {
         let any = bind_udp("[::]:0".parse().unwrap(), 1 << 16).unwrap();
         let local = any.local_addr().unwrap();
         if local.is_ipv6() {
-            assert!(socket2::SockRef::from(&any).only_v6().is_ok_and(|o| !o));
+            assert!(speaks_both_families(&any));
         } else {
             no_ipv6_here();
             assert!(local.ip().is_unspecified() && local.is_ipv4(), "{}", local);

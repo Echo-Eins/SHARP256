@@ -357,7 +357,7 @@ pub fn sort_by_source(dests: &mut [SocketAddr], source: impl Fn(SocketAddr) -> O
     };
     let mut keyed: Vec<_> = dests.iter().map(|d| (key(d), *d)).collect();
     // Stable, so equals keep the order given (rule 10).
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.sort_by_key(|&(k, _)| k);
     for (slot, (_, d)) in dests.iter_mut().zip(keyed) {
         *slot = d;
     }

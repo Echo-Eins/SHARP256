@@ -1708,9 +1708,12 @@ mod tests {
             assert!(n < 1_000_000_000);
             assert_eq!(system_time((s, n)), Some(t));
         }
+        // Just before the epoch is the previous second plus a fraction.
+        // 100 ns, not 1: Windows keeps time in 100 ns ticks, and one
+        // nanosecond before the epoch is the epoch there.
         assert_eq!(
-            unix_time(UNIX_EPOCH - Duration::new(0, 1)),
-            (-1, 999_999_999)
+            unix_time(UNIX_EPOCH - Duration::new(0, 100)),
+            (-1, 999_999_900)
         );
     }
 

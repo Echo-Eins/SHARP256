@@ -816,12 +816,29 @@ mod tests {
         assert_eq!(r.adds.load(Ordering::Relaxed), 1);
     }
 
+    /// Somewhere other than the fake router's own address that this host can
+    /// listen on: a second loopback address where the system has one (Linux
+    /// and Windows answer on all of 127/8), else one of the host's own
+    /// addresses (macOS configures 127.0.0.1 alone).
+    async fn somewhere_else() -> TcpListener {
+        if let Ok(l) = TcpListener::bind("127.0.0.2:0").await {
+            return l;
+        }
+        let ip = if_addrs::get_if_addrs()
+            .expect("the host's addresses")
+            .into_iter()
+            .map(|i| i.ip())
+            .find(|ip| ip.is_ipv4() && !ip.is_loopback())
+            .expect("an IPv4 address other than loopback");
+        TcpListener::bind((ip, 0)).await.unwrap()
+    }
+
     /// Whoever answers the search is believed only about itself. Pointed at
     /// another address — here a port nothing on this host would expect a
     /// router's request on — nothing is fetched there at all.
     #[tokio::test]
     async fn a_router_that_points_elsewhere_is_not_followed() {
-        let bait = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let bait = somewhere_else().await;
         let bait_addr = bait.local_addr().unwrap().to_string();
         let r = fake_router(Behave::Normal, Some(&bait_addr)).await;
         let visited = tokio::spawn(async move {

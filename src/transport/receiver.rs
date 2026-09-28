@@ -182,6 +182,21 @@ struct Shared {
     unwritten_total: AtomicU64,
 }
 
+/// Replaces the value of `a` with `f` of it, unless `f` says `None`;
+/// whether it did. What `AtomicU64::fetch_update` does — spelled out,
+/// because newer compilers deprecate that name for one that does not exist
+/// yet at the oldest compiler this crate supports.
+fn update_atomic(a: &AtomicU64, mut f: impl FnMut(u64) -> Option<u64>) -> bool {
+    let mut current = a.load(Ordering::Acquire);
+    while let Some(new) = f(current) {
+        match a.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(seen) => current = seen,
+        }
+    }
+    false
+}
+
 impl Shared {
     fn queue_budget(&self) -> u64 {
         self.cfg.memory_budget / 4
@@ -190,19 +205,13 @@ impl Shared {
     /// Takes `bytes` of the queue budget; false when it is spent.
     fn take_queued(&self, bytes: u64) -> bool {
         let limit = self.queue_budget();
-        self.queued_total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                (used + bytes <= limit).then_some(used + bytes)
-            })
-            .is_ok()
+        update_atomic(&self.queued_total, |used| {
+            (used + bytes <= limit).then_some(used + bytes)
+        })
     }
 
     fn give_queued(&self, bytes: u64) {
-        let _ = self
-            .queued_total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(bytes))
-            });
+        update_atomic(&self.queued_total, |used| Some(used.saturating_sub(bytes)));
     }
 
     fn unwritten_budget(&self) -> u64 {
