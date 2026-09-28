@@ -320,8 +320,10 @@ pub enum Message {
 /// A receiver must be given the relay's identity — `ID@host:port` — because
 /// registering means proving ownership of *our* identity against *its*
 /// public key, and there is nothing to prove against without it. A sender
-/// only asks to be put through, claims no identity of its own, and so may
-/// write the address alone.
+/// may write the address alone, and then never names itself; given the
+/// relay's identity too, it proves its own when the relay refuses strangers
+/// — which a relay that puts through only the senders it lists does, and
+/// which anyone on the path could fake.
 pub fn parse_relay(s: &str) -> Result<(Option<SharpId>, String), String> {
     let s = s.trim();
     let (id, host) = match s.rsplit_once('@') {

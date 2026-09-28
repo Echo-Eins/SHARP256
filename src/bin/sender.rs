@@ -28,9 +28,13 @@ struct Args {
     #[arg(long, hide = true)]
     no_nat: bool,
 
-    /// Ask a relay at <host>:<port> to put this transfer through when the
-    /// receiver's own addresses do not answer. May be repeated.
-    #[arg(long = "relay", value_name = "HOST:PORT")]
+    /// Ask a relay at [<relay ID>@]<host>:<port> to put this transfer
+    /// through when the receiver's own addresses do not answer. May be
+    /// repeated. Only a relay that puts through just the senders it lists
+    /// needs its ID written in front: the sender then proves who it is when
+    /// the relay asks — in the clear, as all of a relay's messages are.
+    /// Without the ID the sender never names itself.
+    #[arg(long = "relay", value_name = "[ID@]HOST:PORT")]
     relays: Vec<String>,
 
     /// Largest chunk of file bytes per packet (probed downwards if the path

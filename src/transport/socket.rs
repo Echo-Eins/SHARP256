@@ -397,6 +397,16 @@ impl Default for Clock {
 mod tests {
     use super::*;
 
+    /// Fails where IPv6 was required (CI sets `SHARP_REQUIRE_IPV6`) and the
+    /// host turned out not to have it: there the IPv4 branches below would
+    /// pass without the IPv6 ones ever running.
+    fn no_ipv6_here() {
+        assert!(
+            std::env::var_os("SHARP_REQUIRE_IPV6").is_none(),
+            "this host has no IPv6, and SHARP_REQUIRE_IPV6 is set"
+        );
+    }
+
     /// Every family a socket speaks goes out "don't fragment", including
     /// IPv4 through a dual-stack socket where the system allows it — what
     /// the system does allow is printed, since it differs between them.
@@ -429,6 +439,7 @@ mod tests {
             assert!(df.v4, "IPv4 through a dual-stack socket");
         } else {
             // No IPv6 here: the wildcard fell back to IPv4.
+            no_ipv6_here();
             assert!(!df.v6);
         }
     }
@@ -443,6 +454,7 @@ mod tests {
         if local.is_ipv6() {
             assert!(socket2::SockRef::from(&any).only_v6().is_ok_and(|o| !o));
         } else {
+            no_ipv6_here();
             assert!(local.ip().is_unspecified() && local.is_ipv4(), "{}", local);
             // An explicit IPv6 address is not quietly replaced.
             assert!(bind_udp("[::1]:0".parse().unwrap(), 1 << 16).is_err());

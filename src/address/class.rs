@@ -700,5 +700,14 @@ mod tests {
         assert_eq!(source_for(sa("127.0.0.1:9")), Some(ip("127.0.0.1")));
         // Unspecified is not a destination.
         assert_eq!(source_for(sa("0.0.0.0:9")), None);
+        // Where the host has IPv6 at all, it has a route to its loopback.
+        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+            assert_eq!(source_for(sa("[::1]:9")), Some(ip("::1")));
+        } else {
+            assert!(
+                std::env::var_os("SHARP_REQUIRE_IPV6").is_none(),
+                "this host has no IPv6, and SHARP_REQUIRE_IPV6 is set"
+            );
+        }
     }
 }

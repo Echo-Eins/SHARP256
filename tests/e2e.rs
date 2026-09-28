@@ -3248,6 +3248,7 @@ async fn one_dual_stack_receiver_serves_both_families_at_once() {
 /// A relay carries a pair across the families: the sender reaches it over
 /// IPv6, the receiver over IPv4, and the relay's dual-stack ports put the
 /// two together.
+#[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_carries_a_pair_across_address_families() {
     use sharp256::relay::server::{Config, Relay};

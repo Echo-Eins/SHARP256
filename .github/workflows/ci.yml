@@ -31,6 +31,8 @@ jobs:
             ~/.cargo/git
             target
           key: lint-${{ hashFiles('Cargo.lock') }}
+      - name: GTK (the GUI's file dialogs link against it on Linux)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev
       - run: cargo fmt --check
       - name: Clippy, every feature set
         run: |
@@ -62,6 +64,9 @@ jobs:
             ~/.cargo/git
             target
           key: test-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: GTK (the GUI's file dialogs link against it on Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev
       - name: What this runner has
         shell: bash
         run: |
@@ -90,6 +95,8 @@ jobs:
             ~/.cargo/git
             target
           key: msrv-${{ hashFiles('Cargo.lock') }}
+      - name: GTK (the GUI's file dialogs link against it on Linux)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev
       - run: cargo check --all-features --all-targets
       - run: cargo test --all-features --lib
 
@@ -107,6 +114,8 @@ jobs:
             ~/.cargo/git
             target
           key: netns-${{ hashFiles('Cargo.lock') }}
+      - name: GTK (the GUI's file dialogs link against it on Linux)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 restricts them through AppArmor by default.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
