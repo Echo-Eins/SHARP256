@@ -35,8 +35,15 @@ const CHANGE_IP: u32 = 0x04;
 /// CHANGE-REQUEST flag: answer from the other port.
 const CHANGE_PORT: u32 = 0x02;
 
-/// True for datagrams that look like STUN Binding responses. SHARP datagrams
-/// start with "SH", so the two can never be confused.
+/// True for datagrams that look like STUN Binding responses.
+///
+/// A transport packet begins with a random 64-bit connection id, so one
+/// could in principle land on a STUN-shaped prefix and be swallowed here.
+/// It needs the top sixteen bits to be one of three values and the next
+/// thirty-two to be the STUN cookie: about one session in 10^14, and the
+/// session would have to be dispatched by this receiver at the same time.
+/// Worth stating precisely rather than claiming, as this once did, that
+/// the two "can never be confused".
 pub fn is_stun_response(pkt: &[u8]) -> bool {
     if pkt.len() < STUN_HEADER_LEN {
         return false;
@@ -491,7 +498,11 @@ pub fn is_usable_server_address(addr: SocketAddr, same_family_as: SocketAddr) ->
             if v6.is_loopback() {
                 return we_are_on_loopback;
             }
-            !(v6.is_unspecified() || v6.is_multicast())
+            // fe80::/10: a link-local address only means anything together
+            // with the interface it belongs to, which a written address
+            // does not carry. The v4 branch rejects its equivalent, and
+            // this one had not.
+            !(v6.is_unspecified() || v6.is_multicast() || v6.segments()[0] & 0xffc0 == 0xfe80)
         }
     }
 }
@@ -668,6 +679,11 @@ mod tests {
             v6
         ));
         assert!(!is_usable_server_address("[::1]:3479".parse().unwrap(), v6));
+        // Link-local means nothing without the interface it belongs to.
+        assert!(!is_usable_server_address(
+            "[fe80::1]:3479".parse().unwrap(),
+            v6
+        ));
 
         // From loopback, loopback is fine: a server on this host, and the
         // simulated NAT the behaviour tests run against.

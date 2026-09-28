@@ -75,6 +75,7 @@ enum Kind {
     Error = 7,
     Open = 8,
     Punch = 9,
+    Bye = 10,
 }
 
 impl Kind {
@@ -89,6 +90,7 @@ impl Kind {
             7 => Kind::Error,
             8 => Kind::Open,
             9 => Kind::Punch,
+            10 => Kind::Bye,
             _ => return None,
         })
     }
@@ -185,6 +187,14 @@ pub enum Message {
     /// the two, so that both ends are pushing outwards at the same time —
     /// which is the whole of hole punching. Whoever gets one ignores it.
     Punch,
+    /// Peer → relay: I am going away, forget me. Without it the relay would
+    /// keep sending people to an address nothing answers at until the lease
+    /// ran out, which is the difference between a sender failing over in a
+    /// moment and failing over in two minutes.
+    Bye {
+        id: SharpId,
+        token: [u8; TOKEN_LEN],
+    },
 }
 
 /// True when a datagram is a relay control message rather than traffic.
@@ -270,6 +280,11 @@ impl Message {
                 out.extend_from_slice(ticket);
             }
             Message::Punch => out.push(Kind::Punch as u8),
+            Message::Bye { id, token } => {
+                out.push(Kind::Bye as u8);
+                out.extend_from_slice(id.as_bytes());
+                out.extend_from_slice(token);
+            }
         }
         debug_assert!(out.len() <= MAX_MESSAGE);
         out
@@ -287,15 +302,15 @@ impl Message {
         // means this is not the message it claims to be.
         let mut pos;
         let msg = match kind {
-            Kind::Register | Kind::Connect => {
+            Kind::Register | Kind::Connect | Kind::Bye => {
                 let key: [u8; 32] = body.get(0..32)?.try_into().ok()?;
                 let token: [u8; TOKEN_LEN] = body.get(32..32 + TOKEN_LEN)?.try_into().ok()?;
                 let id = SharpId::from_public(key);
                 pos = 32 + TOKEN_LEN;
-                if kind == Kind::Register {
-                    Message::Register { id, token }
-                } else {
-                    Message::Connect { target: id, token }
+                match kind {
+                    Kind::Register => Message::Register { id, token },
+                    Kind::Connect => Message::Connect { target: id, token },
+                    _ => Message::Bye { id, token },
                 }
             }
             Kind::Challenge => {
@@ -405,6 +420,10 @@ mod tests {
             ticket: [8; TOKEN_LEN],
         });
         roundtrip(Message::Punch);
+        roundtrip(Message::Bye {
+            id,
+            token: [2; TOKEN_LEN],
+        });
     }
 
     /// The relay reads these from strangers, so anything that is not exactly

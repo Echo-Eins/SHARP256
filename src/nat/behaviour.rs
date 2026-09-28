@@ -197,10 +197,40 @@ impl Default for Timing {
     }
 }
 
-fn is_own_address(ip: IpAddr) -> bool {
-    if_addrs::get_if_addrs()
-        .map(|ifs| ifs.iter().any(|i| i.ip() == ip))
-        .unwrap_or(false)
+/// Whether a mapped address means there is no NAT at all.
+///
+/// It has to be one of this host's own addresses *and* a globally routable
+/// one. The first half alone trusts a stranger too far: a hostile or
+/// on-path STUN server that guessed a common private address — and
+/// 192.168.1.x is not much of a guess — would be believed, and believing it
+/// skips asking the router for a port forward and publishes a local address
+/// as the public one.
+fn means_no_nat(ip: IpAddr) -> bool {
+    let routable = match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 127
+                // 100.64.0.0/10, where carrier-grade NAT lives.
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 link-local and fc00::/7 unique-local.
+                || v6.segments()[0] & 0xffc0 == 0xfe80
+                || v6.segments()[0] & 0xfe00 == 0xfc00)
+        }
+    };
+    routable
+        && if_addrs::get_if_addrs()
+            .map(|ifs| ifs.iter().any(|i| i.ip() == ip))
+            .unwrap_or(false)
 }
 
 /// Runs the RFC 5780 tests on `socket`, falling back to a cross-check
@@ -265,7 +295,7 @@ pub async fn discover_with(
     out.mapped = Some(first.mapped);
     out.tested_with = Some(server);
     out.port_preserved = Some(first.mapped.port() == local.port());
-    if is_own_address(first.mapped.ip()) {
+    if means_no_nat(first.mapped.ip()) {
         out.open_internet = true;
         out.mapping = Mapping::EndpointIndependent;
     }

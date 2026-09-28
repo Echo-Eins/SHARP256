@@ -484,7 +484,11 @@ pub fn spawn_receiver_discovery(
         let lease = mapping.lifetime();
         if lease > 0 {
             // Renew at half the lease, so one lost renewal is not fatal.
-            let every = Duration::from_secs((lease / 2).max(30) as u64);
+            // The floor is small on purpose: a router may grant far less
+            // than was asked for — PCP explicitly allows it, and they do it
+            // under pressure — and a floor of half a minute would have left
+            // a thirty-second grant dead for half of every cycle.
+            let every = Duration::from_secs((lease as u64 / 2).max(5));
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(every) => {

@@ -703,16 +703,31 @@ fn spawn_relay_clients(shared: &Arc<Shared>) -> Vec<RelayClient> {
         let id = shared.identity.id();
         let cancel = shared.cancel.clone();
         let events = shared.cfg.events.clone();
-        let relay_id = id;
         tokio::spawn(async move {
             crate::relay::client::serve(socket, addr, id, rx, cancel, move |observed| {
-                tracing::info!("senders may also use: {}@{}", relay_id, observed);
+                // Deliberately *not* published as an address to hand a
+                // sender. It is this receiver's NAT mapping towards that
+                // relay's control port, and under the NAT a relay exists to
+                // get around — the kind that uses a different port for every
+                // destination — it is by definition not the mapping anybody
+                // else would arrive at. A sender reaches us here by naming
+                // the relay, not by naming this.
+                tracing::info!(
+                    "registered with the relay at {} (it sees us at {}); senders reach us \
+                     through it with --relay {}",
+                    addr,
+                    observed,
+                    addr
+                );
                 emit(
                     &events,
                     TransferEvent::Reachability {
-                        advertised: Some(observed.to_string()),
-                        address: Some(format!("{}@{}", relay_id, observed)),
-                        summary: format!("registered with the relay at {}", addr),
+                        advertised: None,
+                        address: None,
+                        summary: format!(
+                            "registered with the relay at {}; senders can use --relay {}",
+                            addr, addr
+                        ),
                     },
                 );
             })

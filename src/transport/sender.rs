@@ -940,7 +940,11 @@ impl Engine {
     /// handshake probes briskly instead of backing off: an address that is
     /// simply dead should not hold up the ones behind it.
     fn candidates_left(&self) -> bool {
-        self.secure.is_none() && self.probes_sent < self.candidates.len()
+        // The ring position, not the number of initiations sent: retries at
+        // an address that already answered, and attempts that carry a fresh
+        // cookie, do not try anything new, and counting them would end brisk
+        // probing while addresses were still untouched.
+        self.secure.is_none() && self.next_candidate < self.candidates.len()
     }
 
     /// Takes in addresses a relay introduction has turned up. They arrive
@@ -949,14 +953,33 @@ impl Engine {
     /// goes back to being brisk until they have had their turn.
     fn take_new_candidates(&mut self) {
         while let Ok(addr) = self.found_rx.try_recv() {
-            if self.candidates.len() >= MAX_CANDIDATES {
+            self.add_candidate(addr);
+        }
+    }
+
+    /// Adds an address a relay turned up, if it is one we are willing to
+    /// send to.
+    ///
+    /// The screen matters: a relay is not trusted, and this value is
+    /// entirely its choice. Without it a hostile one could name a loopback
+    /// port, a host on our local network, or a stranger, and we would fire
+    /// handshake initiations there for the length of the handshake timeout.
+    /// The receiving side already screens the same field before sending its
+    /// much smaller probes; the sending side had no business being laxer.
+    fn add_candidate(&mut self, addr: SocketAddr) {
+        if self.candidates.len() >= MAX_CANDIDATES || self.candidates.contains(&addr) {
+            return;
+        }
+        #[cfg(feature = "nat-traversal")]
+        {
+            let local = self.socket.local_addr().unwrap_or(self.peer);
+            if !crate::nat::stun::is_usable_server_address(addr, local) {
+                tracing::debug!("ignoring {}: not an address worth sending to", addr);
                 return;
             }
-            if !self.candidates.contains(&addr) {
-                tracing::debug!("another address to try: {}", addr);
-                self.candidates.push(addr);
-            }
         }
+        tracing::debug!("another address to try: {}", addr);
+        self.candidates.push(addr);
     }
 
     /// Starts a new handshake attempt: a fresh ephemeral key and connection
@@ -1028,12 +1051,20 @@ impl Engine {
     ) -> Result<(), SendError> {
         if pkt.len() == COOKIE_REPLY_LEN {
             if let Some(cookie) = self.attempts[idx].0.read_cookie_reply(pkt) {
-                tracing::debug!("receiver is under load and asked for a cookie; retrying");
                 let issued_by = self.attempts[idx].2;
+                tracing::debug!("{} is under load and asked for a cookie", issued_by);
+                // Keep it for the next scheduled attempt, and send nothing
+                // now. A cookie reply is sealed under a key derived from the
+                // receiver's *public* key, with the initiation's own mac1 as
+                // associated data, so anybody who receives one initiation can
+                // mint a convincing reply. Starting a fresh handshake on the
+                // strength of one would let them spin us through Noise
+                // initiations — a few hundred bytes and a static-static DH
+                // each — as fast as they cared to send 64-byte forgeries.
+                // WireGuard carries the cookie on the next retry for the same
+                // reason; so do we. A real receiver under load loses nothing
+                // but the wait it was asking for anyway.
                 self.cookie = Some((cookie, Instant::now(), issued_by));
-                // Retry at the address that asked for the cookie: it is only
-                // worth anything there.
-                self.send_initiation_to(Some(issued_by))?;
             }
             return Ok(());
         }
@@ -1220,10 +1251,25 @@ impl Engine {
             if let Some(at) = next_poll {
                 wake = wake.min(at);
             }
+            // An introduction can arrive at any point, including after the
+            // retry delay has doubled its way up to seconds. Without an arm
+            // of its own the engine would sleep through it, which is exactly
+            // what moving the introductions off the critical path was meant
+            // to avoid.
+            let mut found = None;
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
+                a = self.found_rx.recv() => { found = a; }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
                 _ = cancel.cancelled() => return Err(SendError::Cancelled),
+            }
+            if let Some(addr) = found {
+                let before = self.candidates.len();
+                self.add_candidate(addr);
+                if self.candidates.len() != before {
+                    // Untried, so probe it now rather than after the backoff.
+                    next_attempt = Instant::now();
+                }
             }
             self.drain_socket()?;
         }

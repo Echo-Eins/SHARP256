@@ -456,13 +456,20 @@ async fn exchange(
     let mut buf = vec![0u8; max_len];
     for _ in 0..3 {
         sock.send_to(request, router).await?;
-        match tokio::time::timeout(wait, sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if from.ip() == router.ip() => return Ok(buf[..n].to_vec()),
-            // A datagram from somewhere else is not an answer to this.
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => wait *= 2,
+        let deadline = tokio::time::Instant::now() + wait;
+        // Anything from elsewhere is not an answer to this, and must not
+        // cost the attempt: the port is ephemeral, but a stray datagram
+        // from anything on the network would otherwise spend one of only
+        // three tries and re-send the request.
+        loop {
+            match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) if from == router => return Ok(buf[..n].to_vec()),
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => break,
+            }
         }
+        wait *= 2;
     }
     Err(anyhow!("{} did not answer", router))
 }

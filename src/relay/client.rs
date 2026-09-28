@@ -39,8 +39,11 @@ const REPEAT_GAP: Duration = Duration::from_millis(150);
 /// trusted, and acting on an introduction means sending a handful of
 /// datagrams at an address it chose; without a bound of our own, a hostile
 /// one could have us do that as fast as it liked.
-const INTRODUCTION_RATE: f64 = 1.0;
-const INTRODUCTION_BURST: f64 = 4.0;
+const INTRODUCTION_RATE: f64 = 2.0;
+const INTRODUCTION_BURST: f64 = 8.0;
+/// Introductions remembered, so that a relay repeating one it already sent
+/// is recognised rather than acted on twice.
+const HANDLED_REMEMBERED: usize = 64;
 
 /// What a relay introduction is worth: two more addresses to try.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +123,9 @@ pub async fn serve(
     // What we are willing to do on this relay's say-so.
     let mut allowance = INTRODUCTION_BURST;
     let mut allowance_at = Instant::now();
+    // Introductions already acted on, so the relay's repeats are free.
+    let mut handled: std::collections::VecDeque<[u8; TOKEN_LEN]> =
+        std::collections::VecDeque::new();
     // Until the relay answers, ask briskly; once registered, just keep the
     // lease and the NAT mapping alive.
     let mut retry = Duration::from_millis(500);
@@ -140,7 +146,17 @@ pub async fn serve(
         let msg = tokio::select! {
             m = incoming.recv() => m,
             _ = tokio::time::sleep(wait) => continue,
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => {
+                // Say so on the way out. Otherwise the relay keeps sending
+                // people to an address that no longer answers until the
+                // lease runs out, which is the difference between a sender
+                // failing over in a moment and failing over in two minutes.
+                if registered {
+                    let bye = Message::Bye { id, token }.encode();
+                    let _ = socket.send_to(&bye, relay).await;
+                }
+                return;
+            }
         };
         let Some((pkt, from)) = msg else { return };
         if from != relay {
@@ -164,6 +180,13 @@ pub async fn serve(
                 next_send = Instant::now() + lease / 2;
             }
             Some(Message::Incoming { port, peer, ticket }) => {
+                // The relay repeats an introduction until we bind our side,
+                // because a lost one would otherwise fail the transfer
+                // silently. A repeat is not a new introduction, and must not
+                // spend the allowance below or start the work again.
+                if handled.contains(&ticket) {
+                    continue;
+                }
                 // Acting on an introduction means sending a handful of
                 // datagrams at an address the relay chose, so how often we
                 // are willing to do that is our decision, not the relay's.
@@ -178,16 +201,22 @@ pub async fn serve(
                     continue;
                 }
                 allowance -= 1.0;
+                if handled.len() >= HANDLED_REMEMBERED {
+                    handled.pop_front();
+                }
+                handled.push_back(ticket);
                 let relayed = SocketAddr::new(relay.ip(), port);
                 tracing::info!("relay {} is introducing {}", relay, peer);
                 let socket = socket.clone();
-                // Both jobs at once, and both urgent: bind our side of the
-                // relay's port, and push outwards towards the sender so
-                // that its own first packet finds a way in. Whichever
-                // succeeds, the transfer is under way a round trip later.
+                // Both jobs at once, and that is not a figure of speech.
+                // Binding our side of the relay's port and pushing outwards
+                // towards the sender are each spread over most of a second,
+                // and hole punching only works while both ends are pushing
+                // at the same time — running them one after the other would
+                // have our first datagram leave after the sender's had
+                // already been dropped by our NAT.
                 tokio::spawn(async move {
-                    announce(&socket, relayed, ticket).await;
-                    punch(&socket, peer).await;
+                    tokio::join!(announce(&socket, relayed, ticket), punch(&socket, peer));
                 });
             }
             Some(Message::Error { code }) => {

@@ -2312,3 +2312,159 @@ async fn dead_relays_do_not_slow_down_a_direct_transfer() {
     );
     stop_receiver(r).await;
 }
+
+/// A cookie reply is sealed under a key derived from the receiver's
+/// *public* key, with the initiation's own mac1 as associated data — so
+/// anybody who receives one initiation can mint a convincing one. This test
+/// mints them holding nothing but the published ID.
+///
+/// Acting on one immediately, as the sender used to, meant a 64-byte
+/// forgery bought a fresh Noise initiation: a few hundred bytes and a
+/// static-static Diffie-Hellman, as fast as the forger cared to send. The
+/// cookie is now kept for the next scheduled attempt, which is what
+/// WireGuard does and for this reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_cookie_replies_cannot_spin_the_sender() {
+    use sharp256::crypto::handshake::CookieJar;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, _out, state) = dirs(&tmp);
+    let file = make_file(&src, "cookies.bin", 64 << 10, 0xC00C);
+
+    // All the attacker has is the identity a receiver publishes.
+    let victim = Identity::generate().id();
+    let trap = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let trap_addr = trap.local_addr().unwrap();
+    let initiations = Arc::new(AtomicU64::new(0));
+
+    let counter = initiations.clone();
+    let liar = trap.clone();
+    let forger = tokio::spawn(async move {
+        let mut jar = CookieJar::new(&victim);
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = liar.recv_from(&mut buf).await {
+            counter.fetch_add(1, Ordering::Relaxed);
+            if let Some(reply) = jar.reply(&buf[..n], from, Instant::now()) {
+                let _ = liar.send_to(&reply, from).await;
+            }
+        }
+    });
+
+    let mut cfg = sender_cfg(&file, trap_addr, victim, &state);
+    cfg.transport.handshake_timeout = Duration::from_secs(2);
+    // Nobody can complete a handshake there, so this is expected to fail.
+    let started = Instant::now();
+    let err = run_sender(cfg).await.expect_err("nothing there can answer");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, SendError::HandshakeTimeout | SendError::Handshake(_)),
+        "unexpected: {}",
+        err
+    );
+    forger.abort();
+
+    // On its own schedule the sender makes a handful of attempts in two
+    // seconds. Answering each forgery with a new one made it thousands.
+    let sent = initiations.load(Ordering::Relaxed);
+    assert!(
+        sent <= 20,
+        "{} initiations in {:?}: a forged cookie is still buying a handshake",
+        sent,
+        elapsed
+    );
+}
+
+/// The relay introduces a receiver exactly once when a sender arrives. If
+/// that datagram is lost the receiver never learns to bind its side, and
+/// the transfer used to fail with nothing anywhere to show why — no error,
+/// no retry, just a relay port nobody ever came to. The relay now repeats
+/// the introduction until the side binds.
+///
+/// Here every introduction but the last is thrown away on the way in.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_introduction_is_repeated() {
+    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::Message;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 256 << 10;
+    let file = make_file(&src, "reintroduced.bin", size, 0x2E12);
+
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_task = tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+
+    // A mapping that also swallows the first few introductions.
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mapping = sock.local_addr().unwrap();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let counter = dropped.clone();
+    let mapping_task = tokio::spawn(async move {
+        let mut inside: Option<SocketAddr> = None;
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            if from == relay_addr {
+                let is_introduction =
+                    matches!(Message::decode(&buf[..n]), Some(Message::Incoming { .. }));
+                if is_introduction && counter.fetch_add(1, Ordering::Relaxed) < 3 {
+                    continue;
+                }
+                if let Some(inside) = inside {
+                    let _ = sock.send_to(&buf[..n], inside).await;
+                }
+                continue;
+            }
+            match inside {
+                Some(known) if known == from => {
+                    let _ = sock.send_to(&buf[..n], relay_addr).await;
+                }
+                Some(_) => {}
+                None => {
+                    inside = Some(from);
+                    let _ = sock.send_to(&buf[..n], relay_addr).await;
+                }
+            }
+        }
+    });
+
+    let r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![mapping.to_string()];
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let mut scfg = sender_cfg(&file, dead_addr, r.id, &state);
+    scfg.relays = vec![relay_addr.to_string()];
+
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(scfg))
+        .await
+        .expect("the repeated introduction gets through in time")
+        .expect("the transfer completes");
+    assert_eq!(summary.file_size, size as u64);
+    assert_same(&file, &out.join("reintroduced.bin"));
+    assert!(
+        dropped.load(Ordering::Relaxed) > 3,
+        "no introduction was ever thrown away, so this proved nothing"
+    );
+
+    mapping_task.abort();
+    cancel.cancel();
+    relay_task.abort();
+    stop_receiver(r).await;
+}

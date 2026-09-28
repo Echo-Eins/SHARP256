@@ -136,6 +136,13 @@ fn random_token() -> [u8; TOKEN_LEN] {
     t
 }
 
+/// Addresses the rate limiter will track at once. Without a cap the table
+/// grows by one entry for every packet from a new source, and pruning only
+/// runs every few seconds: a spray of forged source addresses would fill
+/// memory in between, and then stall the relay while it walked what it had
+/// built.
+const MAX_TRACKED_ADDRESSES: usize = 65_536;
+
 /// A token bucket per source address.
 struct RateLimiter {
     per_ip: HashMap<std::net::IpAddr, (f64, Instant)>,
@@ -155,6 +162,14 @@ impl RateLimiter {
     /// Takes a token for `from`; false when it has had too many.
     fn allow(&mut self, from: SocketAddr, now: Instant) -> bool {
         let (rate, burst) = (self.rate, self.burst);
+        if self.per_ip.len() >= MAX_TRACKED_ADDRESSES && !self.per_ip.contains_key(&from.ip()) {
+            // Full. Make room from entries whose budget has refilled, and if
+            // there is none, refuse rather than grow.
+            self.prune(now);
+            if self.per_ip.len() >= MAX_TRACKED_ADDRESSES {
+                return false;
+            }
+        }
         let (tokens, at) = self.per_ip.entry(from.ip()).or_insert((burst, now));
         *tokens = (*tokens + now.saturating_duration_since(*at).as_secs_f64() * rate).min(burst);
         *at = now;
@@ -181,6 +196,12 @@ struct Registration {
     expires: Instant,
 }
 
+impl Registration {
+    fn fresh(&self, now: Instant) -> bool {
+        self.expires > now
+    }
+}
+
 /// A port carrying one pair, and what it knows about the two sides.
 struct Allocation {
     port: u16,
@@ -190,13 +211,13 @@ struct Allocation {
     /// shut everybody else out — the same mistake as an unshared session
     /// limit, and just as easy to make.
     requested_by: std::net::IpAddr,
-}
-
-/// Which side of an allocation a ticket names, and where that side is.
-#[derive(Default)]
-struct Sides {
-    a: Option<SocketAddr>,
-    b: Option<SocketAddr>,
+    /// The pair it was set aside for, and their tickets. Kept so that a
+    /// sender whose answer went missing and asked again is handed the same
+    /// port back instead of burning another one.
+    sender: SocketAddr,
+    receiver: SocketAddr,
+    sender_ticket: [u8; TOKEN_LEN],
+    receiver_ticket: [u8; TOKEN_LEN],
 }
 
 /// A running relay.
@@ -207,6 +228,10 @@ pub struct Relay {
     tokens: TokenJar,
     registrations: HashMap<SharpId, Registration>,
     allocations: Vec<Allocation>,
+    /// Ports we have set aside. A carried pair refuses to treat one of them
+    /// as a peer, which is what stops two allocations being pointed at each
+    /// other and bouncing a datagram between them for ever.
+    ports: Arc<parking_lot::Mutex<std::collections::HashSet<u16>>>,
     limiter: RateLimiter,
     last_prune: Instant,
 }
@@ -223,6 +248,7 @@ impl Relay {
             tokens: TokenJar::new(),
             registrations: HashMap::new(),
             allocations: Vec::new(),
+            ports: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             limiter: RateLimiter::new(cfg_rate, cfg_burst),
             last_prune: now,
         })
@@ -238,10 +264,28 @@ impl Relay {
         let socket = self.socket.clone();
         let cancel = self.cancel.clone();
         let mut buf = vec![0u8; BUF_LEN];
+        let mut errors = 0u32;
         loop {
             tokio::select! {
                 r = socket.recv_from(&mut buf) => {
-                    let Ok((n, from)) = r else { continue };
+                    let (n, from) = match r {
+                        Ok(v) => {
+                            errors = 0;
+                            v
+                        }
+                        // One is not worth stopping for; a stream of them
+                        // would otherwise spin this loop at full speed,
+                        // which is the whole relay's only thread.
+                        Err(e) => {
+                            errors += 1;
+                            if errors >= MAX_ERRORS {
+                                tracing::error!("relay: receive keeps failing: {}", e);
+                                return Err(e);
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            continue;
+                        }
+                    };
                     let now = Instant::now();
                     self.prune(now);
                     // Anything that is not a control message on the control
@@ -279,16 +323,39 @@ impl Relay {
                     self.reply(from, Message::Challenge { token }).await;
                     return;
                 }
-                let known = self.registrations.contains_key(&id);
-                if !known && self.registrations.len() >= self.cfg.max_registrations {
-                    self.reply(
-                        from,
-                        Message::Error {
-                            code: Refusal::Busy,
-                        },
-                    )
-                    .await;
-                    return;
+                let known = self
+                    .registrations
+                    .get(&id)
+                    .is_some_and(|r| r.addr == from && r.fresh(now));
+                if !known {
+                    // The same share ports get, and for the same reason. An
+                    // identity costs nothing to invent — the id is read
+                    // straight off the wire — so without this one address
+                    // could register thousands and leave room for nobody.
+                    let share = (self.cfg.max_registrations / 8).max(4);
+                    let mine = self
+                        .registrations
+                        .values()
+                        .filter(|r| r.addr.ip() == from.ip() && r.fresh(now))
+                        .count();
+                    if self.registrations.len() >= self.cfg.max_registrations || mine >= share {
+                        if mine >= share {
+                            tracing::info!(
+                                "relay: {} already holds {} of {} registrations",
+                                from.ip(),
+                                mine,
+                                self.cfg.max_registrations
+                            );
+                        }
+                        self.reply(
+                            from,
+                            Message::Error {
+                                code: Refusal::Busy,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                 }
                 self.registrations.insert(
                     id,
@@ -350,7 +417,7 @@ impl Relay {
                     .await;
                     return;
                 }
-                match self.allocate(from, receiver, now).await {
+                match self.allocate(from, receiver).await {
                     Some((port, sender_ticket, receiver_ticket)) => {
                         // Each side is told where the other appears to be,
                         // so they can try a direct path first and leave the
@@ -392,6 +459,18 @@ impl Relay {
                     }
                 }
             }
+            Message::Bye { id, token } => {
+                // Only from the address that holds the registration, and
+                // only with a token proving that address: otherwise anyone
+                // who knew an identity could evict its owner.
+                if !self.tokens.accepts(&token, from, now) {
+                    return;
+                }
+                if self.registrations.get(&id).is_some_and(|r| r.addr == from) {
+                    self.registrations.remove(&id);
+                    tracing::info!("relay: {} has gone", id.short());
+                }
+            }
             // Only a relay sends these; an Open belongs to an allocated
             // port, and a Punch goes between peers and never here.
             Message::Challenge { .. }
@@ -409,36 +488,42 @@ impl Relay {
         &mut self,
         sender: SocketAddr,
         receiver: SocketAddr,
-        now: Instant,
     ) -> Option<(u16, [u8; TOKEN_LEN], [u8; TOKEN_LEN])> {
+        // The same pair asking again means our answer went missing, not that
+        // they want a second port. Hand back the one they already have.
+        if let Some(a) = self
+            .allocations
+            .iter()
+            .find(|a| a.sender == sender && a.receiver == receiver && !a.task.is_finished())
+        {
+            return Some((a.port, a.sender_ticket, a.receiver_ticket));
+        }
         let bind = SocketAddr::new(self.cfg.bind.ip(), 0);
         let sock = Arc::new(UdpSocket::bind(bind).await.ok()?);
         let port = sock.local_addr().ok()?.port();
         let sender_ticket = random_token();
         let receiver_ticket = random_token();
-        let idle = self.cfg.idle;
-        // The addresses the two sides will use here are very likely *not*
-        // the ones they used on the control port: the NAT this relay exists
-        // to get around is the kind that hands out a different port for
-        // every destination. So each side says who it is with its ticket,
-        // and the relay learns the address from that.
-        let hint = Sides {
-            a: Some(sender),
-            b: Some(receiver),
-        };
-        let task = tokio::spawn(carry(
+        self.ports.lock().insert(port);
+        let task = tokio::spawn(carry(Carried {
             sock,
+            control: self.socket.clone(),
+            ports: self.ports.clone(),
+            port,
             sender_ticket,
             receiver_ticket,
-            hint,
-            idle,
-            self.cancel.clone(),
-        ));
-        let _ = now;
+            sender_control: sender,
+            receiver_control: receiver,
+            idle: self.cfg.idle,
+            cancel: self.cancel.clone(),
+        }));
         self.allocations.push(Allocation {
             port,
             task,
             requested_by: sender.ip(),
+            sender,
+            receiver,
+            sender_ticket,
+            receiver_ticket,
         });
         Some((port, sender_ticket, receiver_ticket))
     }
@@ -449,9 +534,11 @@ impl Relay {
         }
         self.last_prune = now;
         self.registrations.retain(|_, r| r.expires > now);
+        let ports = self.ports.clone();
         self.allocations.retain(|a| {
             if a.task.is_finished() {
                 tracing::debug!("relay: port {} released", a.port);
+                ports.lock().remove(&a.port);
                 return false;
             }
             true
@@ -460,40 +547,126 @@ impl Relay {
     }
 }
 
+/// Everything one carried pair needs.
+struct Carried {
+    sock: Arc<UdpSocket>,
+    /// The control socket, for repeating an introduction that went missing.
+    control: Arc<UdpSocket>,
+    /// Every port this relay has set aside, so a pair can refuse to treat
+    /// another one as a peer.
+    ports: Arc<parking_lot::Mutex<std::collections::HashSet<u16>>>,
+    port: u16,
+    sender_ticket: [u8; TOKEN_LEN],
+    receiver_ticket: [u8; TOKEN_LEN],
+    /// Where the control exchange reached each side. Used to repeat the
+    /// introduction, and never as a peer address: what counts here is
+    /// whichever address presents the ticket.
+    sender_control: SocketAddr,
+    receiver_control: SocketAddr,
+    idle: Duration,
+    cancel: CancellationToken,
+}
+
+/// How often an unanswered introduction is repeated, and how many times.
+/// The relay sends `Incoming` once when a sender arrives; if that datagram
+/// is lost, the receiver never learns to bind its side and the transfer
+/// fails with nothing anywhere to show why.
+const INTRODUCE_EVERY: Duration = Duration::from_millis(400);
+const INTRODUCE_TIMES: u32 = 8;
+/// Consecutive receive errors before a pair gives up. One is not worth
+/// tearing an allocation down for: Windows reports WSAECONNRESET on an
+/// unconnected UDP socket when an ICMP port-unreachable comes back, so a
+/// single peer going quiet would otherwise kill the pair.
+const MAX_ERRORS: u32 = 16;
+
 /// Copies datagrams between the two sides of one allocation.
 ///
 /// Each side binds itself by presenting its ticket, which is also what opens
 /// the way back through its NAT. Until a side has done that, nothing is sent
 /// to it; afterwards, only datagrams from the two bound addresses are
 /// carried, so knowing the port is not enough to join in.
-async fn carry(
-    sock: Arc<UdpSocket>,
-    ticket_a: [u8; TOKEN_LEN],
-    ticket_b: [u8; TOKEN_LEN],
-    hint: Sides,
-    idle: Duration,
-    cancel: CancellationToken,
-) {
+async fn carry(c: Carried) {
+    let Carried {
+        sock,
+        control,
+        ports,
+        port,
+        sender_ticket,
+        receiver_ticket,
+        sender_control,
+        receiver_control,
+        idle,
+        cancel,
+    } = c;
     let mut a: Option<SocketAddr> = None;
     let mut b: Option<SocketAddr> = None;
     let mut buf = vec![0u8; BUF_LEN];
     let mut last = Instant::now();
+    let mut errors = 0u32;
+    let mut introduced = 1u32;
+    let mut next_introduce = Instant::now() + INTRODUCE_EVERY;
+    let local = sock.local_addr().ok();
+
+    // An address is only worth carrying to if it is one we would send to at
+    // all, and never one of our own ports: two allocations pointed at each
+    // other would bounce a single datagram between them for ever, each hop
+    // refreshing the idle timer that should have reclaimed them.
+    let acceptable = |addr: SocketAddr| -> bool {
+        let Some(local) = local else { return false };
+        if addr.ip() == local.ip() && ports.lock().contains(&addr.port()) {
+            return false;
+        }
+        crate::nat::stun::is_usable_server_address(addr, local)
+    };
+
     loop {
-        let quiet = idle.saturating_sub(Instant::now().saturating_duration_since(last));
+        let now = Instant::now();
+        let quiet = idle.saturating_sub(now.saturating_duration_since(last));
+        let wake = if b.is_none() && introduced < INTRODUCE_TIMES {
+            quiet.min(next_introduce.saturating_duration_since(now))
+        } else {
+            quiet
+        };
         tokio::select! {
             r = sock.recv_from(&mut buf) => {
-                let Ok((n, from)) = r else { return };
+                let (n, from) = match r {
+                    Ok(v) => {
+                        errors = 0;
+                        v
+                    }
+                    Err(_) => {
+                        errors += 1;
+                        if errors >= MAX_ERRORS {
+                            return;
+                        }
+                        continue;
+                    }
+                };
                 let pkt = &buf[..n];
                 if is_control(pkt) {
                     // A side saying which one it is. The address it comes
                     // from is the one to use, whatever the control port saw.
                     if let Some(Message::Open { ticket }) = Message::decode(pkt) {
-                        if constant_time_eq(&ticket, &ticket_a) {
-                            a = Some(from);
-                        } else if constant_time_eq(&ticket, &ticket_b) {
-                            b = Some(from);
-                        } else {
+                        let is_a = constant_time_eq(&ticket, &sender_ticket);
+                        let is_b = constant_time_eq(&ticket, &receiver_ticket);
+                        if !is_a && !is_b {
                             continue;
+                        }
+                        if !acceptable(from) {
+                            tracing::debug!("relay: port {} will not carry to {}", port, from);
+                            continue;
+                        }
+                        // The two sides have to be two. One address holding
+                        // both tickets is a pair talking to itself, and a
+                        // datagram put into it would never stop going round.
+                        if (is_a && b == Some(from)) || (is_b && a == Some(from)) {
+                            tracing::debug!("relay: port {} refuses {} as both sides", port, from);
+                            continue;
+                        }
+                        if is_a {
+                            a = Some(from);
+                        } else {
+                            b = Some(from);
                         }
                         last = Instant::now();
                     }
@@ -512,20 +685,29 @@ async fn carry(
                     let _ = sock.send_to(pkt, to).await;
                 }
             }
-            _ = tokio::time::sleep(quiet) => {
-                if Instant::now().saturating_duration_since(last) >= idle {
-                    tracing::debug!(
-                        "relay: allocation idle for {:?}; releasing (sides {:?} {:?}, hinted {:?} {:?})",
-                        idle, a, b, hint.a, hint.b
-                    );
+            _ = tokio::time::sleep(wake) => {
+                let now = Instant::now();
+                if now.saturating_duration_since(last) >= idle {
+                    tracing::debug!("relay: port {} idle; releasing", port);
                     return;
+                }
+                // The receiver has not shown up. Its introduction may simply
+                // have been lost, and nothing else would ever repeat it.
+                if b.is_none() && introduced < INTRODUCE_TIMES && now >= next_introduce {
+                    introduced += 1;
+                    next_introduce = now + INTRODUCE_EVERY;
+                    let msg = Message::Incoming {
+                        port,
+                        peer: sender_control,
+                        ticket: receiver_ticket,
+                    };
+                    let _ = control.send_to(&msg.encode(), receiver_control).await;
                 }
             }
             _ = cancel.cancelled() => return,
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +978,117 @@ mod wire_tests {
                 .await
                 .is_err(),
             "the relay answered something that was not a message"
+        );
+        cancel.cancel();
+    }
+
+    /// A receiver that goes away says so, and the relay stops sending
+    /// people to an address nothing answers at. Without it, senders would
+    /// keep being pointed there until the lease ran out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receiver_that_says_goodbye_is_forgotten() {
+        let (relay, cancel) = start_relay().await;
+        let id = Identity::generate().id();
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut token = [0u8; TOKEN_LEN];
+        match ask(&rc, relay, Message::Register { id, token }).await {
+            Some(Message::Challenge { token: t }) => token = t,
+            other => panic!("expected a challenge, got {:?}", other),
+        }
+        assert!(matches!(
+            ask(&rc, relay, Message::Register { id, token }).await,
+            Some(Message::Registered { .. })
+        ));
+
+        // Somebody else's goodbye is not taken: it would evict the owner.
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut stolen = [0u8; TOKEN_LEN];
+        if let Some(Message::Challenge { token: t }) =
+            ask(&stranger, relay, Message::Bye { id, token: stolen }).await
+        {
+            stolen = t;
+        }
+        stranger
+            .send_to(&Message::Bye { id, token: stolen }.encode(), relay)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let still_there =
+            with_token(&sc, relay, |token| Message::Connect { target: id, token }).await;
+        assert!(
+            matches!(still_there, Some(Message::Allocated { .. })),
+            "a stranger's goodbye evicted the owner: {:?}",
+            still_there
+        );
+
+        // The owner's own goodbye is.
+        rc.send_to(&Message::Bye { id, token }.encode(), relay)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gone = with_token(&sc, relay, |token| Message::Connect { target: id, token }).await;
+        assert!(
+            matches!(
+                gone,
+                Some(Message::Error {
+                    code: Refusal::Unknown
+                })
+            ),
+            "got {:?}",
+            gone
+        );
+        cancel.cancel();
+    }
+
+    /// One address holding both tickets is a pair talking to itself. A
+    /// datagram put into that would be forwarded back to where it came
+    /// from, and each hop would refresh the idle timer that should have
+    /// reclaimed the port — one packet, carried for ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_address_cannot_hold_both_sides() {
+        let (relay, cancel) = start_relay().await;
+        let id = Identity::generate().id();
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            with_token(&rc, relay, |token| Message::Register { id, token }).await,
+            Some(Message::Registered { .. })
+        ));
+        let Some(Message::Allocated {
+            port,
+            ticket: sender_ticket,
+            ..
+        }) = with_token(&sc, relay, |token| Message::Connect { target: id, token }).await
+        else {
+            panic!("expected an allocation");
+        };
+        let Some(Message::Incoming {
+            ticket: receiver_ticket,
+            ..
+        }) = recv_message(&rc, Duration::from_secs(2)).await
+        else {
+            panic!("the receiver was not introduced");
+        };
+
+        // One socket presents both tickets.
+        let both = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let allocated = SocketAddr::new(relay.ip(), port);
+        for ticket in [sender_ticket, receiver_ticket] {
+            both.send_to(&Message::Open { ticket }.encode(), allocated)
+                .await
+                .unwrap();
+        }
+        both.send_to(b"round and round", allocated).await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), both.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the relay carried a datagram back to where it came from"
         );
         cancel.cancel();
     }
