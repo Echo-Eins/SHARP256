@@ -33,6 +33,8 @@ pub enum MsgType {
     ProbeAck = 10,
     Abort = 11,
     FinDone = 12,
+    PathChallenge = 13,
+    PathResponse = 14,
 }
 
 impl MsgType {
@@ -50,6 +52,8 @@ impl MsgType {
             10 => MsgType::ProbeAck,
             11 => MsgType::Abort,
             12 => MsgType::FinDone,
+            13 => MsgType::PathChallenge,
+            14 => MsgType::PathResponse,
             _ => return None,
         })
     }
@@ -214,6 +218,21 @@ pub struct Abort {
     pub reason: String,
 }
 
+/// Address validation, as in QUIC (RFC 9000 section 8): unpredictable data
+/// that the peer must echo from the address being validated. Both ends may
+/// send it, and both answer one addressed to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathChallenge {
+    pub data: [u8; PATH_TOKEN_LEN],
+}
+
+/// The echo of a [`PathChallenge`]. Only the holder of the session keys can
+/// produce one, and only from the address it was challenged at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathResponse {
+    pub data: [u8; PATH_TOKEN_LEN],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message<'a> {
     Hello(Hello),
@@ -228,6 +247,8 @@ pub enum Message<'a> {
     ProbeAck(ProbeAck),
     Abort(Abort),
     FinDone(FinDone),
+    PathChallenge(PathChallenge),
+    PathResponse(PathResponse),
 }
 
 impl<'a> Message<'a> {
@@ -245,6 +266,8 @@ impl<'a> Message<'a> {
             Message::ProbeAck(_) => MsgType::ProbeAck,
             Message::Abort(_) => MsgType::Abort,
             Message::FinDone(_) => MsgType::FinDone,
+            Message::PathChallenge(_) => MsgType::PathChallenge,
+            Message::PathResponse(_) => MsgType::PathResponse,
         }
     }
 }
@@ -442,6 +465,8 @@ pub fn encode_body(msg: &Message<'_>, out: &mut Vec<u8>, limit: usize) {
             w.text(&a.reason, MAX_TEXT_LEN);
         }
         Message::FinDone(f) => w.u8(f.verdict),
+        Message::PathChallenge(p) => w.bytes(&p.data),
+        Message::PathResponse(p) => w.bytes(&p.data),
     }
 }
 
@@ -677,6 +702,12 @@ pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<Message<'_>, WireEr
             Message::Abort(Abort { code, reason })
         }
         MsgType::FinDone => Message::FinDone(FinDone { verdict: r.u8()? }),
+        MsgType::PathChallenge => Message::PathChallenge(PathChallenge {
+            data: r.array::<PATH_TOKEN_LEN>()?,
+        }),
+        MsgType::PathResponse => Message::PathResponse(PathResponse {
+            data: r.array::<PATH_TOKEN_LEN>()?,
+        }),
     };
     Ok(msg)
 }
@@ -832,14 +863,14 @@ mod tests {
 
     #[test]
     fn type_byte_packs_type_and_flags() {
-        for t in 1..=12u8 {
+        for t in 1..=14u8 {
             let mt = MsgType::from_u8(t).unwrap();
             for flags in 0..16u8 {
                 assert_eq!(parse_type_byte(type_byte(mt, flags)).unwrap(), (mt, flags));
             }
         }
         assert_eq!(parse_type_byte(0), Err(WireError::UnknownType(0)));
-        assert_eq!(parse_type_byte(0x0d), Err(WireError::UnknownType(13)));
+        assert_eq!(parse_type_byte(0x0f), Err(WireError::UnknownType(15)));
     }
 
     #[test]
@@ -882,6 +913,12 @@ mod tests {
         roundtrip(Message::FinDone(FinDone {
             verdict: VERDICT_OK,
         }));
+        roundtrip(Message::PathChallenge(PathChallenge {
+            data: [0x5A; PATH_TOKEN_LEN],
+        }));
+        roundtrip(Message::PathResponse(PathResponse {
+            data: [0xA5; PATH_TOKEN_LEN],
+        }));
     }
 
     #[test]
@@ -897,7 +934,7 @@ mod tests {
 
     #[test]
     fn malformed_bodies_are_rejected_not_panicking() {
-        for t in 1u8..=12 {
+        for t in 1u8..=14 {
             let msg_type = MsgType::from_u8(t).unwrap();
             for len in 0..80usize {
                 let body: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();

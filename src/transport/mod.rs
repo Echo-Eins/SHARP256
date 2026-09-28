@@ -3,6 +3,7 @@
 pub mod congestion;
 pub mod io;
 pub mod parallel;
+pub mod path;
 pub mod receiver;
 pub mod sender;
 pub mod socket;

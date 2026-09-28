@@ -53,6 +53,7 @@ use crate::protocol::RangeSet;
 use crate::state::{hex16, ReceiverState, StateStore};
 use crate::transport::io::{recv_buffers, BatchSocket, Received, RECV_BATCH, RECV_BUF_LEN};
 use crate::transport::parallel;
+use crate::transport::path::PathProbe;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::io;
@@ -93,6 +94,8 @@ const REPLAY_GUARD_CAPACITY: usize = 100_000;
 /// bytes and datagrams, until the manifest is complete.
 const EARLY_MAX_BYTES: u64 = 16 << 20;
 const EARLY_MAX_ITEMS: usize = 16_384;
+/// How long an unanswered address challenge waits before it is repeated.
+const PATH_RETRY: Duration = Duration::from_millis(250);
 
 /// A transfer is identified by who sends it and its transfer id.
 type TransferKey = (SharpId, [u8; 16]);
@@ -888,6 +891,9 @@ struct Control {
     body: Vec<u8>,
     /// Length of the datagram that carried it.
     datagram_len: usize,
+    /// Source address of that datagram. Address validation needs it: a
+    /// PATH_RESPONSE only proves the address it comes back from.
+    from: SocketAddr,
 }
 
 struct Session {
@@ -902,7 +908,10 @@ struct Session {
 
     transfer_id: [u8; 16],
     sender: SharpId,
+    /// The sender's proven address: everything we send goes there.
     peer: SocketAddr,
+    /// An address the sender claims but has not proven yet.
+    path: PathProbe,
     secure: Option<Secure>,
     tx_buf: Vec<u8>,
 
@@ -963,6 +972,7 @@ impl Session {
             transfer_id: key.1,
             sender: key.0,
             peer,
+            path: PathProbe::new(),
             secure: None,
             tx_buf: Vec::with_capacity(MAX_CONTROL_DATAGRAM),
             file_name: String::new(),
@@ -1005,8 +1015,15 @@ impl Session {
         (self.sender, self.transfer_id)
     }
 
-    /// Encrypts `msg` as a transport packet to the sender.
+    /// Encrypts `msg` as a transport packet to the sender's proven address.
     fn send(&mut self, flags: u8, msg: &Message<'_>) {
+        self.send_to(self.peer, flags, msg);
+    }
+
+    /// Encrypts `msg` as a transport packet and sends it to `to`. Only
+    /// address validation sends anywhere but the proven address, and only
+    /// the small PATH_CHALLENGE / PATH_RESPONSE frames.
+    fn send_to(&mut self, to: SocketAddr, flags: u8, msg: &Message<'_>) {
         let Some(sec) = self.secure.as_mut() else {
             return;
         };
@@ -1022,7 +1039,7 @@ impl Session {
         if sec.keys.send.seal(&mut self.tx_buf).is_err() {
             return;
         }
-        if let Err(e) = self.shared.socket.try_send(self.peer, &self.tx_buf) {
+        if let Err(e) = self.shared.socket.try_send(to, &self.tx_buf) {
             if e.kind() != io::ErrorKind::WouldBlock {
                 tracing::debug!("send {:?} failed: {}", msg.msg_type(), e);
             }
@@ -1573,9 +1590,30 @@ impl Session {
                     replay: ReplayWindow::new(),
                     auth_failures: 0,
                 });
-                self.peer = h.from;
+                // The answer goes where the question came from, always.
                 if let Err(e) = self.shared.socket.try_send(h.from, &pkt) {
                     tracing::debug!("sending handshake response failed: {}", e);
+                }
+                // A handshake from an address we have not proven does not
+                // move the session there on its own: an on-path attacker
+                // able to race our sender could otherwise re-send a captured
+                // initiation with a forged source and point the session's
+                // traffic at it. The new keys are in place now, so the
+                // challenge is sent under them.
+                self.path.reset();
+                if h.from != self.peer {
+                    if let Some(c) = self.path.on_authentic(h.from, self.peer, h.at) {
+                        tracing::info!(
+                            "handshake from {} while the session is at {}; validating it",
+                            c.to,
+                            self.peer
+                        );
+                        self.send_to(
+                            c.to,
+                            0,
+                            &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
+                        );
+                    }
                 }
             }
             Err(e) => tracing::warn!("cannot answer handshake: {}", e),
@@ -1815,6 +1853,7 @@ impl Session {
                 msg_type,
                 body: buf[body].to_vec(),
                 datagram_len: range.len(),
+                from,
             });
             return Ok(());
         }
@@ -1832,6 +1871,12 @@ impl Session {
     }
 
     /// Something authentic arrived from the sender.
+    ///
+    /// An authentic packet from an address we have not proven does *not*
+    /// move the transfer there: it only makes us ask. See
+    /// [`crate::transport::path`] — an attacker that repeats a captured
+    /// packet with a forged source address must not be able to point our
+    /// ACKs (and, on the sending side, the data stream) at a third party.
     fn note_alive(&mut self, from: SocketAddr, at: Instant) {
         self.last_rx = at;
         if self.stalled {
@@ -1843,9 +1888,28 @@ impl Session {
                 },
             );
         }
-        if from != self.peer {
-            tracing::info!("sender address changed {} -> {}", self.peer, from);
-            self.peer = from;
+        if let Some(c) = self.path.on_authentic(from, self.peer, at) {
+            tracing::info!(
+                "sender claims address {} (was {}); validating it",
+                c.to,
+                self.peer
+            );
+            self.send_to(
+                c.to,
+                0,
+                &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
+            );
+        }
+    }
+
+    /// Repeats an unanswered address challenge, or gives the claim up.
+    fn poll_path(&mut self, now: Instant) {
+        if let Some(c) = self.path.poll(now, PATH_RETRY) {
+            self.send_to(
+                c.to,
+                0,
+                &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
+            );
         }
     }
 
@@ -1887,6 +1951,21 @@ impl Session {
             Message::Probe(_) => {
                 let size = c.datagram_len.min(u16::MAX as usize) as u16;
                 self.send(0, &Message::ProbeAck(ProbeAck { size }));
+            }
+            // The sender is validating an address of ours: echo the token
+            // back from the address it challenged, and nowhere else.
+            Message::PathChallenge(p) => {
+                self.send_to(
+                    c.from,
+                    0,
+                    &Message::PathResponse(wire::PathResponse { data: p.data }),
+                );
+            }
+            Message::PathResponse(p) => {
+                if let Some(addr) = self.path.on_response(c.from, p.data) {
+                    tracing::info!("sender address {} proven; moving the session there", addr);
+                    self.peer = addr;
+                }
             }
             Message::FinAck(f) => {
                 if let Phase::Finishing { hash, .. } = &self.phase {
@@ -2181,6 +2260,7 @@ impl Session {
 
     async fn housekeeping(&mut self, now: Instant) -> ControlFlow<()> {
         let since_rx = now.saturating_duration_since(self.last_rx);
+        self.poll_path(now);
         if let Some((kind, error)) = self.writer.as_ref().and_then(|w| w.error()) {
             let msg = format!("cannot write: {}", error);
             if kind == io::ErrorKind::AlreadyExists {

@@ -1838,3 +1838,102 @@ async fn hostile_directory_listings_are_refused() {
     assert_eq!(top, ["out", "src", "state"], "nothing written outside");
     stop_receiver(r).await;
 }
+
+/// An encrypted PATH_CHALLENGE datagram: 33 bytes of packet overhead plus
+/// the 8-byte token. Nothing else the receiver sends is this size.
+const PATH_CHALLENGE_LEN: usize = 33 + 8;
+
+/// An attacker on the path that repeats an authentic packet with a forged
+/// source address must not be able to point the session anywhere it likes:
+/// that would turn every transfer into a redirection weapon aimed at a third
+/// party. The receiver may only *ask* the new address to prove itself with a
+/// PATH_CHALLENGE; until that is answered, every byte keeps going to the
+/// address the peer has already proven, and the transfer finishes normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_source_address_never_redirects_the_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 3 << 20;
+    let file = make_file(&src, "redirect.bin", size, 0x51DE);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+
+    // The sender talks to `relay`, which forwards both ways; the receiver
+    // knows the transfer at `relay_out`'s address. `forger` is the address
+    // the attacker would like the transfer pointed at.
+    let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let forger = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_addr = relay_in.local_addr().unwrap();
+    let target = r.addr;
+
+    let attacker = forger.clone();
+    let relay = tokio::spawn(async move {
+        let mut client: Option<SocketAddr> = None;
+        let mut from_sender = vec![0u8; 65536];
+        let mut from_receiver = vec![0u8; 65536];
+        let mut data_seen: u64 = 0;
+        loop {
+            tokio::select! {
+                res = relay_in.recv_from(&mut from_sender) => {
+                    let Ok((n, from)) = res else { continue };
+                    client = Some(from);
+                    let pkt = &from_sender[..n];
+                    if is_data(pkt) {
+                        data_seen += 1;
+                        // Race the original: the copy leaves from the forged
+                        // address first, so it is new to the replay window
+                        // and the receiver has to decide what to believe.
+                        if data_seen % 100 == 40 && data_seen < 800 {
+                            let _ = attacker.send_to(pkt, target).await;
+                        }
+                    }
+                    let _ = relay_out.send_to(pkt, target).await;
+                }
+                res = relay_out.recv_from(&mut from_receiver) => {
+                    let Ok((n, _)) = res else { continue };
+                    if let Some(c) = client {
+                        let _ = relay_in.send_to(&from_receiver[..n], c).await;
+                    }
+                }
+            }
+        }
+    });
+
+    // Everything the receiver sends to the forged address.
+    let seen: Arc<parking_lot::Mutex<Vec<usize>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let collected = seen.clone();
+    let listener = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, _)) = forger.recv_from(&mut buf).await {
+            collected.lock().push(n);
+        }
+    });
+
+    let summary = run_sender(sender_cfg(&file, relay_addr, r.id, &state))
+        .await
+        .expect("the transfer completes despite the forged packets");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&file, &out.join("redirect.bin"));
+
+    relay.abort();
+    listener.abort();
+    let lens = seen.lock().clone();
+    // The property under test: nothing but challenges ever left for an
+    // address that never proved itself.
+    for len in &lens {
+        assert_eq!(
+            *len, PATH_CHALLENGE_LEN,
+            "the receiver sent session traffic ({} B) to an address that never proved itself; \
+             it was redirected",
+            len
+        );
+    }
+    // And the attack really did reach the receiver, so the check above is
+    // not vacuous.
+    assert!(
+        !lens.is_empty(),
+        "the receiver never challenged the forged address, so this test proved nothing"
+    );
+    stop_receiver(r).await;
+}

@@ -62,6 +62,11 @@ pub const BLOCK_SIZE: u64 = 256 * 1024;
 /// Whole-file hash length (BLAKE3-256).
 pub const FILE_HASH_LEN: usize = 32;
 
+/// Length of the unpredictable token of a PATH_CHALLENGE / PATH_RESPONSE.
+/// Eight bytes make guessing one hopeless (2^-64 per try) while keeping the
+/// frame small enough to be sent freely.
+pub const PATH_TOKEN_LEN: usize = 8;
+
 /// HELLO_ACK status codes.
 pub const HELLO_ACCEPTED: u8 = 1;
 pub const HELLO_REJECTED: u8 = 2;

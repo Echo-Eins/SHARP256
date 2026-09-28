@@ -43,6 +43,7 @@ use crate::transport::io::{
     is_no_buffer_error, recv_buffers, BatchSocket, Received, MAX_SEND_BYTES,
 };
 use crate::transport::parallel;
+use crate::transport::path::PathProbe;
 use crate::transport::socket::{is_msgsize_error, Clock};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -498,7 +499,10 @@ struct AckRecord {
 struct Engine {
     cfg: TransportConfig,
     socket: Arc<BatchSocket>,
+    /// The receiver's proven address: everything we send goes there.
     peer: SocketAddr,
+    /// An address the receiver claims but has not proven yet.
+    path: PathProbe,
     reader: Arc<Source>,
     size: u64,
     file_name: String,
@@ -539,6 +543,8 @@ struct Engine {
     received_bytes: u64,
     max_ack_received: u64,
     resumed_from: u64,
+    /// ACKs describing bytes the file does not have; dropped unread.
+    impossible_acks: u64,
     ack_log: VecDeque<AckRecord>,
     /// Last time an ACK acknowledged new data (restarts the RTO, RFC 6298 5.3).
     last_ack_progress: Instant,
@@ -639,6 +645,7 @@ impl Engine {
             cfg,
             socket,
             peer,
+            path: PathProbe::new(),
             reader,
             size,
             file_name,
@@ -668,6 +675,7 @@ impl Engine {
             received_bytes: 0,
             max_ack_received: 0,
             resumed_from: 0,
+            impossible_acks: 0,
             ack_log: VecDeque::new(),
             last_ack_progress: now,
             rack_sent_at: None,
@@ -764,9 +772,18 @@ impl Engine {
         Ok(())
     }
 
-    /// Encrypts `msg` as a transport packet and sends it. Without an
-    /// established session there is nobody to send it to.
+    /// Encrypts `msg` as a transport packet and sends it to the receiver's
+    /// proven address. Without an established session there is nobody to
+    /// send it to.
     fn send_frame(&mut self, flags: u8, msg: &Message<'_>) -> io::Result<()> {
+        self.send_frame_to(self.peer, flags, msg)
+    }
+
+    /// Encrypts `msg` as a transport packet and sends it to `to`. Only
+    /// address validation sends anywhere but the proven address, and only
+    /// the small PATH_CHALLENGE / PATH_RESPONSE frames: the file itself is
+    /// never sent to an address the receiver has not proven.
+    fn send_frame_to(&mut self, to: SocketAddr, flags: u8, msg: &Message<'_>) -> io::Result<()> {
         let Some(sec) = self.secure.as_mut() else {
             return Ok(());
         };
@@ -783,7 +800,7 @@ impl Engine {
             .send
             .seal(&mut self.ctl_buf)
             .map_err(io::Error::other)?;
-        match self.socket.try_send(self.peer, &self.ctl_buf) {
+        match self.socket.try_send(to, &self.ctl_buf) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => Ok(()),
             Err(e) => Err(e),
@@ -860,7 +877,6 @@ impl Engine {
                     .map_err(|e| SendError::Protocol(format!("bad handshake response: {}", e)))?;
                 let now = Instant::now();
                 self.rtt.on_sample(now.saturating_duration_since(sent_at));
-                self.note_alive(now, from);
                 if resp.ack.status == HELLO_REJECTED {
                     return Err(SendError::Rejected {
                         reason: reason_name(resp.ack.reason).to_string(),
@@ -880,6 +896,15 @@ impl Engine {
                 });
                 // Older attempts are obsolete now.
                 self.attempts.clear();
+                // The new keys are in place, so liveness and — when the
+                // answer came from an address we have not proven — its
+                // validation can both run under them. A handshake response
+                // is authentic, but authenticity says nothing about where
+                // it was sent from: it could have been captured and repeated
+                // with a forged source. Until the new address answers a
+                // challenge, the file keeps going to the proven one.
+                self.path.reset();
+                self.note_alive(now, from);
                 tracing::debug!(
                     "session with {} established ({})",
                     self.auth.receiver.short(),
@@ -1738,6 +1763,21 @@ impl Engine {
                     self.probe_acks.push(p.size);
                 }
             }
+            // The receiver is validating an address of ours: echo the token
+            // back from the address it challenged, and nowhere else.
+            Message::PathChallenge(p) => {
+                let _ = self.send_frame_to(
+                    from,
+                    0,
+                    &Message::PathResponse(wire::PathResponse { data: p.data }),
+                );
+            }
+            Message::PathResponse(p) => {
+                if let Some(addr) = self.path.on_response(from, p.data) {
+                    tracing::info!("receiver address {} proven; sending there now", addr);
+                    self.peer = addr;
+                }
+            }
             Message::Ping(_) => {}
             Message::Hello(_) | Message::Data(_) | Message::FinAck(_) | Message::Probe(_) => {}
         }
@@ -1775,12 +1815,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Something authentic arrived from the receiver.
+    ///
+    /// A packet from an address the receiver has not proven does not move
+    /// the transfer there. This is the side that matters most: the sender
+    /// pushes the whole file, so an attacker that could redirect it by
+    /// repeating one captured packet from a forged source address would have
+    /// a multi-gigabit weapon pointed wherever it likes. It has to answer a
+    /// challenge at the new address first (see [`crate::transport::path`]).
     fn note_alive(&mut self, now: Instant, from: SocketAddr) {
         self.last_rx = now;
         self.ping_backoff = 0;
-        if from != self.peer {
-            tracing::info!("receiver address changed {} -> {}", self.peer, from);
-            self.peer = from;
+        if let Some(c) = self.path.on_authentic(from, self.peer, now) {
+            tracing::info!(
+                "receiver claims address {} (was {}); validating it",
+                c.to,
+                self.peer
+            );
+            let _ = self.send_frame_to(
+                c.to,
+                0,
+                &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
+            );
         }
         if self.stalled {
             self.stalled = false;
@@ -1817,6 +1873,26 @@ impl Engine {
         });
         if self.ack_log.len() > ACK_LOG_LEN {
             self.ack_log.pop_front();
+        }
+        // Nothing a receiver can honestly report exceeds the file it is
+        // being sent. An ACK that does is a bug or a hostile peer, and
+        // believing it once would be permanent: `max_ack_received` only
+        // grows, so an impossible count would make every honest ACK
+        // afterwards look outdated and stall the transfer for good. The
+        // decoder already guarantees `contiguous_upto <= highest`.
+        if ack.received_bytes > self.size || ack.highest > self.size {
+            self.impossible_acks += 1;
+            if self.impossible_acks.is_power_of_two() {
+                tracing::warn!(
+                    "ignoring an ACK beyond the file: {} B received, up to {}, file is {} B \
+                     ({} such ACKs so far)",
+                    ack.received_bytes,
+                    ack.highest,
+                    self.size,
+                    self.impossible_acks
+                );
+            }
+            return;
         }
         if ack.received_bytes < self.max_ack_received {
             return;
@@ -2135,6 +2211,14 @@ impl Engine {
     // ----- timers ----------------------------------------------------------
 
     fn housekeeping(&mut self, now: Instant) -> Result<(), SendError> {
+        // Repeat an unanswered address challenge, or drop the claim.
+        if let Some(c) = self.path.poll(now, self.rtt.rto()) {
+            let _ = self.send_frame_to(
+                c.to,
+                0,
+                &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
+            );
+        }
         self.maybe_send_tail_probe(now)?;
         // Retransmission timeout.
         let rto = self.rtt.rto();

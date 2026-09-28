@@ -28,7 +28,7 @@ use crate::crypto::CryptoError;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -432,8 +432,17 @@ fn random_key() -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 /// Rejects replayed initiations: per sender, timestamps must increase.
+///
+/// The number of remembered senders is capped. When it is reached the
+/// first-seen sender is forgotten in O(1) (a first-in-first-out order kept
+/// alongside the map), so a flood of fresh identities cannot make admission
+/// cost grow with the table size. Forgetting an entry can at worst allow one
+/// replay of an initiation, which still cannot complete without the sender's
+/// private key.
 pub struct ReplayGuard {
     last: HashMap<SharpId, u64>,
+    /// Senders in the order they were first seen; the eviction queue.
+    order: VecDeque<SharpId>,
     capacity: usize,
 }
 
@@ -441,23 +450,28 @@ impl ReplayGuard {
     pub fn new(capacity: usize) -> Self {
         Self {
             last: HashMap::new(),
+            order: VecDeque::new(),
             capacity: capacity.max(1),
         }
     }
 
     pub fn accept(&mut self, sender: &SharpId, timestamp: u64) -> bool {
-        if let Some(&prev) = self.last.get(sender) {
-            if timestamp <= prev {
+        if let Some(slot) = self.last.get_mut(sender) {
+            if timestamp <= *slot {
                 return false;
             }
-        } else if self.last.len() >= self.capacity {
-            // Forget the stalest entry; it can at worst allow one replay of
-            // an initiation that cannot complete without the sender's keys.
-            if let Some(k) = self.last.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
-                self.last.remove(&k);
+            *slot = timestamp;
+            return true;
+        }
+        if self.last.len() >= self.capacity {
+            // `order` holds exactly the live keys (each pushed once when
+            // first inserted, popped only here), so its front is present.
+            if let Some(old) = self.order.pop_front() {
+                self.last.remove(&old);
             }
         }
         self.last.insert(*sender, timestamp);
+        self.order.push_back(*sender);
         true
     }
 }
@@ -648,6 +662,14 @@ mod tests {
         assert!(!g.accept(&a, 9));
         assert!(g.accept(&a, 11));
         assert!(g.accept(&b, 1));
+
+        // At capacity, the first-seen sender (a) is evicted when a third
+        // identity appears, in O(1). Re-accepting `a` afterwards is a fresh
+        // entry (one replay is tolerable; it still cannot complete).
+        let c = Identity::generate().id();
+        assert!(g.accept(&c, 5)); // evicts `a`, keeps `b` and `c`
+        assert!(!g.accept(&b, 1)); // `b` still remembered: replay rejected
+        assert!(g.accept(&a, 1)); // `a` forgotten: accepted anew (evicts `b`)
         let t1 = initiation_timestamp();
         let t2 = initiation_timestamp();
         assert!(t2 > t1);
