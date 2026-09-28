@@ -1,5 +1,5 @@
 use crate::config::{AcceptPolicy, IncomingRequest, ReceiverConfig};
-use crate::progress::{format_bytes, format_rate, TransferEvent, TransferStats};
+use crate::progress::{format_bytes, format_rate, DirectoryInfo, TransferEvent, TransferStats};
 use crate::transport::Receiver;
 use eframe::egui;
 use parking_lot::Mutex;
@@ -15,6 +15,7 @@ struct Active {
     peer_id: String,
     cipher: String,
     file_name: String,
+    directory: Option<DirectoryInfo>,
     stats: Option<TransferStats>,
     stalled: bool,
 }
@@ -81,6 +82,7 @@ impl ReceiverApp {
                     peer_id,
                     cipher,
                     file_name,
+                    directory,
                     ..
                 } => {
                     sh.active.retain(|a| a.transfer_id != transfer_id);
@@ -90,6 +92,7 @@ impl ReceiverApp {
                         peer_id,
                         cipher,
                         file_name,
+                        directory,
                         stats: None,
                         stalled: false,
                     });
@@ -210,8 +213,20 @@ impl eframe::App for ReceiverApp {
                     .show(ctx, |ui| {
                         ui.label(format!("From: {}", r.peer));
                         ui.label(format!("Sender ID: {}", r.sender_id));
-                        ui.label(format!("File: {}", r.file_name));
-                        ui.label(format!("Size: {}", format_bytes(r.file_size)));
+                        match &r.directory {
+                            Some(d) => {
+                                ui.label(format!("Folder: {}", r.file_name));
+                                ui.label(format!(
+                                    "Contents: {}, {}",
+                                    d.describe(),
+                                    format_bytes(r.file_size)
+                                ));
+                            }
+                            None => {
+                                ui.label(format!("File: {}", r.file_name));
+                                ui.label(format!("Size: {}", format_bytes(r.file_size)));
+                            }
+                        }
                         if r.resumed_bytes > 0 {
                             ui.label(format!(
                                 "Resume: {} already stored",
@@ -272,7 +287,15 @@ impl eframe::App for ReceiverApp {
             }
             for a in &sh.active {
                 ui.group(|ui| {
-                    ui.label(format!("{} from {}", a.file_name, a.peer));
+                    match &a.directory {
+                        Some(d) => ui.label(format!(
+                            "folder {} ({}) from {}",
+                            a.file_name,
+                            d.describe(),
+                            a.peer
+                        )),
+                        None => ui.label(format!("{} from {}", a.file_name, a.peer)),
+                    };
                     ui.label(format!("sender {}, {}", a.peer_id, a.cipher));
                     if let Some(s) = &a.stats {
                         ui.add(

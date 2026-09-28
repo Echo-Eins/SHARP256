@@ -81,6 +81,9 @@ pub const REASON_TIMEOUT: u8 = 7;
 pub const REASON_UNAUTHORIZED: u8 = 8;
 /// No AEAD suite in common.
 pub const REASON_NO_SUITE: u8 = 9;
+/// The request exceeds what this receiver supports (e.g. a directory
+/// manifest beyond its limits).
+pub const REASON_UNSUPPORTED: u8 = 10;
 
 /// FIN_ACK verdicts.
 pub const VERDICT_OK: u8 = 1;
@@ -99,6 +102,22 @@ pub const HELLO_FLAG_RESUME: u8 = 0x1;
 pub const HELLO_ACK_FLAG_RESUMED: u8 = 0x1;
 /// DATA: the range was sent before (statistics only).
 pub const DATA_FLAG_RETRANSMIT: u8 = 0x1;
+
+/// What a transfer's byte stream holds (HELLO `kind`).
+pub const KIND_FILE: u8 = 0;
+/// A directory tree: a manifest followed by the contents of its files (see
+/// `file::tree`).
+pub const KIND_DIRECTORY: u8 = 1;
+
+/// Largest directory manifest a receiver accepts. The receiver keeps the
+/// manifest in memory while it arrives.
+pub const MAX_MANIFEST_LEN: u64 = 64 << 20;
+/// Most entries (files plus directories) one directory transfer may hold.
+pub const MAX_MANIFEST_ENTRIES: u64 = 1 << 21;
+/// Deepest nesting of a directory transfer (entries below the root).
+pub const MAX_TREE_DEPTH: usize = 256;
+/// Longest relative path, in bytes, of an entry of a directory transfer.
+pub const MAX_TREE_PATH: usize = 4096;
 
 /// Capability bits offered in HELLO and confirmed in HELLO_ACK. Unknown bits
 /// are ignored by the receiver (it never confirms them), so new features can

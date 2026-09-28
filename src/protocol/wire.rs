@@ -95,7 +95,23 @@ pub struct Hello {
     /// Largest chunk (file bytes per DATA packet) the sender is willing to use.
     pub max_chunk: u16,
     pub capabilities: u32,
+    /// `None` for a single file; for a directory, what describes the tree.
+    /// `file_size` is then the length of the whole stream (manifest plus
+    /// file contents) and `file_name` the name of the directory.
+    pub tree: Option<TreeInfo>,
     pub file_name: String,
+}
+
+/// HELLO fields of a directory transfer (see `crate::file::tree`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeInfo {
+    /// Length of the manifest at the start of the stream.
+    pub manifest_len: u64,
+    /// BLAKE3 of the manifest; the receiver checks the manifest against it
+    /// before acting on any of its contents.
+    pub manifest_hash: [u8; 32],
+    pub files: u64,
+    pub dirs: u64,
 }
 
 /// Receiver -> sender: accept, reject or "still deciding", with resume
@@ -369,6 +385,16 @@ pub fn encode_body(msg: &Message<'_>, out: &mut Vec<u8>, limit: usize) {
             w.i64(h.file_mtime);
             w.u16(h.max_chunk);
             w.u32(h.capabilities);
+            match &h.tree {
+                None => w.u8(KIND_FILE),
+                Some(t) => {
+                    w.u8(KIND_DIRECTORY);
+                    w.u64(t.manifest_len);
+                    w.bytes(&t.manifest_hash);
+                    w.u64(t.files);
+                    w.u64(t.dirs);
+                }
+            }
             w.text(&h.file_name, MAX_FILE_NAME_LEN);
         }
         Message::HelloAck(a) => {
@@ -533,6 +559,26 @@ pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<Message<'_>, WireEr
             let file_mtime = r.i64()?;
             let max_chunk = r.u16()?;
             let capabilities = r.u32()?;
+            let tree = match r.u8()? {
+                KIND_FILE => None,
+                KIND_DIRECTORY => {
+                    let t = TreeInfo {
+                        manifest_len: r.u64()?,
+                        manifest_hash: r.array::<32>()?,
+                        files: r.u64()?,
+                        dirs: r.u64()?,
+                    };
+                    let entries = t.files.checked_add(t.dirs);
+                    if t.manifest_len == 0
+                        || t.manifest_len > file_size
+                        || entries.is_none_or(|n| n > MAX_MANIFEST_ENTRIES)
+                    {
+                        return Err(WireError::Malformed("hello"));
+                    }
+                    Some(t)
+                }
+                _ => return Err(WireError::Malformed("hello")),
+            };
             let file_name = r.text(MAX_FILE_NAME_LEN)?;
             if file_name.is_empty() {
                 return Err(WireError::Malformed("hello"));
@@ -544,6 +590,7 @@ pub fn decode_body(msg_type: MsgType, body: &[u8]) -> Result<Message<'_>, WireEr
                 file_mtime,
                 max_chunk,
                 capabilities,
+                tree,
                 file_name,
             })
         }
@@ -748,7 +795,22 @@ mod tests {
             file_mtime: -5,
             max_chunk: 1427,
             capabilities: 0,
+            tree: None,
             file_name: "отчёт-2026.bin".to_string(),
+        }
+    }
+
+    fn tree_hello() -> Hello {
+        Hello {
+            file_size: 5 << 30,
+            tree: Some(TreeInfo {
+                manifest_len: 12_345,
+                manifest_hash: [7; 32],
+                files: 1000,
+                dirs: 20,
+            }),
+            file_name: "photos".into(),
+            ..hello()
         }
     }
 
@@ -783,6 +845,7 @@ mod tests {
     #[test]
     fn roundtrip_all_frames() {
         roundtrip(Message::Hello(hello()));
+        roundtrip(Message::Hello(tree_hello()));
         roundtrip(Message::HelloAck(hello_ack(
             vec![(1000, 1500), (2000, 2100)],
             5000,
@@ -874,6 +937,38 @@ mod tests {
             decode_body(MsgType::Ack, &b),
             Err(WireError::Malformed("ack"))
         ));
+        // Directory HELLOs whose manifest cannot fit the stream, is empty or
+        // lists too many entries, and unknown kinds.
+        let kind_at = 16 + 4 + 8 + 8 + 2 + 4;
+        for t in [
+            TreeInfo {
+                manifest_len: 0,
+                ..tree_hello().tree.unwrap()
+            },
+            TreeInfo {
+                manifest_len: (5 << 30) + 1,
+                ..tree_hello().tree.unwrap()
+            },
+            TreeInfo {
+                files: MAX_MANIFEST_ENTRIES,
+                dirs: 1,
+                ..tree_hello().tree.unwrap()
+            },
+            TreeInfo {
+                files: u64::MAX,
+                dirs: u64::MAX,
+                ..tree_hello().tree.unwrap()
+            },
+        ] {
+            let h = Hello {
+                tree: Some(t),
+                ..tree_hello()
+            };
+            assert!(decode_body(MsgType::Hello, &body(&Message::Hello(h))).is_err());
+        }
+        let mut b = body(&Message::Hello(hello()));
+        b[kind_at] = 2;
+        assert!(decode_body(MsgType::Hello, &b).is_err());
         // Unknown HELLO_ACK status.
         let mut b = body(&Message::HelloAck(hello_ack(vec![], 1000, "")));
         b[0] = 9;
@@ -981,6 +1076,22 @@ mod tests {
             hello: hello(),
         };
         assert_eq!(decode_initiation(&encode_initiation(&init)).unwrap(), init);
+        // The largest initiation (a directory with the longest name) stays
+        // well within a control datagram.
+        let big = Initiation {
+            hello: Hello {
+                file_name: "x".repeat(MAX_FILE_NAME_LEN),
+                ..tree_hello()
+            },
+            ..init
+        };
+        let enc = encode_initiation(&big);
+        assert_eq!(decode_initiation(&enc).unwrap(), big);
+        assert!(
+            enc.len() + crate::crypto::handshake::INITIATION_OVERHEAD <= MAX_CONTROL_DATAGRAM,
+            "{} bytes",
+            enc.len()
+        );
 
         // A response with the fullest possible hole list and a long message
         // still fits the control datagram bound; holes are never cut.
@@ -1014,6 +1125,7 @@ mod tests {
     fn trailing_bytes_in_control_bodies_are_ignored() {
         let msgs = [
             Message::Hello(hello()),
+            Message::Hello(tree_hello()),
             Message::HelloAck(hello_ack(vec![(1000, 1200)], 2000, "ok")),
             Message::Ack(Ack {
                 contiguous_upto: 1,

@@ -34,6 +34,30 @@ impl TransferStats {
     }
 }
 
+/// What a directory transfer holds, for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryInfo {
+    pub files: u64,
+    pub dirs: u64,
+}
+
+impl DirectoryInfo {
+    /// "12 files in 3 folders" (the directory itself not counted).
+    pub fn describe(&self) -> String {
+        let plural =
+            |n: u64, one: &str, many: &str| format!("{} {}", n, if n == 1 { one } else { many });
+        if self.dirs == 0 {
+            plural(self.files, "file", "files")
+        } else {
+            format!(
+                "{} in {}",
+                plural(self.files, "file", "files"),
+                plural(self.dirs, "folder", "folders")
+            )
+        }
+    }
+}
+
 /// Events emitted by senders and receivers.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
@@ -46,8 +70,12 @@ pub enum TransferEvent {
         peer_id: String,
         /// AEAD protecting the session.
         cipher: String,
+        /// Name of the file, or of the directory.
         file_name: String,
+        /// Bytes to transfer (for a directory: its listing and all files).
         file_size: u64,
+        /// Set for a directory transfer.
+        directory: Option<DirectoryInfo>,
         resumed_from: u64,
         chunk_size: u16,
     },
@@ -85,6 +113,8 @@ pub enum TransferEvent {
         sender_id: String,
         file_name: String,
         file_size: u64,
+        /// Set for a directory transfer.
+        directory: Option<DirectoryInfo>,
         resumed_bytes: u64,
     },
     /// Receiver side: result of NAT discovery (STUN / UPnP).
@@ -170,5 +200,9 @@ mod tests {
         assert_eq!(format_rate(1.5e9), "1.50 Gbit/s");
         assert_eq!(format_bytes(1536), "1.50 KiB");
         assert_eq!(format_bytes(12), "12 B");
+        let d = |files, dirs| DirectoryInfo { files, dirs }.describe();
+        assert_eq!(d(1, 0), "1 file");
+        assert_eq!(d(12, 3), "12 files in 3 folders");
+        assert_eq!(d(0, 1), "0 files in 1 folder");
     }
 }

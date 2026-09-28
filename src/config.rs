@@ -1,7 +1,7 @@
 //! Configuration for the sender and receiver engines.
 
 use crate::crypto::{Identity, SharpId};
-use crate::progress::EventCallback;
+use crate::progress::{DirectoryInfo, EventCallback};
 use crate::protocol::constants::*;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -116,8 +116,11 @@ pub struct IncomingRequest {
     pub peer: SocketAddr,
     /// Authenticated identity of the sender.
     pub sender_id: SharpId,
+    /// Name of the file, or of the directory.
     pub file_name: String,
     pub file_size: u64,
+    /// Set for a directory transfer.
+    pub directory: Option<DirectoryInfo>,
     /// Bytes already stored from an earlier attempt (resume).
     pub resumed_bytes: u64,
 }
@@ -129,6 +132,7 @@ pub struct SenderConfig {
     /// Identity of the receiver. Only the holder of its private key can
     /// answer the handshake, so this authenticates the receiver.
     pub receiver_id: SharpId,
+    /// The file to send, or a directory to send with everything below it.
     pub file_path: PathBuf,
     pub transport: TransportConfig,
     /// Directory for resume state; `None` = per-user data directory.
@@ -178,7 +182,8 @@ pub struct ReceiverConfig {
     pub bind: SocketAddr,
     pub output_dir: PathBuf,
     /// Replace an existing complete file with the same name instead of
-    /// writing `name (1).ext`.
+    /// writing `name (1).ext`. Directories are never replaced (nor merged):
+    /// a received directory whose name is taken is stored as `name (1)`.
     pub overwrite: bool,
     pub max_sessions: usize,
     pub transport: TransportConfig,

@@ -139,15 +139,24 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
             sender_id,
             file_name,
             file_size,
+            directory,
             resumed_bytes,
             ..
         } => {
+            let what = match directory {
+                Some(d) => format!(
+                    "folder {} ({}, {})",
+                    file_name,
+                    d.describe(),
+                    format_bytes(file_size)
+                ),
+                None => format!("{} ({})", file_name, format_bytes(file_size)),
+            };
             println!(
-                "Incoming from {} ({}): {} ({}){}",
+                "Incoming from {} ({}): {}{}",
                 peer,
                 sender_id,
-                file_name,
-                format_bytes(file_size),
+                what,
                 if resumed_bytes > 0 {
                     format!(", resuming from {}", format_bytes(resumed_bytes))
                 } else {

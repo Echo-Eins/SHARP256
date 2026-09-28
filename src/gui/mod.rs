@@ -10,6 +10,7 @@ use std::path::PathBuf;
 pub use receiver_gui::ReceiverApp;
 pub use sender_gui::SenderApp;
 
+/// Opens the sender window; `file` may be a file or a directory.
 pub fn run_sender_gui(file: Option<PathBuf>, receiver: Option<String>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

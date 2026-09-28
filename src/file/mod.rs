@@ -1,9 +1,13 @@
-//! File access for the transfer engines: positional reads for the sender, a
-//! dedicated coalescing writer thread for the receiver, whole-file hashing,
-//! disk-space queries and file-name hygiene.
+//! File access for the transfer engines: positional reads for the sender
+//! (of a file, or of a directory's stream, see [`tree`]), a dedicated
+//! coalescing writer thread for the receiver, whole-file hashing, disk-space
+//! queries and file-name hygiene.
 
+pub mod tree;
+
+use crate::protocol::wire::TreeInfo;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver as MpscReceiver, SyncSender, TryRecvError};
@@ -122,6 +126,75 @@ impl FileReader {
     }
 }
 
+/// What a sender transfers: one file, or the stream of a directory tree.
+pub enum Source {
+    File(FileReader),
+    Tree(Box<tree::TreeSource>),
+}
+
+impl Source {
+    /// Opens a file, or scans a directory (which reads the metadata of the
+    /// whole tree, so call it off the async runtime).
+    pub fn open(path: &Path) -> io::Result<Self> {
+        if std::fs::metadata(path)?.is_dir() {
+            Ok(Source::Tree(Box::new(tree::TreeSource::open(path)?)))
+        } else {
+            Ok(Source::File(FileReader::open(path)?))
+        }
+    }
+
+    /// Length of the transfer stream.
+    pub fn size(&self) -> u64 {
+        match self {
+            Source::File(f) => f.size(),
+            Source::Tree(t) => t.size(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Source::File(f) => f.path(),
+            Source::Tree(t) => t.root(),
+        }
+    }
+
+    /// Reads exactly `buf.len()` bytes of the stream at `offset`.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        match self {
+            Source::File(f) => f.read_at(offset, buf),
+            Source::Tree(t) => t.read_at(offset, buf),
+        }
+    }
+
+    /// Modification time announced in HELLO (a tree is identified by its
+    /// manifest instead).
+    pub fn mtime_unix(&self) -> i64 {
+        match self {
+            Source::File(f) => f.mtime_unix(),
+            Source::Tree(_) => 0,
+        }
+    }
+
+    pub fn tree(&self) -> Option<&tree::TreeSource> {
+        match self {
+            Source::File(_) => None,
+            Source::Tree(t) => Some(t),
+        }
+    }
+
+    pub fn tree_info(&self) -> Option<TreeInfo> {
+        self.tree().map(|t| t.info())
+    }
+
+    /// BLAKE3 of the whole stream (blocking).
+    pub fn hash(&self) -> io::Result<[u8; 32]> {
+        match self {
+            Source::File(f) => hash_file(f.path()),
+            Source::Tree(t) => t.hash(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Writer thread
 // ---------------------------------------------------------------------------
@@ -135,7 +208,12 @@ enum WriteCmd {
         len: usize,
     },
     Flush(oneshot::Sender<io::Result<()>>),
-    Close(oneshot::Sender<io::Result<()>>),
+    /// Write everything, sync and stop; `complete` also finishes a tree
+    /// (creates the entries no write created).
+    Close {
+        reply: oneshot::Sender<io::Result<()>>,
+        complete: bool,
+    },
 }
 
 /// Statistics shared between the writer thread and its owner.
@@ -144,10 +222,51 @@ struct WriterShared {
     queued_bytes: AtomicU64,
     written_bytes: AtomicU64,
     write_calls: AtomicU64,
+    /// First error the writer ran into. It keeps draining its queue so the
+    /// owner never wedges, but nothing it is given afterwards is written.
+    error: parking_lot::Mutex<Option<(io::ErrorKind, String)>>,
+}
+
+/// Where the writer thread puts the bytes.
+enum Target {
+    File(File),
+    Tree(Box<tree::TreeSink>),
+}
+
+impl Target {
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Target::File(f) => write_all_at(f, buf, offset),
+            Target::Tree(t) => t.write_at(offset, buf),
+        }
+    }
+
+    fn sync(&mut self, all: bool) -> io::Result<()> {
+        match self {
+            Target::File(f) if all => f.sync_all(),
+            Target::File(f) => f.sync_data(),
+            Target::Tree(t) => t.sync(all),
+        }
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        match self {
+            Target::File(_) => Ok(()),
+            Target::Tree(t) => t.finish(),
+        }
+    }
+
+    fn close_files(&mut self) {
+        if let Target::Tree(t) = self {
+            t.close_files();
+        }
+    }
 }
 
 /// Handle to a background thread that applies positional writes, coalescing
-/// contiguous chunks into large writes and running `fsync` on demand.
+/// contiguous chunks into large writes and running `fsync` on demand. It
+/// writes one file, or the files of a directory tree (whose stream offsets
+/// it maps to files).
 pub struct FileWriter {
     tx: Option<SyncSender<WriteCmd>>,
     shared: Arc<WriterShared>,
@@ -174,6 +293,41 @@ impl FileWriter {
         if file.metadata()?.len() != size {
             file.set_len(size)?;
         }
+        Self::start(Target::File(file), capacity_bytes, || {})
+    }
+
+    /// Starts a writer for the files of a directory tree below the staging
+    /// directory `root`; stream offsets below the manifest's end are not
+    /// its business. `resume` lets it reuse entries an earlier attempt of
+    /// the same transfer created. Before anything else the thread stores
+    /// `keep_manifest` (path, bytes), if given, so that any later
+    /// successful flush implies the manifest is durable too.
+    pub fn open_tree(
+        root: PathBuf,
+        plan: Arc<tree::Manifest>,
+        resume: bool,
+        keep_manifest: Option<(PathBuf, Arc<Vec<u8>>)>,
+        capacity_bytes: u64,
+    ) -> io::Result<Self> {
+        let sink = tree::TreeSink::new(root, plan, resume);
+        Self::start(Target::Tree(Box::new(sink)), capacity_bytes, move || {
+            if let Some((path, bytes)) = keep_manifest {
+                if let Err(e) = write_file_atomic(&path, &bytes) {
+                    tracing::warn!(
+                        "cannot keep the directory manifest for resume ({}): {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        })
+    }
+
+    fn start(
+        target: Target,
+        capacity_bytes: u64,
+        prelude: impl FnOnce() + Send + 'static,
+    ) -> io::Result<Self> {
         let shared = Arc::new(WriterShared::default());
         // The channel is bounded by message count as a safety net; the real
         // bound is `capacity_bytes`, enforced in `enqueue_slice`.
@@ -181,13 +335,23 @@ impl FileWriter {
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("sharp-writer".into())
-            .spawn(move || writer_loop(file, rx, thread_shared))?;
+            .spawn(move || {
+                prelude();
+                writer_loop(target, rx, thread_shared)
+            })?;
         Ok(Self {
             tx: Some(tx),
             shared,
             capacity_bytes: capacity_bytes.max(1 << 20),
             thread: Some(thread),
         })
+    }
+
+    /// The first error the writer ran into, if any; nothing queued after it
+    /// is written. `AlreadyExists` means two entries of a directory map to
+    /// the same local name, which no retry can fix.
+    pub fn error(&self) -> Option<(io::ErrorKind, String)> {
+        self.shared.error.lock().clone()
     }
 
     pub fn queued_bytes(&self) -> u64 {
@@ -273,10 +437,24 @@ impl FileWriter {
     }
 
     /// Writes everything queued, fsyncs, and stops the thread.
-    pub async fn close(mut self) -> io::Result<()> {
+    pub async fn close(self) -> io::Result<()> {
+        self.shutdown(false).await
+    }
+
+    /// Like [`FileWriter::close`], for a transfer whose data is complete: a
+    /// tree also gets the entries no write created (directories, empty
+    /// files).
+    pub async fn finish(self) -> io::Result<()> {
+        self.shutdown(true).await
+    }
+
+    async fn shutdown(mut self, complete: bool) -> io::Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(WriteCmd::Close(reply_tx));
+            let _ = tx.send(WriteCmd::Close {
+                reply: reply_tx,
+                complete,
+            });
         }
         let result = match reply_rx.await {
             Ok(r) => r,
@@ -305,11 +483,15 @@ impl Drop for FileWriter {
 const COALESCE_LIMIT: usize = 4 << 20;
 
 struct WriterState {
-    file: File,
+    target: Target,
     shared: Arc<WriterShared>,
     buf: Vec<u8>,
     buf_offset: u64,
     error: Option<io::Error>,
+}
+
+fn copy_error(e: &io::Error) -> io::Error {
+    io::Error::new(e.kind(), e.to_string())
 }
 
 impl WriterState {
@@ -329,14 +511,14 @@ impl WriterState {
             return;
         }
         if self.error.is_none() {
-            match write_all_at(&self.file, &self.buf, self.buf_offset) {
+            match self.target.write_at(self.buf_offset, &self.buf) {
                 Ok(()) => {
                     self.shared
                         .written_bytes
                         .fetch_add(self.buf.len() as u64, Ordering::Relaxed);
                     self.shared.write_calls.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(e) => self.error = Some(e),
+                Err(e) => self.fail(e),
             }
         }
         // Release capacity even on error so the session cannot wedge; the
@@ -347,22 +529,41 @@ impl WriterState {
         self.buf.clear();
     }
 
+    fn fail(&mut self, e: io::Error) {
+        if self.error.is_none() {
+            *self.shared.error.lock() = Some((e.kind(), e.to_string()));
+            self.error = Some(e);
+        }
+    }
+
     fn sync(&mut self, all: bool) -> io::Result<()> {
         self.flush_buf();
         if let Some(e) = &self.error {
-            return Err(io::Error::new(e.kind(), e.to_string()));
+            return Err(copy_error(e));
         }
-        if all {
-            self.file.sync_all()
-        } else {
-            self.file.sync_data()
+        self.target.sync(all).map_err(|e| {
+            let copy = copy_error(&e);
+            self.fail(e);
+            copy
+        })
+    }
+
+    fn close(&mut self, complete: bool) -> io::Result<()> {
+        self.flush_buf();
+        if complete && self.error.is_none() {
+            if let Err(e) = self.target.finish() {
+                self.fail(e);
+            }
         }
+        let result = self.sync(true);
+        self.target.close_files();
+        result
     }
 }
 
-fn writer_loop(file: File, rx: MpscReceiver<WriteCmd>, shared: Arc<WriterShared>) {
+fn writer_loop(target: Target, rx: MpscReceiver<WriteCmd>, shared: Arc<WriterShared>) {
     let mut st = WriterState {
-        file,
+        target,
         shared,
         buf: Vec::with_capacity(COALESCE_LIMIT),
         buf_offset: 0,
@@ -394,14 +595,27 @@ fn writer_loop(file: File, rx: MpscReceiver<WriteCmd>, shared: Arc<WriterShared>
                 let r = st.sync(false);
                 let _ = reply.send(r);
             }
-            WriteCmd::Close(reply) => {
-                let r = st.sync(true);
+            WriteCmd::Close { reply, complete } => {
+                let r = st.close(complete);
                 let _ = reply.send(r);
                 return;
             }
         }
     }
-    let _ = st.sync(true);
+    let _ = st.close(false);
+}
+
+/// Replaces `path` with `bytes` durably (temporary file, fsync, rename).
+pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 // ---------------------------------------------------------------------------
@@ -499,13 +713,7 @@ pub fn sanitize_file_name(name: &str) -> Option<String> {
     if trimmed.len() > crate::protocol::constants::MAX_FILE_NAME_LEN {
         return None;
     }
-    // Windows reserved device names.
-    let stem = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if RESERVED.contains(&stem.as_str()) {
+    if tree::is_windows_reserved(&trimmed) {
         return Some(format!("_{}", trimmed));
     }
     Some(trimmed)

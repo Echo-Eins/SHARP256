@@ -1,9 +1,10 @@
 //! Persistent transfer state used to resume interrupted transfers.
 //!
-//! The receiver stores which byte ranges of the partial file are durable
-//! (written and fsynced). The sender stores the transfer id it used for a
-//! given (file, peer) so that a restarted sender can present the same id.
-//! Files are written atomically (temp file + rename).
+//! The receiver stores which byte ranges of the partial file (or of the
+//! stream of a partial directory) are durable (written and fsynced), and for
+//! a directory also its manifest. The sender stores the transfer id it used
+//! for a given (file or directory, peer) so that a restarted sender can
+//! present the same id. Files are written atomically (temp file + rename).
 
 use crate::protocol::RangeSet;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,13 @@ pub struct ReceiverState {
     /// SHARP ID of the sender; only the same sender may resume the transfer.
     #[serde(default)]
     pub sender: String,
+    /// Directory transfers: BLAKE3 of the manifest (hex) and its length;
+    /// empty and 0 for a single file. `part_path` is then the staging
+    /// directory and `durable` refers to the transfer stream.
+    #[serde(default)]
+    pub manifest_hash: String,
+    #[serde(default)]
+    pub manifest_len: u64,
     /// Byte ranges that are written and fsynced.
     pub durable: Vec<(u64, u64)>,
     pub updated_unix: u64,
@@ -70,6 +78,9 @@ pub struct SenderState {
     pub file_path: PathBuf,
     pub file_size: u64,
     pub file_mtime: i64,
+    /// BLAKE3 (hex) of the manifest when the path is a directory.
+    #[serde(default)]
+    pub manifest_hash: String,
     pub peer: String,
     pub updated_unix: u64,
 }
@@ -103,6 +114,15 @@ impl StateStore {
         self.dir.join(format!("recv-{}.json", transfer_id))
     }
 
+    /// Where the manifest of a directory transfer is kept for resume.
+    pub fn manifest_path(&self, transfer_id: &str) -> PathBuf {
+        self.dir.join(format!("recv-{}.manifest", transfer_id))
+    }
+
+    pub fn load_manifest(&self, transfer_id: &str) -> Option<Vec<u8>> {
+        fs::read(self.manifest_path(transfer_id)).ok()
+    }
+
     fn sender_path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("send-{}.json", key))
     }
@@ -129,17 +149,19 @@ impl StateStore {
 
     pub fn remove_receiver(&self, transfer_id: &str) {
         let _ = fs::remove_file(self.receiver_path(transfer_id));
+        let _ = fs::remove_file(self.manifest_path(transfer_id));
     }
 
-    /// Finds the most recent receiver state of `sender` for a file of this
-    /// name, size and source modification time whose partial file still
-    /// exists.
+    /// Finds the most recent receiver state of `sender` for a file (or
+    /// directory, identified by its manifest hash) of this name, size and
+    /// source modification time whose partial file still exists.
     pub fn find_receiver_by_file(
         &self,
         sender: &str,
         file_name: &str,
         file_size: u64,
         file_mtime: i64,
+        manifest_hash: &str,
     ) -> Option<ReceiverState> {
         let mut best: Option<ReceiverState> = None;
         for entry in fs::read_dir(&self.dir).ok()?.flatten() {
@@ -159,6 +181,7 @@ impl StateStore {
                 || st.file_name != file_name
                 || st.file_size != file_size
                 || st.file_mtime != file_mtime
+                || st.manifest_hash != manifest_hash
                 || !st.part_path.exists()
             {
                 continue;
@@ -229,15 +252,17 @@ impl StateStore {
                 .and_then(|v| v.get("part_path").and_then(|p| p.as_str()))
                 .map(PathBuf::from);
             if let Some(part) = part {
-                // Only ever delete our own partial files.
+                // Only ever delete our own partial files (or staging
+                // directories).
                 let ours = part
                     .file_name()
                     .is_some_and(|n| n.to_string_lossy().ends_with(crate::file::PART_SUFFIX));
-                if ours && fs::remove_file(&part).is_ok() {
-                    tracing::info!("removed abandoned partial file {}", part.display());
+                if ours && part.exists() && crate::file::tree::remove_partial(&part).is_ok() {
+                    tracing::info!("removed abandoned partial transfer {}", part.display());
                 }
             }
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path.with_extension("manifest"));
             removed += 1;
         }
         Ok(removed)
@@ -264,6 +289,8 @@ mod tests {
             final_path: dir.path().join("f.bin"),
             peer: "127.0.0.1:1".into(),
             sender: "sh-a".into(),
+            manifest_hash: String::new(),
+            manifest_len: 0,
             durable: vec![(0, 100), (200, 300)],
             updated_unix: 0,
         };
@@ -273,22 +300,26 @@ mod tests {
         assert_eq!(loaded.format, STATE_FORMAT_VERSION);
         assert_eq!(loaded.file_mtime, 1_700_000_000);
         assert!(store
-            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_000)
+            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_000, "")
             .is_some());
         assert!(store
-            .find_receiver_by_file("sh-a", "f.bin", 999, 1_700_000_000)
+            .find_receiver_by_file("sh-a", "f.bin", 999, 1_700_000_000, "")
             .is_none());
         // The source changed since the partial file was started.
         assert!(store
-            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_001)
+            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_001, "")
             .is_none());
         // Another sender never resumes this partial file.
         assert!(store
-            .find_receiver_by_file("sh-b", "f.bin", 1000, 1_700_000_000)
+            .find_receiver_by_file("sh-b", "f.bin", 1000, 1_700_000_000, "")
+            .is_none());
+        // A directory of the same name is something else.
+        assert!(store
+            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_000, "ab12")
             .is_none());
         fs::remove_file(&part).unwrap();
         assert!(store
-            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_000)
+            .find_receiver_by_file("sh-a", "f.bin", 1000, 1_700_000_000, "")
             .is_none());
         store.remove_receiver(&st.transfer_id);
         assert!(store.load_receiver(&st.transfer_id).is_none());
@@ -299,10 +330,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(Some(dir.path().join("states"))).unwrap();
         let part = dir.path().join("old.bin.sharp-part");
+        let staging = dir.path().join("photos.sharp-part");
         let foreign = dir.path().join("keep.txt");
         fs::write(&part, b"partial").unwrap();
+        fs::create_dir_all(staging.join("a/b")).unwrap();
+        fs::write(staging.join("a/b/c.jpg"), b"partial").unwrap();
         fs::write(&foreign, b"user data").unwrap();
-        for (id, part_path) in [(1u8, part.clone()), (2u8, foreign.clone())] {
+        fs::write(store.manifest_path(&hex16(&[3; 16])), b"manifest").unwrap();
+        for (id, part_path) in [
+            (1u8, part.clone()),
+            (2u8, foreign.clone()),
+            (3u8, staging.clone()),
+        ] {
             let st = ReceiverState {
                 format: STATE_FORMAT_VERSION,
                 transfer_id: hex16(&[id; 16]),
@@ -313,6 +352,8 @@ mod tests {
                 final_path: dir.path().join("old.bin"),
                 peer: "127.0.0.1:1".into(),
                 sender: String::new(),
+                manifest_hash: String::new(),
+                manifest_len: 0,
                 durable: vec![(0, 7)],
                 updated_unix: 1, // long ago
             };
@@ -321,9 +362,14 @@ mod tests {
         }
         assert_eq!(
             store.cleanup_older_than(Duration::from_secs(3600)).unwrap(),
-            2
+            3
         );
         assert!(!part.exists(), "abandoned partial file must be removed");
+        assert!(
+            !staging.exists(),
+            "abandoned staging directory must be removed"
+        );
+        assert!(store.load_manifest(&hex16(&[3; 16])).is_none());
         assert!(
             foreign.exists(),
             "files that are not ours are never touched"
@@ -341,6 +387,7 @@ mod tests {
             file_path: PathBuf::from("/tmp/x.bin"),
             file_size: 5,
             file_mtime: 1,
+            manifest_hash: String::new(),
             peer: "10.0.0.1:5555".into(),
             updated_unix: 0,
         };

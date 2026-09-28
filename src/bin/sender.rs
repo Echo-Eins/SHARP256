@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use sharp256::crypto::{psk_from_passphrase, Identity};
-use sharp256::progress::{format_bytes, format_rate, parse_rate};
+use sharp256::progress::{format_bytes, format_rate, parse_rate, DirectoryInfo};
 use sharp256::{init_logging, system_info, Sender, SenderConfig, TransferEvent};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use std::time::Instant;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "SHARP-256 file sender", long_about = None)]
 struct Args {
-    /// File to send (omit to open the GUI, if built with it)
+    /// File or folder to send (omit to open the GUI, if built with it)
     file: Option<PathBuf>,
 
     /// Receiver as <ID>@<host>:<port> (the receiver prints it at startup)
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     match (&args.file, &args.receiver) {
         (Some(file), Some(receiver)) => run_headless(&args, file.clone(), receiver.clone()).await,
         _ if args.headless => {
-            anyhow::bail!("headless mode needs both <FILE> and <RECEIVER>")
+            anyhow::bail!("headless mode needs both <FILE|FOLDER> and <RECEIVER>")
         }
         _ => {
             #[cfg(feature = "gui")]
@@ -93,15 +93,15 @@ async fn main() -> Result<()> {
             }
             #[cfg(not(feature = "gui"))]
             {
-                anyhow::bail!("usage: sharp-sender <FILE> <ID>@<HOST>:<PORT>")
+                anyhow::bail!("usage: sharp-sender <FILE|FOLDER> <ID>@<HOST>:<PORT>")
             }
         }
     }
 }
 
 async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()> {
-    if !file.is_file() {
-        anyhow::bail!("not a file: {}", file.display());
+    if !file.exists() {
+        anyhow::bail!("no such file or folder: {}", file.display());
     }
     let (receiver_id, host) =
         sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?;
@@ -109,13 +109,10 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
         .await
         .with_context(|| format!("cannot resolve {}", host))?;
     let identity = load_identity(&args.identity)?;
-    let size = std::fs::metadata(&file)?.len();
+    let sender_id = identity.id();
     println!("{}", system_info());
-    println!("File:      {} ({})", file.display(), format_bytes(size));
-    println!("Receiver:  {} ({})", addr, receiver_id);
-    println!("Sender ID: {}", identity.id());
 
-    let mut cfg = SenderConfig::new(addr, receiver_id, file);
+    let mut cfg = SenderConfig::new(addr, receiver_id, file.clone());
     cfg.bind = args.bind;
     let _ = args.no_nat;
     cfg.state_dir = args.state_dir.clone();
@@ -183,6 +180,34 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     }));
 
     let sender = Sender::new(cfg).await.context("cannot start sender")?;
+    match sender.source().tree() {
+        Some(tree) => {
+            let m = tree.manifest();
+            let contents = DirectoryInfo {
+                files: m.files(),
+                dirs: m.dirs(),
+            };
+            println!(
+                "Folder:    {} ({}, {})",
+                file.display(),
+                contents.describe(),
+                format_bytes(m.data_len())
+            );
+            if !tree.skipped().is_empty() {
+                println!(
+                    "Skipped:   {} symbolic link(s) or special file(s), which are not sent",
+                    tree.skipped().len()
+                );
+            }
+        }
+        None => println!(
+            "File:      {} ({})",
+            file.display(),
+            format_bytes(sender.source().size())
+        ),
+    }
+    println!("Receiver:  {} ({})", addr, receiver_id);
+    println!("Sender ID: {}", sender_id);
     let cancel = sender.cancel_token();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {

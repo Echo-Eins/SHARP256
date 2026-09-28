@@ -1,6 +1,8 @@
 //! Sending side of a SHARP-256 transfer.
 //!
-//! One `Sender` moves one file to one receiver. The engine is a single-owner
+//! One `Sender` moves one file, or one directory tree, to one receiver (a
+//! directory travels as a single stream: its manifest followed by the
+//! contents of its files, see [`crate::file::tree`]). The engine is a single-owner
 //! state machine. Each turn of its loop drains every datagram already queued
 //! on the socket, runs timers, and then sends as much as the congestion
 //! window, the receiver window and the pacer allow:
@@ -26,8 +28,8 @@ use crate::crypto::handshake::{self as hs, Initiator, COOKIE_REPLY_LEN};
 use crate::crypto::replay::ReplayWindow;
 use crate::crypto::transport::{begin_packet, peek_cid, SessionKeys, Suite};
 use crate::crypto::{CryptoError, Identity, SharpId, NO_PSK};
-use crate::file::{hash_file, hash_to_hex, sanitize_file_name, FileReader};
-use crate::progress::{emit, EventCallback, TransferEvent, TransferStats};
+use crate::file::{hash_to_hex, sanitize_file_name, Source};
+use crate::progress::{emit, DirectoryInfo, EventCallback, TransferEvent, TransferStats};
 use crate::protocol::constants::*;
 use crate::protocol::wire::{
     self, type_byte, Abort, Hello, HelloAck, Message, MsgType, Ping, Probe, MAX_CONTROL_BODY,
@@ -93,13 +95,14 @@ pub struct Sender {
     cfg: SenderConfig,
     identity: Identity,
     socket: Arc<UdpSocket>,
-    reader: Arc<FileReader>,
+    source: Arc<Source>,
     cancel: CancellationToken,
     store: Option<StateStore>,
 }
 
 impl Sender {
-    /// Binds the socket and opens the file. Nothing is sent yet.
+    /// Binds the socket and opens the file, or scans the directory. Nothing
+    /// is sent yet.
     pub async fn new(cfg: SenderConfig) -> Result<Self, SendError> {
         let cfg = SenderConfig {
             transport: cfg.transport.normalized(),
@@ -114,13 +117,29 @@ impl Sender {
                     .map_err(|e| SendError::Identity(format!("{}: {}", path.display(), e)))?
             }
         };
-        let reader = FileReader::open(&cfg.file_path)?;
+        let path = cfg.file_path.clone();
+        let source = tokio::task::spawn_blocking(move || Source::open(&path))
+            .await
+            .map_err(io::Error::other)??;
+        if let Some(tree) = source.tree() {
+            for p in tree.skipped().iter().take(20) {
+                tracing::warn!("not sent (symbolic link or special file): {}", p.display());
+            }
+            if tree.skipped().len() > 20 {
+                tracing::warn!("... and {} more not sent", tree.skipped().len() - 20);
+            }
+        }
         let socket = bind_udp(cfg.bind, cfg.transport.socket_buffer_bytes)?;
         tracing::info!(
-            "sender bound to {}, file {} ({} bytes)",
+            "sender bound to {}, {} {} ({} bytes)",
             socket.local_addr()?,
+            if source.tree().is_some() {
+                "directory"
+            } else {
+                "file"
+            },
             cfg.file_path.display(),
-            reader.size()
+            source.size()
         );
         let store = match StateStore::open(cfg.state_dir.clone()) {
             Ok(s) => {
@@ -141,7 +160,7 @@ impl Sender {
             cfg,
             identity,
             socket: Arc::new(socket),
-            reader: Arc::new(reader),
+            source: Arc::new(source),
             cancel: CancellationToken::new(),
             store,
         })
@@ -161,34 +180,51 @@ impl Sender {
         self.cancel.clone()
     }
 
+    /// What is being sent (for a directory: its listing, and what was
+    /// skipped).
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
     /// Runs the transfer to completion.
     pub async fn run(self) -> Result<TransferSummary, SendError> {
-        let file_name = self
-            .cfg
-            .file_path
+        // A directory is named after itself even when given as "." or "..".
+        let named = match self.source.tree() {
+            Some(_) => {
+                std::fs::canonicalize(&self.cfg.file_path).unwrap_or(self.cfg.file_path.clone())
+            }
+            None => self.cfg.file_path.clone(),
+        };
+        let file_name = named
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .and_then(|n| sanitize_file_name(&n))
             .ok_or_else(|| SendError::BadFileName(self.cfg.file_path.display().to_string()))?;
 
-        let size = self.reader.size();
-        let mtime = self.reader.mtime_unix();
+        let size = self.source.size();
+        let mtime = self.source.mtime_unix();
+        let manifest_hex = self
+            .source
+            .tree_info()
+            .map(|t| hash_to_hex(&t.manifest_hash))
+            .unwrap_or_default();
         // Resume state is kept per receiver identity, not per address.
         let peer_str = self.cfg.receiver_id.to_string();
         // Present the id of an interrupted attempt so the receiver resumes
-        // it, unless the file changed since (its data would not match).
+        // it, unless the source changed since (its data would not match).
         let transfer_id = self
             .store
             .as_ref()
             .and_then(|s| s.load_sender(&self.cfg.file_path, size, &peer_str))
-            .filter(|st| st.file_mtime == mtime)
+            .filter(|st| st.file_mtime == mtime && st.manifest_hash == manifest_hex)
             .and_then(|st| parse_hex16(&st.transfer_id))
             .unwrap_or_else(rand::random::<[u8; 16]>);
 
-        // Whole-file hash in the background; it is only needed at the end.
-        let hash_path = self.cfg.file_path.clone();
+        // Hash of the whole stream in the background; it is only needed at
+        // the end.
+        let hash_source = self.source.clone();
         let hash_task: JoinHandle<io::Result<[u8; 32]>> =
-            tokio::task::spawn_blocking(move || hash_file(&hash_path));
+            tokio::task::spawn_blocking(move || hash_source.hash());
 
         let mut engine = Engine::new(
             self.cfg.transport.clone(),
@@ -199,7 +235,7 @@ impl Sender {
                 receiver: self.cfg.receiver_id,
                 psk: self.cfg.psk.unwrap_or(NO_PSK),
             },
-            self.reader.clone(),
+            self.source.clone(),
             file_name,
             transfer_id,
             self.cfg.events.clone(),
@@ -239,6 +275,7 @@ impl Sender {
                         file_path: self.cfg.file_path.clone(),
                         file_size: size,
                         file_mtime: mtime,
+                        manifest_hash: manifest_hex.clone(),
                         peer: peer_str.clone(),
                         updated_unix: 0,
                     };
@@ -369,7 +406,7 @@ struct Engine {
     cfg: TransportConfig,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
-    reader: Arc<FileReader>,
+    reader: Arc<Source>,
     size: u64,
     file_name: String,
     transfer_id: [u8; 16],
@@ -477,7 +514,7 @@ impl Engine {
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
         auth: Peer,
-        reader: Arc<FileReader>,
+        reader: Arc<Source>,
         file_name: String,
         transfer_id: [u8; 16],
         events: Option<EventCallback>,
@@ -720,6 +757,7 @@ impl Engine {
             file_mtime: self.reader.mtime_unix(),
             max_chunk: self.cfg.max_chunk,
             capabilities: SUPPORTED_CAPS,
+            tree: self.reader.tree_info(),
             file_name: self.file_name.clone(),
         }
     }
@@ -1000,6 +1038,10 @@ impl Engine {
                 cipher: cipher.to_string(),
                 file_name: self.file_name.clone(),
                 file_size: self.size,
+                directory: self.reader.tree_info().map(|t| DirectoryInfo {
+                    files: t.files,
+                    dirs: t.dirs,
+                }),
                 resumed_from: self.resumed_from,
                 chunk_size: self.chunk,
             },

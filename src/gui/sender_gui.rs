@@ -29,6 +29,7 @@ pub struct SenderApp {
     cancel: Option<CancellationToken>,
     error: Option<String>,
     pick_file: bool,
+    pick_folder: bool,
 }
 
 impl SenderApp {
@@ -49,12 +50,13 @@ impl SenderApp {
             cancel: None,
             error: None,
             pick_file: false,
+            pick_folder: false,
         }
     }
 
     fn start(&mut self, ctx: &egui::Context) {
         let Some(file) = self.file_path.clone() else {
-            self.error = Some("Select a file first".into());
+            self.error = Some("Select a file or folder first".into());
             return;
         };
         let identity = match &self.identity {
@@ -172,6 +174,15 @@ impl eframe::App for SenderApp {
                 self.file_path = Some(path);
             }
         }
+        if self.pick_folder {
+            self.pick_folder = false;
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Select folder to send")
+                .pick_folder()
+            {
+                self.file_path = Some(path);
+            }
+        }
 
         let state = self.state.lock().clone();
         let busy = matches!(state, State::Connecting | State::Transferring(_));
@@ -195,24 +206,34 @@ impl eframe::App for SenderApp {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("File:");
+                        ui.label("Send:");
                         match &self.file_path {
                             Some(p) => {
-                                ui.label(
-                                    p.file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default(),
-                                );
-                                if let Ok(m) = std::fs::metadata(p) {
-                                    ui.label(format!("({})", format_bytes(m.len())));
+                                let name = p
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| p.display().to_string());
+                                match std::fs::metadata(p) {
+                                    Ok(m) if m.is_dir() => {
+                                        ui.label(format!("folder {}", name));
+                                    }
+                                    Ok(m) => {
+                                        ui.label(format!("{} ({})", name, format_bytes(m.len())));
+                                    }
+                                    Err(_) => {
+                                        ui.label(name);
+                                    }
                                 }
                             }
                             None => {
-                                ui.label("none selected");
+                                ui.label("nothing selected");
                             }
                         }
-                        if ui.button("Browse...").clicked() {
+                        if ui.button("File...").clicked() {
                             self.pick_file = true;
+                        }
+                        if ui.button("Folder...").clicked() {
+                            self.pick_folder = true;
                         }
                     });
                     ui.horizontal(|ui| {

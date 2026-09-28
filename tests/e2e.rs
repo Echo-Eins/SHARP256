@@ -980,6 +980,7 @@ fn fake_hello(tid: [u8; 16], name: &str) -> sharp256::protocol::wire::Hello {
         file_mtime: 0,
         max_chunk: DEFAULT_CHUNK,
         capabilities: CAP_NONE,
+        tree: None,
         file_name: name.into(),
     }
 }
@@ -990,6 +991,13 @@ fn fake_initiation(
     tid: [u8; 16],
     name: &str,
 ) -> (sharp256::crypto::handshake::Initiator, Vec<u8>) {
+    fake_initiation_with(receiver, fake_hello(tid, name))
+}
+
+fn fake_initiation_with(
+    receiver: SharpId,
+    hello: sharp256::protocol::wire::Hello,
+) -> (sharp256::crypto::handshake::Initiator, Vec<u8>) {
     use sharp256::crypto::handshake::{initiation_timestamp, Initiator};
     use sharp256::crypto::{Suite, NO_PSK};
     use sharp256::protocol::wire;
@@ -999,7 +1007,7 @@ fn fake_initiation(
         suites: Suite::ALL_BITS,
         hardware_aes: false,
         hello_flags: 0,
-        hello: fake_hello(tid, name),
+        hello,
     });
     let pkt = init.initiation(&payload, None).unwrap();
     (init, pkt)
@@ -1007,10 +1015,14 @@ fn fake_initiation(
 
 impl FakeSender {
     async fn connect(r: &TestReceiver, tid: [u8; 16], name: &str) -> (Self, u8) {
+        Self::connect_with(r, fake_hello(tid, name)).await
+    }
+
+    async fn connect_with(r: &TestReceiver, hello: sharp256::protocol::wire::Hello) -> (Self, u8) {
         use sharp256::crypto::{SessionKeys, Suite};
         use sharp256::protocol::wire;
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (init, pkt) = fake_initiation(r.id, tid, name);
+        let (init, pkt) = fake_initiation_with(r.id, hello);
         sock.send_to(&pkt, r.addr).await.unwrap();
         let mut buf = vec![0u8; 2048];
         let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
@@ -1447,5 +1459,381 @@ async fn transfer_waits_for_the_users_decision() {
     if let TransferEvent::Completed { path: Some(p), .. } = ev {
         assert_same(&path, Path::new(&p));
     }
+    stop_receiver(r).await;
+}
+
+// ---------------------------------------------------------------------------
+// Directories
+// ---------------------------------------------------------------------------
+
+/// Builds a tree with nested and empty directories, empty, small and larger
+/// files, a non-ASCII name and (on Unix) an executable and a symbolic link.
+fn make_tree(dir: &Path, name: &str, seed: u64, big: usize, many: usize) -> PathBuf {
+    let root = dir.join(name);
+    std::fs::create_dir_all(root.join("empty-dir")).unwrap();
+    std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+    make_file(&root, "top.bin", big, seed);
+    make_file(&root.join("a"), "empty.txt", 0, seed + 1);
+    make_file(&root.join("a/b"), "middle.bin", big / 3, seed + 2);
+    make_file(&root.join("a/b/c"), "отчёт 2026.txt", 777, seed + 3);
+    let dir_many = root.join("many");
+    std::fs::create_dir_all(&dir_many).unwrap();
+    for i in 0..many {
+        make_file(
+            &dir_many,
+            &format!("f{:04}.dat", i),
+            (i * 37) % 5000,
+            seed + 10 + i as u64,
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = make_file(&root, "run.sh", 100, seed + 4);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("top.bin", root.join("link-to-top")).unwrap();
+    }
+    root
+}
+
+/// Names in `dir` that a directory transfer carries (no symbolic links).
+fn tree_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| !e.file_type().unwrap().is_symlink())
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `b` holds the same tree as `a`: names, kinds, contents, modification
+/// times and (on Unix) the owner's permission bits.
+fn assert_same_tree(a: &Path, b: &Path) {
+    assert_eq!(tree_names(a), tree_names(b), "entries of {}", b.display());
+    for name in tree_names(a) {
+        let (pa, pb) = (a.join(&name), b.join(&name));
+        let (ma, mb) = (
+            std::fs::symlink_metadata(&pa).unwrap(),
+            std::fs::symlink_metadata(&pb).unwrap(),
+        );
+        assert_eq!(ma.is_dir(), mb.is_dir(), "kind of {}", pb.display());
+        if ma.is_dir() {
+            assert_same_tree(&pa, &pb);
+        } else {
+            assert_same(&pa, &pb);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                ma.permissions().mode() & 0o700,
+                mb.permissions().mode() & 0o700,
+                "mode of {}",
+                pb.display()
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::metadata(a).unwrap().modified().unwrap(),
+        std::fs::metadata(b).unwrap().modified().unwrap(),
+        "modification time of {}",
+        b.display()
+    );
+}
+
+fn partial_leftovers(out: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().contains(".sharp-part"))
+        .collect()
+}
+
+/// A tree with every kind of entry crosses a lossy, reordering link intact,
+/// next to (never into) an existing directory of the same name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_tree_arrives_intact() {
+    init_test_logging();
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let root = make_tree(&src, "project", 100, 3 << 20, 300);
+    std::fs::create_dir_all(out.join("project")).unwrap();
+    std::fs::write(out.join("project/keep.txt"), b"mine").unwrap();
+
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            drop: 0.02,
+            dup: 0.01,
+            reorder: 0.02,
+            reorder_delay: Duration::from_millis(3),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let summary = run_sender(sender_cfg(&root, proxy.addr, r.id, &state))
+        .await
+        .expect("send");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    let TransferEvent::Completed {
+        path: Some(p),
+        peer_confirmed,
+        file_hash_hex,
+        ..
+    } = ev
+    else {
+        panic!("unexpected event {:?}", ev)
+    };
+    assert!(peer_confirmed);
+    assert_eq!(file_hash_hex, summary.file_hash_hex);
+    assert_eq!(Path::new(&p), out.join("project (1)"));
+    assert_same_tree(&root, Path::new(&p));
+    assert!(
+        !Path::new(&p).join("link-to-top").exists(),
+        "links are not sent"
+    );
+    assert_eq!(
+        std::fs::read(out.join("project/keep.txt")).unwrap(),
+        b"mine"
+    );
+    assert!(partial_leftovers(&out).is_empty());
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    stop_receiver(r).await;
+}
+
+/// Data that overtakes the directory listing (because the listing's first
+/// packets were lost) is kept and written once the listing is complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_data_overtaking_its_listing_is_kept() {
+    init_test_logging();
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let root = make_tree(&src, "overtake", 200, 1 << 20, 200);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    // Datagram 0 is the path probe; 1 and 2 carry the start of the listing.
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            drop: 1.0,
+            data_loss_window: Some((1, 2)),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let summary = run_sender(sender_cfg(&root, proxy.addr, r.id, &state))
+        .await
+        .expect("send");
+    assert!(summary.retransmitted_bytes > 0, "the listing was resent");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same_tree(&root, Path::new(&p));
+    }
+    stop_receiver(r).await;
+}
+
+/// A receiver that crashes in the middle of a directory resumes it after a
+/// restart from the saved listing and the files already on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_resumes_after_receiver_restart() {
+    init_test_logging();
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let root = make_tree(&src, "photos", 300, 3 << 20, 50);
+    let r1 = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(r1.addr, Impairment::none()).await;
+    let identity = r1.identity.clone();
+
+    let mut cfg = sender_cfg(&root, proxy.addr, r1.id, &state);
+    cfg.transport.max_rate_bytes = Some(2_000_000);
+    let sender_task = tokio::spawn(run_sender(cfg));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while proxy.to_target_bytes.load(Ordering::Relaxed) < 2 << 20 {
+        assert!(Instant::now() < deadline, "transfer did not progress");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    proxy.blackhole.store(true, Ordering::Relaxed);
+    stop_receiver(r1).await;
+    assert!(out.join("photos.sharp-part").is_dir(), "staging kept");
+    let kept: Vec<_> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".manifest"))
+        .collect();
+    assert_eq!(kept.len(), 1, "listing kept for resume");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut r2 = start_receiver(&out, &state, |c| c.identity = Some(identity.clone())).await;
+    *proxy.target.lock() = r2.addr;
+    proxy.blackhole.store(false, Ordering::Relaxed);
+    let summary = tokio::time::timeout(Duration::from_secs(90), sender_task)
+        .await
+        .expect("sender finished in time")
+        .unwrap()
+        .expect("send");
+    let mut resumed_from = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let path = loop {
+        match tokio::time::timeout(deadline - Instant::now(), r2.events.recv()).await {
+            Ok(Some(TransferEvent::Started {
+                resumed_from: rf,
+                directory,
+                ..
+            })) => {
+                assert!(directory.is_some());
+                resumed_from = Some(rf);
+            }
+            Ok(Some(TransferEvent::Completed { path: Some(p), .. })) => break p,
+            Ok(Some(TransferEvent::Failed { error, .. })) => panic!("receiver failed: {}", error),
+            Ok(Some(_)) => {}
+            _ => panic!("no completion from restarted receiver"),
+        }
+    };
+    assert!(resumed_from.expect("started") >= 1 << 20);
+    let total = summary.file_size;
+    assert!(
+        summary.bytes_sent < total + total / 3,
+        "resume must not resend everything (sent {} of {})",
+        summary.bytes_sent,
+        total
+    );
+    assert_eq!(Path::new(&path), out.join("photos"));
+    assert_same_tree(&root, Path::new(&path));
+    assert!(partial_leftovers(&out).is_empty());
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    stop_receiver(r2).await;
+}
+
+/// A cancelled directory transfer continues where it stopped when the
+/// sender tries again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_resumes_after_sender_cancel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let root = make_tree(&src, "docs", 400, 2 << 20, 20);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let mut cfg = sender_cfg(&root, r.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(1_500_000);
+    let sender = Sender::new(cfg).await.unwrap();
+    let cancel = sender.cancel_token();
+    let task = tokio::spawn(sender.run());
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    cancel.cancel();
+    assert!(matches!(task.await.unwrap(), Err(SendError::Cancelled)));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let summary = run_sender(sender_cfg(&root, r.addr, r.id, &state))
+        .await
+        .expect("second attempt");
+    assert!(summary.resumed_from > 0, "second attempt must resume");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match tokio::time::timeout(deadline - Instant::now(), r.events.recv()).await {
+            Ok(Some(TransferEvent::Completed { path: Some(p), .. })) => {
+                assert_same_tree(&root, Path::new(&p));
+                break;
+            }
+            Ok(Some(TransferEvent::Failed {
+                error,
+                resumable: false,
+                ..
+            })) => panic!("receiver failed: {}", error),
+            Ok(Some(_)) => {}
+            _ => panic!("no completion"),
+        }
+    }
+    stop_receiver(r).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_directory_is_transferred() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let root = src.join("nothing-here");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    run_sender(sender_cfg(&root, r.addr, r.id, &state))
+        .await
+        .expect("send");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_eq!(Path::new(&p), out.join("nothing-here"));
+        assert_same_tree(&root, Path::new(&p));
+    }
+    stop_receiver(r).await;
+}
+
+/// Sends `listing` as a directory (with `data` after it) from a hand-driven
+/// sender and returns the receiver's failure.
+async fn send_listing(
+    r: &mut TestReceiver,
+    listing: &[u8],
+    announced_hash: [u8; 32],
+    data: &[u8],
+) -> (String, bool) {
+    use sharp256::protocol::wire::{Data, Message, TreeInfo};
+    let hello = sharp256::protocol::wire::Hello {
+        file_size: (listing.len() + data.len()) as u64,
+        tree: Some(TreeInfo {
+            manifest_len: listing.len() as u64,
+            manifest_hash: announced_hash,
+            files: 1,
+            dirs: 0,
+        }),
+        ..fake_hello(rand::random(), "evil")
+    };
+    let (mut fake, status) = FakeSender::connect_with(r, hello).await;
+    assert_eq!(status, sharp256::protocol::constants::HELLO_ACCEPTED);
+    let mut stream = listing.to_vec();
+    stream.extend_from_slice(data);
+    fake.send(&Message::Data(Data {
+        offset: 0,
+        timestamp: 1,
+        payload: &stream,
+    }))
+    .await;
+    wait_failed(&mut r.events, Duration::from_secs(10)).await
+}
+
+/// A listing that tries to escape the output directory, or that does not
+/// match the hash announced in HELLO, ends the transfer; nothing is
+/// written anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_directory_listings_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    // version, reserved, root head (directory), one entry: a file named
+    // "..", "/etc/x" or "a\0b" of five bytes.
+    for name in [&b".."[..], b"/etc/x", b"a\0b", b"."] {
+        let mut listing = vec![1u8, 0, 1, 1, 0, 0, name.len() as u8];
+        listing.extend_from_slice(name);
+        listing.push(5);
+        let hash = *blake3::hash(&listing).as_bytes();
+        let (error, resumable) = send_listing(&mut r, &listing, hash, b"owned").await;
+        assert!(error.contains("invalid directory manifest"), "{}", error);
+        assert!(!resumable);
+    }
+    // A well-formed listing that is not the announced one.
+    let mut listing = vec![1u8, 0, 1, 1, 0, 0, 1, b'f', 5];
+    let hash = *blake3::hash(&listing).as_bytes();
+    listing[7] = b'g';
+    let (error, _) = send_listing(&mut r, &listing, hash, b"12345").await;
+    assert!(error.contains("announced hash"), "{}", error);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        std::fs::read_dir(&out).unwrap().count(),
+        0,
+        "nothing may remain in the output directory"
+    );
+    let mut top: Vec<String> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    top.sort();
+    assert_eq!(top, ["out", "src", "state"], "nothing written outside");
     stop_receiver(r).await;
 }

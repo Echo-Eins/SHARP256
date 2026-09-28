@@ -23,6 +23,13 @@
 //! * when every byte is present, closes, hashes and renames the file in a
 //!   background task while it keeps answering the sender, then exchanges
 //!   FIN / FIN_ACK / FIN_DONE.
+//!
+//! A directory arrives as one stream as well (see [`crate::file::tree`]): the
+//! session collects the manifest at its start in memory, verifies it against
+//! the hash announced in HELLO, and only then lets the writer create files
+//! in a private staging directory; data that overtakes the manifest waits in
+//! a bounded buffer. The finished tree is hashed, gets its times and
+//! permissions, and is renamed into place.
 
 use crate::config::{AcceptPolicy, IncomingRequest, ReceiverConfig, TransportConfig};
 use crate::crypto::handshake::{self as hs, CookieJar, HandshakeLimiter, ReplayGuard, Responder};
@@ -31,15 +38,16 @@ use crate::crypto::transport::{
     begin_packet, peek_cid, SessionKeys, Suite, HEADER_LEN, OVERHEAD, TAG_LEN,
 };
 use crate::crypto::{Identity, SharpId, NO_PSK};
+use crate::file::tree::{self, Manifest};
 use crate::file::{
     available_space, hash_file, hash_to_hex, part_path_for, rename_with_retry, sanitize_file_name,
     unique_path, FileWriter,
 };
-use crate::progress::{emit, EventCallback, TransferEvent, TransferStats};
+use crate::progress::{emit, DirectoryInfo, EventCallback, TransferEvent, TransferStats};
 use crate::protocol::constants::*;
 use crate::protocol::wire::{
     self, parse_type_byte, type_byte, Ack, Fin, Hello, HelloAck, Message, MsgType, Pong, ProbeAck,
-    MAX_CONTROL_BODY,
+    TreeInfo, MAX_CONTROL_BODY,
 };
 use crate::protocol::RangeSet;
 use crate::state::{hex16, ReceiverState, StateStore};
@@ -73,6 +81,10 @@ const SESSION_QUEUE: usize = 16_384;
 const SESSION_BATCH: usize = 256;
 /// Senders whose last initiation timestamp is remembered (replay guard).
 const REPLAY_GUARD_CAPACITY: usize = 100_000;
+/// Directory data that overtook the manifest is held back, up to this many
+/// bytes and datagrams, until the manifest is complete.
+const EARLY_MAX_BYTES: u64 = 16 << 20;
+const EARLY_MAX_ITEMS: usize = 16_384;
 
 /// A transfer is identified by who sends it and its transfer id.
 type TransferKey = (SharpId, [u8; 16]);
@@ -559,6 +571,66 @@ async fn finish_file(
     Ok((hash, target))
 }
 
+/// Closes the writer of a complete directory (which creates the entries no
+/// write created), hashes the stream, applies times and permissions and
+/// moves the tree to its final name, which never replaces anything.
+async fn finish_tree(
+    writer: FileWriter,
+    staging: PathBuf,
+    final_path: PathBuf,
+    plan: Arc<Manifest>,
+    manifest: Arc<Vec<u8>>,
+) -> Result<([u8; 32], PathBuf), String> {
+    writer
+        .finish()
+        .await
+        .map_err(|e| format!("cannot finish writing the directory: {}", e))?;
+    tokio::task::spawn_blocking(move || {
+        let hash = tree::hash_tree(&staging, &plan, &manifest)
+            .map_err(|e| format!("cannot hash the directory: {}", e))?;
+        let umask = tree::local_umask(&staging);
+        let failures = tree::apply_metadata(&staging, &plan, umask);
+        if failures > 0 {
+            tracing::warn!(
+                "{} entries of {} keep default times or permissions",
+                failures,
+                staging.display()
+            );
+        }
+        let dir = final_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let name = final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let target = tree::unique_dir_path(&dir, &name);
+        rename_with_retry(&staging, &target)
+            .map_err(|e| format!("cannot move {} into place: {}", staging.display(), e))?;
+        if let Err(e) = tree::apply_root_metadata(&target, &plan, umask) {
+            tracing::warn!("cannot set metadata of {}: {}", target.display(), e);
+        }
+        Ok((hash, target))
+    })
+    .await
+    .map_err(|e| format!("finishing task failed: {}", e))?
+}
+
+/// Checks a complete manifest against what HELLO announced and decodes it.
+fn verify_manifest(bytes: &[u8], info: &TreeInfo, stream_len: u64) -> Result<Manifest, String> {
+    if bytes.len() as u64 != info.manifest_len
+        || *blake3::hash(bytes).as_bytes() != info.manifest_hash
+    {
+        return Err("the directory listing does not match its announced hash".into());
+    }
+    let m = Manifest::decode(bytes).map_err(|e| e.to_string())?;
+    if m.stream_len() != stream_len || m.files() != info.files || m.dirs() != info.dirs {
+        return Err("the directory listing does not match the announced transfer".into());
+    }
+    Ok(m)
+}
+
 /// Resolves when the application decided, or never without a pending
 /// decision.
 async fn decided(rx: &mut Option<oneshot::Receiver<bool>>) -> bool {
@@ -587,6 +659,21 @@ enum Phase {
         fin_delay: Duration,
         started_at: Instant,
     },
+}
+
+/// A directory transfer's manifest, while it arrives and once verified.
+struct TreeRecv {
+    info: TreeInfo,
+    /// Manifest bytes received so far.
+    buf: Vec<u8>,
+    /// The verified manifest and its encoding (hashed again at the end).
+    plan: Option<(Arc<Manifest>, Arc<Vec<u8>>)>,
+    /// DATA beyond the manifest that arrived before the manifest was
+    /// complete: (offset, datagram, payload start, payload length).
+    early: Vec<(u64, Vec<u8>, usize, usize)>,
+    early_bytes: u64,
+    /// The staging directory holds entries of an earlier attempt.
+    resume: bool,
 }
 
 /// Keys and packet state of the session's current handshake.
@@ -620,6 +707,8 @@ struct Session {
     final_path: PathBuf,
     part_path: PathBuf,
     writer: Option<FileWriter>,
+    /// Set for a directory transfer.
+    tree: Option<TreeRecv>,
     received: RangeSet,
     highest: u64,
     resumed_from: u64,
@@ -674,6 +763,7 @@ impl Session {
             final_path: PathBuf::new(),
             part_path: PathBuf::new(),
             writer: None,
+            tree: None,
             received: RangeSet::new(),
             highest: 0,
             resumed_from: 0,
@@ -863,6 +953,7 @@ impl Session {
                 sender_id: self.sender.to_string(),
                 file_name: self.file_name.clone(),
                 file_size: self.file_size,
+                directory: self.directory(),
                 resumed_bytes: self.received.total(),
             },
         );
@@ -886,6 +977,7 @@ impl Session {
                         sender_id: self.sender,
                         file_name: self.file_name.clone(),
                         file_size: self.file_size,
+                        directory: self.directory(),
                         resumed_bytes: self.received.total(),
                     },
                     tx,
@@ -922,6 +1014,13 @@ impl Session {
         ControlFlow::Continue(())
     }
 
+    fn directory(&self) -> Option<DirectoryInfo> {
+        self.tree.as_ref().map(|t| DirectoryInfo {
+            files: t.info.files,
+            dirs: t.info.dirs,
+        })
+    }
+
     fn on_accepted(&mut self) {
         let cipher = self
             .secure
@@ -929,11 +1028,15 @@ impl Session {
             .map(|s| s.keys.suite.name())
             .unwrap_or("none");
         tracing::info!(
-            "transfer {} from {} ({}): {} ({} bytes) -> {}, {}",
+            "transfer {} from {} ({}): {}{} ({} bytes) -> {}, {}",
             self.tid_hex(),
             self.peer,
             self.sender,
             self.file_name,
+            match &self.tree {
+                Some(t) => format!(" ({} files, {} folders)", t.info.files, t.info.dirs),
+                None => String::new(),
+            },
             self.file_size,
             self.final_path.display(),
             cipher
@@ -947,6 +1050,7 @@ impl Session {
                 cipher: cipher.to_string(),
                 file_name: self.file_name.clone(),
                 file_size: self.file_size,
+                directory: self.directory(),
                 resumed_from: self.resumed_from,
                 chunk_size: self.max_chunk,
             },
@@ -967,11 +1071,35 @@ impl Session {
         self.file_mtime = hello.file_mtime;
         self.max_chunk = hello.max_chunk.min(self.cfg.max_chunk).max(MIN_CHUNK);
         let out_dir = self.shared.cfg.output_dir.clone();
+        if let Some(info) = hello.tree {
+            if info.manifest_len > MAX_MANIFEST_LEN {
+                return Err((
+                    REASON_UNSUPPORTED,
+                    format!(
+                        "directory listing of {} bytes exceeds the limit of {}",
+                        info.manifest_len, MAX_MANIFEST_LEN
+                    ),
+                ));
+            }
+            self.tree = Some(TreeRecv {
+                info,
+                buf: Vec::new(),
+                plan: None,
+                early: Vec::new(),
+                early_bytes: 0,
+                resume: false,
+            });
+        }
+        let manifest_hex = hello
+            .tree
+            .map(|t| hash_to_hex(&t.manifest_hash))
+            .unwrap_or_default();
 
         // Resume: by transfer id first, then by file identity (name, size and
-        // source modification time, so that a changed source starts afresh
-        // instead of failing the whole-file check at the very end). Only the
-        // sender that started a partial file may continue it.
+        // source modification time or, for a directory, the hash of its
+        // listing, so that a changed source starts afresh instead of failing
+        // the whole-transfer check at the very end). Only the sender that
+        // started a partial transfer may continue it.
         let tid_hex = self.tid_hex();
         let sender = self.sender.to_string();
         let saved = self.shared.store.as_ref().and_then(|st| {
@@ -980,19 +1108,54 @@ impl Session {
                     s.sender == sender
                         && s.file_size == hello.file_size
                         && s.file_mtime == hello.file_mtime
+                        && s.manifest_hash == manifest_hex
                         && s.part_path.exists()
                 })
                 .or_else(|| {
-                    st.find_receiver_by_file(&sender, &name, hello.file_size, hello.file_mtime)
+                    st.find_receiver_by_file(
+                        &sender,
+                        &name,
+                        hello.file_size,
+                        hello.file_mtime,
+                        &manifest_hex,
+                    )
                 })
         });
         let mut durable = RangeSet::new();
         if let Some(saved) = &saved {
-            let ok_len = std::fs::metadata(&saved.part_path)
-                .map(|m| m.len() == hello.file_size)
-                .unwrap_or(false);
-            if ok_len {
+            // Never continue through a symbolic link someone put in place
+            // of the partial data.
+            let usable = match std::fs::symlink_metadata(&saved.part_path) {
+                Ok(m) if self.tree.is_some() => m.is_dir(),
+                Ok(m) => m.is_file() && m.len() == hello.file_size,
+                Err(_) => false,
+            };
+            if usable {
                 durable = saved.durable_set();
+                if let Some(tree) = &mut self.tree {
+                    // A directory resumes with its listing, if that was
+                    // kept; otherwise the sender sends it again.
+                    let m = tree.info.manifest_len;
+                    let kept = self
+                        .shared
+                        .store
+                        .as_ref()
+                        .and_then(|st| st.load_manifest(&saved.transfer_id))
+                        .and_then(|bytes| {
+                            let plan = verify_manifest(&bytes, &tree.info, hello.file_size).ok()?;
+                            Some((Arc::new(plan), Arc::new(bytes)))
+                        });
+                    match kept {
+                        Some(plan) => {
+                            tree.plan = Some(plan);
+                            durable.insert(0, m);
+                        }
+                        None => {
+                            durable.remove(0, m);
+                        }
+                    }
+                    tree.resume = true;
+                }
                 self.part_path = saved.part_path.clone();
                 self.final_path = saved.final_path.clone();
                 if saved.transfer_id != tid_hex {
@@ -1009,18 +1172,27 @@ impl Session {
             }
         }
         if self.part_path.as_os_str().is_empty() {
-            let final_path = if self.shared.cfg.overwrite {
-                out_dir.join(&name)
+            if self.tree.is_some() {
+                // The final name is chosen when the tree is complete.
+                self.final_path = out_dir.join(&name);
+                self.part_path = tree::unique_dir_path(
+                    &out_dir,
+                    &format!("{}{}", name, crate::file::PART_SUFFIX),
+                );
             } else {
-                unique_path(&out_dir, &name)
-            };
-            let mut part = part_path_for(&final_path);
-            if part.exists() {
-                // An unrelated leftover; do not clobber it.
-                part = unique_path(&out_dir, &format!("{}{}", name, crate::file::PART_SUFFIX));
+                let final_path = if self.shared.cfg.overwrite {
+                    out_dir.join(&name)
+                } else {
+                    unique_path(&out_dir, &name)
+                };
+                let mut part = part_path_for(&final_path);
+                if part.exists() {
+                    // An unrelated leftover; do not clobber it.
+                    part = unique_path(&out_dir, &format!("{}{}", name, crate::file::PART_SUFFIX));
+                }
+                self.final_path = final_path;
+                self.part_path = part;
             }
-            self.final_path = final_path;
-            self.part_path = part;
         }
 
         let needed = hello.file_size.saturating_sub(durable.total());
@@ -1040,8 +1212,20 @@ impl Session {
         Ok(())
     }
 
-    /// Opens (creates or reopens) the partial file.
+    /// Opens (creates or reopens) the partial file, or the staging
+    /// directory of a directory transfer.
     fn create_file(&mut self) -> Result<(), String> {
+        if let Some(tree) = &self.tree {
+            if !tree.resume {
+                tree::create_private_dir(&self.part_path)
+                    .map_err(|e| format!("cannot create {}: {}", self.part_path.display(), e))?;
+            }
+            if tree.plan.is_some() {
+                self.open_tree_writer()?;
+            }
+            self.persist_state_now();
+            return Ok(());
+        }
         let writer = FileWriter::open(
             &self.part_path,
             self.file_size,
@@ -1050,6 +1234,59 @@ impl Session {
         .map_err(|e| format!("cannot open output file: {}", e))?;
         self.writer = Some(writer);
         self.persist_state_now();
+        Ok(())
+    }
+
+    /// Starts the writer of a directory whose manifest is verified. It
+    /// keeps a copy of the manifest with the resume state.
+    fn open_tree_writer(&mut self) -> Result<(), String> {
+        let tree = self.tree.as_ref().expect("directory transfer");
+        let (plan, bytes) = tree.plan.clone().expect("verified manifest");
+        let keep = self
+            .shared
+            .store
+            .as_ref()
+            .map(|st| (st.manifest_path(&self.tid_hex()), bytes));
+        let writer = FileWriter::open_tree(
+            self.part_path.clone(),
+            plan,
+            tree.resume,
+            keep,
+            self.cfg.writer_capacity_bytes,
+        )
+        .map_err(|e| format!("cannot start writing: {}", e))?;
+        self.writer = Some(writer);
+        Ok(())
+    }
+
+    /// The manifest of a directory is complete: verify it, start the writer
+    /// and hand it what arrived early.
+    fn manifest_complete(&mut self) -> Result<(), String> {
+        let tree = self.tree.as_mut().expect("directory transfer");
+        let bytes = std::mem::take(&mut tree.buf);
+        let plan = verify_manifest(&bytes, &tree.info, self.file_size)?;
+        tracing::info!(
+            "transfer {}: directory listing verified ({} files, {} folders)",
+            hex16(&self.transfer_id),
+            plan.files(),
+            plan.dirs()
+        );
+        tree.plan = Some((Arc::new(plan), Arc::new(bytes)));
+        let early = std::mem::take(&mut tree.early);
+        if !early.is_empty() {
+            tracing::debug!(
+                "{} B that arrived before the listing go to the writer now",
+                tree.early_bytes
+            );
+        }
+        tree.early_bytes = 0;
+        self.open_tree_writer()?;
+        let writer = self.writer.as_ref().expect("writer just opened");
+        for (offset, data, start, len) in early {
+            writer
+                .enqueue_slice(offset, data, start, len)
+                .map_err(|_| "the writer cannot take the buffered data".to_string())?;
+        }
         Ok(())
     }
 
@@ -1154,12 +1391,20 @@ impl Session {
     }
 
     fn rwnd(&self) -> u64 {
-        match &self.writer {
-            Some(w) => w.available(),
-            None if matches!(self.phase, Phase::Receiving | Phase::Pending { .. }) => {
-                self.cfg.writer_capacity_bytes
-            }
-            None => 0,
+        if let Some(w) = &self.writer {
+            return w.available();
+        }
+        if !matches!(self.phase, Phase::Receiving | Phase::Pending { .. }) {
+            return 0;
+        }
+        match &self.tree {
+            // Until the manifest is complete, data beyond it is buffered.
+            Some(t) if t.plan.is_none() => self
+                .cfg
+                .writer_capacity_bytes
+                .min(EARLY_MAX_BYTES)
+                .saturating_sub(t.early_bytes),
+            _ => self.cfg.writer_capacity_bytes,
         }
     }
 
@@ -1228,7 +1473,10 @@ impl Session {
             if flags & DATA_FLAG_RETRANSMIT != 0 {
                 self.retransmitted_bytes += len as u64;
             }
-            self.on_data(offset, ts, data, HEADER_LEN + DATA_FIXED_LEN, len, at);
+            if let Err(msg) = self.on_data(offset, ts, data, HEADER_LEN + DATA_FIXED_LEN, len, at) {
+                self.abandon(msg).await;
+                return ControlFlow::Break(());
+            }
             return ControlFlow::Continue(());
         }
 
@@ -1302,6 +1550,8 @@ impl Session {
     }
 
     /// Handles a DATA payload `datagram[start..start + len]` for `offset`.
+    /// An error ends the transfer for good (a directory listing that fails
+    /// verification).
     fn on_data(
         &mut self,
         offset: u64,
@@ -1310,50 +1560,53 @@ impl Session {
         start: usize,
         len: usize,
         at: Instant,
-    ) {
+    ) -> Result<(), String> {
         if !matches!(self.phase, Phase::Receiving) {
-            return;
+            return Ok(());
         }
         let len64 = len as u64;
         let end = match offset.checked_add(len64) {
             Some(end) if len > 0 && len64 <= MAX_CHUNK as u64 && end <= self.file_size => end,
             _ => {
                 tracing::debug!("ignoring DATA outside file: offset {} len {}", offset, len);
-                return;
+                return Ok(());
             }
         };
         let prev_highest = self.highest;
-        let missing = self.received.holes(offset, end, usize::MAX);
-        if !missing.is_empty() {
-            let Some(writer) = &self.writer else { return };
-            let need: u64 = missing.iter().map(|&(s, e)| e - s).sum();
-            if writer.available() < need {
-                // Writer saturated: drop the packet without recording it; the
-                // shrinking receive window slows the sender down.
-                self.writer_full_drops += 1;
-                return;
-            }
-            if missing.len() == 1 && missing[0] == (offset, end) {
-                if writer.enqueue_slice(offset, datagram, start, len).is_err() {
-                    self.writer_full_drops += 1;
-                    return;
-                }
-                self.received.insert(offset, end);
-            } else {
-                // Partly known already (resent after a chunk-size change):
-                // write only the new sub-ranges.
-                for (s, e) in missing {
-                    let a = start + (s - offset) as usize;
-                    let b = start + (e - offset) as usize;
-                    if writer.enqueue(s, datagram[a..b].to_vec()).is_err() {
-                        self.writer_full_drops += 1;
-                        break;
+        // The manifest of a directory is collected in memory; the rest of
+        // the datagram (if any) is file data.
+        let (mut data_off, mut data_start, mut data_len) = (offset, start, len);
+        let mut manifest_done = false;
+        if let Some(tree) = &mut self.tree {
+            let m = tree.info.manifest_len;
+            if offset < m {
+                let m_end = end.min(m);
+                if tree.plan.is_none() {
+                    for (s, e) in self.received.holes(offset, m_end, usize::MAX) {
+                        if tree.buf.len() < e as usize {
+                            tree.buf.resize(e as usize, 0);
+                        }
+                        let a = start + (s - offset) as usize;
+                        tree.buf[s as usize..e as usize]
+                            .copy_from_slice(&datagram[a..a + (e - s) as usize]);
+                        self.received.insert(s, e);
+                        self.got_data = true;
                     }
-                    self.received.insert(s, e);
+                    manifest_done = self.received.contains(0, m);
                 }
+                let skip = (m_end - offset) as usize;
+                data_off = m_end;
+                data_start += skip;
+                data_len -= skip;
             }
-            self.persist_dirty = true;
-            self.got_data = true;
+        }
+        if data_len > 0 && !self.store_data(data_off, datagram, data_start, data_len) {
+            // Saturated: treated as not received; the shrinking receive
+            // window slows the sender down.
+            return Ok(());
+        }
+        if manifest_done {
+            self.manifest_complete()?;
         }
         self.highest = self.highest.max(end);
         self.last_data_ts = ts;
@@ -1371,6 +1624,72 @@ impl Session {
             self.send_ack(at);
             self.begin_finishing();
         }
+        Ok(())
+    }
+
+    /// Hands file data to the writer (or, while a directory's manifest is
+    /// incomplete, to the early buffer). Returns false when it had to be
+    /// dropped because the writer is saturated.
+    fn store_data(&mut self, offset: u64, datagram: Vec<u8>, start: usize, len: usize) -> bool {
+        let end = offset + len as u64;
+        let missing = self.received.holes(offset, end, usize::MAX);
+        if missing.is_empty() {
+            return true;
+        }
+        let need: u64 = missing.iter().map(|&(s, e)| e - s).sum();
+        let whole = missing.len() == 1 && missing[0] == (offset, end);
+        if let Some(writer) = &self.writer {
+            if writer.available() < need {
+                self.writer_full_drops += 1;
+                return false;
+            }
+            if whole {
+                if writer.enqueue_slice(offset, datagram, start, len).is_err() {
+                    self.writer_full_drops += 1;
+                    return false;
+                }
+                self.received.insert(offset, end);
+            } else {
+                // Partly known already (resent after a chunk-size change):
+                // write only the new sub-ranges.
+                for (s, e) in missing {
+                    let a = start + (s - offset) as usize;
+                    let b = start + (e - offset) as usize;
+                    if writer.enqueue(s, datagram[a..b].to_vec()).is_err() {
+                        self.writer_full_drops += 1;
+                        break;
+                    }
+                    self.received.insert(s, e);
+                }
+            }
+        } else if let Some(tree) = self.tree.as_mut().filter(|t| t.plan.is_none()) {
+            // The manifest is not complete yet: hold the data until the
+            // writer knows which files it belongs to.
+            let cap = self.cfg.writer_capacity_bytes.min(EARLY_MAX_BYTES);
+            if tree.early_bytes + need > cap || tree.early.len() + missing.len() > EARLY_MAX_ITEMS {
+                self.writer_full_drops += 1;
+                return false;
+            }
+            if whole {
+                tree.early.push((offset, datagram, start, len));
+            } else {
+                for &(s, e) in &missing {
+                    let a = start + (s - offset) as usize;
+                    let b = start + (e - offset) as usize;
+                    tree.early
+                        .push((s, datagram[a..b].to_vec(), 0, (e - s) as usize));
+                }
+            }
+            tree.early_bytes += need;
+            for (s, e) in missing {
+                self.received.insert(s, e);
+            }
+        } else {
+            return false;
+        }
+        self.persist_dirty = true;
+        self.got_data = true;
+        true
     }
 
     fn next_ack_delay(&self, now: Instant) -> Option<Duration> {
@@ -1432,6 +1751,12 @@ impl Session {
             final_path: self.final_path.clone(),
             peer: self.peer.to_string(),
             sender: self.sender.to_string(),
+            manifest_hash: self
+                .tree
+                .as_ref()
+                .map(|t| hash_to_hex(&t.info.manifest_hash))
+                .unwrap_or_default(),
+            manifest_len: self.tree.as_ref().map_or(0, |t| t.info.manifest_len),
             durable: durable.to_vec(),
             updated_unix: 0,
         }
@@ -1488,6 +1813,23 @@ impl Session {
 
     async fn housekeeping(&mut self, now: Instant) -> ControlFlow<()> {
         let since_rx = now.saturating_duration_since(self.last_rx);
+        if let Some((kind, error)) = self.writer.as_ref().and_then(|w| w.error()) {
+            let msg = format!("cannot write: {}", error);
+            if kind == io::ErrorKind::AlreadyExists {
+                // Entries of the directory collide here; no retry can help.
+                self.abandon(msg).await;
+            } else {
+                self.send(
+                    0,
+                    &Message::Abort(wire::Abort {
+                        code: ABORT_IO_ERROR,
+                        reason: msg.clone(),
+                    }),
+                );
+                self.suspend(&msg).await;
+            }
+            return ControlFlow::Break(());
+        }
         match &mut self.phase {
             Phase::Receiving => {
                 if self.persist_dirty
@@ -1576,11 +1918,32 @@ impl Session {
         if let Some(writer) = self.writer.take() {
             let _ = writer.close().await;
         }
-        let _ = std::fs::remove_file(&self.part_path);
+        let _ = tree::remove_partial(&self.part_path);
         if let Some(store) = &self.shared.store {
             store.remove_receiver(&self.tid_hex());
         }
         self.emit_failed(why.to_string(), false);
+    }
+
+    /// Ends a transfer that cannot succeed (a directory listing that fails
+    /// verification, colliding names): tells the sender and removes the
+    /// partial data together with its resume state.
+    async fn abandon(&mut self, msg: String) {
+        self.send(
+            0,
+            &Message::Abort(wire::Abort {
+                code: ABORT_IO_ERROR,
+                reason: msg.clone(),
+            }),
+        );
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.close().await;
+        }
+        if let Some(store) = &self.shared.store {
+            store.remove_receiver(&self.tid_hex());
+        }
+        let _ = tree::remove_partial(&self.part_path);
+        self.report_failure(msg, false);
     }
 
     // ----- completion ------------------------------------------------------
@@ -1601,9 +1964,13 @@ impl Session {
         let part = self.part_path.clone();
         let final_path = self.final_path.clone();
         let overwrite = self.shared.cfg.overwrite;
+        let plan = self.tree.as_ref().and_then(|t| t.plan.clone());
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
-            let result = finish_file(writer, part, final_path, overwrite).await;
+            let result = match plan {
+                Some((plan, bytes)) => finish_tree(writer, part, final_path, plan, bytes).await,
+                None => finish_file(writer, part, final_path, overwrite).await,
+            };
             let _ = tx.send(Incoming::Verified(result)).await;
         });
     }
