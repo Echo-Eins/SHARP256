@@ -725,7 +725,11 @@ against the manifest.
   modification times and permission bits (deepest entries first; never
   set-id or sticky bits; masked with the receiver's umask) and renames the
   staging directory to the final name, which never replaces anything: a
-  taken name becomes `name (1)`.
+  taken name becomes `name (1)`. The system itself refuses the move when
+  the name is taken — `renameat2` with `RENAME_NOREPLACE` on Linux,
+  `renamex_np` with `RENAME_EXCL` on macOS, `MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING` on Windows — so a name another process takes
+  between the choosing and the moving is passed over, not replaced.
 * The manifest is kept with the resume state, so an interrupted directory
   resumes after a restart of either side without resending it. Files that
   already exist in the staging directory are reused on resume; their data
@@ -740,7 +744,9 @@ against the manifest.
 * Partial files are written as `name.sharp-part` (or `name (1).sharp-part`
   if an unrelated partial file already exists) and renamed on success. An
   existing complete `name` is never overwritten unless configured; the new
-  file becomes `name (1)`. Directories are never overwritten or merged.
+  file becomes `name (1)`, by the same refusing move as a directory (a
+  hard link where the system has no such call). Directories are never
+  overwritten or merged.
 * Files are pre-sized with `set_len`, which creates a sparse file where the
   file system supports it. Free space is checked for the bytes still to be
   received plus a 1 MiB margin before accepting.
@@ -756,8 +762,10 @@ Every endpoint binds one dual-stack socket by default (`[::]` with
 `[::]:0`, the relay `[::]:5560`. It speaks IPv6 natively and IPv4 through
 mapped addresses (`::ffff:a.b.c.d`). Where the system has no IPv6 — switched
 off in the kernel, or no address — the wildcard falls back to IPv4 on the
-same port; an explicit address is bound as given or not at all, and a port
-already taken is an error, never a fallback.
+same port; an explicit address is bound as given or not at all — an IPv6
+one IPv6-only (`IPV6_V6ONLY` on: it cannot speak IPv4 anyway, and Windows
+refuses IPv4 options on it), an IPv4-mapped one with `IPV6_V6ONLY` off —
+and a port already taken is an error, never a fallback.
 
 Addresses are compared, screened and remembered in canonical form: a mapped
 address is the IPv4 address it maps, the flow label is zeroed, and the zone
