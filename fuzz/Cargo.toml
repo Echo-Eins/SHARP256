@@ -1,0 +1,98 @@
+# Fuzz targets for everything SHARP-256 reads from the network, run with
+# cargo-fuzz (nightly):
+#
+#     cargo +nightly fuzz run relay_message
+#
+# Each target hands libFuzzer's input to one entry point of
+# `sharp256::fuzz` (src/fuzz.rs); the same entry points run on mutated seeds
+# in every `cargo test`. Seeds are in corpus/<target>, written by
+# `SHARP_WRITE_CORPUS=1 cargo test --lib write_seed_corpus`.
+[package]
+name = "sharp256-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sharp256 = { path = "..", default-features = false, features = ["nat-traversal"] }
+
+# Its own workspace: the fuzz targets never build with the crate itself.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "wire_frame"
+path = "fuzz_targets/wire_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_payload"
+path = "fuzz_targets/handshake_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "datagram"
+path = "fuzz_targets/datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "addresses"
+path = "fuzz_targets/addresses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_message"
+path = "fuzz_targets/relay_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stun"
+path = "fuzz_targets/stun.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "portmap"
+path = "fuzz_targets/portmap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upnp"
+path = "fuzz_targets/upnp.rs"
+test = false
+doc = false
+bench = false

@@ -24,7 +24,6 @@
 use crate::crypto::CryptoError;
 use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use std::sync::{Arc, RwLock};
 use zeroize::Zeroizing;
 
@@ -172,13 +171,25 @@ impl HeaderKey {
                 block.into()
             }
             HeaderKey::ChaCha(key) => {
+                use chacha20::cipher::{
+                    consts::U10, KeyIvInit, StreamCipherCore, StreamCipherSeekCore,
+                };
                 let counter = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
                 let mut nonce = [0u8; 12];
                 nonce.copy_from_slice(&sample[4..16]);
-                let mut c = chacha20::ChaCha20::new((&**key).into(), (&nonce).into());
-                c.seek(counter as u64 * 64);
+                // One keystream block, at whatever counter the sample names
+                // — u32::MAX included. The stream-cipher interface refuses
+                // that last block (it counts the blocks left *after* the
+                // position) and refusing panics, so a packet whose tag began
+                // with ff ff ff ff took the endpoint down before its tag was
+                // even checked; and one of our own came out that way once
+                // in 2^32 packets. Found by fuzzing.
+                let mut core = chacha20::ChaChaCore::<U10>::new((&**key).into(), (&nonce).into());
+                core.set_block_pos(counter);
+                let mut block = Default::default();
+                core.write_keystream_block(&mut block);
                 let mut mask = [0u8; 16];
-                c.apply_keystream(&mut mask);
+                mask.copy_from_slice(&block[..16]);
                 mask
             }
         }
@@ -350,6 +361,47 @@ pub fn peek_cid(pkt: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The ChaCha20 header protection of RFC 9001 (appendix A.5): counter
+    /// and nonce from the sample, the mask the first bytes of that block.
+    #[test]
+    fn chacha20_header_mask_matches_rfc9001() {
+        let key: [u8; 32] = hex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")
+            .try_into()
+            .unwrap();
+        let sample: [u8; 16] = hex("5e5cd55c41f69080575d7999c25a5bfb").try_into().unwrap();
+        let hp = super::HeaderKey::new(super::Suite::ChaCha20Poly1305, &key);
+        assert_eq!(hp.mask(&sample)[..5], hex("aefefe7d03")[..]);
+    }
+
+    /// A sample naming the last block of the counter space is a sample like
+    /// any other. It used to make the stream cipher refuse, and the refusal
+    /// panicked: anybody who could put a packet with such a tag in front of
+    /// an endpoint took it down, and so did one of our own packets in 2^32.
+    #[test]
+    fn a_tag_naming_the_last_block_does_not_take_the_endpoint_down() {
+        let key = [0x42u8; 32];
+        let hp = super::HeaderKey::new(super::Suite::ChaCha20Poly1305, &key);
+        let mut sample = [0x5au8; 16];
+        sample[..4].copy_from_slice(&[0xff; 4]);
+        let a = hp.mask(&sample);
+        assert_eq!(a, hp.mask(&sample), "the mask is a function of the sample");
+        sample[0] = 0xfe;
+        assert_ne!(a, hp.mask(&sample));
+        // And a whole packet with such a tag is simply not authentic.
+        let keys = super::DirectionKeys::new(super::Suite::ChaCha20Poly1305, &key);
+        let mut pkt = vec![0u8; 64];
+        let n = pkt.len();
+        pkt[n - 16..n - 12].copy_from_slice(&[0xff; 4]);
+        assert!(keys.open(&mut pkt).is_err());
+    }
+
     use super::*;
     use crate::crypto::handshake::Split;
 

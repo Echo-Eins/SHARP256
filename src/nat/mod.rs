@@ -373,7 +373,7 @@ const PREFERENCE_PROBE: std::net::Ipv6Addr =
 
 /// What the system says about one of its IPv6 addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct V6State {
+pub(crate) struct V6State {
     temporary: bool,
     deprecated: bool,
     tentative: bool,
@@ -408,10 +408,10 @@ fn ipv6_states() -> std::collections::HashMap<std::net::Ipv6Addr, V6State> {
 /// interface index, prefix length, scope and flags in hex, and the
 /// interface name. The flags are the kernel's `IFA_F_*`.
 #[cfg_attr(
-    not(any(target_os = "linux", target_os = "android", test)),
+    not(any(target_os = "linux", target_os = "android", test, fuzzing)),
     allow(dead_code)
 )]
-fn parse_if_inet6(text: &str) -> std::collections::HashMap<std::net::Ipv6Addr, V6State> {
+pub(crate) fn parse_if_inet6(text: &str) -> std::collections::HashMap<std::net::Ipv6Addr, V6State> {
     const IFA_F_TEMPORARY: u32 = 0x01;
     const IFA_F_DADFAILED: u32 = 0x08;
     const IFA_F_DEPRECATED: u32 = 0x20;

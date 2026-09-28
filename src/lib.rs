@@ -21,6 +21,11 @@ pub mod relay;
 #[cfg(feature = "gui")]
 pub mod gui;
 
+/// Entry points for fuzzing; see `fuzz/`. Only in test and fuzzing builds.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzz;
+
 pub use config::{AcceptPolicy, IncomingRequest, ReceiverConfig, SenderConfig, TransportConfig};
 pub use crypto::{Identity, SharpId};
 pub use progress::{EventCallback, TransferEvent, TransferStats};

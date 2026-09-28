@@ -56,7 +56,7 @@ const ONLY_PERMANENT_LEASES: u32 = 725;
 
 /// An `http://a.b.c.d:port/path` URL on one device.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Url {
+pub(crate) struct Url {
     host: SocketAddrV4,
     path: String,
 }
@@ -64,7 +64,7 @@ struct Url {
 impl Url {
     /// Only plain HTTP to a literal IPv4 address: a router names itself by
     /// address, and a name would need a DNS lookup somebody else answers.
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         let rest = s.trim().strip_prefix("http://")?;
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
@@ -85,7 +85,7 @@ impl Url {
 
     /// `reference` resolved against this URL: an absolute URL as it is, a
     /// path relative to this one's host.
-    fn join(&self, reference: &str) -> Option<Self> {
+    pub(crate) fn join(&self, reference: &str) -> Option<Self> {
         let r = reference.trim();
         if r.starts_with("http://") {
             return Self::parse(r);
@@ -108,7 +108,7 @@ impl Url {
 
 /// A router's port-forwarding service.
 #[derive(Debug, Clone)]
-struct Service {
+pub(crate) struct Service {
     control: Url,
     kind: &'static str,
 }
@@ -204,7 +204,7 @@ async fn search(target: SocketAddr) -> Result<Vec<Url>> {
 }
 
 /// The value of an HTTP-style header in `text`, case-insensitively.
-fn header<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     text.lines().find_map(|line| {
         let (k, v) = line.split_once(':')?;
         k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
@@ -234,16 +234,23 @@ async fn http(url: &Url, request: &[u8], max: usize) -> Result<(u16, String)> {
     let data = tokio::time::timeout(HTTP_TIMEOUT, exchange)
         .await
         .map_err(|_| anyhow!("{} did not answer in time", url.host))??;
-    let text = String::from_utf8_lossy(&data).into_owned();
+    parse_http_answer(&data).map_err(|e| anyhow!("{} {}", url.host, e))
+}
+
+/// The status and body of an HTTP answer, from whatever bytes a device
+/// sent. It is a stranger on the local network, so nothing is assumed:
+/// no header block, or no status in it, is an error, never a guess.
+pub(crate) fn parse_http_answer(data: &[u8]) -> Result<(u16, String)> {
+    let text = String::from_utf8_lossy(data).into_owned();
     let (head, body) = text
         .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow!("{} sent no HTTP answer", url.host))?;
+        .ok_or_else(|| anyhow!("sent no HTTP answer"))?;
     let status: u16 = head
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| anyhow!("{} sent no HTTP status", url.host))?;
+        .ok_or_else(|| anyhow!("sent no HTTP status"))?;
     Ok((status, body.to_string()))
 }
 
@@ -261,7 +268,7 @@ async fn get(url: &Url) -> Result<String> {
 
 /// The text inside the first `<tag>…</tag>` in `xml` (namespace prefixes
 /// on the tag are allowed).
-fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let mut rest = xml;
     loop {
         let open = rest.find('<')?;
@@ -283,7 +290,7 @@ fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 
 /// Finds a port-forwarding service in a device description, preferring the
 /// newest. Its control URL must be on the device that described it.
-fn find_service(description: &str, location: &Url) -> Option<Service> {
+pub(crate) fn find_service(description: &str, location: &Url) -> Option<Service> {
     let base = element(description, "URLBase")
         .and_then(Url::parse)
         .filter(|b| b.host.ip() == location.host.ip())

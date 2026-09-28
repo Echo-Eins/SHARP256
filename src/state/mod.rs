@@ -26,13 +26,19 @@ pub fn hex16(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Reads what [`hex16`] writes. Anything else — including text that is 32
+/// bytes long but not 32 characters, which a damaged state file can hold —
+/// is `None`, never a panic: slicing it two bytes at a time used to cut a
+/// multi-byte character in half (found by the fuzzing smoke test).
 pub fn parse_hex16(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+    let b = s.as_bytes();
+    if b.len() != 32 {
         return None;
     }
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = digit(b[2 * i])? << 4 | digit(b[2 * i + 1])?;
     }
     Some(out)
 }
@@ -420,6 +426,13 @@ mod tests {
             .load_sender(Path::new("/tmp/x.bin"), 6, "10.0.0.1:5555")
             .is_none());
         assert_eq!(parse_hex16(&l.transfer_id), Some([9; 16]));
+        // 32 bytes that are not 32 hex digits, or not even 32 characters.
+        assert_eq!(parse_hex16("200\u{fffd}0db80000000000000000000000"), None);
+        assert_eq!(parse_hex16(&"g".repeat(32)), None);
+        assert_eq!(
+            parse_hex16(&hex16(&[0xab; 16]).to_uppercase()),
+            Some([0xab; 16])
+        );
         assert_eq!(store.cleanup_older_than(Duration::from_secs(0)).unwrap(), 0);
         store.remove_sender(Path::new("/tmp/x.bin"), 5, "10.0.0.1:5555");
         assert!(store
