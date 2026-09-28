@@ -129,6 +129,13 @@ pub struct IncomingRequest {
 pub struct SenderConfig {
     pub bind: SocketAddr,
     pub peer: SocketAddr,
+    /// Further addresses the same receiver may answer at. A name usually
+    /// resolves to several (see `address::resolve_all`), and only one of
+    /// them may be reachable. Handshake attempts rotate through `peer` and
+    /// these until one is answered; the handshake itself decides which
+    /// address is really the receiver, so a wrong or forged one costs time
+    /// rather than safety.
+    pub alternate_peers: Vec<SocketAddr>,
     /// Identity of the receiver. Only the holder of its private key can
     /// answer the handshake, so this authenticates the receiver.
     pub receiver_id: SharpId,
@@ -150,6 +157,7 @@ impl std::fmt::Debug for SenderConfig {
         f.debug_struct("SenderConfig")
             .field("bind", &self.bind)
             .field("peer", &self.peer)
+            .field("alternate_peers", &self.alternate_peers)
             .field("receiver_id", &self.receiver_id)
             .field("file_path", &self.file_path)
             .field("transport", &self.transport)
@@ -166,6 +174,7 @@ impl SenderConfig {
         Self {
             bind: "0.0.0.0:0".parse().unwrap(),
             peer,
+            alternate_peers: Vec::new(),
             receiver_id,
             file_path,
             transport: TransportConfig::default(),

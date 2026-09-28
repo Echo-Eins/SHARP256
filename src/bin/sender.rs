@@ -105,14 +105,18 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     }
     let (receiver_id, host) =
         sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?;
-    let addr = sharp256::address::resolve(&host)
+    // A name usually has more than one address; try them all and let the
+    // handshake decide which one is the receiver.
+    let addrs = sharp256::address::resolve_all(&host)
         .await
         .with_context(|| format!("cannot resolve {}", host))?;
+    let addr = addrs[0];
     let identity = load_identity(&args.identity)?;
     let sender_id = identity.id();
     println!("{}", system_info());
 
     let mut cfg = SenderConfig::new(addr, receiver_id, file.clone());
+    cfg.alternate_peers = addrs[1..].to_vec();
     cfg.bind = args.bind;
     let _ = args.no_nat;
     cfg.state_dir = args.state_dir.clone();

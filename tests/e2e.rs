@@ -1937,3 +1937,50 @@ async fn a_forged_source_address_never_redirects_the_session() {
     );
     stop_receiver(r).await;
 }
+
+/// A name that resolves to several addresses — a stale record, a broken IPv6
+/// path, or an answer someone forged — must not strand the transfer.
+/// Handshake attempts rotate through every candidate, and completing one
+/// takes the receiver's private key, so the impostor that answers with noise
+/// gets nowhere while the real receiver is found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_first_address_does_not_strand_the_transfer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 512 << 10;
+    let file = make_file(&src, "candidates.bin", size, 0xC0FE);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+
+    // Bound so the port stays taken, but nothing ever reads it: the classic
+    // address that resolves and goes nowhere.
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+
+    // Something that does answer, but is not the receiver.
+    let impostor = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let impostor_addr = impostor.local_addr().unwrap();
+    let liar = impostor.clone();
+    let noise = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = liar.recv_from(&mut buf).await {
+            let mut reply = buf[..n].to_vec();
+            for b in reply.iter_mut() {
+                *b ^= 0x5A;
+            }
+            let _ = liar.send_to(&reply, from).await;
+        }
+    });
+
+    let mut cfg = sender_cfg(&file, dead_addr, r.id, &state);
+    cfg.alternate_peers = vec![impostor_addr, r.addr];
+    let summary = run_sender(cfg)
+        .await
+        .expect("the real receiver is found among the candidates");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&file, &out.join("candidates.bin"));
+
+    noise.abort();
+    drop(dead);
+    stop_receiver(r).await;
+}

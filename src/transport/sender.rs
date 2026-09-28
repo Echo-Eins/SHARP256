@@ -233,10 +233,20 @@ impl Sender {
         let hash_task: JoinHandle<io::Result<[u8; 32]>> =
             tokio::task::spawn_blocking(move || hash_source.hash());
 
+        // The receiver's name may have given several addresses; the
+        // handshake decides which one is really the receiver.
+        let mut candidates = vec![self.cfg.peer];
+        for a in &self.cfg.alternate_peers {
+            if !candidates.contains(a) {
+                candidates.push(*a);
+            }
+        }
+
         let mut engine = Engine::new(
             self.cfg.transport.clone(),
             self.socket.clone(),
             self.cfg.peer,
+            candidates,
             Peer {
                 identity: self.identity.clone(),
                 receiver: self.cfg.receiver_id,
@@ -513,10 +523,16 @@ struct Engine {
 
     auth: Peer,
     secure: Option<Secure>,
-    /// Handshake attempts waiting for an answer, with their send times.
-    attempts: VecDeque<(Initiator, Instant)>,
-    /// Latest cookie from the receiver (it asked us to prove our address).
-    cookie: Option<([u8; 16], Instant)>,
+    /// Handshake attempts waiting for an answer, with their send times and
+    /// the address each was sent to.
+    attempts: VecDeque<(Initiator, Instant, SocketAddr)>,
+    /// Latest cookie, with the address that issued it: a cookie proves our
+    /// address to one receiver and is worthless anywhere else.
+    cookie: Option<([u8; 16], Instant, SocketAddr)>,
+    /// Addresses the receiver's name resolved to; handshake attempts rotate
+    /// through them until one answers.
+    candidates: Vec<SocketAddr>,
+    next_candidate: usize,
     /// Answer to a handshake or to a state query, not yet acted upon.
     answer: Option<HelloAck>,
     /// Still negotiating: every HELLO_ACK counts, including the one the
@@ -625,6 +641,7 @@ impl Engine {
         cfg: TransportConfig,
         socket: Arc<BatchSocket>,
         peer: SocketAddr,
+        candidates: Vec<SocketAddr>,
         auth: Peer,
         reader: Arc<Source>,
         file_name: String,
@@ -657,6 +674,8 @@ impl Engine {
             secure: None,
             attempts: VecDeque::new(),
             cookie: None,
+            candidates,
+            next_candidate: 0,
             answer: None,
             negotiating: true,
             handshake_failures: 0,
@@ -734,16 +753,6 @@ impl Engine {
         hex16(&self.transfer_id)
     }
 
-    /// Sends a single datagram. A full buffer drops it, like the network
-    /// would; the protocol retries what matters.
-    fn send_datagram(&self, bytes: &[u8]) -> io::Result<()> {
-        match self.socket.try_send(self.peer, bytes) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Handles everything queued on the socket.
     fn drain_socket(&mut self) -> Result<(), SendError> {
         for _ in 0..MAX_RECV_CALLS {
@@ -819,10 +828,35 @@ impl Engine {
         }
     }
 
+    /// The address the next handshake attempt goes to.
+    ///
+    /// Once a session exists its proven address is the only sensible target.
+    /// Before that, attempts rotate through every address the receiver's
+    /// name gave us: only one of them may be reachable, and only the
+    /// handshake can tell which one is really the receiver.
+    fn next_target(&mut self) -> SocketAddr {
+        if self.secure.is_some() || self.candidates.len() <= 1 {
+            return self.peer;
+        }
+        let target = self.candidates[self.next_candidate % self.candidates.len()];
+        self.next_candidate = self.next_candidate.wrapping_add(1);
+        target
+    }
+
     /// Starts a new handshake attempt: a fresh ephemeral key and connection
     /// id, carrying HELLO. The receiver answers with its current state.
     fn send_initiation(&mut self) -> Result<(), SendError> {
+        self.send_initiation_to(None)
+    }
+
+    /// [`Engine::send_initiation`] aimed at a given address instead of the
+    /// next candidate in the rotation.
+    fn send_initiation_to(&mut self, to: Option<SocketAddr>) -> Result<(), SendError> {
         let now = Instant::now();
+        let to = match to {
+            Some(to) => to,
+            None => self.next_target(),
+        };
         let mut attempt = Initiator::new(&self.auth.identity, &self.auth.receiver, &self.auth.psk)
             .map_err(|e| SendError::Handshake(e.to_string()))?;
         let ts = self.clock.now_us().max(1);
@@ -833,21 +867,35 @@ impl Engine {
             hello_flags: HELLO_FLAG_RESUME,
             hello: self.hello(ts),
         });
+        // A cookie proves our address to one receiver, so it is only worth
+        // anything at the address that issued it.
         let cookie = self
             .cookie
-            .filter(|(_, at)| now.saturating_duration_since(*at) < hs::COOKIE_LIFETIME)
-            .map(|(c, _)| c);
+            .filter(|(_, at, from)| {
+                *from == to && now.saturating_duration_since(*at) < hs::COOKIE_LIFETIME
+            })
+            .map(|(c, _, _)| c);
         let pkt = attempt
             .initiation(&payload, cookie.as_ref())
             .map_err(|e| SendError::Handshake(e.to_string()))?;
-        self.send_datagram(&pkt)?;
+        match self.socket.try_send(to, &pkt) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => {}
+            // One unreachable address (a broken IPv6 path, say) must not end
+            // the transfer while other candidates are untried.
+            Err(e) if self.candidates.len() > 1 && self.secure.is_none() => {
+                tracing::debug!("cannot reach {}: {}", to, e);
+                return Ok(());
+            }
+            Err(e) => return Err(SendError::Io(e)),
+        }
         if self.attempts.len() >= MAX_ATTEMPTS {
             self.attempts.pop_front();
         }
-        self.attempts.push_back((attempt, now));
+        self.attempts.push_back((attempt, now, to));
         tracing::debug!(
             "handshake initiation sent to {} ({})",
-            self.peer,
+            to,
             self.auth.receiver.short()
         );
         Ok(())
@@ -864,12 +912,15 @@ impl Engine {
         if pkt.len() == COOKIE_REPLY_LEN {
             if let Some(cookie) = self.attempts[idx].0.read_cookie_reply(pkt) {
                 tracing::debug!("receiver is under load and asked for a cookie; retrying");
-                self.cookie = Some((cookie, Instant::now()));
-                self.send_initiation()?;
+                let issued_by = self.attempts[idx].2;
+                self.cookie = Some((cookie, Instant::now(), issued_by));
+                // Retry at the address that asked for the cookie: it is only
+                // worth anything there.
+                self.send_initiation_to(Some(issued_by))?;
             }
             return Ok(());
         }
-        let (attempt, sent_at) = self.attempts.remove(idx).expect("index in range");
+        let (attempt, sent_at, target) = self.attempts.remove(idx).expect("index in range");
         let cid = attempt.cid();
         match attempt.read_response(pkt) {
             Ok((receiver_cid, payload, split)) => {
@@ -896,12 +947,20 @@ impl Engine {
                 });
                 // Older attempts are obsolete now.
                 self.attempts.clear();
+                // We sent this attempt to `target` and got back an answer
+                // bound to it, so `target` is reachable and is the receiver:
+                // that round trip is the proof, and it settles which of the
+                // candidate addresses a name resolved to is the real one.
+                if self.peer != target {
+                    tracing::info!("receiver answered at {}", target);
+                    self.peer = target;
+                }
                 // The new keys are in place, so liveness and — when the
                 // answer came from an address we have not proven — its
                 // validation can both run under them. A handshake response
                 // is authentic, but authenticity says nothing about where
                 // it was sent from: it could have been captured and repeated
-                // with a forged source. Until the new address answers a
+                // with a forged source. Until that address answers a
                 // challenge, the file keeps going to the proven one.
                 self.path.reset();
                 self.note_alive(now, from);
@@ -1683,7 +1742,7 @@ impl Engine {
         if self.secure.as_ref().is_some_and(|s| s.local_cid == dcid) {
             return self.on_transport(pkt, from);
         }
-        if let Some(i) = self.attempts.iter().position(|(a, _)| a.cid() == dcid) {
+        if let Some(i) = self.attempts.iter().position(|(a, _, _)| a.cid() == dcid) {
             return self.on_handshake_reply(i, pkt, from);
         }
         Ok(())

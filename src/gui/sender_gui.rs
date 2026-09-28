@@ -129,7 +129,7 @@ impl SenderApp {
                 }
             };
             rt.block_on(async move {
-                let addr = match crate::address::resolve(&host).await {
+                let addrs = match crate::address::resolve_all(&host).await {
                     Ok(a) => a,
                     Err(e) => {
                         *state.lock() = State::Failed(format!("cannot resolve {}: {}", host, e));
@@ -137,7 +137,8 @@ impl SenderApp {
                         return;
                     }
                 };
-                let mut cfg = SenderConfig::new(addr, receiver_id, file);
+                let mut cfg = SenderConfig::new(addrs[0], receiver_id, file);
+                cfg.alternate_peers = addrs[1..].to_vec();
                 cfg.bind = bind;
                 cfg.identity = Some(identity);
                 cfg.transport.max_rate_bytes = max_rate;
