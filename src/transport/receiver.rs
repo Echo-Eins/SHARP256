@@ -866,7 +866,9 @@ impl Dispatcher {
 /// hands its control messages over on.
 #[cfg(feature = "nat-traversal")]
 struct RelayClient {
-    addr: SocketAddr,
+    /// Every address the relay's name gave, the one in use among them: its
+    /// messages may come from any.
+    addrs: Vec<SocketAddr>,
     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
 }
 
@@ -924,20 +926,24 @@ fn spawn_relay_clients(shared: &Arc<Shared>) -> RelayClients {
         let events = shared.cfg.events.clone();
         let list = list.clone();
         tasks.push(tokio::spawn(async move {
-            let Some(addr) = resolve_relay(&host, reach, &cancel).await else {
+            let Some(addrs) = resolve_relay(&host, reach, &cancel).await else {
                 return;
             };
             let (tx, rx) = mpsc::channel(32);
-            list.write().push(RelayClient { addr, tx });
+            list.write().push(RelayClient {
+                addrs: addrs.clone(),
+                tx,
+            });
             crate::relay::client::serve(
                 socket,
-                addr,
+                addrs,
                 relay_id,
                 identity,
                 private,
                 rx,
                 cancel,
-                move |observed| {
+                crate::nat::keepalive::Keepalive::default(),
+                move |addr: SocketAddr, observed: SocketAddr| {
                     // Deliberately *not* published as an address to hand a
                     // sender. It is this receiver's NAT mapping towards that
                     // relay's control port, and under the NAT a relay exists
@@ -968,14 +974,16 @@ fn spawn_relay_clients(shared: &Arc<Shared>) -> RelayClients {
     RelayClients { list, tasks }
 }
 
-/// Resolves a relay's name to the first address this socket can reach,
-/// trying again with growing pauses until it does or the receiver stops.
+/// Resolves a relay's name to the addresses this socket can reach, in the
+/// order to try them (IPv6 first where this host has it, the families
+/// taking turns), trying again with growing pauses until there is one or
+/// the receiver stops.
 #[cfg(feature = "nat-traversal")]
 async fn resolve_relay(
     host: &str,
     reach: crate::address::Reach,
     cancel: &CancellationToken,
-) -> Option<SocketAddr> {
+) -> Option<Vec<SocketAddr>> {
     let mut wait = Duration::from_secs(2);
     let mut told = false;
     loop {
@@ -984,13 +992,16 @@ async fn resolve_relay(
             _ = cancel.cancelled() => return None,
         };
         let why = match attempt {
-            Ok(Ok(all)) => match all.iter().find_map(|a| reach.native(*a)) {
-                Some(a) => return Some(a),
-                None => format!(
+            Ok(Ok(all)) => {
+                let usable: Vec<SocketAddr> = all.iter().filter_map(|a| reach.native(*a)).collect();
+                if !usable.is_empty() {
+                    return Some(usable);
+                }
+                format!(
                     "none of its addresses ({:?}) can be reached from this socket",
                     all
-                ),
-            },
+                )
+            }
             Ok(Err(e)) => e.to_string(),
             Err(_) => "the name did not resolve in time".to_string(),
         };
@@ -1048,7 +1059,10 @@ fn side_channel(
     // would parse as is one no endpoint ever picks.
     if crate::relay::is_control(first) {
         let list = relays.list.read();
-        if let Some(c) = list.iter().find(|c| c.addr.ip() == from.ip()) {
+        if let Some(c) = list
+            .iter()
+            .find(|c| c.addrs.iter().any(|a| a.ip() == from.ip()))
+        {
             for d in run.chunks(stride) {
                 if crate::relay::is_control(d) {
                     let _ = c.tx.try_send((d.to_vec(), from));

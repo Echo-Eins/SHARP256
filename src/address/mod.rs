@@ -1,14 +1,53 @@
-//! Receiver addresses as users write them: `<SHARP ID>@<host>:<port>`.
+//! Addresses: how users write them (`<SHARP ID>@<host>:<port>`), what
+//! they are ([`class`]), how names become them ([`dns`]), and how an
+//! IPv6-only network reaches IPv4 ones ([`nat64`]).
+
+pub mod class;
+pub mod dns;
+pub mod nat64;
 
 use crate::crypto::SharpId;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 /// `addr` in the one form code that compares or screens addresses should
 /// see. An IPv4 peer that reaches a dual-stack IPv6 socket appears as
 /// `::ffff:a.b.c.d`; it is the same peer as `a.b.c.d`, and a check that
 /// only knew about one spelling would let the other straight through.
+///
+/// An IPv6 address loses its flow label, which says nothing about who the
+/// peer is, and keeps its zone only where one means something — on a
+/// link-local address, whose interface it names.
 pub fn canonical(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+    match addr {
+        SocketAddr::V4(_) => addr,
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, zone_of(&v6))),
+        },
+    }
+}
+
+/// A source address as a socket reports it, in the form everything it is
+/// compared against uses: the spelling kept (a dual-stack socket must keep
+/// writing IPv4 peers mapped), but no flow label and no zone where none
+/// belongs. `SocketAddr` equality counts both, so a system that reported
+/// a peer's flow label with its address would otherwise make the same peer
+/// look like a stranger from one datagram to the next.
+pub fn normalize(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(_) => addr,
+        SocketAddr::V6(v6) => {
+            SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, zone_of(&v6)))
+        }
+    }
+}
+
+fn zone_of(v6: &SocketAddrV6) -> u32 {
+    if class::is_link_local_v6(v6.ip()) {
+        v6.scope_id()
+    } else {
+        0
+    }
 }
 
 /// Who a request counts against, for rate limits and shares: an IPv4
@@ -171,26 +210,86 @@ pub async fn resolve(host_port: &str) -> std::io::Result<SocketAddr> {
     Ok(resolve_all(host_port).await?[0])
 }
 
+/// Addresses a receiver published (see [`parse_peer`]), sorted out: the
+/// literal ones, in the order a sender should try them, and the names,
+/// which a sender resolves while it is already trying the literals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Targets {
+    pub addrs: Vec<SocketAddr>,
+    pub names: Vec<String>,
+}
+
+/// Splits published hosts into literals and names. The literals are put in
+/// the order RFC 6724 and RFC 8305 section 4 would try them: native IPv6
+/// before IPv4 where this host has IPv6 to speak it with, anything it has
+/// no route to last, and the families taking turns after the first.
+pub fn targets(hosts: &[String]) -> Targets {
+    let mut out = Targets::default();
+    for host in hosts {
+        match dns::parse_literal(host) {
+            Some(a) => {
+                if !out.addrs.contains(&a) && out.addrs.len() < MAX_ADDRESSES * 2 {
+                    out.addrs.push(a);
+                }
+            }
+            None => {
+                if !out.names.contains(host) {
+                    out.names.push(host.clone());
+                }
+            }
+        }
+    }
+    class::sort_destinations(&mut out.addrs);
+    out.addrs = class::interleave_families(&out.addrs);
+    out
+}
+
 /// Resolves every candidate a receiver published (see [`parse_peer`]) into
-/// the addresses to try, in the order given and without repeats.
+/// the addresses to try, without repeats, in the order [`targets`] and
+/// [`resolve_all`] give.
 ///
 /// A candidate that does not resolve is reported only when *none* of them
 /// do: a receiver behind a NAT publishes addresses it cannot know are
 /// reachable from where the sender sits, and one of them failing to resolve
 /// is expected rather than an error.
 pub async fn resolve_candidates(hosts: &[String]) -> Result<Vec<SocketAddr>, String> {
+    let Targets { addrs, names } = targets(hosts);
     let mut out: Vec<SocketAddr> = Vec::new();
+    for a in addrs {
+        for a in nat64::alternatives(a).await {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
     let mut last_error = None;
-    for host in hosts {
-        match resolve_all(host).await {
-            Ok(addrs) => {
-                for a in addrs {
-                    if !out.contains(&a) && out.len() < MAX_ADDRESSES {
+    // All names at once: each is bounded, and one slow name server must not
+    // hold up the others.
+    let mut set = tokio::task::JoinSet::new();
+    for (i, name) in names.into_iter().enumerate() {
+        set.spawn(async move {
+            let r = resolve_all(&name).await;
+            (i, name, r)
+        });
+    }
+    let mut results: Vec<(usize, String, std::io::Result<Vec<SocketAddr>>)> = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(r) = r {
+            results.push(r);
+        }
+    }
+    // In the order they were published.
+    results.sort_by_key(|(i, _, _)| *i);
+    for (_, name, r) in results {
+        match r {
+            Ok(list) => {
+                for a in list {
+                    if !out.contains(&a) && out.len() < MAX_ADDRESSES * 2 {
                         out.push(a);
                     }
                 }
             }
-            Err(e) => last_error = Some(format!("cannot resolve {}: {}", host, e)),
+            Err(e) => last_error = Some(format!("cannot resolve {}: {}", name, e)),
         }
     }
     if out.is_empty() {
@@ -200,7 +299,7 @@ pub async fn resolve_candidates(hosts: &[String]) -> Result<Vec<SocketAddr>, Str
 }
 
 /// Resolves `host:port` to every address it names, at most
-/// [`MAX_ADDRESSES`].
+/// [`MAX_ADDRESSES`], in the order to try them.
 ///
 /// Name resolution is a *hint*, never an authority. DNS and mDNS answers
 /// travel unauthenticated and are the easiest thing on the network to forge
@@ -211,36 +310,29 @@ pub async fn resolve_candidates(hosts: &[String]) -> Result<Vec<SocketAddr>, Str
 /// a host whose first address happens to be unreachable (a broken IPv6 path
 /// is the usual case) no longer strands the transfer.
 ///
-/// The families are interleaved for the same reason: if one of them is
-/// broken end to end, it cannot fill the whole list of attempts.
+/// Both families are asked for separately, each bounded on its own (see
+/// [`dns`]), and interleaved: if one of them is broken end to end, it cannot
+/// fill the whole list of attempts. An IPv4 literal on a network that has
+/// no IPv4 route comes back translated for its NAT64 as well (see
+/// [`nat64`]).
 pub async fn resolve_all(host_port: &str) -> std::io::Result<Vec<SocketAddr>> {
-    if let Ok(addr) = host_port.parse() {
-        return Ok(vec![addr]);
+    if let Some(addr) = dns::parse_literal(host_port) {
+        return Ok(nat64::alternatives(addr).await);
     }
-    let mut v6: Vec<SocketAddr> = Vec::new();
-    let mut v4: Vec<SocketAddr> = Vec::new();
-    for addr in tokio::net::lookup_host(host_port).await? {
-        let bucket = if addr.is_ipv6() { &mut v6 } else { &mut v4 };
-        if !bucket.contains(&addr) {
-            bucket.push(addr);
-        }
-    }
+    let (host, port) = dns::split_host_port(host_port)?;
     let mut out = Vec::with_capacity(MAX_ADDRESSES);
-    let mut v6 = v6.into_iter();
-    let mut v4 = v4.into_iter();
-    while out.len() < MAX_ADDRESSES {
-        let (a, b) = (v6.next(), v4.next());
-        if a.is_none() && b.is_none() {
-            break;
-        }
-        out.extend(a.into_iter().chain(b).take(MAX_ADDRESSES - out.len()));
-    }
-    if out.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{} does not resolve to an address", host_port),
-        ));
-    }
+    // The whole list is wanted, so the late family is waited for as long
+    // as its own lookup may take.
+    dns::resolve_happily(
+        host,
+        port,
+        true,
+        true,
+        dns::LOOKUP_TIMEOUT,
+        MAX_ADDRESSES,
+        |a| out.push(a),
+    )
+    .await?;
     Ok(out)
 }
 
@@ -287,11 +379,14 @@ mod tests {
         let reach = Reach::of(&v4);
         assert!(reach.reaches("127.0.0.1:9".parse().unwrap()));
         assert!(!reach.reaches("[::1]:9".parse().unwrap()));
-        // An IPv6 socket, where this host has IPv6 at all.
-        if let Ok(v6) = crate::transport::socket::bind_udp("[::]:0".parse().unwrap(), 1 << 16) {
-            let reach = Reach::of(&v6);
-            assert!(reach.reaches("[::1]:9".parse().unwrap()));
-        }
+        // `[::]` is one dual-stack socket where the host has IPv6, and an
+        // IPv4 one where it has not; either way it reaches IPv4.
+        let any = crate::transport::socket::bind_udp("[::]:0".parse().unwrap(), 1 << 16).unwrap();
+        let reach = Reach::of(&any);
+        assert!(reach.reaches("127.0.0.1:9".parse().unwrap()));
+        let has_v6 = any.local_addr().unwrap().is_ipv6();
+        assert_eq!(reach.reaches("[::1]:9".parse().unwrap()), has_v6);
+        assert_eq!(reach.v6(), has_v6);
     }
 
     #[test]

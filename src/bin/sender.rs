@@ -18,8 +18,10 @@ struct Args {
     /// Receiver as <ID>@<host>:<port> (the receiver prints it at startup)
     receiver: Option<String>,
 
-    /// Local bind address
-    #[arg(short, long, default_value = "0.0.0.0:0")]
+    /// Local bind address. The default, [::]:0, speaks IPv6 and IPv4
+    /// alike through one dual-stack socket, and falls back to IPv4 where
+    /// the system has no IPv6
+    #[arg(short, long, default_value = "[::]:0")]
     bind: SocketAddr,
 
     /// Accepted for compatibility; the sender needs no NAT handling
@@ -110,35 +112,23 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     }
     let (receiver_id, hosts) =
         sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?;
-    // A receiver may publish several addresses, and each name may have
-    // several of its own. Try them all and let the handshake decide which
-    // one is the receiver.
     // A receiver reached only through a relay publishes no address.
-    let addrs = if hosts.is_empty() {
-        if args.relays.is_empty() {
-            anyhow::bail!(
-                "{} has no address: write it as <ID>@<host>:<port>, or name the relay it \
-                 registered with using --relay",
-                receiver
-            );
-        }
-        Vec::new()
-    } else {
-        sharp256::address::resolve_candidates(&hosts)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    // An unspecified address stands for "none yet": the relays supply them.
-    let addr = addrs
-        .first()
-        .copied()
-        .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+    if hosts.is_empty() && args.relays.is_empty() {
+        anyhow::bail!(
+            "{} has no address: write it as <ID>@<host>:<port>, or name the relay it \
+             registered with using --relay",
+            receiver
+        );
+    }
     let identity = load_identity(&args.identity)?;
     let sender_id = identity.id();
     println!("{}", system_info());
 
-    let mut cfg = SenderConfig::new(addr, receiver_id, file.clone());
-    cfg.alternate_peers = addrs.get(1..).unwrap_or_default().to_vec();
+    // A receiver may publish several addresses, and each name may have
+    // several of its own. The sender tries them all — names resolved while
+    // the literal addresses are already being tried — and the handshake
+    // decides which one is the receiver.
+    let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file.clone());
     cfg.bind = args.bind;
     let _ = args.no_nat;
     cfg.relays = args.relays.clone();
@@ -233,7 +223,12 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
             format_bytes(sender.source().size())
         ),
     }
-    println!("Receiver:  {} ({})", addr, receiver_id);
+    if hosts.is_empty() {
+        println!("Receiver:  {} (through the relays)", receiver_id);
+    } else {
+        println!("Receiver:  {} ({})", hosts.join(", "), receiver_id);
+    }
+    println!("Local:     {}", sender.local_addr()?);
     println!("Sender ID: {}", sender_id);
     let cancel = sender.cancel_token();
     tokio::spawn(async move {

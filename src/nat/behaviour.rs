@@ -213,30 +213,9 @@ fn means_no_nat(ip: IpAddr) -> bool {
 }
 
 /// Whether `ip` can be reached from the internet at large, as far as its
-/// address alone can say: not private, not carrier-grade NAT, not loopback,
-/// link-local, documentation or unspecified.
+/// address alone can say (see `address::class`).
 pub(crate) fn is_globally_routable(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 127
-                // 100.64.0.0/10, where carrier-grade NAT lives.
-                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
-        }
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // fe80::/10 link-local and fc00::/7 unique-local.
-                || v6.segments()[0] & 0xffc0 == 0xfe80
-                || v6.segments()[0] & 0xfe00 == 0xfc00)
-        }
-    }
+    crate::address::class::is_global(ip)
 }
 
 /// Runs the RFC 5780 tests on `socket`, falling back to a cross-check

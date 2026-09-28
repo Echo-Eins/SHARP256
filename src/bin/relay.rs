@@ -28,8 +28,10 @@ use tokio_util::sync::CancellationToken;
     version
 )]
 struct Args {
-    /// Address to listen on.
-    #[arg(short, long, default_value = "0.0.0.0:5560")]
+    /// Address to listen on. The default, [::]:5560, serves IPv6 and IPv4
+    /// alike on one dual-stack socket — and carries pairs across the two —
+    /// falling back to IPv4 where the system has no IPv6.
+    #[arg(short, long, default_value = "[::]:5560")]
     bind: SocketAddr,
 
     /// Identities that may be registered at once.
@@ -109,9 +111,15 @@ async fn main() -> Result<()> {
     println!("{}", sharp256::system_info());
     println!("Relay listening on {}", addr);
     // A receiver has to know which relay it is registering with; a sender
-    // claims no identity of its own and so needs only the address.
-    println!("Receivers: --relay {}@{}", identity.id(), addr);
-    println!("Senders:   --relay {}", addr);
+    // claims no identity of its own and so needs only the address. A
+    // wildcard is no address anyone else can use.
+    let public = if addr.ip().is_unspecified() {
+        format!("<this host>:{}", addr.port())
+    } else {
+        addr.to_string()
+    };
+    println!("Receivers: --relay {}@{}", identity.id(), public);
+    println!("Senders:   --relay {}", public);
 
     let stopper = cancel.clone();
     tokio::spawn(async move {

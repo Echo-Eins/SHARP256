@@ -59,6 +59,27 @@ pub struct Introduction {
     pub ticket: [u8; TOKEN_LEN],
 }
 
+/// Why a relay did not put us through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    /// It answered, and said no. Asking it at another of its addresses
+    /// would get the same answer.
+    Refused(String),
+    /// Nothing came back from this address, or we could not send there.
+    /// Another address of the same relay may do better.
+    NoAnswer(String),
+    Cancelled,
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Refused(why) | ConnectError::NoAnswer(why) => f.write_str(why),
+            ConnectError::Cancelled => f.write_str("cancelled"),
+        }
+    }
+}
+
 /// Asks a relay to put us through to `target`.
 ///
 /// Runs alongside the connectivity checks rather than before them, as ICE
@@ -74,15 +95,18 @@ pub async fn connect(
     target: SharpId,
     incoming: &mut mpsc::Receiver<Incoming>,
     cancel: &CancellationToken,
-) -> Result<Introduction, String> {
+) -> Result<Introduction, ConnectError> {
     let mut token = [0u8; TOKEN_LEN];
     for _ in 0..TRIES {
         if cancel.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(ConnectError::Cancelled);
         }
         let ask = Message::Connect { target, token };
         if let Err(e) = socket.send_to(&ask.encode(), relay).await {
-            return Err(format!("cannot reach the relay {}: {}", relay, e));
+            return Err(ConnectError::NoAnswer(format!(
+                "cannot reach the relay {}: {}",
+                relay, e
+            )));
         }
         match wait_for(incoming, relay, REPLY_WAIT).await {
             // The relay wants us to prove we receive where we say we do.
@@ -107,11 +131,16 @@ pub async fn connect(
                     ticket,
                 });
             }
-            Some(Message::Error { code }) => return Err(code.describe().to_string()),
+            Some(Message::Error { code }) => {
+                return Err(ConnectError::Refused(code.describe().to_string()))
+            }
             _ => {}
         }
     }
-    Err(format!("the relay {} did not answer", relay))
+    Err(ConnectError::NoAnswer(format!(
+        "the relay {} did not answer",
+        relay
+    )))
 }
 
 /// Binds our side of an allocated port and keeps it bound, until cancelled.
@@ -162,20 +191,40 @@ pub async fn hold(
 /// Registers with a relay and stays registered, introducing senders as they
 /// arrive. Runs until cancelled.
 ///
+/// `relays` are the addresses the relay's name gave, in the order to try
+/// them: until one of them answers, the registration moves on to the next
+/// after two unanswered attempts, so that a relay whose IPv6 path is broken
+/// is still reached over IPv4.
+///
+/// Once registered, the registration is refreshed often enough to keep our
+/// NAT's mapping towards the relay alive (see [`crate::nat::keepalive`]),
+/// not merely the relay's lease: a mapping forgotten between refreshes
+/// leaves the relay introducing senders to an address that leads nowhere
+/// until the next one. If the relay sees us at a new address after a
+/// refresh anyway, the mapping did lapse, and the refreshes get closer
+/// together. A relay that stops answering for a whole lease has forgotten
+/// us: registering starts over, on the next address if there is one.
+///
 /// `incoming` carries the relay's datagrams — from its control port and
 /// from the ports it allocates — handed over by whoever owns the socket's
-/// receive loop.
+/// receive loop. `on_registered` hears the address registered with and
+/// where the relay sees us, the first time and whenever that changes.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     socket: Arc<UdpSocket>,
-    relay: SocketAddr,
+    relays: Vec<SocketAddr>,
     relay_id: SharpId,
     identity: Identity,
     private: bool,
     mut incoming: mpsc::Receiver<Incoming>,
     cancel: CancellationToken,
-    on_registered: impl Fn(SocketAddr) + Send + 'static,
+    keepalive: crate::nat::keepalive::Keepalive,
+    on_registered: impl Fn(SocketAddr, SocketAddr) + Send + 'static,
 ) {
+    let Some(&first) = relays.first() else {
+        return;
+    };
+    let mut relay = first;
     let id = identity.id();
     // A secret only this receiver and this relay can work out, from their
     // long-term keys and nothing else. It is what turns "I am sh-…" into
@@ -200,14 +249,42 @@ pub async fn serve(
     // matched to the port they came from.
     let mut handled: std::collections::VecDeque<([u8; TOKEN_LEN], u16)> =
         std::collections::VecDeque::new();
-    // Until the relay answers, ask briskly; once registered, just keep the
-    // lease and the NAT mapping alive.
+    // Until the relay answers, ask briskly; once registered, keep the lease
+    // and the NAT mapping alive.
     let mut retry = Duration::from_millis(500);
     let mut lease = Duration::from_secs(60);
+    let mut keepalive = keepalive;
     let mut send_failures = 0u32;
+    // Registrations sent to the current address with nothing back yet.
+    let mut unanswered = 0u32;
+    let mut index = 0usize;
+    // When the relay last confirmed the registration, and where it saw us.
+    let mut confirmed_at = Instant::now();
+    let mut observed: Option<SocketAddr> = None;
     loop {
         let now = Instant::now();
+        // A whole lease without a confirmation: the relay has let the
+        // registration go, or cannot hear us. Start over.
+        if registered && now.saturating_duration_since(confirmed_at) > lease {
+            tracing::warn!(
+                "relay {} has not answered for {:?}; registering again",
+                relay,
+                lease
+            );
+            registered = false;
+            retry = Duration::from_millis(500);
+            unanswered = 0;
+        }
         if now >= next_send {
+            // Nothing back from this address after two tries: the next one
+            // may do better (a broken IPv6 path is the usual case).
+            if !registered && unanswered >= 2 && relays.len() > 1 {
+                index = (index + 1) % relays.len();
+                relay = relays[index];
+                token = [0; TOKEN_LEN];
+                unanswered = 0;
+                tracing::debug!("relay: trying its address {}", relay);
+            }
             let msg = signed(
                 &key,
                 Message::Register {
@@ -221,8 +298,11 @@ pub async fn serve(
             match socket.send_to(&msg, relay).await {
                 Ok(_) => {
                     send_failures = 0;
-                    next_send = now + if registered { lease / 2 } else { retry };
-                    if !registered {
+                    if registered {
+                        next_send = now + keepalive.next().min(lease / 2);
+                    } else {
+                        unanswered += 1;
+                        next_send = now + retry;
                         retry = (retry * 2).min(Duration::from_secs(15));
                     }
                 }
@@ -234,6 +314,9 @@ pub async fn serve(
                     send_failures = send_failures.saturating_add(1);
                     if send_failures == 1 {
                         tracing::warn!("relay {}: cannot send ({}); will keep trying", relay, e);
+                    }
+                    if !registered {
+                        unanswered += 1;
                     }
                     next_send = now + Duration::from_secs(2u64 << send_failures.min(4));
                 }
@@ -274,6 +357,7 @@ pub async fn serve(
             }
             continue;
         }
+        unanswered = 0;
         match msg {
             Message::Challenge { token: t } => {
                 token = t;
@@ -281,15 +365,43 @@ pub async fn serve(
             }
             Message::Registered {
                 lease: secs,
-                observed,
+                observed: seen,
             } => {
-                if !registered {
-                    tracing::info!("relay {} reached; it sees us at {}", relay, observed);
-                    on_registered(observed);
-                }
-                registered = true;
                 lease = Duration::from_secs(secs.clamp(10, 3600) as u64);
-                next_send = Instant::now() + lease / 2;
+                confirmed_at = Instant::now();
+                match observed {
+                    None => {
+                        tracing::info!("relay {} reached; it sees us at {}", relay, seen);
+                        on_registered(relay, seen);
+                    }
+                    // The mapping lapsed although it was being refreshed:
+                    // the refreshes are too far apart for this NAT.
+                    Some(before) if before != seen => {
+                        if keepalive.mapping_changed() {
+                            tracing::info!(
+                                "our NAT gave us a new address towards relay {} ({} -> {}); \
+                                 refreshing every {:?} from now on",
+                                relay,
+                                before,
+                                seen,
+                                keepalive.interval()
+                            );
+                        } else {
+                            tracing::info!(
+                                "our NAT gave us a new address towards relay {} ({} -> {})",
+                                relay,
+                                before,
+                                seen
+                            );
+                        }
+                        on_registered(relay, seen);
+                    }
+                    Some(_) => {}
+                }
+                observed = Some(seen);
+                registered = true;
+                retry = Duration::from_millis(500);
+                next_send = Instant::now() + keepalive.next().min(lease / 2);
             }
             Message::Incoming { port, peer, ticket } => {
                 let relayed = SocketAddr::new(relay.ip(), port);

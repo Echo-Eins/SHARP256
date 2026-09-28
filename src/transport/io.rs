@@ -65,7 +65,21 @@ impl BatchSocket {
         // The batch layer lets the kernel ignore the path MTUs it learns;
         // the transfer engines want to hear about them (EMSGSIZE) so that
         // they can shrink their packets.
-        set_dont_fragment(&io);
+        let df = set_dont_fragment(&io);
+        let reach = crate::address::Reach::of(&io);
+        if reach.v4() && !df.v4 {
+            tracing::info!(
+                "this system does not mark IPv4 datagrams from {} \"don't fragment\"; routers \
+                 may fragment them, which path MTU probing cannot see",
+                io.local_addr()?
+            );
+        }
+        if reach.v6() && !df.v6 {
+            tracing::info!(
+                "this system does not mark IPv6 datagrams from {} \"don't fragment\"",
+                io.local_addr()?
+            );
+        }
         io.writable().await?;
         Ok(Self {
             io: Arc::new(io),
@@ -159,7 +173,10 @@ impl BatchSocket {
         })?;
         for (o, m) in out.iter_mut().zip(&meta[..got]) {
             *o = Received {
-                from: m.addr,
+                // Without the flow label and stray zone some systems report:
+                // the same peer must compare equal from one datagram to the
+                // next.
+                from: crate::address::normalize(m.addr),
                 len: m.len,
                 stride: if m.stride == 0 { m.len } else { m.stride },
             };

@@ -136,6 +136,12 @@ pub struct SenderConfig {
     /// address is really the receiver, so a wrong or forged one costs time
     /// rather than safety.
     pub alternate_peers: Vec<SocketAddr>,
+    /// Names the receiver is published under (`host:port`), resolved while
+    /// the addresses above are already being tried: each family is asked
+    /// for separately and its addresses join the attempts as they arrive,
+    /// the way RFC 8305 (Happy Eyeballs) describes, so a name server that
+    /// is slow to answer one family holds nothing up.
+    pub peer_names: Vec<String>,
     /// Identity of the receiver. Only the holder of its private key can
     /// answer the handshake, so this authenticates the receiver.
     pub receiver_id: SharpId,
@@ -162,6 +168,7 @@ impl std::fmt::Debug for SenderConfig {
             .field("bind", &self.bind)
             .field("peer", &self.peer)
             .field("alternate_peers", &self.alternate_peers)
+            .field("peer_names", &self.peer_names)
             .field("receiver_id", &self.receiver_id)
             .field("file_path", &self.file_path)
             .field("transport", &self.transport)
@@ -175,11 +182,33 @@ impl std::fmt::Debug for SenderConfig {
 }
 
 impl SenderConfig {
+    /// A sender for a receiver published under `hosts` (see
+    /// `address::parse_peer`): the literal addresses become `peer` and
+    /// `alternate_peers`, in the order RFC 6724 would try them with the
+    /// families taking turns (RFC 8305 section 4), and the names become
+    /// `peer_names`, resolved while the literals are already being tried.
+    /// With no literal address at all, `peer` is unspecified — "none yet".
+    pub fn for_hosts(hosts: &[String], receiver_id: SharpId, file_path: PathBuf) -> Self {
+        let targets = crate::address::targets(hosts);
+        let peer = targets
+            .addrs
+            .first()
+            .copied()
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let mut cfg = Self::new(peer, receiver_id, file_path);
+        cfg.alternate_peers = targets.addrs.get(1..).unwrap_or_default().to_vec();
+        cfg.peer_names = targets.names;
+        cfg
+    }
+
     pub fn new(peer: SocketAddr, receiver_id: SharpId, file_path: PathBuf) -> Self {
         Self {
-            bind: "0.0.0.0:0".parse().unwrap(),
+            // Both families where the system has them (see
+            // `transport::socket::bind_udp`), IPv4 alone where it does not.
+            bind: "[::]:0".parse().unwrap(),
             peer,
             alternate_peers: Vec::new(),
+            peer_names: Vec::new(),
             receiver_id,
             file_path,
             transport: TransportConfig::default(),

@@ -42,7 +42,9 @@ impl SenderApp {
         Self {
             file_path: file,
             receiver_addr: receiver.unwrap_or_default(),
-            bind_addr: "0.0.0.0:0".to_string(),
+            // Both families where the system has them, IPv4 alone where it
+            // does not.
+            bind_addr: "[::]:0".to_string(),
             max_rate: String::new(),
             secret: String::new(),
             identity,
@@ -129,16 +131,9 @@ impl SenderApp {
                 }
             };
             rt.block_on(async move {
-                let addrs = match crate::address::resolve_candidates(&hosts).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        *state.lock() = State::Failed(e);
-                        repaint.request_repaint();
-                        return;
-                    }
-                };
-                let mut cfg = SenderConfig::new(addrs[0], receiver_id, file);
-                cfg.alternate_peers = addrs[1..].to_vec();
+                // Names are resolved by the sender itself, while it is
+                // already trying the literal addresses (RFC 8305).
+                let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file);
                 cfg.bind = bind;
                 cfg.identity = Some(identity);
                 cfg.transport.max_rate_bytes = max_rate;

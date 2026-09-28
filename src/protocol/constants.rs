@@ -27,6 +27,9 @@ pub const UDP_PAYLOAD_JUMBO: usize = 8972;
 
 /// Default DATA chunk (file bytes per packet) for a 1500-byte MTU.
 pub const DEFAULT_CHUNK: u16 = (UDP_PAYLOAD_IPV4_1500 - DATA_OVERHEAD) as u16;
+/// The same over IPv6, whose header is 20 bytes longer. It is also what a
+/// 1492-byte PPPoE link carries over IPv4, the most common MTU below 1500.
+pub const DEFAULT_CHUNK_V6: u16 = (UDP_PAYLOAD_IPV6_1500 - DATA_OVERHEAD) as u16;
 /// Chunk that is safe without path-MTU probing.
 pub const SAFE_CHUNK: u16 = (UDP_PAYLOAD_SAFE - DATA_OVERHEAD) as u16;
 /// Smallest chunk we ever negotiate.

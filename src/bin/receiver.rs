@@ -16,8 +16,10 @@ struct Args {
     #[arg(short, long, default_value = "./received")]
     output: PathBuf,
 
-    /// Listen address (IP:port)
-    #[arg(short, long, default_value = "0.0.0.0:5555")]
+    /// Listen address (IP:port). The default, [::]:5555, takes IPv6 and
+    /// IPv4 alike on one dual-stack socket, and falls back to IPv4 where
+    /// the system has no IPv6
+    #[arg(short, long, default_value = "[::]:5555")]
     bind: SocketAddr,
 
     /// Disable NAT traversal (address discovery, NAT behaviour tests, port
@@ -140,7 +142,6 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
     println!("{}", system_info());
     std::fs::create_dir_all(&cfg.output_dir)?;
     println!("Output:      {}", cfg.output_dir.canonicalize()?.display());
-    println!("Listening:   {}", cfg.bind);
     println!("Receiver ID: {}", id);
     if cfg.relay_private && cfg.relays.is_empty() {
         println!("Warning:     --relay-private does nothing without --relay");
@@ -247,6 +248,9 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
     }));
 
     let receiver = Receiver::new(cfg).await.context("cannot start receiver")?;
+    // What was actually bound: `[::]` falls back to IPv4 where the system
+    // has no IPv6.
+    println!("Listening:   {}", receiver.local_addr()?);
     let cancel = receiver.cancel_token();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {

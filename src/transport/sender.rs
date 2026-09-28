@@ -68,6 +68,8 @@ pub enum SendError {
     HandshakeTimeout,
     #[error("handshake with the receiver failed: {0}")]
     Handshake(String),
+    #[error("cannot reach the receiver: {0}")]
+    Unreachable(String),
     #[error("identity: {0}")]
     Identity(String),
     #[error("receiver unreachable for {0:?}; transfer state kept for resume")]
@@ -208,12 +210,15 @@ impl Sender {
     /// every transfer wait on the relay — including the ones on a local
     /// network that never needed it.
     ///
+    /// A relay's name may resolve to several addresses — both families,
+    /// usually — and only some of them may work from here: they are asked
+    /// in turn, IPv6 first where this host has it, until one answers.
+    ///
     /// Returns the inboxes the engine routes each relay's datagrams into —
     /// filled in as the relays' names resolve, so a slow name server holds
-    /// up nothing — and a channel the addresses arrive on.
+    /// up nothing. The addresses the introductions turn up go to `found`.
     #[cfg(feature = "nat-traversal")]
-    fn spawn_relay_introductions(&self) -> (RelayInboxes, mpsc::UnboundedReceiver<SocketAddr>) {
-        let (found_tx, found_rx) = mpsc::unbounded_channel();
+    fn spawn_relay_introductions(&self, found_tx: mpsc::UnboundedSender<Found>) -> RelayInboxes {
         let inboxes: RelayInboxes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let reach = crate::address::Reach::of(&self.socket.udp());
         for name in &self.cfg.relays {
@@ -233,8 +238,7 @@ impl Sender {
             let found = found_tx.clone();
             let inboxes = inboxes.clone();
             tokio::spawn(async move {
-                // A name is resolved like the receiver's own: as a hint, and
-                // to the first address this socket can actually reach.
+                // A name is resolved like the receiver's own: as a hint.
                 let resolved = tokio::select! {
                     r = tokio::time::timeout(
                         RELAY_RESOLVE_TIMEOUT,
@@ -242,14 +246,8 @@ impl Sender {
                     ) => r,
                     _ = cancel.cancelled() => return,
                 };
-                let addr = match resolved {
-                    Ok(Ok(all)) => match all.into_iter().find_map(|a| reach.native(a)) {
-                        Some(a) => a,
-                        None => {
-                            tracing::info!("relay {}: no address this socket can reach", host);
-                            return;
-                        }
-                    },
+                let addrs: Vec<SocketAddr> = match resolved {
+                    Ok(Ok(all)) => all.into_iter().filter_map(|a| reach.native(a)).collect(),
                     Ok(Err(e)) => {
                         tracing::info!("relay {}: {}", host, e);
                         return;
@@ -259,46 +257,170 @@ impl Sender {
                         return;
                     }
                 };
+                if addrs.is_empty() {
+                    tracing::info!("relay {}: no address this socket can reach", host);
+                    return;
+                }
                 let (tx, mut rx) = mpsc::channel(32);
-                inboxes.write().push((addr, tx));
-                match crate::relay::client::connect(socket.clone(), addr, target, &mut rx, &cancel)
-                    .await
-                {
-                    Ok(i) => {
-                        match i.peer {
-                            Some(peer) => tracing::info!(
-                                "relay {} says the receiver is at {}, and will carry the \
-                                 transfer on {}",
-                                addr,
-                                peer,
-                                i.relayed
-                            ),
-                            None => tracing::info!(
-                                "relay {} will not say where the receiver is, and will carry \
-                                 the transfer on {}",
-                                addr,
-                                i.relayed
-                            ),
-                        }
-                        // Where the receiver appears to be first: if that
-                        // works the relay carries nothing.
-                        if let Some(peer) = i.peer {
-                            let _ = found.send(peer);
-                        }
-                        let _ = found.send(i.relayed);
-                        // And bind our side of the relay's port, which
-                        // takes a round trip to it: until then it carries
-                        // nothing of ours.
-                        crate::relay::client::hold(socket, i.relayed, i.ticket, &mut rx, &cancel)
-                            .await;
+                for addr in addrs {
+                    // The engine hands over what arrives from the address
+                    // being asked, and only from it.
+                    {
+                        let mut list = inboxes.write();
+                        list.retain(|(_, t)| !t.same_channel(&tx));
+                        list.push((addr, tx.clone()));
                     }
-                    // A relay that cannot help is not a failure: the
-                    // addresses we already have may well work.
-                    Err(e) => tracing::info!("relay {}: {}", addr, e),
+                    match crate::relay::client::connect(
+                        socket.clone(),
+                        addr,
+                        target,
+                        &mut rx,
+                        &cancel,
+                    )
+                    .await
+                    {
+                        Ok(i) => {
+                            match i.peer {
+                                Some(peer) => tracing::info!(
+                                    "relay {} says the receiver is at {}, and will carry the \
+                                     transfer on {}",
+                                    addr,
+                                    peer,
+                                    i.relayed
+                                ),
+                                None => tracing::info!(
+                                    "relay {} will not say where the receiver is, and will \
+                                     carry the transfer on {}",
+                                    addr,
+                                    i.relayed
+                                ),
+                            }
+                            // Where the receiver appears to be first: if that
+                            // works the relay carries nothing.
+                            if let Some(peer) = i.peer {
+                                let _ = found.send(Found::Relay(peer));
+                            }
+                            let _ = found.send(Found::Relay(i.relayed));
+                            // And bind our side of the relay's port, which
+                            // takes a round trip to it: until then it carries
+                            // nothing of ours.
+                            crate::relay::client::hold(
+                                socket, i.relayed, i.ticket, &mut rx, &cancel,
+                            )
+                            .await;
+                            return;
+                        }
+                        // A relay that cannot help is not a failure: the
+                        // addresses we already have may well work. One that
+                        // refused (as opposed to not answering) would refuse
+                        // at its other addresses too.
+                        Err(crate::relay::client::ConnectError::Refused(e)) => {
+                            tracing::info!("relay {}: {}", addr, e);
+                            return;
+                        }
+                        Err(e) => tracing::info!("relay {}: {}", addr, e),
+                    }
+                    if cancel.is_cancelled() {
+                        return;
+                    }
                 }
             });
         }
-        (inboxes, found_rx)
+        inboxes
+    }
+
+    /// Resolves the names the receiver is published under while the
+    /// handshake is already trying its addresses, both families at once,
+    /// each address joining the attempts as RFC 8305 says it may (see
+    /// `address::dns`). Returns where the names that did not resolve are
+    /// told, for the error when nothing else turned up either.
+    fn spawn_name_resolution(
+        &self,
+        reach: crate::address::Reach,
+        found: mpsc::UnboundedSender<Found>,
+    ) -> Arc<parking_lot::Mutex<Vec<String>>> {
+        let unresolved = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        for name in &self.cfg.peer_names {
+            let (host, port) = match crate::address::dns::split_host_port(name) {
+                Ok((h, p)) => (h.to_string(), p),
+                Err(e) => {
+                    unresolved.lock().push(e.to_string());
+                    continue;
+                }
+            };
+            let name = name.clone();
+            let found = found.clone();
+            let unresolved = unresolved.clone();
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                let resolution = crate::address::dns::resolve_happily(
+                    &host,
+                    port,
+                    reach.v6(),
+                    reach.v4(),
+                    CANDIDATE_PROBE,
+                    crate::address::MAX_ADDRESSES,
+                    |a| {
+                        let _ = found.send(Found::Named(a));
+                    },
+                );
+                tokio::select! {
+                    r = resolution => {
+                        if let Err(e) = r {
+                            unresolved.lock().push(format!("cannot resolve {}: {}", name, e));
+                        }
+                    }
+                    _ = cancel.cancelled() => {}
+                }
+            });
+        }
+        unresolved
+    }
+
+    /// On a network that has IPv6 alone, an IPv4 address is reachable only
+    /// through the network's NAT64 translator, under an address inside its
+    /// prefix (RFC 6052); RFC 8305 section 7.1 asks the client to work
+    /// that address out itself for a literal, which is what a receiver
+    /// publishes. The translated addresses join the attempts once the
+    /// prefix is known (RFC 7050). Nothing happens on a host that has an
+    /// IPv4 route.
+    fn spawn_nat64(
+        &self,
+        given: &[SocketAddr],
+        reach: crate::address::Reach,
+        found: mpsc::UnboundedSender<Found>,
+    ) {
+        if !reach.v6() {
+            return;
+        }
+        let v4: Vec<SocketAddr> = given
+            .iter()
+            .copied()
+            .filter(|a| a.is_ipv4() && !crate::address::nat64::has_ipv4_route(*a))
+            .collect();
+        if v4.is_empty() {
+            return;
+        }
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let prefix = tokio::select! {
+                p = crate::address::nat64::discover() => p,
+                _ = cancel.cancelled() => return,
+            };
+            let Some(prefix) = prefix else {
+                tracing::info!(
+                    "no IPv4 route to {:?}, and no NAT64 on this network to reach it through",
+                    v4
+                );
+                return;
+            };
+            for a in v4 {
+                if let Some(t) = prefix.synthesize_addr(a) {
+                    tracing::info!("{} is reached through NAT64 as {}", a, t);
+                    let _ = found.send(Found::Named(t));
+                }
+            }
+        });
     }
 
     /// Runs the transfer to completion.
@@ -341,35 +463,46 @@ impl Sender {
         let hash_task: JoinHandle<io::Result<[u8; 32]>> =
             tokio::task::spawn_blocking(move || hash_source.hash());
 
-        // The receiver's name may have given several addresses; the
-        // handshake decides which one is really the receiver. Only those
-        // this socket can reach are worth a turn — an IPv4 socket handed an
-        // IPv6 address would spend it on an error — and each is written the
-        // way this socket will see replies from it, or a dual-stack socket
-        // would take its own peer's answers for a stranger's.
+        // The receiver may be published under several addresses; the
+        // handshake decides which one is really the receiver. They are
+        // tried in the order RFC 6724 would use them — native IPv6 first
+        // where this host has it, anything it has no route to last — with
+        // the families taking turns after the first (RFC 8305 section 4).
+        // Only those this socket can reach are worth a turn — an IPv4
+        // socket handed an IPv6 address would spend it on an error — and
+        // each is written the way this socket will see replies from it, or
+        // a dual-stack socket would take its own peer's answers for a
+        // stranger's.
         let reach = crate::address::Reach::of(&self.socket.udp());
-        let mut candidates: Vec<SocketAddr> = Vec::new();
-        for a in std::iter::once(&self.cfg.peer).chain(&self.cfg.alternate_peers) {
+        let local = self.socket.local_addr()?;
+        let mut given: Vec<SocketAddr> = std::iter::once(self.cfg.peer)
+            .chain(self.cfg.alternate_peers.iter().copied())
             // An unspecified address stands for "none": a receiver that is
             // reached only through a relay publishes no address of its own.
-            if a.ip().is_unspecified() {
+            .filter(|a| !a.ip().is_unspecified())
+            .map(crate::address::canonical)
+            .collect();
+        crate::address::class::sort_destinations(&mut given);
+        let given = crate::address::class::interleave_families(&given);
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        for a in &given {
+            if !crate::address::class::is_sendable_named(*a, local) {
+                tracing::info!("not trying {}: this socket ({}) cannot use it", a, local);
                 continue;
             }
             match reach.native(*a) {
                 Some(n) if !candidates.contains(&n) => candidates.push(n),
-                Some(_) => {}
-                None => tracing::info!(
-                    "not trying {}: this socket ({}) cannot reach it",
-                    a,
-                    self.socket.local_addr()?
-                ),
+                _ => {}
             }
         }
+        let names_pending = !self.cfg.peer_names.is_empty();
         let first = match candidates.first() {
             Some(&first) => first,
-            // Nothing to try until a relay turns something up.
-            None if !self.cfg.relays.is_empty() => {
-                tracing::info!("no direct address for the receiver; asking the relays");
+            // Nothing to try until a relay or a name turns something up.
+            None if !self.cfg.relays.is_empty() || names_pending => {
+                if !names_pending {
+                    tracing::info!("no direct address for the receiver; asking the relays");
+                }
                 self.cfg.peer
             }
             None => {
@@ -378,17 +511,21 @@ impl Sender {
                     format!(
                         "none of the receiver's addresses can be reached from {} \
                          (to use IPv6, bind the sender to [::]:0)",
-                        self.socket.local_addr()?
+                        local
                     ),
                 )));
             }
         };
-        // Relays add more as they answer, while the addresses above are
-        // already being tried.
+        // Relays, names and the NAT64 translation of IPv4 addresses on an
+        // IPv6-only network all add more as they turn up, while the
+        // addresses above are already being tried.
+        let (found_tx, found_rx) = mpsc::unbounded_channel();
         #[cfg(feature = "nat-traversal")]
-        let (relay_inboxes, found_rx) = self.spawn_relay_introductions();
+        let relay_inboxes = self.spawn_relay_introductions(found_tx.clone());
         #[cfg(not(feature = "nat-traversal"))]
-        let (relay_inboxes, found_rx) = (RelayInboxes::default(), mpsc::unbounded_channel().1);
+        let relay_inboxes = RelayInboxes::default();
+        let unresolved = self.spawn_name_resolution(reach, found_tx.clone());
+        self.spawn_nat64(&given, reach, found_tx);
 
         let mut engine = Engine::new(
             self.cfg.transport.clone(),
@@ -397,6 +534,7 @@ impl Sender {
             candidates,
             relay_inboxes,
             found_rx,
+            unresolved,
             Peer {
                 identity: self.identity.clone(),
                 receiver: self.cfg.receiver_id,
@@ -426,6 +564,7 @@ impl Sender {
                 | SendError::HashMismatch { .. }
                 | SendError::Aborted { .. }
                 | SendError::Handshake(_)
+                | SendError::Unreachable(_)
                 | SendError::Identity(_) => None,
             };
             if let Some(code) = code {
@@ -661,6 +800,18 @@ const MTU_RAISE_AFTER: Duration = Duration::from_secs(30);
 /// too big for the path (RFC 8899, section 4.3).
 const MTU_BLACKHOLE_RTOS: u32 = 2;
 
+/// An address that turned up while the handshake was already under way,
+/// and who named it: that decides how far it is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    /// From a relay, which is not trusted with anything.
+    #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
+    Relay(SocketAddr),
+    /// From a name the user gave, or the NAT64 translation of an address
+    /// the user gave.
+    Named(SocketAddr),
+}
+
 /// A relay we are talking to, and the inbox its datagrams go into.
 type RelayInbox = (SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>);
 /// Every relay's inbox, added to as each relay's name resolves.
@@ -747,8 +898,12 @@ struct Engine {
     /// `nat-traversal` feature, which is the only thing that fills it.
     #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
     relay_inboxes: RelayInboxes,
-    /// Addresses the introductions turn up, as they turn up.
-    found_rx: mpsc::UnboundedReceiver<SocketAddr>,
+    /// Addresses the introductions, the names and NAT64 turn up, as they
+    /// turn up.
+    found_rx: mpsc::UnboundedReceiver<Found>,
+    /// Names that did not resolve, for the error when nothing else turned
+    /// up either.
+    unresolved: Arc<parking_lot::Mutex<Vec<String>>>,
     /// A candidate that answered an attempt we could not adopt. Worth going
     /// straight back to rather than finishing the round.
     answered_at: Option<SocketAddr>,
@@ -866,7 +1021,8 @@ impl Engine {
         peer: SocketAddr,
         candidates: Vec<SocketAddr>,
         relay_inboxes: RelayInboxes,
-        found_rx: mpsc::UnboundedReceiver<SocketAddr>,
+        found_rx: mpsc::UnboundedReceiver<Found>,
+        unresolved: Arc<parking_lot::Mutex<Vec<String>>>,
         auth: Peer,
         reader: Arc<Source>,
         file_name: String,
@@ -909,6 +1065,7 @@ impl Engine {
             next_candidate: 0,
             relay_inboxes,
             found_rx,
+            unresolved,
             answered_at: None,
             probes_sent: 0,
             answer: None,
@@ -1116,36 +1273,40 @@ impl Engine {
         self.secure.is_none() && self.next_candidate < self.candidates.len()
     }
 
-    /// Takes in addresses a relay introduction has turned up. They arrive
-    /// while the handshake is already trying the ones we started with, so
-    /// they simply join the ring — and because they are untried, probing
-    /// goes back to being brisk until they have had their turn.
+    /// Takes in addresses a relay introduction, a name or NAT64 has turned
+    /// up. They arrive while the handshake is already trying the ones we
+    /// started with, so they simply join the ring — and because they are
+    /// untried, probing goes back to being brisk until they have had their
+    /// turn.
     fn take_new_candidates(&mut self) {
-        while let Ok(addr) = self.found_rx.try_recv() {
-            self.add_candidate(addr);
+        while let Ok(found) = self.found_rx.try_recv() {
+            self.add_candidate(found);
         }
     }
 
-    /// Adds an address a relay turned up, if it is one we are willing to
-    /// send to.
+    /// Adds an address that turned up, if it is one we are willing to send
+    /// to.
     ///
-    /// The screen matters: a relay is not trusted, and this value is
-    /// entirely its choice. Without it a hostile one could name a port on
-    /// this very host, a multicast or broadcast group, or an address this
-    /// socket cannot reach at all, and we would fire handshake initiations
-    /// there for the length of the handshake timeout. What it cannot do is
-    /// tell an ordinary address from a victim's: any host on our network or
-    /// beyond it may be named, and what bounds that is how little is sent —
-    /// a handful of initiations, a quarter of a second apart, that draw no
-    /// answer from anyone but the receiver.
-    fn add_candidate(&mut self, addr: SocketAddr) {
-        #[cfg(feature = "nat-traversal")]
-        {
-            let local = self.socket.local_addr().unwrap_or(self.peer);
-            if !crate::nat::stun::is_usable_server_address(addr, local) {
-                tracing::debug!("ignoring {}: not an address worth sending to", addr);
-                return;
-            }
+    /// The screen matters most for a relay's: a relay is not trusted, and
+    /// the value is entirely its choice. Without it a hostile one could name
+    /// a port on this very host, a multicast or broadcast group, or an
+    /// address this socket cannot reach at all, and we would fire handshake
+    /// initiations there for the length of the handshake timeout. What it
+    /// cannot do is tell an ordinary address from a victim's: any host on
+    /// our network or beyond it may be named, and what bounds that is how
+    /// little is sent — a handful of initiations, a quarter of a second
+    /// apart, that draw no answer from anyone but the receiver. A name the
+    /// user gave may point at this host (see
+    /// `address::class::is_sendable_named`).
+    fn add_candidate(&mut self, found: Found) {
+        let local = self.socket.local_addr().unwrap_or(self.peer);
+        let (addr, usable) = match found {
+            Found::Relay(a) => (a, crate::address::class::is_sendable_hint(a, local)),
+            Found::Named(a) => (a, crate::address::class::is_sendable_named(a, local)),
+        };
+        if !usable {
+            tracing::debug!("ignoring {}: not an address worth sending to", addr);
+            return;
         }
         // Written as replies from it will arrive, like every other
         // candidate.
@@ -1491,19 +1652,33 @@ impl Engine {
             // what moving the introductions off the critical path was meant
             // to avoid.
             let mut found = None;
-            // Once every relay task is done the channel is closed, and a
-            // closed channel is always ready: without the guard this loop
-            // would spin for as long as the handshake lasts.
-            let relays_pending = !self.found_rx.is_closed();
+            // Once every relay, name and NAT64 task is done the channel is
+            // closed, and a closed channel is always ready: without the
+            // guard this loop would spin for as long as the handshake lasts.
+            let finders_pending = !self.found_rx.is_closed();
+            // With nothing to try and nothing left that could turn up
+            // something, waiting out the handshake timeout would only
+            // postpone the error.
+            if !finders_pending && self.candidates.is_empty() && self.secure.is_none() {
+                self.take_new_candidates();
+                if self.candidates.is_empty() {
+                    let why = self.unresolved.lock().join("; ");
+                    return Err(SendError::Unreachable(if why.is_empty() {
+                        "no address of the receiver could be used".to_string()
+                    } else {
+                        why
+                    }));
+                }
+            }
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
-                a = self.found_rx.recv(), if relays_pending => { found = a; }
+                a = self.found_rx.recv(), if finders_pending => { found = a; }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
                 _ = cancel.cancelled() => return Err(SendError::Cancelled),
             }
-            if let Some(addr) = found {
+            if let Some(found) = found {
                 let before = self.candidates.len();
-                self.add_candidate(addr);
+                self.add_candidate(found);
                 if self.candidates.len() != before {
                     // Untried, so probe it now rather than after the backoff.
                     next_attempt = Instant::now();
@@ -1544,7 +1719,7 @@ impl Engine {
     /// Applies the handshake answer: negotiated chunk, receive window and
     /// what to send.
     fn apply_hello_ack(&mut self, ack: &HelloAck) {
-        let negotiated = ack.max_chunk.min(self.cfg.max_chunk).max(MIN_CHUNK);
+        let negotiated = self.family_chunk(ack.max_chunk.min(self.cfg.max_chunk).max(MIN_CHUNK));
         self.set_chunk(negotiated);
         self.apply_receiver_state(ack);
         self.resumed_from = self.received_bytes;
@@ -1563,7 +1738,7 @@ impl Engine {
         let before = self.pending.total() + self.inflight_bytes;
         self.apply_receiver_state(ack);
         // Keep the probed chunk size: the path may not carry the negotiated one.
-        let chunk = self.chunk.min(ack.max_chunk.max(MIN_CHUNK));
+        let chunk = self.family_chunk(self.chunk.min(ack.max_chunk.max(MIN_CHUNK)));
         if chunk != self.chunk {
             self.set_chunk(chunk);
         }
@@ -1575,6 +1750,19 @@ impl Engine {
             self.pending.total(),
             before
         );
+    }
+
+    /// `chunk`, or less where the path's address family cannot carry it:
+    /// when the configuration leaves the chunk at its default, which fits a
+    /// 1500-byte MTU over IPv4, a path over IPv6 — whose header is 20 bytes
+    /// longer — starts at the size that fits there instead of finding out
+    /// by losing a probe.
+    fn family_chunk(&self, chunk: u16) -> u16 {
+        if self.cfg.max_chunk == DEFAULT_CHUNK && crate::address::canonical(self.peer).is_ipv6() {
+            chunk.min(DEFAULT_CHUNK_V6)
+        } else {
+            chunk
+        }
     }
 
     fn set_chunk(&mut self, chunk: u16) {
@@ -1597,7 +1785,11 @@ impl Engine {
         if !self.cfg.probe_mtu {
             return Ok(());
         }
-        let mut candidates: Vec<u16> = vec![self.chunk, DEFAULT_CHUNK, SAFE_CHUNK];
+        // 1500 bytes over IPv4, then 1500 over IPv6 — which is also 1492
+        // over IPv4, the PPPoE links DSL runs on — then what every path
+        // carries.
+        let mut candidates: Vec<u16> =
+            vec![self.chunk, DEFAULT_CHUNK, DEFAULT_CHUNK_V6, SAFE_CHUNK];
         candidates.retain(|&c| c <= self.chunk && c >= MIN_CHUNK);
         candidates.sort_unstable_by(|a, b| b.cmp(a));
         candidates.dedup();
@@ -2208,10 +2400,14 @@ impl Engine {
         Some(SendBlock::Pacer(SEND_ERROR_BACKOFF))
     }
 
-    /// One step down in chunk size: to the size every path carries, then
-    /// by halves to the floor. False when already at the floor.
+    /// One step down in chunk size: from the size a 1500-byte MTU carries
+    /// over IPv4 to the one it carries over IPv6 (also a PPPoE link's), else
+    /// to the size every path carries, then by halves to the floor. False
+    /// when already at the floor.
     fn step_down_chunk(&mut self, why: &str) -> bool {
-        let smaller = if self.chunk > SAFE_CHUNK {
+        let smaller = if self.chunk == DEFAULT_CHUNK {
+            DEFAULT_CHUNK_V6
+        } else if self.chunk > SAFE_CHUNK {
             SAFE_CHUNK
         } else {
             (self.chunk / 2).max(MIN_CHUNK)
@@ -2373,6 +2569,12 @@ impl Engine {
                 if let Some(addr) = self.path.on_response(from, p.data) {
                     tracing::info!("receiver address {} proven; sending there now", addr);
                     self.peer = addr;
+                    // A move from IPv4 to IPv6 makes every header 20 bytes
+                    // longer.
+                    let fitted = self.family_chunk(self.chunk);
+                    if fitted < self.chunk {
+                        self.set_chunk(fitted);
+                    }
                 }
             }
             Message::Ping(_) => {}

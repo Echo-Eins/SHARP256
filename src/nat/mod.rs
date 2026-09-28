@@ -27,6 +27,7 @@
 //! Authentication settles that, so a lie costs a wasted attempt.
 
 pub mod behaviour;
+pub mod keepalive;
 pub mod portmap;
 pub mod stun;
 pub mod upnp;
@@ -53,6 +54,12 @@ pub struct NatConfig {
     pub stun_servers: Vec<String>,
     /// Requested lease in seconds; the mapping is renewed at half of it.
     pub mapping_lease: u32,
+    /// Publish this host's addresses on the local network (private IPv4,
+    /// unique-local IPv6) along with the public ones. They let a sender on
+    /// the same network in without going out and back through the router,
+    /// and they tell whoever is given the address how that network is laid
+    /// out; this is the switch for the second concern.
+    pub publish_lan_addresses: bool,
 }
 
 impl Default for NatConfig {
@@ -66,6 +73,7 @@ impl Default for NatConfig {
                 "stun1.l.google.com:19302".to_string(),
             ],
             mapping_lease: 3600,
+            publish_lan_addresses: true,
         }
     }
 }
@@ -214,21 +222,7 @@ async fn forward_port(local_addr: SocketAddr, lease: u32) -> Option<PortForward>
 /// inside: a private or carrier-grade NAT address means the router is
 /// itself behind a NAT, and what it forwards only reaches it from there.
 fn is_inner_address(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_link_local()
-                || v4.is_loopback()
-                || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.segments()[0] & 0xffc0 == 0xfe80
-                || v6.segments()[0] & 0xfe00 == 0xfc00
-        }
-    }
+    crate::address::class::is_inside(ip)
 }
 
 /// Where a port forward can be reached from outside, and whether it
@@ -251,46 +245,191 @@ fn forward_address(
     }
 }
 
-/// This host's own addresses that a peer on the same network could use.
+/// This host's own addresses that a peer could use, best first.
 ///
 /// A socket bound to one address has only that one; a wildcard socket is
-/// reachable on every interface. Loopback is left out: a candidate nobody
-/// but this host can use is only a quarter of a second wasted for whoever
-/// tries it.
-fn host_addresses(local: SocketAddr) -> Vec<IpAddr> {
-    if !local.ip().is_unspecified() {
-        return if local.ip().is_loopback() {
-            Vec::new()
+/// reachable on every interface, and a wildcard IPv6 one (dual-stack) on
+/// every address of both families. ICE's rules for host candidates apply
+/// (RFC 8445 section 5.1.1.1, see `address::class::is_publishable_host`),
+/// and two more:
+///
+/// * An IPv6 address the system itself no longer prefers or has not
+///   finished checking — deprecated, tentative, failed duplicate address
+///   detection — is left out: it may be gone, or someone else's, by the
+///   time a sender uses it.
+/// * Where the system uses temporary IPv6 addresses (RFC 8981), whose whole
+///   point is that the stable half of an address cannot be used to follow
+///   a host from network to network, the stable address of the same
+///   interface and prefix is left out too (RFC 8445 section 5.1.1.1 says
+///   MUST NOT): publishing it would give away exactly what the temporary
+///   one hides. Where the system cannot say which addresses are temporary,
+///   the one it picks itself as the source for a global destination (RFC
+///   6724 prefers a temporary one) stands for its prefix.
+///
+/// With `lan` off, only addresses the internet routes are published: the
+/// rest say how the local network is laid out, to whoever is given them.
+fn host_addresses(local: SocketAddr, lan: bool) -> Vec<IpAddr> {
+    use crate::address::class;
+    let wanted = |ip: IpAddr| class::is_publishable_host(ip) && (lan || class::is_global(ip));
+    let local_ip = crate::address::canonical(local).ip();
+    if !local_ip.is_unspecified() {
+        return if wanted(local_ip) {
+            vec![local_ip]
         } else {
-            vec![local.ip()]
+            Vec::new()
         };
     }
     let Ok(ifaces) = if_addrs::get_if_addrs() else {
         return Vec::new();
     };
+    // A wildcard IPv6 socket usually also serves IPv4; a wildcard IPv4 one
+    // never serves IPv6.
+    let serves_v6 = local.is_ipv6();
+    let states = ipv6_states();
+    let found: Vec<(IpAddr, String)> = ifaces
+        .into_iter()
+        .map(|i| (i.ip(), i.name))
+        .filter(|(ip, _)| wanted(*ip) && (serves_v6 || ip.is_ipv4()))
+        .filter(|(ip, _)| match ip {
+            IpAddr::V6(v6) => states.get(v6).is_none_or(|s| s.usable()),
+            IpAddr::V4(_) => true,
+        })
+        .collect();
+    let preferred = if serves_v6 {
+        class::source_for(SocketAddr::new(PREFERENCE_PROBE.into(), 9))
+    } else {
+        None
+    };
+    choose_host_addresses(&found, &states, preferred)
+}
+
+/// The choice [`host_addresses`] makes, from what it gathered: every
+/// usable address with its interface, the system's flags, and the source
+/// address the system prefers for a global destination.
+fn choose_host_addresses(
+    found: &[(IpAddr, String)],
+    states: &std::collections::HashMap<std::net::Ipv6Addr, V6State>,
+    preferred: Option<IpAddr>,
+) -> Vec<IpAddr> {
+    use crate::address::class;
+    // One IPv6 address per interface and /64 stands for it: the one the
+    // system itself prefers, else a temporary one, else the first listed.
+    let score = |ip: &IpAddr| match ip {
+        IpAddr::V6(v6) => (
+            Some(*ip) == preferred,
+            states.get(v6).is_some_and(|s| s.temporary),
+        ),
+        IpAddr::V4(_) => (false, false),
+    };
+    let group = |(ip, iface): &(IpAddr, String)| match ip {
+        IpAddr::V6(v6) => Some((iface.clone(), v6.segments()[..4].to_vec())),
+        IpAddr::V4(_) => None,
+    };
     let mut out: Vec<IpAddr> = Vec::new();
-    for i in ifaces {
-        let ip = i.ip();
-        if ip.is_loopback() || out.contains(&ip) {
+    for (i, entry) in found.iter().enumerate() {
+        if let Some(g) = group(entry) {
+            let best = found
+                .iter()
+                .enumerate()
+                .filter(|(_, other)| group(other).as_ref() == Some(&g))
+                .max_by_key(|(j, other)| (score(&other.0), std::cmp::Reverse(*j)))
+                .map(|(j, _)| j);
+            if best != Some(i) {
+                continue;
+            }
+        }
+        if !out.contains(&entry.0) {
+            out.push(entry.0);
+        }
+    }
+    // Global first — they are what a peer anywhere can use — the system's
+    // own preference first among those, then the local network's.
+    out.sort_by_key(|ip| {
+        let rank = match class::classify(*ip) {
+            class::Class::Global if ip.is_ipv6() => 0,
+            class::Class::Global => 1,
+            class::Class::Private | class::Class::Shared if ip.is_ipv4() => 2,
+            class::Class::Private | class::Class::Shared => 3,
+            _ => 4,
+        };
+        (rank, Some(*ip) != preferred)
+    });
+    out.truncate(MAX_CANDIDATES);
+    out
+}
+
+/// A global IPv6 destination, to ask the system which of its addresses it
+/// would send from (nothing is sent: see `address::class::source_for`).
+/// From the documentation prefix, so that it can never be anybody's.
+const PREFERENCE_PROBE: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
+
+/// What the system says about one of its IPv6 addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct V6State {
+    temporary: bool,
+    deprecated: bool,
+    tentative: bool,
+    dad_failed: bool,
+}
+
+impl V6State {
+    /// Still one to give out.
+    fn usable(&self) -> bool {
+        !(self.deprecated || self.tentative || self.dad_failed)
+    }
+}
+
+/// The system's own view of its IPv6 addresses, where it offers one:
+/// Linux lists them with their flags in `/proc/net/if_inet6`. Elsewhere
+/// the map is empty, and the choice falls back to the system's preferred
+/// source address (see [`host_addresses`]).
+fn ipv6_states() -> std::collections::HashMap<std::net::Ipv6Addr, V6State> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        std::fs::read_to_string("/proc/net/if_inet6")
+            .map(|t| parse_if_inet6(&t))
+            .unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        std::collections::HashMap::new()
+    }
+}
+
+/// Parses `/proc/net/if_inet6`: per line the address as 32 hex digits, the
+/// interface index, prefix length, scope and flags in hex, and the
+/// interface name. The flags are the kernel's `IFA_F_*`.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", test)),
+    allow(dead_code)
+)]
+fn parse_if_inet6(text: &str) -> std::collections::HashMap<std::net::Ipv6Addr, V6State> {
+    const IFA_F_TEMPORARY: u32 = 0x01;
+    const IFA_F_DADFAILED: u32 = 0x08;
+    const IFA_F_DEPRECATED: u32 = 0x20;
+    const IFA_F_TENTATIVE: u32 = 0x40;
+    let mut out = std::collections::HashMap::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[0].len() != 32 {
             continue;
         }
-        // A wildcard IPv6 socket usually also serves IPv4; a wildcard IPv4
-        // one never serves IPv6.
-        if ip.is_ipv6() && !local.is_ipv6() {
+        let Ok(raw) = u128::from_str_radix(fields[0], 16) else {
             continue;
-        }
-        // An IPv6 link-local address (fe80::/10) only works with the scope
-        // it belongs to, which a written address does not carry.
-        // `Ipv6Addr::is_unicast_link_local` would say this, but it is newer
-        // than the Rust version this crate supports.
-        match ip {
-            IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80 => continue,
-            _ => {}
-        }
-        out.push(ip);
-        if out.len() >= MAX_CANDIDATES {
-            break;
-        }
+        };
+        let Ok(flags) = u32::from_str_radix(fields[4], 16) else {
+            continue;
+        };
+        out.insert(
+            std::net::Ipv6Addr::from(raw),
+            V6State {
+                temporary: flags & IFA_F_TEMPORARY != 0,
+                deprecated: flags & IFA_F_DEPRECATED != 0,
+                tentative: flags & IFA_F_TENTATIVE != 0,
+                dad_failed: flags & IFA_F_DADFAILED != 0,
+            },
+        );
     }
     out
 }
@@ -357,6 +496,9 @@ pub struct Reachability {
     /// own: it is behind another NAT, and the forward does not reach it
     /// from the internet.
     pub double_nat: bool,
+    /// This host's own addresses worth publishing, best first (see
+    /// [`host_addresses`]).
+    pub host: Vec<IpAddr>,
 }
 
 impl Reachability {
@@ -414,9 +556,9 @@ impl Reachability {
                 add(p, CandidateKind::ServerReflexive);
             }
         }
-        for ip in host_addresses(self.local_addr) {
+        for ip in &self.host {
             add(
-                SocketAddr::new(ip, self.local_addr.port()),
+                SocketAddr::new(*ip, self.local_addr.port()),
                 CandidateKind::Host,
             );
         }
@@ -499,6 +641,7 @@ fn reachability(
     local_addr: SocketAddr,
     behaviour: &Behaviour,
     forward: Option<&PortForward>,
+    publish_lan: bool,
 ) -> Reachability {
     let public_addr = behaviour.mapped;
     let (upnp_addr, double_nat) = match forward {
@@ -511,6 +654,7 @@ fn reachability(
         behaviour: *behaviour,
         upnp_addr,
         double_nat,
+        host: host_addresses(local_addr, publish_lan),
     }
 }
 
@@ -574,7 +718,12 @@ pub fn spawn_receiver_discovery(
         while behaviour.is_none() || forward.is_none() {
             tokio::select! {
                 b = &mut tests, if behaviour.is_none() => {
-                    let r = reachability(local, &b, forward.as_ref().and_then(|f| f.as_ref()));
+                    let r = reachability(
+                        local,
+                        &b,
+                        forward.as_ref().and_then(|f| f.as_ref()),
+                        config.publish_lan_addresses,
+                    );
                     tracing::info!("NAT: {}", r.describe());
                     on_result(&r);
                     behaviour = Some(b);
@@ -585,7 +734,7 @@ pub fn spawn_receiver_discovery(
                         // Worth saying again only once there is something
                         // to say it with.
                         if let Some(b) = &behaviour {
-                            let r = reachability(local, b, Some(f));
+                            let r = reachability(local, b, Some(f), config.publish_lan_addresses);
                             tracing::info!("NAT: {}", r.describe());
                             on_result(&r);
                         }
@@ -658,6 +807,7 @@ mod tests {
             behaviour,
             upnp_addr: upnp.map(|u| u.parse().unwrap()),
             double_nat: false,
+            host: Vec::new(),
         }
     }
 
@@ -765,7 +915,7 @@ mod tests {
             Some("203.0.113.9:50000"),
         );
         let c = r.candidates();
-        assert_eq!(c.len(), 1 + host_addresses(r.local_addr).len());
+        assert_eq!(c.len(), 1 + r.host.len());
         assert_eq!(c[0].kind, CandidateKind::PortForward);
         assert!(c.len() <= MAX_CANDIDATES);
     }
@@ -802,6 +952,7 @@ mod tests {
                 ..behaviour
             },
             Some(&inner("100.64.3.4")),
+            true,
         );
         assert!(r.double_nat);
         assert!(r
@@ -815,6 +966,76 @@ mod tests {
         );
     }
 
+    /// The kernel's own list, flags and all.
+    #[test]
+    fn reads_the_kernels_ipv6_flags() {
+        let text = "\
+20010db8000000000000000000000001 02 40 00 80     eth0
+20010db800000000a1b2c3d4e5f60718 02 40 00 01     eth0
+20010db8000000000000000000000002 02 40 00 a0     eth0
+fe800000000000000000000000000001 02 40 20 80     eth0
+20010db8000000000000000000000003 02 40 00 c0     eth0
+garbage line
+";
+        let states = parse_if_inet6(text);
+        let v6 = |s: &str| s.parse::<std::net::Ipv6Addr>().unwrap();
+        assert_eq!(states.len(), 5);
+        assert!(states[&v6("2001:db8::1")].usable());
+        assert!(!states[&v6("2001:db8::1")].temporary);
+        assert!(states[&v6("2001:db8::a1b2:c3d4:e5f6:718")].temporary);
+        assert!(!states[&v6("2001:db8::2")].usable(), "deprecated");
+        assert!(!states[&v6("2001:db8::3")].usable(), "tentative");
+    }
+
+    /// RFC 8445 section 5.1.1.1: where a temporary address exists, the
+    /// stable one of the same interface and prefix is not published; one
+    /// address stands for each prefix; global addresses come first.
+    #[test]
+    fn temporary_addresses_hide_the_stable_ones() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let v6 = |s: &str| s.parse::<std::net::Ipv6Addr>().unwrap();
+        let found: Vec<(IpAddr, String)> = [
+            ("192.168.1.7", "eth0"),
+            ("2a00:1:1::1", "eth0"),
+            ("2a00:1:1::a1b2:c3d4", "eth0"),
+            ("2a00:1:2::1", "eth0"),
+            ("fd00::1", "eth0"),
+            ("2a00:1:1::5", "wlan0"),
+        ]
+        .iter()
+        .map(|(a, i)| (ip(a), i.to_string()))
+        .collect();
+        let mut states = std::collections::HashMap::new();
+        states.insert(
+            v6("2a00:1:1::a1b2:c3d4"),
+            V6State {
+                temporary: true,
+                ..V6State::default()
+            },
+        );
+        let out = choose_host_addresses(&found, &states, None);
+        assert_eq!(
+            out,
+            [
+                ip("2a00:1:1::a1b2:c3d4"),
+                ip("2a00:1:2::1"),
+                ip("2a00:1:1::5"),
+                ip("192.168.1.7"),
+                ip("fd00::1"),
+            ]
+        );
+        // Where the system does not say which are temporary, its own
+        // choice of source stands for its prefix, and comes first.
+        let out = choose_host_addresses(
+            &found,
+            &std::collections::HashMap::new(),
+            Some(ip("2a00:1:2::1")),
+        );
+        assert_eq!(out[0], ip("2a00:1:2::1"));
+        assert!(out.contains(&ip("2a00:1:1::1")));
+        assert!(!out.contains(&ip("2a00:1:1::a1b2:c3d4")), "{:?}", out);
+    }
+
     /// A loopback socket has nothing to offer anyone else.
     #[test]
     fn loopback_is_never_a_candidate() {
@@ -824,9 +1045,10 @@ mod tests {
             behaviour: Behaviour::default(),
             upnp_addr: None,
             double_nat: false,
+            host: host_addresses("127.0.0.1:5555".parse().unwrap(), true),
         };
         assert!(r.candidates().is_empty());
-        for ip in host_addresses("0.0.0.0:1".parse().unwrap()) {
+        for ip in host_addresses("0.0.0.0:1".parse().unwrap(), true) {
             assert!(!ip.is_loopback());
         }
     }

@@ -9,7 +9,35 @@ use tokio::net::UdpSocket;
 /// hundreds of Mbit/s overflows the default ~200 KiB receive buffer within
 /// milliseconds whenever the application pauses, so we ask for more (the
 /// kernel may clamp the request; see `net.core.rmem_max` on Linux).
+///
+/// `[::]` means every address of both families: one dual-stack socket
+/// (RFC 3493 section 5.3, `IPV6_V6ONLY` off) that reaches IPv4 peers under
+/// their mapped addresses. Where the system has no IPv6 at all, or will not
+/// let one socket speak both (OpenBSD, or IPv6 switched off in the kernel),
+/// it falls back to `0.0.0.0` on the same port — IPv4 reaches the most, and
+/// a socket that silently spoke IPv6 alone would reach nobody on IPv4.
+/// Any other address is bound exactly as given.
 pub fn bind_udp(addr: SocketAddr, buffer_bytes: usize) -> io::Result<UdpSocket> {
+    if let SocketAddr::V6(v6) = addr {
+        if v6.ip().is_unspecified() {
+            match bind_socket(addr, buffer_bytes, true) {
+                Ok(s) => return Ok(s),
+                Err(e) if ipv6_unavailable(&e) => {
+                    let v4 = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), addr.port());
+                    static TOLD: std::sync::Once = std::sync::Once::new();
+                    TOLD.call_once(|| {
+                        tracing::info!("IPv6 is not available here ({}); using IPv4 only", e)
+                    });
+                    return bind_socket(v4, buffer_bytes, false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    bind_socket(addr, buffer_bytes, false)
+}
+
+fn bind_socket(addr: SocketAddr, buffer_bytes: usize, dual_stack: bool) -> io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -17,8 +45,20 @@ pub fn bind_udp(addr: SocketAddr, buffer_bytes: usize) -> io::Result<UdpSocket> 
         Domain::IPV4
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    if addr.is_ipv6() {
-        // Accept IPv4-mapped peers on a v6 wildcard socket where the OS allows.
+    if dual_stack {
+        // Has to hold, or the socket would not reach IPv4 at all.
+        socket.set_only_v6(false).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "this system will not let one socket speak both IPv4 and IPv6 ({})",
+                    e
+                ),
+            )
+        })?;
+    } else if addr.is_ipv6() {
+        // An address bound explicitly speaks its own family; a mapped one
+        // speaks IPv4 through this IPv6 socket, where the system allows.
         let _ = socket.set_only_v6(false);
     }
     set_buffer_sizes(&socket, buffer_bytes);
@@ -29,6 +69,31 @@ pub fn bind_udp(addr: SocketAddr, buffer_bytes: usize) -> io::Result<UdpSocket> 
     set_dont_fragment(&udp);
     disable_udp_connreset(&udp);
     Ok(udp)
+}
+
+/// Whether an error from making or binding an IPv6 socket means this host
+/// cannot do IPv6 (or dual-stack) at all, rather than that something is
+/// wrong with the address asked for.
+fn ipv6_unavailable(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EAFNOSUPPORT) | Some(libc::EPROTONOSUPPORT) | Some(libc::EADDRNOTAVAIL)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEAFNOSUPPORT, WSAEPROTONOSUPPORT, WSAEADDRNOTAVAIL
+        matches!(e.raw_os_error(), Some(10047) | Some(10043) | Some(10049))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 /// Asks for kernel socket buffers of `bytes` each. Linux caps ordinary
@@ -96,6 +161,13 @@ fn set_buffer_sizes(socket: &socket2::Socket, bytes: usize) {
     }
 }
 
+/// Which address families a socket sends with "don't fragment".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DontFragment {
+    pub v4: bool,
+    pub v6: bool,
+}
+
 /// Marks outgoing datagrams "don't fragment" so that an oversized probe is
 /// dropped on the path instead of being silently fragmented — and makes the
 /// socket ignore what ICMP says about the path MTU.
@@ -111,34 +183,67 @@ fn set_buffer_sizes(socket: &socket2::Socket, bytes: usize) {
 /// shows up as full-size packets being lost while small ones are not.
 /// EMSGSIZE is then only ever about the local interface.
 ///
-/// Best effort; other platforms keep their default behaviour.
-pub fn set_dont_fragment(socket: &UdpSocket) {
-    let is_v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
-    #[cfg(target_os = "linux")]
+/// IPv6 routers never fragment, but the sending host does unless told not
+/// to — Linux in probe mode still splits an IPv6 datagram larger than the
+/// interface — so `IPV6_DONTFRAG` (RFC 3542 section 11.2) goes on as well.
+/// A dual-stack socket gets the IPv4 options too, for the IPv4 peers it
+/// reaches through mapped addresses, where the system accepts them on an
+/// IPv6 socket. macOS and FreeBSD may not; those datagrams can then be
+/// fragmented by routers on the way, which costs efficiency, not
+/// correctness. The result says what took.
+pub fn set_dont_fragment(socket: &UdpSocket) -> DontFragment {
+    let local = socket.local_addr().ok();
+    let is_v6 = local.is_some_and(|a| a.is_ipv6());
+    let dual = is_v6
+        && socket2::SockRef::from(socket)
+            .only_v6()
+            .is_ok_and(|only| !only);
+    let speaks_v4 = !is_v6 || dual;
+    #[allow(unused_mut)]
+    let mut out = DontFragment::default();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        use std::os::unix::io::AsRawFd;
-        let fd = socket.as_raw_fd();
-        // SAFETY: plain setsockopt on a socket we own, with a correctly sized
-        // integer option value.
-        unsafe {
-            let val: libc::c_int = libc::IP_PMTUDISC_PROBE;
-            libc::setsockopt(
-                fd,
+        if speaks_v4 {
+            out.v4 = set_int_option(
+                socket,
                 libc::IPPROTO_IP,
                 libc::IP_MTU_DISCOVER,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                libc::IP_PMTUDISC_PROBE,
             );
-            if is_v6 {
-                let val6: libc::c_int = libc::IPV6_PMTUDISC_PROBE;
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_IPV6,
-                    libc::IPV6_MTU_DISCOVER,
-                    &val6 as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+        }
+        if is_v6 {
+            let probe = set_int_option(
+                socket,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                libc::IPV6_PMTUDISC_PROBE,
+            );
+            let dontfrag = set_int_option(socket, libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1);
+            out.v6 = probe && dontfrag;
+        }
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd"
+    ))]
+    {
+        if speaks_v4 {
+            out.v4 = set_int_option(socket, libc::IPPROTO_IP, libc::IP_DONTFRAG, 1);
+        }
+        if is_v6 {
+            out.v6 = set_int_option(socket, libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1);
+        }
+    }
+    #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+    {
+        // IPV6_DONTFRAG, which the libc crate does not export there. IPv4
+        // has no per-socket switch on these systems.
+        const IPV6_DONTFRAG: libc::c_int = 62;
+        if is_v6 {
+            out.v6 = set_int_option(socket, libc::IPPROTO_IPV6, IPV6_DONTFRAG, 1);
         }
     }
     #[cfg(windows)]
@@ -148,53 +253,56 @@ pub fn set_dont_fragment(socket: &UdpSocket) {
         use winapi::shared::ws2ipdef::{IPV6_DONTFRAG, IP_DONTFRAGMENT};
         use winapi::um::winsock2::setsockopt;
         let s = socket.as_raw_socket() as winapi::um::winsock2::SOCKET;
-        let val: u32 = 1;
-        // SAFETY: setsockopt on a socket we own with a DWORD option value.
-        unsafe {
-            setsockopt(
-                s,
-                IPPROTO_IP,
-                IP_DONTFRAGMENT,
-                &val as *const u32 as *const i8,
-                std::mem::size_of::<u32>() as i32,
-            );
-            if is_v6 {
+        let set = |level: i32, name: i32, value: u32| -> bool {
+            // SAFETY: setsockopt on a socket we own with a DWORD value.
+            unsafe {
                 setsockopt(
                     s,
-                    IPPROTO_IPV6 as i32,
-                    IPV6_DONTFRAG,
-                    &val as *const u32 as *const i8,
+                    level,
+                    name,
+                    &value as *const u32 as *const i8,
                     std::mem::size_of::<u32>() as i32,
-                );
+                ) == 0
             }
-            // Probe mode where the system has it (IP_MTU_DISCOVER with
-            // IP_PMTUDISC_PROBE, ws2ipdef.h; Windows 10 1703 and later).
-            // Older systems refuse the option and keep DF alone.
-            const IP_MTU_DISCOVER: i32 = 71;
-            const IPV6_MTU_DISCOVER: i32 = 71;
-            const IP_PMTUDISC_PROBE: u32 = 3;
-            let probe = IP_PMTUDISC_PROBE;
-            setsockopt(
-                s,
-                IPPROTO_IP,
-                IP_MTU_DISCOVER,
-                &probe as *const u32 as *const i8,
-                std::mem::size_of::<u32>() as i32,
-            );
-            if is_v6 {
-                setsockopt(
-                    s,
-                    IPPROTO_IPV6 as i32,
-                    IPV6_MTU_DISCOVER,
-                    &probe as *const u32 as *const i8,
-                    std::mem::size_of::<u32>() as i32,
-                );
-            }
+        };
+        // Probe mode where the system has it (IP_MTU_DISCOVER with
+        // IP_PMTUDISC_PROBE, ws2ipdef.h; Windows 10 1703 and later).
+        // Older systems refuse the option and keep DF alone.
+        const IP_MTU_DISCOVER: i32 = 71;
+        const IPV6_MTU_DISCOVER: i32 = 71;
+        const IP_PMTUDISC_PROBE: u32 = 3;
+        if speaks_v4 {
+            out.v4 = set(IPPROTO_IP, IP_DONTFRAGMENT, 1);
+            set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_PROBE);
+        }
+        if is_v6 {
+            out.v6 = set(IPPROTO_IPV6 as i32, IPV6_DONTFRAG, 1);
+            set(IPPROTO_IPV6 as i32, IPV6_MTU_DISCOVER, IP_PMTUDISC_PROBE);
         }
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        let _ = (socket, is_v6);
+    let _ = (speaks_v4, is_v6);
+    out
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+fn set_int_option(
+    socket: &UdpSocket,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> bool {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: plain setsockopt on a socket we own, with a correctly sized
+    // integer option value.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            name,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
     }
 }
 

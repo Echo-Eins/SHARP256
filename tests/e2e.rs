@@ -3151,3 +3151,211 @@ async fn transfers_share_one_memory_budget() {
     );
     stop_receiver(r).await;
 }
+
+// ----- IPv6 ----------------------------------------------------------------
+
+/// Whether this host can do IPv6 at all. Where it cannot — some containers
+/// boot with IPv6 switched off in the kernel — the IPv6 tests have nothing
+/// to run on and say so. With `SHARP_REQUIRE_IPV6` set, as CI sets it, that
+/// is a failure instead of a skip: a runner that lost IPv6 must not make
+/// these tests pass by not running them.
+fn ipv6_or_skip(test: &str) -> bool {
+    let ok = std::net::UdpSocket::bind("[::1]:0").is_ok();
+    if !ok {
+        assert!(
+            std::env::var_os("SHARP_REQUIRE_IPV6").is_none(),
+            "{}: this host has no IPv6, and SHARP_REQUIRE_IPV6 is set",
+            test
+        );
+        eprintln!("{}: SKIPPED, this host has no IPv6", test);
+    }
+    ok
+}
+
+/// A transfer over IPv6 from end to end, in packets sized for IPv6: its
+/// header is 20 bytes longer than IPv4's, so the default chunk — which
+/// fills a 1500-byte MTU over IPv4 — would not fit one over IPv6.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_runs_over_ipv6_in_packets_sized_for_it() {
+    use sharp256::protocol::constants::DEFAULT_CHUNK_V6;
+    if !ipv6_or_skip("a_transfer_runs_over_ipv6_in_packets_sized_for_it") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 4 << 20;
+    let file = make_file(&src, "over-ipv6.bin", size, 0x6666);
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.bind = "[::1]:0".parse().unwrap();
+    })
+    .await;
+    assert!(r.addr.is_ipv6(), "{}", r.addr);
+    let mut cfg = sender_cfg(&file, r.addr, r.id, &state);
+    cfg.bind = "[::1]:0".parse().unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("finishes in time")
+        .expect("completes");
+    assert_eq!(summary.file_size, size as u64);
+    assert_eq!(summary.chunk_size, DEFAULT_CHUNK_V6);
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("over-ipv6.bin"));
+    stop_receiver(r).await;
+}
+
+/// One dual-stack receiver serves an IPv4 sender and an IPv6 sender at the
+/// same time: IPv4 peers reach its socket under their mapped addresses, and
+/// everything that compares or screens addresses sees them for what they
+/// are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_dual_stack_receiver_serves_both_families_at_once() {
+    if !ipv6_or_skip("one_dual_stack_receiver_serves_both_families_at_once") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 2 << 20;
+    let a = make_file(&src, "from-ipv4.bin", size, 0x44);
+    let b = make_file(&src, "from-ipv6.bin", size, 0x66);
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.bind = "[::]:0".parse().unwrap();
+    })
+    .await;
+    assert!(r.addr.is_ipv6(), "not dual-stack: {}", r.addr);
+    let port = r.addr.port();
+    let mut via4 = sender_cfg(
+        &a,
+        format!("127.0.0.1:{}", port).parse().unwrap(),
+        r.id,
+        &state,
+    );
+    via4.bind = "127.0.0.1:0".parse().unwrap();
+    let mut via6 = sender_cfg(&b, format!("[::1]:{}", port).parse().unwrap(), r.id, &state);
+    via6.bind = "[::1]:0".parse().unwrap();
+    let (x, y) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(60), run_sender(via4)),
+        tokio::time::timeout(Duration::from_secs(60), run_sender(via6)),
+    );
+    x.expect("IPv4 in time").expect("IPv4 completes");
+    y.expect("IPv6 in time").expect("IPv6 completes");
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&a, &out.join("from-ipv4.bin"));
+    assert_same(&b, &out.join("from-ipv6.bin"));
+    stop_receiver(r).await;
+}
+
+/// A relay carries a pair across the families: the sender reaches it over
+/// IPv6, the receiver over IPv4, and the relay's dual-stack ports put the
+/// two together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_carries_a_pair_across_address_families() {
+    use sharp256::relay::server::{Config, Relay};
+    if !ipv6_or_skip("a_relay_carries_a_pair_across_address_families") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 512 << 10;
+    let file = make_file(&src, "across-families.bin", size, 0x46);
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "[::]:0".parse().unwrap(),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let port = relay.local_addr().unwrap().port();
+    let relay_id = relay.id();
+    let relay_task = tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+    // The receiver is on IPv4 only and registers over IPv4.
+    let r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![format!("{}@127.0.0.1:{}", relay_id, port)];
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The sender is on IPv6 only: the receiver's own (IPv4) address is of
+    // no use to it, and the relay's IPv6 address is all it has.
+    let dead = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let mut scfg = sender_cfg(&file, dead_addr, r.id, &state);
+    scfg.bind = "[::1]:0".parse().unwrap();
+    scfg.relays = vec![format!("[::1]:{}", port)];
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(scfg))
+        .await
+        .expect("the relay path is found in time")
+        .expect("the transfer completes through the relay");
+    assert_eq!(summary.file_size, size as u64);
+    assert_same(&file, &out.join("across-families.bin"));
+    cancel.cancel();
+    relay_task.abort();
+    stop_receiver(r).await;
+}
+
+/// A receiver given by name: the sender resolves it while the handshake is
+/// already running, both families at once (RFC 8305), and gets through on
+/// whichever the host has. Runs on any host: `[::]` falls back to IPv4
+/// where there is no IPv6, and the name resolves to what there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_given_by_name_is_found_while_the_handshake_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 1 << 20;
+    let file = make_file(&src, "by-name.bin", size, 0x4e);
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.bind = "[::]:0".parse().unwrap();
+    })
+    .await;
+    let hosts = vec![format!("localhost:{}", r.addr.port())];
+    let mut cfg = SenderConfig::for_hosts(&hosts, r.id, file.clone());
+    cfg.state_dir = Some(state.clone());
+    cfg.transport = fast_transport();
+    cfg.identity = Some(sender_identity());
+    assert!(cfg.alternate_peers.is_empty());
+    assert_eq!(cfg.peer_names, hosts);
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("finishes in time")
+        .expect("completes");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("by-name.bin"));
+    stop_receiver(r).await;
+}
+
+/// A name that resolves to nothing, and nothing else to try: the sender
+/// says so at once, with the name server's answer, instead of waiting out
+/// the whole handshake timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_that_does_not_resolve_fails_fast_and_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, _out, state) = dirs(&tmp);
+    let file = make_file(&src, "nowhere.bin", 1024, 1);
+    let hosts = vec!["no-such-receiver.invalid:5555".to_string()];
+    let mut cfg = SenderConfig::for_hosts(&hosts, Identity::generate().id(), file);
+    cfg.state_dir = Some(state.clone());
+    cfg.transport = fast_transport();
+    cfg.transport.handshake_timeout = Duration::from_secs(60);
+    cfg.identity = Some(sender_identity());
+    let started = Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(30), run_sender(cfg))
+        .await
+        .expect("fails well before the handshake timeout")
+        .expect_err("nothing to reach");
+    assert!(
+        matches!(&err, SendError::Unreachable(why) if why.contains("no-such-receiver.invalid")),
+        "{}",
+        err
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}

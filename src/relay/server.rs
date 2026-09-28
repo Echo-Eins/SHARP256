@@ -96,7 +96,7 @@ impl std::fmt::Debug for Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:5560".parse().expect("valid address"),
+            bind: "[::]:5560".parse().expect("valid address"),
             identity: Identity::generate(),
             max_registrations: 4096,
             max_allocations: 256,
@@ -744,7 +744,15 @@ impl Relay {
         receiver: SocketAddr,
         disclose: bool,
     ) -> Option<(u16, [u8; TOKEN_LEN], [u8; TOKEN_LEN])> {
-        let bind = SocketAddr::new(self.cfg.bind.ip(), 0);
+        // On the address the control port actually has: `[::]` may have
+        // fallen back to IPv4 there, and a pair must be reachable the way
+        // its peers reached the relay.
+        let ip = self
+            .socket
+            .local_addr()
+            .map(|a| a.ip())
+            .unwrap_or(self.cfg.bind.ip());
+        let bind = SocketAddr::new(ip, 0);
         let sock = Arc::new(crate::transport::socket::bind_udp(bind, PAIR_BUFFER).ok()?);
         let port = sock.local_addr().ok()?.port();
         let sender_ticket = random_token();
@@ -903,6 +911,11 @@ async fn carry(c: Carried) {
     // refreshing the idle timer that should have reclaimed them. The
     // confirmation below is what actually rules that out — none of our
     // ports ever answers one — and this catches the obvious case early.
+    //
+    // Every address judged here is one a datagram really came from, not a
+    // stranger's suggestion, so it is screened as such: a peer on this very
+    // host, reaching a relay bound to the wildcard over loopback, is a peer
+    // like any other; a group, a broadcast or nothing at all is not.
     let acceptable = |addr: SocketAddr| -> bool {
         let Some(local) = local else { return false };
         let ours = crate::address::canonical(local).ip();
@@ -910,7 +923,7 @@ async fn carry(c: Carried) {
         if (ours == theirs || ours.is_unspecified()) && ports.lock().contains(&addr.port()) {
             return false;
         }
-        crate::nat::stun::is_usable_server_address(addr, local)
+        crate::address::class::is_sendable_named(addr, local)
     };
 
     loop {

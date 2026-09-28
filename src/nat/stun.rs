@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -494,40 +494,9 @@ impl StunClient {
 /// no amplification to be had (we send a request and it draws no reply from
 /// the victim), but the packets should not be sent at all.
 pub fn is_usable_server_address(addr: SocketAddr, local: SocketAddr) -> bool {
-    // The socket has to be able to reach it at all: an IPv4 socket cannot
-    // send to IPv6, and an IPv6 socket bound to one address cannot send to
-    // IPv4 either.
-    if addr.port() == 0 || !crate::address::Reach::assume(local).reaches(addr) {
-        return false;
-    }
-    // Screen the address, not one spelling of it. On a dual-stack socket
-    // `::ffff:127.0.0.1` is loopback and `::ffff:224.0.0.1` multicast, and
-    // the IPv6 checks know nothing about either.
-    let addr = crate::address::canonical(addr);
-    // Loopback is acceptable only when we are on loopback ourselves. A
-    // stranger must never be able to point a socket with a public address
-    // back into this host; a server that really is on this host, and the
-    // simulated NAT the tests run against, still work.
-    let we_are_on_loopback = crate::address::canonical(local).ip().is_loopback();
-    match addr.ip() {
-        std::net::IpAddr::V4(v4) => {
-            if v4.is_loopback() {
-                return we_are_on_loopback;
-            }
-            // 0.0.0.0/8 is "this network": nothing is addressed there.
-            !(v4.octets()[0] == 0 || v4.is_multicast() || v4.is_broadcast() || v4.is_link_local())
-        }
-        std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                return we_are_on_loopback;
-            }
-            // fe80::/10: a link-local address only means anything together
-            // with the interface it belongs to, which a written address
-            // does not carry. The v4 branch rejects its equivalent, and
-            // this one had not.
-            !(v6.is_unspecified() || v6.is_multicast() || v6.segments()[0] & 0xffc0 == 0xfe80)
-        }
-    }
+    // One screen for everything a stranger names; see there for why each
+    // kind of address is or is not worth a datagram.
+    crate::address::class::is_sendable_hint(addr, local)
 }
 
 /// Resolves a server name to an address `socket` can reach, written the way
@@ -544,13 +513,32 @@ pub async fn resolve_server(
         let a = crate::address::canonical(*a);
         family.is_none_or(|v6| a.is_ipv6() == v6) && reach.reaches(a)
     };
-    if let Ok(addr) = server.parse::<SocketAddr>() {
+    if let Some(addr) = crate::address::dns::parse_literal(server) {
         return fits(&addr).then(|| reach.native(addr)).flatten();
     }
-    let addrs = tokio::time::timeout(Duration::from_secs(2), lookup_host(server))
-        .await
-        .ok()?
-        .ok()?;
+    let (host, port) = crate::address::dns::split_host_port(server).ok()?;
+    // Asked for the family wanted, not for "any": the other family's
+    // answer is not waited for, and not asked for at all.
+    let addrs = match family {
+        Some(v6) => {
+            let f = if v6 {
+                crate::address::dns::Family::V6
+            } else {
+                crate::address::dns::Family::V4
+            };
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::address::dns::lookup(host, port, f),
+            )
+            .await
+            .ok()?
+            .ok()?
+        }
+        None => tokio::time::timeout(Duration::from_secs(2), crate::address::resolve_all(server))
+            .await
+            .ok()?
+            .ok()?,
+    };
     addrs
         .into_iter()
         .find(|a| fits(a))
