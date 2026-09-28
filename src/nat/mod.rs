@@ -1036,6 +1036,23 @@ garbage line
         assert!(!out.contains(&ip("2a00:1:1::a1b2:c3d4")), "{:?}", out);
     }
 
+    /// With the local network's addresses withheld, only what the internet
+    /// routes is published — whatever this host's interfaces are.
+    #[test]
+    fn without_lan_addresses_only_global_ones_are_published() {
+        use crate::address::class::is_global;
+        for local in ["[::]:1", "0.0.0.0:1"] {
+            for ip in host_addresses(local.parse().unwrap(), false) {
+                assert!(is_global(ip), "{} published from {}", ip, local);
+            }
+        }
+        let lan: SocketAddr = "192.168.1.7:5555".parse().unwrap();
+        assert!(host_addresses(lan, false).is_empty());
+        assert_eq!(host_addresses(lan, true), vec![lan.ip()]);
+        let public: SocketAddr = "[2a00:1:2::7]:5555".parse().unwrap();
+        assert_eq!(host_addresses(public, false), vec![public.ip()]);
+    }
+
     /// A loopback socket has nothing to offer anyone else.
     #[test]
     fn loopback_is_never_a_candidate() {

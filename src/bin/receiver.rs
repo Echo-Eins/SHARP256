@@ -45,6 +45,14 @@ struct Args {
     #[arg(long)]
     relay_private: bool,
 
+    /// Do not publish this host's addresses on the local network (private
+    /// IPv4, unique-local IPv6), only those the internet routes. Senders on
+    /// the same network then come in through the router, or not at all;
+    /// in exchange, whoever is given the receiver's address learns nothing
+    /// about how that network is laid out.
+    #[arg(long)]
+    no_lan_addresses: bool,
+
     /// Replace existing files with the same name instead of writing "name (1)"
     #[arg(long)]
     overwrite: bool,
@@ -112,6 +120,7 @@ async fn main() -> Result<()> {
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
     cfg.relays = args.relays.clone();
     cfg.relay_private = args.relay_private;
+    cfg.publish_lan_addresses = !args.no_lan_addresses;
     cfg.state_dir = args.state_dir.clone();
     if let Some(c) = args.chunk_size {
         cfg.transport.max_chunk = c;

@@ -260,6 +260,12 @@ pub struct ReceiverConfig {
     /// direct path, and it is the only arrangement in which a relay actually
     /// hides anyone.
     pub relay_private: bool,
+    /// Publish this host's addresses on the local network — private IPv4,
+    /// unique-local IPv6 — among the receiver's candidates. They let a
+    /// sender on the same network in directly; they also tell whoever is
+    /// given the receiver's address how that network is laid out. Off, only
+    /// addresses the internet routes are published.
+    pub publish_lan_addresses: bool,
     pub accept: AcceptPolicy,
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
@@ -291,6 +297,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("nat_traversal", &self.nat_traversal)
             .field("relays", &self.relays)
             .field("relay_private", &self.relay_private)
+            .field("publish_lan_addresses", &self.publish_lan_addresses)
             .field("accept", &self.accept)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
@@ -344,6 +351,7 @@ impl ReceiverConfig {
             nat_traversal: false,
             relays: Vec::new(),
             relay_private: false,
+            publish_lan_addresses: true,
             accept: AcceptPolicy::AcceptAll,
             identity: None,
             psk: None,

@@ -392,3 +392,64 @@ impl Default for Clock {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every family a socket speaks goes out "don't fragment", including
+    /// IPv4 through a dual-stack socket where the system allows it — what
+    /// the system does allow is printed, since it differs between them.
+    #[tokio::test]
+    async fn every_family_a_socket_speaks_is_sent_unfragmented() {
+        let v4 = bind_udp("127.0.0.1:0".parse().unwrap(), 1 << 16).unwrap();
+        let df = set_dont_fragment(&v4);
+        eprintln!("IPv4 socket: {:?}", df);
+        #[cfg(any(
+            target_os = "linux",
+            windows,
+            target_os = "macos",
+            target_os = "freebsd"
+        ))]
+        assert!(df.v4);
+        assert!(!df.v6);
+
+        let any = bind_udp("[::]:0".parse().unwrap(), 1 << 16).unwrap();
+        let df = set_dont_fragment(&any);
+        eprintln!("[::] socket ({}): {:?}", any.local_addr().unwrap(), df);
+        if any.local_addr().unwrap().is_ipv6() {
+            #[cfg(any(
+                target_os = "linux",
+                windows,
+                target_os = "macos",
+                target_os = "freebsd"
+            ))]
+            assert!(df.v6);
+            #[cfg(any(target_os = "linux", windows))]
+            assert!(df.v4, "IPv4 through a dual-stack socket");
+        } else {
+            // No IPv6 here: the wildcard fell back to IPv4.
+            assert!(!df.v6);
+        }
+    }
+
+    /// `[::]` binds both families where it can, and falls back to IPv4 on
+    /// the same port where it cannot; an explicit address is bound as it
+    /// is, or not at all.
+    #[tokio::test]
+    async fn the_wildcard_falls_back_to_ipv4_but_nothing_else_does() {
+        let any = bind_udp("[::]:0".parse().unwrap(), 1 << 16).unwrap();
+        let local = any.local_addr().unwrap();
+        if local.is_ipv6() {
+            assert!(socket2::SockRef::from(&any).only_v6().is_ok_and(|o| !o));
+        } else {
+            assert!(local.ip().is_unspecified() && local.is_ipv4(), "{}", local);
+            // An explicit IPv6 address is not quietly replaced.
+            assert!(bind_udp("[::1]:0".parse().unwrap(), 1 << 16).is_err());
+        }
+        // A port that is taken is an error, never a fallback.
+        let port = local.port();
+        let again = bind_udp(SocketAddr::new(local.ip(), port), 1 << 16);
+        assert!(again.is_err());
+    }
+}
