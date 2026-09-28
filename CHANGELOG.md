@@ -333,6 +333,13 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   whether it reached IPv4 peers at all, and set "don't fragment" for them —
   depended on stale memory. The option is now read into a zeroed buffer of
   our own on Windows.
+- "Never replaces anything" was a free name chosen and then a plain rename:
+  a file another process created under that name in between would have been
+  replaced (and on POSIX an empty directory too). The move is now refused
+  by the system itself when the name is taken — `renameat2` with
+  `RENAME_NOREPLACE` on Linux, `renamex_np` with `RENAME_EXCL` on macOS,
+  `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows, a hard link
+  elsewhere — and the next free name is tried.
 - Also found on Windows: a directory being sent was described from the
   copies of its entries' metadata in the directory listing, which NTFS
   updates lazily — a directory's modification time went out stale, and a

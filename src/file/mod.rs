@@ -796,10 +796,14 @@ pub fn part_path_for(final_path: &Path) -> PathBuf {
 /// Renames with a few retries on "permission denied" (on Windows, antivirus
 /// scanners and indexers briefly hold freshly written files open).
 pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    retry_denied(|| std::fs::rename(from, to))
+}
+
+fn retry_denied(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut delay = Duration::from_millis(20);
     let mut attempt = 0;
     loop {
-        match std::fs::rename(from, to) {
+        match op() {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 5 && e.kind() == io::ErrorKind::PermissionDenied => {
                 std::thread::sleep(delay);
@@ -809,6 +813,167 @@ pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Moves `from` into `dir` under `name`, or under the first free variant of
+/// it that `free_name` finds, and never over anything: a name that is taken
+/// between the looking and the moving — by another process writing into
+/// the same directory — is left alone, and the next free one is tried.
+/// Returns where it went.
+pub fn move_into_free_name(
+    from: &Path,
+    dir: &Path,
+    name: &str,
+    free_name: impl Fn(&Path, &str) -> PathBuf,
+) -> io::Result<PathBuf> {
+    for _ in 0..16 {
+        let target = free_name(dir, name);
+        match retry_denied(|| rename_no_replace(from, &target)) {
+            Ok(()) => return Ok(target),
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    || std::fs::symlink_metadata(&target).is_ok() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free name for {} in {}", name, dir.display()),
+    ))
+}
+
+/// Moves `from` to `to` only if nothing is at `to` — decided in one step by
+/// the system wherever it can: `renameat2` with `RENAME_NOREPLACE` on Linux,
+/// `renamex_np` with `RENAME_EXCL` on macOS, `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING` on Windows. Elsewhere, and on file systems
+/// that refuse those, a file is linked under its new name — which fails if
+/// the name is taken — and unlinked from the old one; only a directory
+/// there is looked for first and then renamed, a moment apart. (A plain
+/// rename replaces a file, and on POSIX systems an empty directory too.)
+/// A name that is taken is `ErrorKind::AlreadyExists`.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match system_rename_no_replace(from, to) {
+        Some(done) => done,
+        None => portable_rename_no_replace(from, to),
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn c_path(p: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(p.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL byte in it"))
+}
+
+/// `None` where the system, or the file system, has no such call.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
+    let (f, t) = match (c_path(from), c_path(to)) {
+        (Ok(f), Ok(t)) => (f, t),
+        (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
+    };
+    // The system call itself: glibc before 2.28 has no wrapper for it.
+    // SAFETY: two NUL-terminated paths, relative to the working directory.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        // A kernel older than 3.15, or a file system without the flag.
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
+    let (f, t) = match (c_path(from), c_path(to)) {
+        (Ok(f), Ok(t)) => (f, t),
+        (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
+    };
+    // SAFETY: two NUL-terminated paths.
+    if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        // A file system without it.
+        Some(libc::ENOTSUP) | Some(libc::EINVAL) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+#[cfg(windows)]
+fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (f, t) = (wide(from), wide(to));
+    // SAFETY: two NUL-terminated wide paths. Without
+    // MOVEFILE_REPLACE_EXISTING an existing target is refused.
+    let ok = unsafe { winapi::um::winbase::MoveFileExW(f.as_ptr(), t.as_ptr(), 0) };
+    if ok != 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    // Something in the way can come back as "access denied" rather than
+    // "already exists" (a directory, say); either way it stays.
+    Some(
+        if e.kind() != io::ErrorKind::AlreadyExists && std::fs::symlink_metadata(to).is_ok() {
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, e))
+        } else {
+            Err(e)
+        },
+    )
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    windows
+)))]
+fn system_rename_no_replace(_from: &Path, _to: &Path) -> Option<io::Result<()>> {
+    None
+}
+
+fn portable_rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if std::fs::symlink_metadata(from)?.is_file() {
+        match std::fs::hard_link(from, to) {
+            Ok(()) => return std::fs::remove_file(from),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+            // No hard links on this file system (FAT, say): as for a
+            // directory, below.
+            Err(_) => {}
+        }
+    }
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists", to.display()),
+        ));
+    }
+    std::fs::rename(from, to)
 }
 
 #[cfg(test)]
@@ -834,6 +999,61 @@ mod tests {
         assert_eq!(sanitize_file_name("con.txt"), Some("_con.txt".into()));
         assert_eq!(sanitize_file_name("name."), Some("name".into()));
         assert_eq!(sanitize_file_name("отчёт.bin"), Some("отчёт.bin".into()));
+    }
+
+    /// Nothing is ever moved over an existing file or directory — not even
+    /// an empty directory, which a plain POSIX rename would replace — by
+    /// the system's own call, nor by the fallback.
+    #[test]
+    fn a_name_that_is_taken_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for mv in [rename_no_replace, portable_rename_no_replace] {
+            let _ = std::fs::remove_dir_all(d.join("x"));
+            std::fs::create_dir(d.join("x")).unwrap();
+            let d = d.join("x");
+            std::fs::write(d.join("new"), b"new").unwrap();
+            std::fs::write(d.join("old"), b"old").unwrap();
+            let e = mv(&d.join("new"), &d.join("old")).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(d.join("old")).unwrap(), b"old");
+            assert_eq!(std::fs::read(d.join("new")).unwrap(), b"new");
+            mv(&d.join("new"), &d.join("free")).unwrap();
+            assert!(!d.join("new").exists());
+            assert_eq!(std::fs::read(d.join("free")).unwrap(), b"new");
+
+            std::fs::create_dir(d.join("tree")).unwrap();
+            std::fs::write(d.join("tree/f"), b"f").unwrap();
+            std::fs::create_dir(d.join("empty")).unwrap();
+            let e = mv(&d.join("tree"), &d.join("empty")).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert!(d.join("tree/f").exists() && d.join("empty").is_dir());
+            mv(&d.join("tree"), &d.join("moved")).unwrap();
+            assert!(d.join("moved/f").exists());
+        }
+    }
+
+    /// A name taken between the looking and the moving is left alone, and
+    /// the next free one is used.
+    #[test]
+    fn a_name_taken_meanwhile_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("part"), b"ours").unwrap();
+        let looked = std::cell::Cell::new(0);
+        let target = move_into_free_name(&d.join("part"), d, "a.txt", |dir, name| {
+            let p = unique_path(dir, name);
+            if looked.get() == 0 {
+                // Somebody else writes the free name right after we saw it.
+                std::fs::write(&p, b"theirs").unwrap();
+            }
+            looked.set(looked.get() + 1);
+            p
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(d.join("a.txt")).unwrap(), b"theirs");
+        assert_eq!(target, d.join("a (1).txt"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"ours");
     }
 
     #[test]

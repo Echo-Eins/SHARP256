@@ -562,7 +562,7 @@ NAT (двойной NAT): его проброс не публикуется ка
 | Г9з | Личность может зарегистрировать только её владелец | MAC на ключе статического Диффи-Хеллмана между получателем и ретранслятором, покрывающий всё сообщение | `relay/mod.rs`, `relay/server.rs` |
 | Г9и | Подделанный ответ-cookie не даёт усиления | Cookie сохраняется до следующей плановой попытки, немедленное рукопожатие не запускается | `transport/sender.rs` |
 | Г10 | Побайтовая корректность результата | BLAKE3-256 всего потока, сверка обеими сторонами (FIN / FIN_ACK) | `file/mod.rs`, `transport/*` |
-| Г11 | Безопасность записи на диск | Нормализация имён, «только новый», атомарное переименование без замещения, маскирование прав, проверка описи каталога по хешу до создания файлов | `file/tree.rs`, `file/mod.rs` |
+| Г11 | Безопасность записи на диск | Нормализация имён, «только новый», перенос на свободное имя без замещения одним системным вызовом (`renameat2` с `RENAME_NOREPLACE`, `renamex_np` с `RENAME_EXCL`, `MoveFileExW` без замены; иначе жёсткая ссылка) — имя, занятое другим процессом между выбором и переносом, пропускается; маскирование прав, проверка описи каталога по хешу до создания файлов | `file/tree.rs`, `file/mod.rs` |
 | Г12 | Ограниченность потребляемых ресурсов и справедливость их распределения | Общий лимит сессий и доля на отправителя, лимиты очередей, описи каталога, буферов; истечение простаивающих сессий | `transport/receiver.rs`, `protocol/constants.rs` |
 | Г13 | Устойчивость к ложным ICMP о размере пакета | Сокеты в режиме зондирования (`IP_PMTUDISC_PROBE`, для IPv6 — `IPV6_PMTUDISC_PROBE` и `IPV6_DONTFRAG` по RFC 3542): ядро не принимает ICMP в расчёт; размер пути — только по подтверждённым PROBE (RFC 8899); падение MTU распознаётся по потерям полноразмерных пакетов при живых мелких и стоит шаг вниз. На macOS и BSD — `IP_DONTFRAG`/`IPV6_DONTFRAG`, на Windows — `IP_DONTFRAGMENT`/`IPV6_DONTFRAG` | `transport/socket.rs`, `transport/sender.rs` |
 | Г14 | Ограничение срока жизни ключа AEAD | Смена ключа каждые 2²² пакетов по эпохам, без сигнализации | `crypto/transport.rs` |
@@ -758,7 +758,7 @@ Tor или аналогичные сети.
 | Один отправитель не занимает все слоты сессий | `one_sender_cannot_take_every_session_slot` |
 | Возобновление требует того же отправителя и того же источника | `resume_requires_the_same_sender`, `changed_source_is_not_resumed_onto_stale_data` |
 | Враждебная опись каталога не создаёт ничего на диске | `hostile_directory_listings_are_refused` |
-| Существующий файл не перезаписывается | `existing_file_is_not_overwritten_by_default` |
+| Существующий файл или каталог не замещается, в том числе занятый между выбором имени и переносом | `existing_file_is_not_overwritten_by_default`, `a_name_that_is_taken_is_never_replaced`, `a_name_taken_meanwhile_is_passed_over` |
 | Побайтовая корректность при потерях, дублировании, переупорядочивании | `survives_loss_duplication_and_reordering`, `survives_heavy_loss`, `burst_loss_with_hundreds_of_holes_recovers_quickly`, `transfers_of_many_sizes_are_byte_exact` |
 | Возобновление после перезапуска любой из сторон | `resumes_after_receiver_restart_during_outage`, `resumes_after_sender_cancel_and_restart`, `directory_resumes_after_receiver_restart`, `directory_resumes_after_sender_cancel` |
 | Точка малого порядка не признаётся личностью нигде | `a_key_with_no_private_half_is_not_an_identity`, `a_low_order_receiver_key_is_refused`, `an_identity_nobody_holds_cannot_be_registered` |

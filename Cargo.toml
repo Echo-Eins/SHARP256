@@ -64,7 +64,7 @@ libc = "0.2"
 # "winuser" is not used by this crate directly: eframe 0.24 imports
 # winapi::um::winuser for the window icon without enabling that feature
 # itself, so the GUI build on Windows depends on it being enabled here.
-winapi = { version = "0.3.9", features = ["fileapi", "ntdef", "winnt", "winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "netioapi", "inaddr", "in6addr", "minwinbase", "winuser"] }
+winapi = { version = "0.3.9", features = ["fileapi", "ntdef", "winnt", "winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "netioapi", "inaddr", "in6addr", "minwinbase", "winbase", "winuser"] }
 
 [dev-dependencies]
 tempfile = "3"

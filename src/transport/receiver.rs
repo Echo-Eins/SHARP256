@@ -1132,24 +1132,22 @@ async fn finish_file(
         .map_err(|e| format!("hash task failed: {}", e))?
         .map_err(|e| format!("cannot hash file: {}", e))?;
     let target = tokio::task::spawn_blocking(move || -> io::Result<PathBuf> {
-        let mut target = final_path;
-        if target.exists() {
-            if overwrite {
-                let _ = std::fs::remove_file(&target);
-            } else {
-                let name = target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let dir = target
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("."));
-                target = unique_path(&dir, &name);
-            }
+        if overwrite {
+            let _ = std::fs::remove_file(&final_path);
+            rename_with_retry(&part, &final_path)?;
+            return Ok(final_path);
         }
-        rename_with_retry(&part, &target)?;
-        Ok(target)
+        let name = final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let dir = final_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Never over anything, even a file that appears after the free
+        // name was chosen.
+        crate::file::move_into_free_name(&part, &dir, &name, unique_path)
     })
     .await
     .map_err(|e| format!("rename task failed: {}", e))?
@@ -1191,8 +1189,7 @@ async fn finish_tree(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let target = tree::unique_dir_path(&dir, &name);
-        rename_with_retry(&staging, &target)
+        let target = crate::file::move_into_free_name(&staging, &dir, &name, tree::unique_dir_path)
             .map_err(|e| format!("cannot move {} into place: {}", staging.display(), e))?;
         if let Err(e) = tree::apply_root_metadata(&target, &plan, umask) {
             tracing::warn!("cannot set metadata of {}: {}", target.display(), e);
