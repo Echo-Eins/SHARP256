@@ -1080,6 +1080,15 @@ impl FakeSender {
 
     /// The `received_bytes` of every ACK that arrives within `within`.
     async fn acked_bytes(&mut self, within: Duration) -> Vec<u64> {
+        self.acks(within)
+            .await
+            .into_iter()
+            .map(|a| a.received_bytes)
+            .collect()
+    }
+
+    /// Every ACK that arrives within `within`.
+    async fn acks(&mut self, within: Duration) -> Vec<sharp256::protocol::wire::Ack> {
         use sharp256::protocol::wire::{self, Message};
         let mut out = Vec::new();
         let mut buf = vec![0u8; 65536];
@@ -1097,7 +1106,7 @@ impl FakeSender {
                 continue;
             };
             if let Ok(Message::Ack(ack)) = wire::decode_body(t, body) {
-                out.push(ack.received_bytes);
+                out.push(ack);
             }
         }
         out
@@ -3088,4 +3097,57 @@ async fn a_restarted_receiver_that_accepts_carries_on() {
     let summary = result.expect("the transfer completes after the user accepts");
     assert_eq!(summary.file_size, 8 << 20);
     assert_eq!(asked, 1, "the user was asked {} times", asked);
+}
+
+/// The receive window a session offers after taking a little data.
+async fn rwnd_of(fake: &mut FakeSender) -> u64 {
+    use sharp256::protocol::wire::{Data, Message};
+    fake.send(&Message::Data(Data {
+        offset: 0,
+        timestamp: 1,
+        payload: &[7u8; 1000],
+    }))
+    .await;
+    fake.acks(Duration::from_millis(400))
+        .await
+        .last()
+        .map(|a| a.rwnd)
+        .expect("an ACK")
+}
+
+/// Memory for data not yet on disk is shared by all transfers together.
+/// With a small budget, a transfer is offered no more than its share — and
+/// less once another transfer starts receiving beside it — however much
+/// its own writer could take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfers_share_one_memory_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let budget: u64 = 8 << 20;
+    let r = start_receiver(&out, &state, move |cfg| {
+        cfg.memory_budget = budget;
+    })
+    .await;
+    let share = budget / 4 * 3;
+
+    let (mut first, status) = FakeSender::connect(&r, rand::random(), "first.bin").await;
+    assert_eq!(status, sharp256::protocol::constants::HELLO_ACCEPTED);
+    let alone = rwnd_of(&mut first).await;
+    assert!(
+        alone <= share,
+        "offered {} with a share of {}",
+        alone,
+        share
+    );
+    let (mut second, status) = FakeSender::connect(&r, rand::random(), "second.bin").await;
+    assert_eq!(status, sharp256::protocol::constants::HELLO_ACCEPTED);
+    let _ = rwnd_of(&mut second).await;
+    let shared = rwnd_of(&mut first).await;
+    assert!(
+        shared <= share / 2,
+        "offered {} with two transfers sharing {}",
+        shared,
+        share
+    );
+    stop_receiver(r).await;
 }

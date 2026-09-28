@@ -171,6 +171,59 @@ struct Shared {
     /// handshake was already on its way when the user said no must get the
     /// same answer, not a fresh question.
     declined: parking_lot::Mutex<HashMap<TransferKey, Instant>>,
+    /// Bytes of datagrams queued to sessions, all of them together; held to
+    /// a quarter of the memory budget.
+    queued_total: AtomicU64,
+    /// Sessions receiving file data now, which share the rest of it.
+    receiving: std::sync::atomic::AtomicUsize,
+}
+
+impl Shared {
+    fn queue_budget(&self) -> u64 {
+        self.cfg.memory_budget / 4
+    }
+
+    /// Takes `bytes` of the queue budget; false when it is spent.
+    fn take_queued(&self, bytes: u64) -> bool {
+        let limit = self.queue_budget();
+        self.queued_total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used + bytes <= limit).then_some(used + bytes)
+            })
+            .is_ok()
+    }
+
+    fn give_queued(&self, bytes: u64) {
+        let _ = self
+            .queued_total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
+    /// What one receiving session may hold of file data not yet written:
+    /// its part of three quarters of the budget, and never more than its
+    /// writer takes.
+    fn write_share(&self) -> u64 {
+        let receiving = self.receiving.load(Ordering::Acquire).max(1) as u64;
+        (self.cfg.memory_budget / 4 * 3 / receiving).min(self.cfg.transport.writer_capacity_bytes)
+    }
+}
+
+/// Counts a session among those receiving for as long as it lives.
+struct Receiving(Arc<Shared>);
+
+impl Receiving {
+    fn new(shared: &Arc<Shared>) -> Self {
+        shared.receiving.fetch_add(1, Ordering::AcqRel);
+        Self(shared.clone())
+    }
+}
+
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        self.0.receiving.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// How long a declined transfer is remembered, and how many are.
@@ -228,6 +281,8 @@ impl Receiver {
                 cancel: CancellationToken::new(),
                 identity,
                 declined: parking_lot::Mutex::new(HashMap::new()),
+                queued_total: AtomicU64::new(0),
+                receiving: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -485,6 +540,13 @@ impl Dispatcher {
                 continue;
             };
             let bytes: u64 = runs.iter().map(|d| d.buf.capacity() as u64).sum();
+            // Within the session's own limit, and within what all sessions
+            // together may have queued: sixteen sessions each at their own
+            // limit would otherwise hold half a gigabyte between them.
+            if !self.shared.take_queued(bytes) {
+                self.dropped += 1;
+                continue;
+            }
             let queued = s.queued.fetch_add(bytes, Ordering::AcqRel);
             let refused = queued + bytes > SESSION_QUEUE_BYTES
                 || s.tx
@@ -492,6 +554,7 @@ impl Dispatcher {
                     .is_err();
             if refused {
                 s.queued.fetch_sub(bytes, Ordering::AcqRel);
+                self.shared.give_queued(bytes);
                 self.dropped += 1;
                 if self.dropped.is_power_of_two() {
                     tracing::debug!(
@@ -606,8 +669,7 @@ impl Dispatcher {
                 }
                 return;
             }
-            let old = self.sessions.remove(&key).expect("present");
-            self.by_cid.remove(&old.cid);
+            self.drop_session(&key);
         }
 
         self.prune();
@@ -705,9 +767,7 @@ impl Dispatcher {
     /// Drops the routing of a session whose task ended.
     fn forget(&mut self, key: &TransferKey) {
         if self.sessions.get(key).is_some_and(|s| s.task.is_finished()) {
-            if let Some(s) = self.sessions.remove(key) {
-                self.by_cid.remove(&s.cid);
-            }
+            self.drop_session(key);
         }
     }
 
@@ -719,9 +779,16 @@ impl Dispatcher {
             .map(|(k, _)| *k)
             .collect();
         for k in finished {
-            if let Some(s) = self.sessions.remove(&k) {
-                self.by_cid.remove(&s.cid);
-            }
+            self.drop_session(&k);
+        }
+    }
+
+    /// Forgets a finished session, and gives back the queue budget of
+    /// whatever was still queued to it when it ended.
+    fn drop_session(&mut self, key: &TransferKey) {
+        if let Some(s) = self.sessions.remove(key) {
+            self.by_cid.remove(&s.cid);
+            self.shared.give_queued(s.queued.swap(0, Ordering::AcqRel));
         }
     }
 }
@@ -1204,6 +1271,9 @@ struct Session {
     queued: Arc<AtomicU64>,
     /// Deliveries being decrypted, or decrypted and waiting for their turn.
     opening: OpenPipe,
+    /// Counts us among the sessions sharing the memory budget while we
+    /// receive file data.
+    receiving: Option<Receiving>,
 
     transfer_id: [u8; 16],
     sender: SharpId,
@@ -1265,6 +1335,7 @@ impl Session {
         let cfg = shared.cfg.transport.clone();
         let events = shared.cfg.events.clone();
         Self {
+            receiving: None,
             shared,
             cfg,
             events,
@@ -1571,6 +1642,9 @@ impl Session {
     }
 
     fn on_accepted(&mut self) {
+        if self.receiving.is_none() {
+            self.receiving = Some(Receiving::new(&self.shared));
+        }
         let cipher = self
             .secure
             .as_ref()
@@ -1979,9 +2053,12 @@ impl Session {
     fn rwnd(&self) -> u64 {
         if let Some(w) = &self.writer {
             // What the writer can take once the datagrams already queued
-            // for this session are processed.
+            // for this session are processed — and no more than this
+            // session's share of the memory all transfers together may use.
+            let share = self.shared.write_share().saturating_sub(w.queued_bytes());
             return w
                 .available()
+                .min(share)
                 .saturating_sub(self.queued.load(Ordering::Relaxed));
         }
         if !matches!(self.phase, Phase::Receiving | Phase::Pending { .. }) {
@@ -1993,8 +2070,9 @@ impl Session {
                 .cfg
                 .writer_capacity_bytes
                 .min(EARLY_MAX_BYTES)
+                .min(self.shared.write_share())
                 .saturating_sub(t.early_bytes),
-            _ => self.cfg.writer_capacity_bytes,
+            _ => self.shared.write_share(),
         }
     }
 
@@ -2079,6 +2157,7 @@ impl Session {
         while let Some(d) = self.opening.ready.remove(&self.opening.next_done) {
             self.opening.next_done += 1;
             self.queued.fetch_sub(d.bytes, Ordering::AcqRel);
+            self.shared.give_queued(d.bytes);
             // Decrypted under keys that were replaced since: stale.
             if self.secure.as_ref().map(|s| s.generation) != Some(d.generation) {
                 continue;
@@ -2440,7 +2519,12 @@ impl Session {
         }
         let need: u64 = missing.iter().map(|&(s, e)| e - s).sum();
         if let Some(writer) = &self.writer {
-            if writer.available() < pieces.bytes + need {
+            // Within the writer's capacity, and within this session's share
+            // of the memory budget: a sender that ignores the window it is
+            // given gets no more room for doing so.
+            if writer.available() < pieces.bytes + need
+                || writer.queued_bytes() + pieces.bytes + need > self.shared.write_share()
+            {
                 self.writer_full_drops += 1;
                 return false;
             }
@@ -2456,7 +2540,11 @@ impl Session {
         } else if let Some(tree) = self.tree.as_mut().filter(|t| t.plan.is_none()) {
             // The manifest is not complete yet: hold the data until the
             // writer knows which files it belongs to.
-            let cap = self.cfg.writer_capacity_bytes.min(EARLY_MAX_BYTES);
+            let cap = self
+                .cfg
+                .writer_capacity_bytes
+                .min(EARLY_MAX_BYTES)
+                .min(self.shared.write_share());
             if tree.early_bytes + need > cap || tree.early.len() + missing.len() > EARLY_MAX_ITEMS {
                 self.writer_full_drops += 1;
                 return false;
@@ -2799,6 +2887,8 @@ impl Session {
     }
 
     fn complete(&mut self, hash: [u8; 32], peer_confirmed: bool) {
+        // Everything is on disk: nothing of the budget is ours any more.
+        self.receiving = None;
         if let Some(store) = &self.shared.store {
             store.remove_receiver(&self.tid_hex());
         }

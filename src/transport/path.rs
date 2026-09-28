@@ -122,9 +122,8 @@ impl PathProbe {
         self.forget_old(now);
         if let Some(p) = self.probes.iter_mut().find(|p| p.addr == from) {
             p.received = p.received.saturating_add(len);
-            if p.given_up.is_none() {
-                return None; // already being tested
-            }
+            // Still being tested: nothing new to send.
+            p.given_up?;
             // Speaking again after we gave up: test it again, with the same
             // token, so an answer to an earlier challenge still counts.
             p.given_up = None;

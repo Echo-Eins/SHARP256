@@ -201,6 +201,12 @@ pub struct ReceiverConfig {
     /// a received directory whose name is taken is stored as `name (1)`.
     pub overwrite: bool,
     pub max_sessions: usize,
+    /// Memory all transfers together may hold for data not yet on disk:
+    /// datagrams waiting to be processed (a quarter of it) and file data
+    /// waiting to be written (the rest, shared among the transfers that
+    /// are receiving). Each transfer's own limits still apply within it;
+    /// this is what bounds them all together, whatever senders do.
+    pub memory_budget: u64,
     /// Concurrent transfers one sender identity may hold. Without this the
     /// session limit is first-come-first-served: a single authenticated
     /// sender could take every slot and lock everybody else out, which the
@@ -249,6 +255,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("output_dir", &self.output_dir)
             .field("overwrite", &self.overwrite)
             .field("max_sessions", &self.max_sessions)
+            .field("memory_budget", &self.memory_budget)
             .field("max_sessions_per_sender", &self.max_sessions_per_sender)
             .field("transport", &self.transport)
             .field("state_dir", &self.state_dir)
@@ -301,6 +308,7 @@ impl ReceiverConfig {
             output_dir,
             overwrite: false,
             max_sessions: 16,
+            memory_budget: 512 << 20,
             max_sessions_per_sender: 8,
             transport: TransportConfig::default(),
             state_dir: None,
