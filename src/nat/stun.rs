@@ -18,8 +18,22 @@ const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS: u16 = 0x0101;
 const BINDING_ERROR: u16 = 0x0111;
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+/// RFC 3489 SOURCE-ADDRESS, superseded by RESPONSE-ORIGIN.
+const ATTR_SOURCE_ADDRESS: u16 = 0x0004;
+/// RFC 3489 CHANGED-ADDRESS, superseded by OTHER-ADDRESS.
+const ATTR_CHANGED_ADDRESS: u16 = 0x0005;
+const ATTR_CHANGE_REQUEST: u16 = 0x0003;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// RFC 5780: address the response was sent from.
+const ATTR_RESPONSE_ORIGIN: u16 = 0x802b;
+/// RFC 5780: the server's second address and port.
+const ATTR_OTHER_ADDRESS: u16 = 0x802c;
 const STUN_HEADER_LEN: usize = 20;
+
+/// CHANGE-REQUEST flag: answer from the other IP address.
+const CHANGE_IP: u32 = 0x04;
+/// CHANGE-REQUEST flag: answer from the other port.
+const CHANGE_PORT: u32 = 0x02;
 
 /// True for datagrams that look like STUN Binding responses. SHARP datagrams
 /// start with "SH", so the two can never be confused.
@@ -32,6 +46,26 @@ pub fn is_stun_response(pkt: &[u8]) -> bool {
         && pkt[4..8] == STUN_MAGIC_COOKIE.to_be_bytes()
 }
 
+/// True for a STUN Binding *request*. The hairpinning test (RFC 5780
+/// section 4.5) works by sending one to our own mapped address and seeing
+/// whether the NAT loops it back to us, so the receiver has to recognise
+/// these too.
+pub fn is_stun_request(pkt: &[u8]) -> bool {
+    pkt.len() >= STUN_HEADER_LEN
+        && u16::from_be_bytes([pkt[0], pkt[1]]) == BINDING_REQUEST
+        && pkt[4..8] == STUN_MAGIC_COOKIE.to_be_bytes()
+}
+
+/// True for any STUN message the discovery task may need to see.
+pub fn is_stun_message(pkt: &[u8]) -> bool {
+    is_stun_response(pkt) || is_stun_request(pkt)
+}
+
+/// The transaction id of a STUN message, if it is long enough to have one.
+pub fn message_transaction_id(pkt: &[u8]) -> Option<[u8; 12]> {
+    pkt.get(8..20)?.try_into().ok()
+}
+
 /// A random 96-bit transaction id from a cryptographically secure generator
 /// (RFC 8489 section 6).
 pub fn transaction_id() -> [u8; 12] {
@@ -41,19 +75,165 @@ pub fn transaction_id() -> [u8; 12] {
 }
 
 /// Binding request without attributes.
-pub fn binding_request(tid: &[u8; 12]) -> [u8; STUN_HEADER_LEN] {
-    let mut msg = [0u8; STUN_HEADER_LEN];
-    msg[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
-    // message length 0
-    msg[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    msg[8..20].copy_from_slice(tid);
+pub fn binding_request(tid: &[u8; 12]) -> Vec<u8> {
+    binding_request_with_change(tid, false, false)
+}
+
+/// Binding request carrying CHANGE-REQUEST (RFC 5780 section 7.2), which
+/// asks the server to answer from its other IP address and/or its other
+/// port. Whether such an answer gets back to us is what reveals the NAT's
+/// filtering behaviour.
+pub fn binding_request_with_change(tid: &[u8; 12], change_ip: bool, change_port: bool) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(STUN_HEADER_LEN + 8);
+    msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    let body_len: u16 = if change_ip || change_port { 8 } else { 0 };
+    msg.extend_from_slice(&body_len.to_be_bytes());
+    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(tid);
+    if body_len > 0 {
+        let mut flags = 0u32;
+        if change_ip {
+            flags |= CHANGE_IP;
+        }
+        if change_port {
+            flags |= CHANGE_PORT;
+        }
+        msg.extend_from_slice(&ATTR_CHANGE_REQUEST.to_be_bytes());
+        msg.extend_from_slice(&4u16.to_be_bytes());
+        msg.extend_from_slice(&flags.to_be_bytes());
+    }
     msg
+}
+
+/// Encodes an address the plain way (MAPPED-ADDRESS, RESPONSE-ORIGIN,
+/// OTHER-ADDRESS), or XOR-ed against the cookie and transaction id when
+/// `xor_tid` is given (XOR-MAPPED-ADDRESS).
+pub fn encode_address(addr: SocketAddr, xor_tid: Option<&[u8; 12]>) -> Vec<u8> {
+    let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+    let mut port = addr.port();
+    if xor_tid.is_some() {
+        port ^= (STUN_MAGIC_COOKIE >> 16) as u16;
+    }
+    let mut out = Vec::with_capacity(20);
+    out.push(0);
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            out.push(0x01);
+            out.extend_from_slice(&port.to_be_bytes());
+            let mut ip = v4.octets();
+            if xor_tid.is_some() {
+                for (b, c) in ip.iter_mut().zip(cookie) {
+                    *b ^= c;
+                }
+            }
+            out.extend_from_slice(&ip);
+        }
+        std::net::IpAddr::V6(v6) => {
+            out.push(0x02);
+            out.extend_from_slice(&port.to_be_bytes());
+            let mut ip = v6.octets();
+            if let Some(tid) = xor_tid {
+                let mask = cookie.iter().chain(tid.iter());
+                for (b, m) in ip.iter_mut().zip(mask) {
+                    *b ^= m;
+                }
+            }
+            out.extend_from_slice(&ip);
+        }
+    }
+    out
+}
+
+/// Builds a Binding success response.
+///
+/// SHARP-256 needs to *answer* Binding requests, not only send them: a
+/// connectivity check between two candidate addresses is a Binding request
+/// that the far end has to reply to. The behaviour tests are exercised
+/// against a server built from this too.
+pub fn binding_success(
+    tid: &[u8; 12],
+    mapped: SocketAddr,
+    response_origin: Option<SocketAddr>,
+    other_address: Option<SocketAddr>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut attr = |t: u16, v: Vec<u8>| {
+        body.extend_from_slice(&t.to_be_bytes());
+        body.extend_from_slice(&(v.len() as u16).to_be_bytes());
+        body.extend_from_slice(&v);
+        // Attributes are padded to a multiple of four bytes.
+        body.resize(body.len() + (4 - v.len() % 4) % 4, 0);
+    };
+    attr(ATTR_XOR_MAPPED_ADDRESS, encode_address(mapped, Some(tid)));
+    if let Some(o) = response_origin {
+        attr(ATTR_RESPONSE_ORIGIN, encode_address(o, None));
+    }
+    if let Some(o) = other_address {
+        attr(ATTR_OTHER_ADDRESS, encode_address(o, None));
+    }
+    let mut msg = Vec::with_capacity(STUN_HEADER_LEN + body.len());
+    msg.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+    msg.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(tid);
+    msg.extend_from_slice(&body);
+    msg
+}
+
+/// The CHANGE-REQUEST flags a Binding request carries, as
+/// `(change_ip, change_port)`. Both false when the attribute is absent.
+pub fn requested_change(pkt: &[u8]) -> (bool, bool) {
+    let Some(len) = pkt
+        .get(2..4)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+    else {
+        return (false, false);
+    };
+    let Some(body) = pkt.get(STUN_HEADER_LEN..STUN_HEADER_LEN + len) else {
+        return (false, false);
+    };
+    let mut pos = 0;
+    while pos + 4 <= body.len() {
+        let attr = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let alen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+        let end = pos + 4 + alen;
+        if end > body.len() {
+            break;
+        }
+        if attr == ATTR_CHANGE_REQUEST && alen >= 4 {
+            let flags = u32::from_be_bytes(body[pos + 4..pos + 8].try_into().unwrap());
+            return (flags & CHANGE_IP != 0, flags & CHANGE_PORT != 0);
+        }
+        pos = end + (4 - alen % 4) % 4;
+    }
+    (false, false)
+}
+
+/// What one Binding success response tells us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingResponse {
+    /// Our address as the server saw it (XOR-MAPPED-ADDRESS, or the legacy
+    /// MAPPED-ADDRESS).
+    pub mapped: SocketAddr,
+    /// The address the server answered from (RESPONSE-ORIGIN, or the legacy
+    /// SOURCE-ADDRESS). With CHANGE-REQUEST this is how we tell which of the
+    /// server's addresses actually answered.
+    pub response_origin: Option<SocketAddr>,
+    /// The server's *other* address and port (OTHER-ADDRESS, or the legacy
+    /// CHANGED-ADDRESS). Only a server that has two of each can be used for
+    /// the behaviour tests of RFC 5780.
+    pub other_address: Option<SocketAddr>,
 }
 
 /// Extracts the mapped address from a Binding success response for `tid`.
 /// XOR-MAPPED-ADDRESS is preferred; MAPPED-ADDRESS is accepted from legacy
 /// servers.
-pub fn parse_binding_response(data: &[u8], tid: &[u8; 12]) -> Result<SocketAddr> {
+pub fn parse_mapped_address(data: &[u8], tid: &[u8; 12]) -> Result<SocketAddr> {
+    Ok(parse_binding_response(data, tid)?.mapped)
+}
+
+/// Parses a Binding success response for `tid` into everything it carries.
+pub fn parse_binding_response(data: &[u8], tid: &[u8; 12]) -> Result<BindingResponse> {
     if data.len() < STUN_HEADER_LEN {
         bail!("STUN response too short");
     }
@@ -76,7 +256,10 @@ pub fn parse_binding_response(data: &[u8], tid: &[u8; 12]) -> Result<SocketAddr>
     }
     let body = &data[STUN_HEADER_LEN..STUN_HEADER_LEN + len];
     let mut pos = 0;
-    let mut legacy = None;
+    let mut xor_mapped = None;
+    let mut legacy_mapped = None;
+    let mut response_origin = None;
+    let mut other_address = None;
     while pos + 4 <= body.len() {
         let attr = u16::from_be_bytes([body[pos], body[pos + 1]]);
         let alen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
@@ -86,14 +269,29 @@ pub fn parse_binding_response(data: &[u8], tid: &[u8; 12]) -> Result<SocketAddr>
             bail!("STUN attribute overruns the message");
         }
         let value = &body[start..end];
+        // A malformed address in an attribute we do not need must not throw
+        // the whole response away.
         match attr {
-            ATTR_XOR_MAPPED_ADDRESS => return parse_address(value, Some(tid)),
-            ATTR_MAPPED_ADDRESS => legacy = Some(parse_address(value, None)?),
+            ATTR_XOR_MAPPED_ADDRESS => xor_mapped = Some(parse_address(value, Some(tid))?),
+            ATTR_MAPPED_ADDRESS => legacy_mapped = parse_address(value, None).ok(),
+            ATTR_RESPONSE_ORIGIN | ATTR_SOURCE_ADDRESS => {
+                response_origin = response_origin.or(parse_address(value, None).ok());
+            }
+            ATTR_OTHER_ADDRESS | ATTR_CHANGED_ADDRESS => {
+                other_address = other_address.or(parse_address(value, None).ok());
+            }
             _ => {}
         }
         pos = end + (4 - alen % 4) % 4;
     }
-    legacy.ok_or_else(|| anyhow!("no mapped address in STUN response"))
+    let mapped = xor_mapped
+        .or(legacy_mapped)
+        .ok_or_else(|| anyhow!("no mapped address in STUN response"))?;
+    Ok(BindingResponse {
+        mapped,
+        response_origin,
+        other_address,
+    })
 }
 
 fn parse_address(value: &[u8], xor_tid: Option<&[u8; 12]>) -> Result<SocketAddr> {
@@ -137,6 +335,19 @@ fn parse_address(value: &[u8], xor_tid: Option<&[u8; 12]>) -> Result<SocketAddr>
     }
 }
 
+/// A STUN datagram that arrived on the transfer socket, with the address the
+/// socket saw it come from. The source address is kept because a STUN server
+/// is an unauthenticated stranger: what it *claims* in RESPONSE-ORIGIN is
+/// worth checking against where the packet actually came from.
+pub type Incoming = (Vec<u8>, SocketAddr);
+
+/// A parsed reply and where it really came from.
+#[derive(Debug, Clone, Copy)]
+pub struct StunReply {
+    pub response: BindingResponse,
+    pub from: SocketAddr,
+}
+
 /// STUN client working on a shared socket plus a response channel.
 pub struct StunClient {
     servers: Vec<String>,
@@ -153,15 +364,32 @@ impl StunClient {
         }
     }
 
-    /// Asks one server for the mapped address of `socket`.
-    pub async fn query(
+    pub fn with_timing(mut self, per_try: Duration, tries: u32) -> Self {
+        self.per_try = per_try;
+        self.tries = tries.max(1);
+        self
+    }
+
+    pub fn servers(&self) -> &[String] {
+        &self.servers
+    }
+
+    /// One Binding transaction. `change_ip` / `change_port` ask the server to
+    /// answer from its other address and/or port (RFC 5780).
+    ///
+    /// Returns `Ok(None)` when nothing came back: for a filtering test that
+    /// silence *is* the result, not an error. `Err` means the response
+    /// channel is gone or the socket refused the send.
+    pub async fn transaction(
         &self,
         socket: &UdpSocket,
         server: SocketAddr,
-        responses: &mut mpsc::Receiver<Vec<u8>>,
-    ) -> Result<SocketAddr> {
+        responses: &mut mpsc::Receiver<Incoming>,
+        change_ip: bool,
+        change_port: bool,
+    ) -> Result<Option<StunReply>> {
         let tid = transaction_id();
-        let request = binding_request(&tid);
+        let request = binding_request_with_change(&tid, change_ip, change_port);
         for _ in 0..self.tries {
             socket.send_to(&request, server).await?;
             let deadline = Instant::now() + self.per_try;
@@ -171,9 +399,16 @@ impl StunClient {
                     break;
                 }
                 match tokio::time::timeout(left, responses.recv()).await {
-                    Ok(Some(pkt)) => {
-                        if let Ok(addr) = parse_binding_response(&pkt, &tid) {
-                            return Ok(addr);
+                    // Anything for another transaction (a late answer, or a
+                    // stranger's packet that merely looks like STUN) is
+                    // dropped: the transaction id is what binds a reply to
+                    // its request.
+                    Ok(Some((pkt, from))) => {
+                        if message_transaction_id(&pkt) != Some(tid) {
+                            continue;
+                        }
+                        if let Ok(response) = parse_binding_response(&pkt, &tid) {
+                            return Ok(Some(StunReply { response, from }));
                         }
                     }
                     Ok(None) => bail!("STUN response channel closed"),
@@ -181,14 +416,30 @@ impl StunClient {
                 }
             }
         }
-        bail!("no answer from STUN server {}", server)
+        Ok(None)
+    }
+
+    /// Asks one server for the mapped address of `socket`.
+    pub async fn query(
+        &self,
+        socket: &UdpSocket,
+        server: SocketAddr,
+        responses: &mut mpsc::Receiver<Incoming>,
+    ) -> Result<SocketAddr> {
+        match self
+            .transaction(socket, server, responses, false, false)
+            .await?
+        {
+            Some(r) => Ok(r.response.mapped),
+            None => bail!("no answer from STUN server {}", server),
+        }
     }
 
     /// Mapped addresses reported by up to `want` different servers.
     pub async fn mapped_addresses(
         &self,
         socket: &UdpSocket,
-        responses: &mut mpsc::Receiver<Vec<u8>>,
+        responses: &mut mpsc::Receiver<Incoming>,
         want: usize,
     ) -> Vec<SocketAddr> {
         let v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
@@ -197,7 +448,7 @@ impl StunClient {
             if out.len() >= want {
                 break;
             }
-            let Some(addr) = resolve(server, v6).await else {
+            let Some(addr) = resolve_server(server, v6).await else {
                 tracing::debug!("STUN: cannot resolve {}", server);
                 continue;
             };
@@ -213,7 +464,39 @@ impl StunClient {
     }
 }
 
-async fn resolve(server: &str, v6: bool) -> Option<SocketAddr> {
+/// Whether an address a server told us about is worth sending a packet to.
+///
+/// OTHER-ADDRESS comes from an unauthenticated stranger, and we act on it by
+/// sending there. Without this check a hostile STUN server could use every
+/// client as a small reflector aimed at an address of its choosing. There is
+/// no amplification to be had (we send a request and it draws no reply from
+/// the victim), but the packets should not be sent at all.
+pub fn is_usable_server_address(addr: SocketAddr, same_family_as: SocketAddr) -> bool {
+    if addr.is_ipv6() != same_family_as.is_ipv6() || addr.port() == 0 {
+        return false;
+    }
+    // Loopback is acceptable only when we are on loopback ourselves. A
+    // stranger must never be able to point a socket with a public address
+    // back into this host; a server that really is on this host, and the
+    // simulated NAT the tests run against, still work.
+    let we_are_on_loopback = same_family_as.ip().is_loopback();
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                return we_are_on_loopback;
+            }
+            !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() || v4.is_link_local())
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return we_are_on_loopback;
+            }
+            !(v6.is_unspecified() || v6.is_multicast())
+        }
+    }
+}
+
+pub async fn resolve_server(server: &str, v6: bool) -> Option<SocketAddr> {
     if let Ok(addr) = server.parse::<SocketAddr>() {
         return (addr.is_ipv6() == v6).then_some(addr);
     }
@@ -269,9 +552,170 @@ mod tests {
         let msg = response(&tid, &[(ATTR_XOR_MAPPED_ADDRESS, v)]);
         assert!(is_stun_response(&msg));
         assert_eq!(
-            parse_binding_response(&msg, &tid).unwrap(),
+            parse_mapped_address(&msg, &tid).unwrap(),
             SocketAddr::new(ip.into(), port)
         );
+    }
+
+    /// The plain address encoding used by RESPONSE-ORIGIN / OTHER-ADDRESS.
+    fn plain_v4(ip: Ipv4Addr, port: u16) -> Vec<u8> {
+        let mut v = vec![0, 0x01];
+        v.extend_from_slice(&port.to_be_bytes());
+        v.extend_from_slice(&ip.octets());
+        v
+    }
+
+    /// The attributes the behaviour tests of RFC 5780 depend on: where the
+    /// answer came from, and the server's second address.
+    #[test]
+    fn parses_response_origin_and_other_address() {
+        let tid = transaction_id();
+        let msg = response(
+            &tid,
+            &[
+                (
+                    ATTR_XOR_MAPPED_ADDRESS,
+                    xor_v4(Ipv4Addr::new(203, 0, 113, 7), 40000),
+                ),
+                (
+                    ATTR_RESPONSE_ORIGIN,
+                    plain_v4(Ipv4Addr::new(198, 51, 100, 1), 3478),
+                ),
+                (
+                    ATTR_OTHER_ADDRESS,
+                    plain_v4(Ipv4Addr::new(198, 51, 100, 2), 3479),
+                ),
+            ],
+        );
+        let r = parse_binding_response(&msg, &tid).unwrap();
+        assert_eq!(r.mapped, "203.0.113.7:40000".parse().unwrap());
+        assert_eq!(r.response_origin, "198.51.100.1:3478".parse().ok());
+        assert_eq!(r.other_address, "198.51.100.2:3479".parse().ok());
+
+        // The legacy RFC 3489 spellings carry the same meaning.
+        let legacy = response(
+            &tid,
+            &[
+                (
+                    ATTR_XOR_MAPPED_ADDRESS,
+                    xor_v4(Ipv4Addr::new(203, 0, 113, 7), 40000),
+                ),
+                (
+                    ATTR_SOURCE_ADDRESS,
+                    plain_v4(Ipv4Addr::new(198, 51, 100, 1), 3478),
+                ),
+                (
+                    ATTR_CHANGED_ADDRESS,
+                    plain_v4(Ipv4Addr::new(198, 51, 100, 2), 3479),
+                ),
+            ],
+        );
+        let r = parse_binding_response(&legacy, &tid).unwrap();
+        assert_eq!(r.response_origin, "198.51.100.1:3478".parse().ok());
+        assert_eq!(r.other_address, "198.51.100.2:3479".parse().ok());
+    }
+
+    #[test]
+    fn change_request_carries_the_asked_for_flags() {
+        let tid = transaction_id();
+        assert_eq!(binding_request(&tid).len(), STUN_HEADER_LEN);
+        for (ip, port, want) in [
+            (false, true, CHANGE_PORT),
+            (true, false, CHANGE_IP),
+            (true, true, CHANGE_IP | CHANGE_PORT),
+        ] {
+            let req = binding_request_with_change(&tid, ip, port);
+            assert_eq!(req.len(), STUN_HEADER_LEN + 8);
+            assert!(is_stun_request(&req) && !is_stun_response(&req));
+            assert_eq!(message_transaction_id(&req), Some(tid));
+            assert_eq!(u16::from_be_bytes([req[2], req[3]]), 8);
+            let attr = u16::from_be_bytes([req[20], req[21]]);
+            assert_eq!(attr, ATTR_CHANGE_REQUEST);
+            let flags = u32::from_be_bytes(req[24..28].try_into().unwrap());
+            assert_eq!(flags, want);
+        }
+    }
+
+    /// An address a stranger told us to send to is filtered: loopback,
+    /// multicast, link-local, port 0 and the wrong family are all refused.
+    #[test]
+    fn server_addresses_are_screened_before_we_send_there() {
+        let v4: SocketAddr = "198.51.100.1:3478".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:3478".parse().unwrap();
+        assert!(is_usable_server_address(
+            "198.51.100.2:3479".parse().unwrap(),
+            v4
+        ));
+        for bad in [
+            "127.0.0.1:3478",
+            "0.0.0.0:3478",
+            "224.0.0.1:3478",
+            "255.255.255.255:3478",
+            "169.254.1.1:3478",
+            "198.51.100.2:0",
+        ] {
+            assert!(
+                !is_usable_server_address(bad.parse().unwrap(), v4),
+                "{} accepted",
+                bad
+            );
+        }
+        // Family must match the socket we would send from.
+        assert!(!is_usable_server_address(v6, v4));
+        assert!(!is_usable_server_address(v4, v6));
+        assert!(is_usable_server_address(
+            "[2001:db8::2]:3479".parse().unwrap(),
+            v6
+        ));
+        assert!(!is_usable_server_address("[::1]:3479".parse().unwrap(), v6));
+
+        // From loopback, loopback is fine: a server on this host, and the
+        // simulated NAT the behaviour tests run against.
+        let local: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        assert!(is_usable_server_address(
+            "127.0.0.2:3478".parse().unwrap(),
+            local
+        ));
+        assert!(!is_usable_server_address(
+            "224.0.0.1:3478".parse().unwrap(),
+            local
+        ));
+    }
+
+    /// A response we build is a response we can read back.
+    #[test]
+    fn binding_success_roundtrips() {
+        let tid = transaction_id();
+        let mapped: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        let origin: SocketAddr = "198.51.100.1:3478".parse().unwrap();
+        let other: SocketAddr = "198.51.100.2:3479".parse().unwrap();
+        let msg = binding_success(&tid, mapped, Some(origin), Some(other));
+        assert!(is_stun_response(&msg));
+        let r = parse_binding_response(&msg, &tid).unwrap();
+        assert_eq!(r.mapped, mapped);
+        assert_eq!(r.response_origin, Some(origin));
+        assert_eq!(r.other_address, Some(other));
+
+        // IPv6 and the minimal form with no optional attributes.
+        let v6m: SocketAddr = "[2001:db8::5]:1234".parse().unwrap();
+        let bare = binding_success(&tid, v6m, None, None);
+        let r = parse_binding_response(&bare, &tid).unwrap();
+        assert_eq!(r.mapped, v6m);
+        assert_eq!(r.response_origin, None);
+        assert_eq!(r.other_address, None);
+    }
+
+    #[test]
+    fn change_request_flags_are_read_back() {
+        let tid = transaction_id();
+        assert_eq!(requested_change(&binding_request(&tid)), (false, false));
+        for (ip, port) in [(false, true), (true, false), (true, true)] {
+            let req = binding_request_with_change(&tid, ip, port);
+            assert_eq!(requested_change(&req), (ip, port));
+        }
+        // Nonsense must not panic.
+        assert_eq!(requested_change(b""), (false, false));
+        assert_eq!(requested_change(&[0u8; 24]), (false, false));
     }
 
     #[test]
@@ -296,7 +740,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            parse_binding_response(&msg, &tid).unwrap(),
+            parse_mapped_address(&msg, &tid).unwrap(),
             "203.0.113.7:40000".parse::<SocketAddr>().unwrap()
         );
     }
@@ -309,12 +753,12 @@ mod tests {
         v.extend_from_slice(&[198, 51, 100, 9]);
         let msg = response(&tid, &[(ATTR_MAPPED_ADDRESS, v)]);
         assert_eq!(
-            parse_binding_response(&msg, &tid).unwrap(),
+            parse_mapped_address(&msg, &tid).unwrap(),
             "198.51.100.9:5555".parse::<SocketAddr>().unwrap()
         );
         // Wrong transaction id, truncated message, SHARP datagram.
-        assert!(parse_binding_response(&msg, &transaction_id()).is_err());
-        assert!(parse_binding_response(&msg[..msg.len() - 3], &tid).is_err());
+        assert!(parse_mapped_address(&msg, &transaction_id()).is_err());
+        assert!(parse_mapped_address(&msg[..msg.len() - 3], &tid).is_err());
         assert!(!is_stun_response(b"SH\x02\x03................"));
         assert!(is_stun_response(&msg));
         let req = binding_request(&tid);

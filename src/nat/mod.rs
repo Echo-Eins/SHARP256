@@ -13,10 +13,11 @@
 //! actually come from. Hole punching between two NATed peers would need a
 //! rendezvous service and is not implemented.
 
+pub mod behaviour;
 pub mod stun;
 pub mod upnp;
 
-use self::stun::StunClient;
+use self::behaviour::{Behaviour, Reachable};
 use self::upnp::UpnpMapping;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -50,24 +51,13 @@ impl Default for NatConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NatType {
-    /// The public address is one of this host's own addresses.
-    None,
-    /// The same public mapping is used towards different servers.
-    Cone,
-    /// The mapping changes per destination; inbound transfers need a port
-    /// forward.
-    Symmetric,
-    Unknown,
-}
-
 /// Outcome of a discovery run.
 #[derive(Debug, Clone)]
 pub struct Reachability {
     pub local_addr: SocketAddr,
     pub public_addr: Option<SocketAddr>,
-    pub nat_type: NatType,
+    /// What the NAT in front of this socket actually does (RFC 5780).
+    pub behaviour: Behaviour,
     pub upnp_addr: Option<SocketAddr>,
 }
 
@@ -77,72 +67,86 @@ impl Reachability {
         if let Some(a) = self.upnp_addr {
             return Some(a);
         }
-        match (self.nat_type, self.public_addr) {
-            (NatType::None, Some(p)) => Some(SocketAddr::new(p.ip(), self.local_addr.port())),
+        if self.behaviour.open_internet {
+            return self
+                .public_addr
+                .map(|p| SocketAddr::new(p.ip(), self.local_addr.port()));
+        }
+        // A mapping that does not change with the destination is the same
+        // one a sender would arrive at, so it is worth publishing even when
+        // a filter means the sender has to be let in first.
+        match self.behaviour.reachable() {
+            Reachable::OncePublished | Reachable::ByPunching => self.public_addr,
             _ => None,
         }
     }
 
     /// One-line human-readable summary.
     pub fn describe(&self) -> String {
-        match (self.advertised(), self.public_addr) {
-            (Some(a), _) if self.upnp_addr.is_some() => {
-                format!("reachable from outside at {} (UPnP port forward)", a)
+        if let Some(a) = self.upnp_addr {
+            return format!("reachable from outside at {} (port forward)", a);
+        }
+        if self.behaviour.open_internet {
+            let a = self.advertised();
+            return match a {
+                Some(a) => format!("reachable from outside at {} (public address)", a),
+                None => "on the open internet".to_string(),
+            };
+        }
+        match (self.public_addr, self.behaviour.reachable()) {
+            (Some(p), Reachable::OncePublished) => {
+                format!(
+                    "reachable from outside at {} ({})",
+                    p,
+                    self.behaviour.describe()
+                )
             }
-            (Some(a), _) => format!("reachable from outside at {} (public address)", a),
-            (None, Some(p)) => format!(
-                "behind {} NAT (public IP {}); senders outside this network need a port forward to local port {}",
-                match self.nat_type {
-                    NatType::Symmetric => "a symmetric",
-                    _ => "a",
-                },
+            (Some(p), Reachable::ByPunching) => format!(
+                "seen from outside at {}, but inbound packets are filtered: a sender has to be \
+                 let in first ({})",
+                p,
+                self.behaviour.describe()
+            ),
+            (Some(p), Reachable::OnlyByRelay) => format!(
+                "behind a symmetric NAT (seen at {} right now, but the port changes per \
+                 destination): senders outside this network need a port forward to local port {}, \
+                 or a relay",
+                p,
+                self.local_addr.port()
+            ),
+            (Some(p), _) => format!(
+                "public IP {}, NAT behaviour not determined; senders outside this network may \
+                 need a port forward to local port {}",
                 p.ip(),
                 self.local_addr.port()
             ),
-            (None, None) => "public address unknown (no STUN answer, no UPnP gateway); \
-                             senders on the local network can connect directly"
+            (None, _) => "public address unknown (no STUN answer, no port forward); \
+                          senders on the local network can connect directly"
                 .to_string(),
         }
     }
 }
 
-fn is_own_address(ip: IpAddr) -> bool {
-    if_addrs::get_if_addrs()
-        .map(|ifs| ifs.iter().any(|i| i.ip() == ip))
-        .unwrap_or(false)
-}
-
 async fn discover(
     socket: &UdpSocket,
     config: &NatConfig,
-    responses: &mut mpsc::Receiver<Vec<u8>>,
+    responses: &mut mpsc::Receiver<stun::Incoming>,
 ) -> (Reachability, Option<UpnpMapping>) {
     let local_addr = socket
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-    let mapped = if config.enable_stun {
-        StunClient::new(config.stun_servers.clone())
-            .mapped_addresses(socket, responses, 2)
-            .await
+    let behaviour = if config.enable_stun {
+        behaviour::discover(socket, &config.stun_servers, responses).await
     } else {
-        Vec::new()
+        Behaviour::default()
     };
-    let public_addr = mapped.first().copied();
-    let nat_type = match public_addr {
-        None => NatType::Unknown,
-        Some(p) if is_own_address(p.ip()) => NatType::None,
-        Some(_) if mapped.len() >= 2 => {
-            if mapped.iter().all(|m| *m == mapped[0]) {
-                NatType::Cone
-            } else {
-                NatType::Symmetric
-            }
-        }
-        Some(_) => NatType::Unknown,
-    };
+    let public_addr = behaviour.mapped;
+    if config.enable_stun {
+        tracing::debug!("NAT: {}", behaviour.describe());
+    }
 
     let mut mapping = None;
-    if config.enable_upnp && nat_type != NatType::None {
+    if config.enable_upnp && !behaviour.open_internet {
         let bind_ip = match local_addr.ip() {
             IpAddr::V4(v4) => Some(v4),
             IpAddr::V6(_) => None,
@@ -179,7 +183,7 @@ async fn discover(
         Reachability {
             local_addr,
             public_addr,
-            nat_type,
+            behaviour,
             upnp_addr,
         },
         mapping,
@@ -188,8 +192,10 @@ async fn discover(
 
 /// Handle of a background discovery task.
 pub struct NatTask {
-    /// The receiver's dispatcher passes STUN responses here.
-    pub stun_responses: mpsc::Sender<Vec<u8>>,
+    /// The receiver's dispatcher passes STUN messages here, with the address
+    /// each came from: what a server claims about where it answered from is
+    /// worth checking against where the packet really came from.
+    pub stun_responses: mpsc::Sender<stun::Incoming>,
     pub task: JoinHandle<()>,
 }
 
@@ -207,7 +213,7 @@ pub fn spawn_receiver_discovery(
     if local.ip().is_loopback() {
         return None;
     }
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    let (tx, mut rx) = mpsc::channel::<stun::Incoming>(64);
     let task = tokio::spawn(async move {
         let (reach, mapping) = tokio::select! {
             r = discover(&socket, &config, &mut rx) => r,

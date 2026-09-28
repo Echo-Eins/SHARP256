@@ -281,8 +281,12 @@ impl Receiver {
                             #[cfg(feature = "nat-traversal")]
                             if let Some(nat) = &nat {
                                 let pkt = &buf[..r.len];
-                                if r.stride >= r.len && crate::nat::stun::is_stun_response(pkt) {
-                                    let _ = nat.stun_responses.try_send(pkt.to_vec());
+                                // STUN travels on the transfer socket, so
+                                // discovery never competes for datagrams.
+                                // The hairpinning test looks for our own
+                                // request coming back, hence requests too.
+                                if r.stride >= r.len && crate::nat::stun::is_stun_message(pkt) {
+                                    let _ = nat.stun_responses.try_send((pkt.to_vec(), r.from));
                                     continue;
                                 }
                             }
