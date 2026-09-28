@@ -195,6 +195,11 @@ pub struct ReceiverConfig {
     /// a received directory whose name is taken is stored as `name (1)`.
     pub overwrite: bool,
     pub max_sessions: usize,
+    /// Concurrent transfers one sender identity may hold. Without this the
+    /// session limit is first-come-first-served: a single authenticated
+    /// sender could take every slot and lock everybody else out, which the
+    /// allow-list does not help with when the sender is on it.
+    pub max_sessions_per_sender: usize,
     pub transport: TransportConfig,
     pub state_dir: Option<PathBuf>,
     /// Discover the public address (STUN) and ask the router for a port
@@ -224,6 +229,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("output_dir", &self.output_dir)
             .field("overwrite", &self.overwrite)
             .field("max_sessions", &self.max_sessions)
+            .field("max_sessions_per_sender", &self.max_sessions_per_sender)
             .field("transport", &self.transport)
             .field("state_dir", &self.state_dir)
             .field("nat_traversal", &self.nat_traversal)
@@ -245,6 +251,7 @@ impl ReceiverConfig {
             output_dir,
             overwrite: false,
             max_sessions: 16,
+            max_sessions_per_sender: 8,
             transport: TransportConfig::default(),
             state_dir: None,
             nat_traversal: false,

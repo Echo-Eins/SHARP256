@@ -1984,3 +1984,76 @@ async fn an_unreachable_first_address_does_not_strand_the_transfer() {
     drop(dead);
     stop_receiver(r).await;
 }
+
+/// Performs a handshake as `identity` and returns the receiver's answer,
+/// which may be a rejection (and then carries no session keys). The socket
+/// is returned so the caller can keep the session's path alive.
+async fn handshake_as(
+    r: &TestReceiver,
+    identity: &Identity,
+    tid: [u8; 16],
+    name: &str,
+) -> (UdpSocket, sharp256::protocol::wire::Response) {
+    use sharp256::crypto::handshake::{initiation_timestamp, Initiator};
+    use sharp256::crypto::{Suite, NO_PSK};
+    use sharp256::protocol::wire;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut init = Initiator::new(identity, &r.id, &NO_PSK).unwrap();
+    let payload = wire::encode_initiation(&wire::Initiation {
+        timestamp: initiation_timestamp(),
+        suites: Suite::ALL_BITS,
+        hardware_aes: false,
+        hello_flags: 0,
+        hello: fake_hello(tid, name),
+    });
+    let pkt = init.initiation(&payload, None).unwrap();
+    sock.send_to(&pkt, r.addr).await.unwrap();
+    let mut buf = vec![0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("the receiver answers the handshake")
+        .unwrap();
+    let (_, answer, _) = init.read_response(&buf[..n]).expect("a valid response");
+    (sock, wire::decode_response(&answer).unwrap())
+}
+
+/// The session limit must be shared, not first-come-first-served. One
+/// authenticated sender opening transfer after transfer would otherwise take
+/// every slot and lock everybody else out — and being on the allow-list
+/// would not make that any better.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_sender_cannot_take_every_session_slot() {
+    use sharp256::protocol::constants::{HELLO_ACCEPTED, HELLO_REJECTED, REASON_BUSY};
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let r = start_receiver(&out, &state, |cfg| {
+        cfg.max_sessions = 6;
+        cfg.max_sessions_per_sender = 2;
+    })
+    .await;
+
+    let greedy = Identity::generate();
+    let mut held = Vec::new();
+    for i in 0..2u8 {
+        let (sock, answer) = handshake_as(&r, &greedy, [i; 16], &format!("greedy{}.bin", i)).await;
+        assert_eq!(answer.ack.status, HELLO_ACCEPTED, "slot {} refused", i);
+        held.push(sock);
+    }
+    // Its share is spent, although four of the six slots are free.
+    let (sock, answer) = handshake_as(&r, &greedy, [9; 16], "greedy9.bin").await;
+    assert_eq!(answer.ack.status, HELLO_REJECTED);
+    assert_eq!(answer.ack.reason, REASON_BUSY);
+    held.push(sock);
+
+    // Another sender is unaffected.
+    let other = Identity::generate();
+    let (sock, answer) = handshake_as(&r, &other, [7; 16], "other.bin").await;
+    assert_eq!(
+        answer.ack.status, HELLO_ACCEPTED,
+        "a greedy sender locked out an unrelated one"
+    );
+    held.push(sock);
+
+    drop(held);
+    stop_receiver(r).await;
+}

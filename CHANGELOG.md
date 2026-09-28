@@ -53,6 +53,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   minimum instead of failing the transfer. The ICMP message behind such a
   refusal is unauthenticated, so a forged one now costs throughput at worst;
   the size only ever grows again on an authenticated PROBE_ACK.
+- The session limit is shared rather than first-come-first-served: one
+  sender identity may hold only a configured number of concurrent transfers
+  (`max_sessions_per_sender`, 8 of 16 by default), so it cannot take every
+  slot and lock everybody else out.
 - `docs/THREAT_MODEL.md`: adversary classes and what each can achieve, every
   guarantee with the mechanism responsible, explicit non-goals and residual
   risks.

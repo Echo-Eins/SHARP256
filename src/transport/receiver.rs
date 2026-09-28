@@ -548,6 +548,32 @@ impl Dispatcher {
             );
             return;
         }
+        // Without a per-sender share the session limit is
+        // first-come-first-served, and one authenticated sender could take
+        // every slot and lock everybody else out. Being on the allow-list
+        // does not make that acceptable.
+        let cfg = &self.shared.cfg;
+        let share = cfg
+            .max_sessions_per_sender
+            .clamp(1, cfg.max_sessions.max(1));
+        if self.sessions.keys().filter(|(s, _)| *s == sender).count() >= share {
+            tracing::info!(
+                "transfer from {} ({}) refused: it already holds {} of {} sessions",
+                from,
+                sender,
+                share,
+                cfg.max_sessions
+            );
+            let Handshake { incoming, init, .. } = *handshake;
+            self.reject(
+                incoming,
+                &init,
+                from,
+                REASON_BUSY,
+                "too many concurrent transfers from this sender",
+            );
+            return;
+        }
         let (tx, rx) = mpsc::channel::<Incoming>(SESSION_QUEUE);
         let _ = tx.try_send(Incoming::Handshake(handshake));
         let shared = self.shared.clone();

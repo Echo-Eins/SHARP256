@@ -725,7 +725,8 @@ UDP checksum missed.
 **Denial of service.** Datagrams without a valid mac1 cost one keyed hash
 and get no answer. Floods from spoofed addresses are met with cookies
 (one MAC per datagram, no public-key operations, no amplification);
-per-address rate limits, a session limit, the free-space check, sparse
+per-address rate limits, a session limit with a per-sender share (so one
+authenticated sender cannot take every slot), the free-space check, sparse
 pre-allocation and the expiry of idle sessions bound what an authenticated
 but hostile sender can occupy. A directory listing is size-limited and
 validated before any file is created.
