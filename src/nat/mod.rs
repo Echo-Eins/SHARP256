@@ -36,7 +36,7 @@ use self::behaviour::{Behaviour, Reachable};
 use self::upnp::UpnpMapping;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -60,6 +60,11 @@ pub struct NatConfig {
     /// and they tell whoever is given the address how that network is laid
     /// out; this is the switch for the second concern.
     pub publish_lan_addresses: bool,
+    /// How often the mapping behind a published address is checked with a
+    /// request, between the keepalives (see [`maintain`]).
+    pub mapping_check: Duration,
+    /// How often this host's own addresses are looked at again.
+    pub host_refresh: Duration,
 }
 
 impl Default for NatConfig {
@@ -74,6 +79,8 @@ impl Default for NatConfig {
             ],
             mapping_lease: 3600,
             publish_lan_addresses: true,
+            mapping_check: MAPPING_CHECK,
+            host_refresh: HOST_REFRESH,
         }
     }
 }
@@ -667,19 +674,26 @@ pub struct NatTask {
     pub task: JoinHandle<()>,
 }
 
-/// Starts NAT discovery for the receiver's socket in the background.
+/// Starts NAT discovery for the receiver's socket in the background, and
+/// keeps what it found true for as long as the receiver runs.
 ///
 /// The address tests and the port-forward request run side by side, and
 /// what they find is reported through `on_result` as it comes: first when
 /// the tests are done, again if a port forward is granted after that. A
 /// router that is slow to answer, or never does, no longer holds up telling
-/// the user where the receiver can be reached. A port forward is kept alive
-/// until `cancel` fires and then given back, so the router does not keep
-/// forwarding a port nothing listens on. Returns `None` for loopback
-/// sockets, where there is nothing to discover.
+/// the user where the receiver can be reached.
+///
+/// After that the task maintains it all (see [`maintain`]): the NAT mapping
+/// a published address rests on is kept alive and checked, its lifetime
+/// measured where the server allows, this host's own addresses looked at
+/// again now and then, and a port forward renewed — each change reported
+/// through `on_result` again. A port forward is given back when `cancel`
+/// fires, so the router does not keep forwarding a port nothing listens on.
+/// Returns `None` for loopback sockets, where there is nothing to discover.
 pub fn spawn_receiver_discovery(
     socket: Arc<UdpSocket>,
     config: NatConfig,
+    keepalive: keepalive::SharedKeepalive,
     cancel: CancellationToken,
     on_result: impl Fn(&Reachability) + Send + 'static,
 ) -> Option<NatTask> {
@@ -687,7 +701,7 @@ pub fn spawn_receiver_discovery(
     if crate::address::canonical(local).ip().is_loopback() {
         return None;
     }
-    let (tx, mut rx) = mpsc::channel::<stun::Incoming>(64);
+    let (tx, rx) = mpsc::channel::<stun::Incoming>(64);
     let task = tokio::spawn(async move {
         // Owns the channel the STUN messages come in on, and lets go of it
         // when done: the dispatcher then stops handing us any.
@@ -697,27 +711,31 @@ pub fn spawn_receiver_discovery(
             config.enable_stun,
         );
         let tests = async move {
-            if enable_stun {
+            let mut rx = rx;
+            let b = if enable_stun {
                 let b = behaviour::discover(&tests_socket, &servers, &mut rx).await;
                 tracing::debug!("NAT: {}", b.describe());
                 b
             } else {
                 Behaviour::default()
-            }
+            };
+            (b, rx)
         };
-        let mapping = async {
-            if config.enable_port_mapping {
-                forward_port(local, config.mapping_lease).await
+        let (enable_mapping, lease) = (config.enable_port_mapping, config.mapping_lease);
+        let mapping = async move {
+            if enable_mapping {
+                forward_port(local, lease).await
             } else {
                 None
             }
         };
         tokio::pin!(tests, mapping);
         let mut behaviour: Option<Behaviour> = None;
+        let mut responses: Option<mpsc::Receiver<stun::Incoming>> = None;
         let mut forward: Option<Option<PortForward>> = None;
         while behaviour.is_none() || forward.is_none() {
             tokio::select! {
-                b = &mut tests, if behaviour.is_none() => {
+                (b, rx) = &mut tests, if behaviour.is_none() => {
                     let r = reachability(
                         local,
                         &b,
@@ -727,6 +745,7 @@ pub fn spawn_receiver_discovery(
                     tracing::info!("NAT: {}", r.describe());
                     on_result(&r);
                     behaviour = Some(b);
+                    responses = Some(rx);
                 }
                 f = &mut mapping, if forward.is_none() => {
                     if let Some(f) = &f {
@@ -749,50 +768,225 @@ pub fn spawn_receiver_discovery(
                 }
             }
         }
-        let Some(Some(mapping)) = forward else { return };
-        let lease = mapping.lifetime();
-        if lease > 0 {
-            // Renew at half the lease, so one lost renewal is not fatal.
-            // The floor is small on purpose: a router may grant far less
-            // than was asked for — PCP explicitly allows it, and they do it
-            // under pressure — and a floor of half a minute would have left
-            // a thirty-second grant dead for half of every cycle.
-            let every = Duration::from_secs((lease as u64 / 2).max(5));
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(every) => {
-                        // Bounded, and interruptible: a router that stops
-                        // answering must not keep the receiver from
-                        // shutting down.
-                        tokio::select! {
-                            r = tokio::time::timeout(
-                                Duration::from_secs(10),
-                                mapping.refresh(config.mapping_lease),
-                            ) => match r {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => tracing::warn!("NAT: {}", e),
-                                Err(_) => tracing::warn!("NAT: the router did not answer the renewal"),
-                            },
-                            _ = cancel.cancelled() => break,
-                        }
-                    }
-                    _ = cancel.cancelled() => break,
-                }
-            }
-        } else {
-            cancel.cancelled().await;
-        }
-        let how = mapping.protocol();
-        match tokio::time::timeout(Duration::from_secs(3), mapping.remove()).await {
-            Ok(Ok(())) => tracing::info!("NAT: {} port forward given back", how),
-            Ok(Err(e)) => tracing::warn!("NAT: {}", e),
-            Err(_) => tracing::warn!("NAT: the router did not answer the removal request"),
-        }
+        let (Some(behaviour), Some(responses), Some(forward)) = (behaviour, responses, forward)
+        else {
+            return;
+        };
+        maintain(Maintained {
+            socket,
+            config,
+            local,
+            behaviour,
+            forward,
+            responses,
+            keepalive,
+            cancel,
+            on_result,
+        })
+        .await;
     });
     Some(NatTask {
         stun_responses: tx,
         task,
     })
+}
+
+/// How often the mapping behind a published address is checked with a
+/// request (the keepalives in between are indications, which a server
+/// takes in without answering, and which tell us nothing back).
+const MAPPING_CHECK: Duration = Duration::from_secs(60);
+/// How often this host's own addresses are looked at again: interfaces
+/// come and go, and a temporary IPv6 address is replaced every day or so.
+const HOST_REFRESH: Duration = Duration::from_secs(300);
+
+/// What [`maintain`] looks after.
+struct Maintained<F> {
+    socket: Arc<UdpSocket>,
+    config: NatConfig,
+    local: SocketAddr,
+    behaviour: Behaviour,
+    forward: Option<PortForward>,
+    responses: mpsc::Receiver<stun::Incoming>,
+    keepalive: keepalive::SharedKeepalive,
+    cancel: CancellationToken,
+    on_result: F,
+}
+
+/// Keeps what discovery found true until `cancel` fires, then gives the
+/// port forward back.
+///
+/// * The NAT mapping a published address rests on — the address a STUN
+///   server sees us at, when the mapping is stable enough to publish — is
+///   kept alive with a STUN indication at the keepalive interval (RFC 8445
+///   section 11), and checked with a request every [`MAPPING_CHECK`]. A
+///   mapping that changed anyway is reported, and the interval shortened.
+/// * Where the server has shown itself an RFC 5780 one, how long the NAT
+///   keeps an idle mapping is measured in the background (RFC 5780 section
+///   4.6) and sets the interval.
+/// * This host's own addresses are looked at again every [`HOST_REFRESH`].
+/// * A port forward is renewed at half its lease.
+async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
+    let Maintained {
+        socket,
+        config,
+        local,
+        mut behaviour,
+        forward,
+        mut responses,
+        keepalive,
+        cancel,
+        on_result,
+    } = m;
+    let lan = config.publish_lan_addresses;
+    let mut current = reachability(local, &behaviour, forward.as_ref(), lan);
+    let server = behaviour.tested_with;
+    // Worth keeping only when an address resting on the mapping is
+    // published: a NAT that changes the port per destination gets nothing
+    // published, and no NAT at all needs nothing kept.
+    let rests_on_mapping = |b: &Behaviour| {
+        b.mapped.is_some()
+            && !b.open_internet
+            && matches!(
+                b.reachable(),
+                Reachable::OncePublished | Reachable::ByPunching
+            )
+    };
+    let now = Instant::now();
+    let mut next_keepalive = now + keepalive.lock().next();
+    let mut next_check = now + config.mapping_check;
+    let mut next_host = now + config.host_refresh;
+    // Renew at half the lease, so one lost renewal is not fatal. The floor
+    // is small on purpose: a router may grant far less than was asked for —
+    // PCP explicitly allows it, and they do it under pressure — and a floor
+    // of half a minute would have left a thirty-second grant dead for half
+    // of every cycle.
+    let renew_every = forward
+        .as_ref()
+        .map(|f| f.lifetime())
+        .filter(|&l| l > 0)
+        .map(|l| Duration::from_secs((l as u64 / 2).max(5)));
+    let mut next_renewal = renew_every.map(|e| now + e);
+    let lifetime = match server {
+        Some(server) if behaviour.rfc5780 && rests_on_mapping(&behaviour) => {
+            let bind_ip: IpAddr = if crate::address::canonical(server).is_ipv6() {
+                std::net::Ipv6Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            };
+            Some(tokio::spawn(behaviour::binding_lifetime(
+                bind_ip,
+                server,
+                &behaviour::LIFETIME_PROBES,
+                Duration::from_millis(500),
+            )))
+        }
+        _ => None,
+    };
+    let mut lifetime = lifetime;
+    let client = stun::StunClient::new(Vec::new()).with_timing(Duration::from_millis(500), 2);
+    let at = |i: Instant| tokio::time::sleep_until(tokio::time::Instant::from_std(i));
+    loop {
+        let keeping = server.filter(|_| rests_on_mapping(&behaviour));
+        tokio::select! {
+            _ = at(next_keepalive), if keeping.is_some() => {
+                let server = keeping.expect("guarded");
+                let _ = socket
+                    .send_to(&stun::binding_indication(&stun::transaction_id()), server)
+                    .await;
+                next_keepalive = Instant::now() + keepalive.lock().next();
+            }
+            _ = at(next_check), if keeping.is_some() => {
+                let server = keeping.expect("guarded");
+                // Bounded, and interruptible like everything else here.
+                let reply = tokio::select! {
+                    r = client.transaction(&socket, server, &mut responses, false, false) => r,
+                    _ = cancel.cancelled() => break,
+                };
+                if let Ok(Some(reply)) = reply {
+                    let seen = reply.response.mapped;
+                    if behaviour.mapped != Some(seen) {
+                        let shorter = keepalive.lock().mapping_changed();
+                        tracing::info!(
+                            "NAT: the address we are seen at changed ({} -> {}){}",
+                            behaviour
+                                .mapped
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "none".into()),
+                            seen,
+                            if shorter {
+                                format!(
+                                    "; keeping the mapping alive every {:?} from now on",
+                                    keepalive.lock().interval()
+                                )
+                            } else {
+                                String::new()
+                            }
+                        );
+                        behaviour.mapped = Some(seen);
+                        current = reachability(local, &behaviour, forward.as_ref(), lan);
+                        on_result(&current);
+                    }
+                }
+                next_check = Instant::now() + config.mapping_check;
+            }
+            _ = at(next_host) => {
+                let fresh = reachability(local, &behaviour, forward.as_ref(), lan);
+                if fresh.candidates() != current.candidates() {
+                    tracing::info!("NAT: this host's addresses changed");
+                    current = fresh;
+                    on_result(&current);
+                }
+                next_host = Instant::now() + config.host_refresh;
+            }
+            _ = at(next_renewal.unwrap_or(next_host)), if next_renewal.is_some() => {
+                if let Some(f) = &forward {
+                    // Bounded, and interruptible: a router that stops
+                    // answering must not keep the receiver from shutting
+                    // down.
+                    tokio::select! {
+                        r = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            f.refresh(config.mapping_lease),
+                        ) => match r {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!("NAT: {}", e),
+                            Err(_) => tracing::warn!("NAT: the router did not answer the renewal"),
+                        },
+                        _ = cancel.cancelled() => break,
+                    }
+                }
+                next_renewal = renew_every.map(|e| Instant::now() + e);
+            }
+            r = async { lifetime.as_mut().expect("guarded").await }, if lifetime.is_some() => {
+                lifetime = None;
+                match r {
+                    Ok(Some(l)) => {
+                        let mut k = keepalive.lock();
+                        k.lifetime_measured(l);
+                        tracing::info!(
+                            "NAT: an idle mapping lasts at least {:?} here; keeping ours alive \
+                             every {:?}",
+                            l,
+                            k.interval()
+                        );
+                    }
+                    _ => tracing::debug!("NAT: the mapping lifetime could not be measured"),
+                }
+            }
+            _ = cancel.cancelled() => break,
+        }
+    }
+    if let Some(task) = lifetime {
+        task.abort();
+    }
+    if let Some(f) = forward {
+        let how = f.protocol();
+        match tokio::time::timeout(Duration::from_secs(3), f.remove()).await {
+            Ok(Ok(())) => tracing::info!("NAT: {} port forward given back", how),
+            Ok(Err(e)) => tracing::warn!("NAT: {}", e),
+            Err(_) => tracing::warn!("NAT: the router did not answer the removal request"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1051,6 +1245,112 @@ garbage line
         assert_eq!(host_addresses(lan, true), vec![lan.ip()]);
         let public: SocketAddr = "[2a00:1:2::7]:5555".parse().unwrap();
         assert_eq!(host_addresses(public, false), vec![public.ip()]);
+    }
+
+    /// The mapping behind a published address is kept alive with STUN
+    /// indications at the keepalive interval, checked with requests in
+    /// between, and when it changes anyway the new address is reported at
+    /// once and the keepalives come closer together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_published_mapping_is_kept_alive_and_its_changes_reported() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let indications = Arc::new(AtomicU32::new(0));
+        let requests = Arc::new(AtomicU32::new(0));
+        let fake = {
+            let (server, indications, requests) =
+                (server.clone(), indications.clone(), requests.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((n, from)) = server.recv_from(&mut buf).await {
+                    let pkt = &buf[..n];
+                    if pkt.len() >= 20 && pkt[0..2] == [0x00, 0x11] {
+                        indications.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if !stun::is_stun_request(pkt) {
+                        continue;
+                    }
+                    let Some(tid) = stun::message_transaction_id(pkt) else {
+                        continue;
+                    };
+                    // The NAT moves us to a new port from the second check on.
+                    let port = if requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                        50000
+                    } else {
+                        50001
+                    };
+                    let mapped: SocketAddr = format!("203.0.113.9:{}", port).parse().unwrap();
+                    let reply = stun::binding_success(&tid, mapped, Some(server_addr), None);
+                    let _ = server.send_to(&reply, from).await;
+                }
+            })
+        };
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let pump = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    if stun::is_stun_message(&buf[..n]) {
+                        let _ = tx.send((buf[..n].to_vec(), from)).await;
+                    }
+                }
+            })
+        };
+        let behaviour = Behaviour {
+            mapping: behaviour::Mapping::EndpointIndependent,
+            filtering: behaviour::Filtering::EndpointIndependent,
+            mapped: Some("203.0.113.9:50000".parse().unwrap()),
+            tested_with: Some(server_addr),
+            ..Behaviour::default()
+        };
+        let keepalive: keepalive::SharedKeepalive = Arc::new(parking_lot::Mutex::new(
+            keepalive::Keepalive::new(Duration::from_millis(100)),
+        ));
+        let cancel = CancellationToken::new();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let config = NatConfig {
+            enable_port_mapping: false,
+            mapping_check: Duration::from_millis(300),
+            host_refresh: Duration::from_secs(3600),
+            ..NatConfig::default()
+        };
+        let task = tokio::spawn(maintain(Maintained {
+            socket: socket.clone(),
+            config,
+            local: socket.local_addr().unwrap(),
+            behaviour,
+            forward: None,
+            responses: rx,
+            keepalive: keepalive.clone(),
+            cancel: cancel.clone(),
+            on_result: move |r: &Reachability| {
+                let _ = seen_tx.send(r.public_addr);
+            },
+        }));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stops when cancelled")
+            .unwrap();
+        pump.abort();
+        fake.abort();
+        assert!(
+            indications.load(Ordering::Relaxed) >= 5,
+            "only {} keepalives in a second at 100 ms",
+            indications.load(Ordering::Relaxed)
+        );
+        assert!(requests.load(Ordering::Relaxed) >= 2);
+        assert_eq!(
+            seen_rx.try_recv().ok(),
+            Some(Some("203.0.113.9:50001".parse().unwrap())),
+            "the new address was not reported"
+        );
+        assert_eq!(keepalive.lock().interval(), Duration::from_millis(50));
     }
 
     /// A loopback socket has nothing to offer anyone else.

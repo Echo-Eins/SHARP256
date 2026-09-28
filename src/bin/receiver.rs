@@ -53,6 +53,13 @@ struct Args {
     #[arg(long)]
     no_lan_addresses: bool,
 
+    /// Seconds between the packets that keep this receiver's NAT mapping
+    /// alive while it waits (RFC 8445 suggests 15). It sends less often
+    /// once it has measured that the NAT keeps mappings longer, and more
+    /// often when it sees one lapse.
+    #[arg(long, value_name = "SECONDS", default_value_t = 15)]
+    keepalive: u64,
+
     /// Replace existing files with the same name instead of writing "name (1)"
     #[arg(long)]
     overwrite: bool,
@@ -121,6 +128,7 @@ async fn main() -> Result<()> {
     cfg.relays = args.relays.clone();
     cfg.relay_private = args.relay_private;
     cfg.publish_lan_addresses = !args.no_lan_addresses;
+    cfg.nat_keepalive = std::time::Duration::from_secs(args.keepalive.clamp(1, 3600));
     cfg.state_dir = args.state_dir.clone();
     if let Some(c) = args.chunk_size {
         cfg.transport.max_chunk = c;

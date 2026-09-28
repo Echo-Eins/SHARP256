@@ -385,6 +385,13 @@ impl Receiver {
                 "reachable only through the relays: not discovering or publishing direct addresses"
             );
         }
+        // One keepalive policy for everything that goes out through this
+        // socket's NAT mapping — STUN and every relay registration — so
+        // that what one learns about the NAT, all act on.
+        #[cfg(feature = "nat-traversal")]
+        let keepalive: crate::nat::keepalive::SharedKeepalive = Arc::new(parking_lot::Mutex::new(
+            crate::nat::keepalive::Keepalive::new(shared.cfg.nat_keepalive),
+        ));
         #[cfg(feature = "nat-traversal")]
         let nat = if shared.cfg.nat_traversal && !shared.cfg.relay_only() {
             let events = shared.cfg.events.clone();
@@ -395,6 +402,7 @@ impl Receiver {
                     publish_lan_addresses: shared.cfg.publish_lan_addresses,
                     ..crate::nat::NatConfig::default()
                 },
+                keepalive.clone(),
                 shared.cancel.clone(),
                 move |r| {
                     emit(
@@ -416,7 +424,7 @@ impl Receiver {
         // introduced to it, and carried if the introduction is not enough.
         // Their control messages arrive on this same socket.
         #[cfg(feature = "nat-traversal")]
-        let relays = spawn_relay_clients(&shared);
+        let relays = spawn_relay_clients(&shared, &keepalive);
 
         let socket = shared.socket.clone();
         let cancel = shared.cancel.clone();
@@ -897,7 +905,10 @@ const RELAY_RESOLVE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Registers this receiver with every configured relay, in the background.
 #[cfg(feature = "nat-traversal")]
-fn spawn_relay_clients(shared: &Arc<Shared>) -> RelayClients {
+fn spawn_relay_clients(
+    shared: &Arc<Shared>,
+    keepalive: &crate::nat::keepalive::SharedKeepalive,
+) -> RelayClients {
     let list: Arc<parking_lot::RwLock<Vec<RelayClient>>> =
         Arc::new(parking_lot::RwLock::new(Vec::new()));
     let reach = crate::address::Reach::of(&shared.socket.udp());
@@ -928,6 +939,7 @@ fn spawn_relay_clients(shared: &Arc<Shared>) -> RelayClients {
         let cancel = shared.cancel.clone();
         let events = shared.cfg.events.clone();
         let list = list.clone();
+        let keepalive = keepalive.clone();
         tasks.push(tokio::spawn(async move {
             let Some(addrs) = resolve_relay(&host, reach, &cancel).await else {
                 return;
@@ -945,7 +957,7 @@ fn spawn_relay_clients(shared: &Arc<Shared>) -> RelayClients {
                 private,
                 rx,
                 cancel,
-                crate::nat::keepalive::Keepalive::default(),
+                keepalive,
                 move |addr: SocketAddr, observed: SocketAddr| {
                     // Deliberately *not* published as an address to hand a
                     // sender. It is this receiver's NAT mapping towards that

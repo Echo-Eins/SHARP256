@@ -328,6 +328,120 @@ pub async fn discover_with(
     out
 }
 
+/// How long [`binding_lifetime`] lets each mapping sit idle, shortest
+/// first. Longer would change nothing: the keepalive interval stops growing
+/// at a minute (see `keepalive::CEILING`), which a two-minute lifetime
+/// already allows.
+pub const LIFETIME_PROBES: [Duration; 4] = [
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
+
+/// RFC 5780 section 4.6: how long the NAT in front of this host keeps a
+/// mapping nothing uses.
+///
+/// Each probe gets a socket of its own, because a mapping in use is
+/// refreshed by its own traffic, which is exactly what must not happen: the
+/// socket makes its mapping with one request to `server` and falls silent.
+/// When its time is up, a request from yet another socket asks the server,
+/// with RESPONSE-PORT, to answer to that mapping instead. The answer
+/// arrives only if the mapping is still there. A server that answers the
+/// asking socket instead does not support RESPONSE-PORT, and then nothing
+/// can be concluded at all — which is why this only runs against a server
+/// that has shown itself to be an RFC 5780 one.
+///
+/// Probes run side by side and end at the first mapping that did not
+/// survive: a NAT that forgot one after half a minute will not have kept
+/// another for a whole one. Returns the longest idleness a mapping
+/// survived — the lifetime is at least that — or half the shortest probe
+/// when none did, or `None` when the server could not be used.
+pub async fn binding_lifetime(
+    bind_ip: IpAddr,
+    server: SocketAddr,
+    probes: &[Duration],
+    per_try: Duration,
+) -> Option<Duration> {
+    let server = crate::address::canonical(server);
+    if probes.is_empty() || bind_ip.to_canonical().is_ipv6() != server.is_ipv6() {
+        return None;
+    }
+    let bind = SocketAddr::new(bind_ip, 0);
+    // One mapping per probe, each made with a single exchange.
+    let mut mappings: Vec<(UdpSocket, SocketAddr, Instant, Duration)> = Vec::new();
+    for &idle in probes {
+        let sock = UdpSocket::bind(bind).await.ok()?;
+        let tid = transaction_id();
+        let mut mapped = None;
+        for _ in 0..3 {
+            sock.send_to(&binding_request(&tid), server).await.ok()?;
+            if let Some(r) = answer(&sock, server, &tid, per_try).await {
+                mapped = Some(r.mapped);
+                break;
+            }
+        }
+        mappings.push((sock, mapped?, Instant::now(), idle));
+    }
+    let asker = UdpSocket::bind(bind).await.ok()?;
+    let mut survived: Option<Duration> = None;
+    for (sock, mapped, made, idle) in &mappings {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(*made + *idle)).await;
+        let tid = transaction_id();
+        let ask = super::stun::binding_request_with_response_port(&tid, mapped.port());
+        let mut verdict = None;
+        for _ in 0..2 {
+            if asker.send_to(&ask, server).await.is_err() {
+                return None;
+            }
+            tokio::select! {
+                r = answer(sock, server, &tid, per_try) => {
+                    if r.is_some() {
+                        verdict = Some(true);
+                        break;
+                    }
+                }
+                r = answer(&asker, server, &tid, per_try) => {
+                    if r.is_some() {
+                        tracing::debug!("STUN: {} ignores RESPONSE-PORT; mapping lifetime not measured", server);
+                        return None;
+                    }
+                }
+            }
+            verdict = Some(false);
+        }
+        if verdict != Some(true) {
+            break;
+        }
+        survived = Some(*idle);
+    }
+    Some(survived.unwrap_or(probes[0] / 2))
+}
+
+/// Waits `within` for the Binding success response to `tid` from `server`
+/// on `sock`, ignoring anything else.
+async fn answer(
+    sock: &UdpSocket,
+    server: SocketAddr,
+    tid: &[u8; 12],
+    within: Duration,
+) -> Option<BindingResponse> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut buf = [0u8; 1024];
+    loop {
+        let (n, from) = tokio::time::timeout_at(deadline, sock.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        if crate::address::canonical(from).ip() != server.ip() {
+            continue;
+        }
+        if let Ok(r) = super::stun::parse_binding_response(&buf[..n], tid) {
+            return Some(r);
+        }
+    }
+}
+
 /// RFC 5780 section 4.3: does the external port follow the destination?
 async fn mapping_behaviour(
     socket: &UdpSocket,
@@ -724,6 +838,86 @@ mod tests {
         assert_eq!(got.mapping, Mapping::Unknown);
         assert_eq!(got.reachable(), Reachable::Unknown);
         assert_eq!(got.mapped, "203.0.113.9:50000".parse().ok());
+    }
+
+    /// A STUN server behind which a NAT forgets a mapping `lifetime` after
+    /// it was last used: RESPONSE-PORT answers go out only while the mapping
+    /// they are for is fresh. `honours_response_port` false makes it a
+    /// server that answers the asker instead, as most public ones would.
+    async fn forgetful_stun(
+        lifetime: Duration,
+        honours_response_port: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut last_used: std::collections::HashMap<u16, Instant> =
+                std::collections::HashMap::new();
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                let pkt = &buf[..n];
+                if !crate::nat::stun::is_stun_request(pkt) {
+                    continue;
+                }
+                let Some(tid) = message_transaction_id(pkt) else {
+                    continue;
+                };
+                let now = Instant::now();
+                last_used.insert(from.port(), now);
+                let reply = binding_success(&tid, from, Some(addr), None);
+                match crate::nat::stun::requested_response_port(pkt) {
+                    Some(port) if honours_response_port => {
+                        let fresh = last_used
+                            .get(&port)
+                            .is_some_and(|t| now.duration_since(*t) <= lifetime);
+                        if fresh {
+                            let _ = sock.send_to(&reply, SocketAddr::new(from.ip(), port)).await;
+                        }
+                    }
+                    _ => {
+                        let _ = sock.send_to(&reply, from).await;
+                    }
+                }
+            }
+        });
+        (addr, task)
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// RFC 5780 section 4.6, against a NAT that keeps idle mappings for
+    /// 300 ms: the mapping left idle for 200 ms survives, the one left for
+    /// 600 ms does not, and the answer is the longest survivor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measures_how_long_an_idle_mapping_lasts() {
+        let (server, task) = forgetful_stun(ms(300), true).await;
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let got =
+            binding_lifetime(lo, server, &[ms(100), ms(200), ms(600), ms(1200)], ms(100)).await;
+        assert_eq!(got, Some(ms(200)));
+        // A NAT faster than every probe: half the shortest.
+        let (server2, task2) = forgetful_stun(ms(30), true).await;
+        let got = binding_lifetime(lo, server2, &[ms(200), ms(400)], ms(100)).await;
+        assert_eq!(got, Some(ms(100)));
+        task.abort();
+        task2.abort();
+    }
+
+    /// A server that answers the asker instead of the port it was given
+    /// cannot measure anything, and says nothing rather than a guess.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_without_response_port_measures_nothing() {
+        let (server, task) = forgetful_stun(ms(300), false).await;
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let got = binding_lifetime(lo, server, &[ms(100), ms(200)], ms(100)).await;
+        assert_eq!(got, None);
+        // Nor does a server that does not answer at all.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let got = binding_lifetime(lo, dead.local_addr().unwrap(), &[ms(100)], ms(50)).await;
+        assert_eq!(got, None);
+        task.abort();
     }
 
     fn b(mapping: Mapping, filtering: Filtering) -> Behaviour {

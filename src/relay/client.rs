@@ -218,7 +218,7 @@ pub async fn serve(
     private: bool,
     mut incoming: mpsc::Receiver<Incoming>,
     cancel: CancellationToken,
-    keepalive: crate::nat::keepalive::Keepalive,
+    keepalive: crate::nat::keepalive::SharedKeepalive,
     on_registered: impl Fn(SocketAddr, SocketAddr) + Send + 'static,
 ) {
     let Some(&first) = relays.first() else {
@@ -253,7 +253,6 @@ pub async fn serve(
     // and the NAT mapping alive.
     let mut retry = Duration::from_millis(500);
     let mut lease = Duration::from_secs(60);
-    let mut keepalive = keepalive;
     let mut send_failures = 0u32;
     // Registrations sent to the current address with nothing back yet.
     let mut unanswered = 0u32;
@@ -299,7 +298,7 @@ pub async fn serve(
                 Ok(_) => {
                     send_failures = 0;
                     if registered {
-                        next_send = now + keepalive.next().min(lease / 2);
+                        next_send = now + keepalive.lock().next().min(lease / 2);
                     } else {
                         unanswered += 1;
                         next_send = now + retry;
@@ -377,14 +376,15 @@ pub async fn serve(
                     // The mapping lapsed although it was being refreshed:
                     // the refreshes are too far apart for this NAT.
                     Some(before) if before != seen => {
-                        if keepalive.mapping_changed() {
+                        let shorter = keepalive.lock().mapping_changed();
+                        if shorter {
                             tracing::info!(
                                 "our NAT gave us a new address towards relay {} ({} -> {}); \
                                  refreshing every {:?} from now on",
                                 relay,
                                 before,
                                 seen,
-                                keepalive.interval()
+                                keepalive.lock().interval()
                             );
                         } else {
                             tracing::info!(
@@ -401,7 +401,7 @@ pub async fn serve(
                 observed = Some(seen);
                 registered = true;
                 retry = Duration::from_millis(500);
-                next_send = Instant::now() + keepalive.next().min(lease / 2);
+                next_send = Instant::now() + keepalive.lock().next().min(lease / 2);
             }
             Message::Incoming { port, peer, ticket } => {
                 let relayed = SocketAddr::new(relay.ip(), port);

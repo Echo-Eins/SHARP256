@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 
 pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
+/// A Binding indication: sent, never answered (RFC 8489 section 6.3.2).
+const BINDING_INDICATION: u16 = 0x0011;
 const BINDING_SUCCESS: u16 = 0x0101;
 const BINDING_ERROR: u16 = 0x0111;
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
@@ -24,6 +26,9 @@ const ATTR_SOURCE_ADDRESS: u16 = 0x0004;
 const ATTR_CHANGED_ADDRESS: u16 = 0x0005;
 const ATTR_CHANGE_REQUEST: u16 = 0x0003;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// RFC 5780: the port the response is to go to, instead of the one the
+/// request came from (section 7.5).
+const ATTR_RESPONSE_PORT: u16 = 0x0027;
 /// RFC 5780: address the response was sent from.
 const ATTR_RESPONSE_ORIGIN: u16 = 0x802b;
 /// RFC 5780: the server's second address and port.
@@ -106,6 +111,37 @@ pub fn binding_request_with_change(tid: &[u8; 12], change_ip: bool, change_port:
         msg.extend_from_slice(&4u16.to_be_bytes());
         msg.extend_from_slice(&flags.to_be_bytes());
     }
+    msg
+}
+
+/// Binding request carrying RESPONSE-PORT (RFC 5780 section 7.5): the
+/// server is to answer to the source IP address of the request but this
+/// port. Measuring how long a NAT keeps an idle mapping rests on it (RFC
+/// 5780 section 4.6): a request from one socket asks for the answer to be
+/// sent to another socket's mapping, and whether it arrives says whether
+/// that mapping still exists.
+pub fn binding_request_with_response_port(tid: &[u8; 12], port: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(STUN_HEADER_LEN + 8);
+    msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    msg.extend_from_slice(&8u16.to_be_bytes());
+    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(tid);
+    msg.extend_from_slice(&ATTR_RESPONSE_PORT.to_be_bytes());
+    msg.extend_from_slice(&4u16.to_be_bytes());
+    msg.extend_from_slice(&port.to_be_bytes());
+    msg.extend_from_slice(&[0, 0]);
+    msg
+}
+
+/// A Binding indication (RFC 8489 section 6.3.2): a message a server
+/// takes in and never answers. It is what keeps a NAT mapping towards the
+/// server alive (RFC 8445 section 11) without costing the server a reply.
+pub fn binding_indication(tid: &[u8; 12]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(STUN_HEADER_LEN);
+    msg.extend_from_slice(&BINDING_INDICATION.to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(tid);
     msg
 }
 
@@ -211,6 +247,27 @@ pub fn requested_change(pkt: &[u8]) -> (bool, bool) {
         pos = end + (4 - alen % 4) % 4;
     }
     (false, false)
+}
+
+/// The RESPONSE-PORT a Binding request carries, if any (what a server
+/// supporting RFC 5780 reads; the tests' servers read it with this).
+pub fn requested_response_port(pkt: &[u8]) -> Option<u16> {
+    let len = u16::from_be_bytes([*pkt.get(2)?, *pkt.get(3)?]) as usize;
+    let body = pkt.get(STUN_HEADER_LEN..STUN_HEADER_LEN + len)?;
+    let mut pos = 0;
+    while pos + 4 <= body.len() {
+        let attr = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let alen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+        let end = pos + 4 + alen;
+        if end > body.len() {
+            return None;
+        }
+        if attr == ATTR_RESPONSE_PORT && alen >= 2 {
+            return Some(u16::from_be_bytes([body[pos + 4], body[pos + 5]]));
+        }
+        pos = end + (4 - alen % 4) % 4;
+    }
+    None
 }
 
 /// What one Binding success response tells us.

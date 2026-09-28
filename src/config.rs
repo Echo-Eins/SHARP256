@@ -266,6 +266,13 @@ pub struct ReceiverConfig {
     /// given the receiver's address how that network is laid out. Off, only
     /// addresses the internet routes are published.
     pub publish_lan_addresses: bool,
+    /// How often, at most, something is sent to keep this receiver's NAT
+    /// mapping alive while nothing else flows: a keepalive to the STUN
+    /// server behind a published address, and each relay registration.
+    /// RFC 8445 (section 11) suggests 15 seconds, which is the default;
+    /// the receiver sends less often once it has measured that its NAT
+    /// keeps mappings longer, and more often when it sees one lapse.
+    pub nat_keepalive: Duration,
     pub accept: AcceptPolicy,
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
@@ -298,6 +305,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("relays", &self.relays)
             .field("relay_private", &self.relay_private)
             .field("publish_lan_addresses", &self.publish_lan_addresses)
+            .field("nat_keepalive", &self.nat_keepalive)
             .field("accept", &self.accept)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
@@ -352,6 +360,7 @@ impl ReceiverConfig {
             relays: Vec::new(),
             relay_private: false,
             publish_lan_addresses: true,
+            nat_keepalive: Duration::from_secs(15),
             accept: AcceptPolicy::AcceptAll,
             identity: None,
             psk: None,

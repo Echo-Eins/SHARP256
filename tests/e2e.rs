@@ -3359,3 +3359,184 @@ async fn a_name_that_does_not_resolve_fails_fast_and_says_why() {
         started.elapsed()
     );
 }
+
+// ----- NAT keepalive -------------------------------------------------------
+
+/// A NAT between one inside host and one outside address that forgets its
+/// mapping `idle` after the last datagram out: the next one out gets a new
+/// outside port, and whatever arrives for the old one is lost — the way a
+/// home router or carrier-grade NAT with a short UDP timeout behaves. The
+/// inside host sends to the returned address as if it were the outside
+/// one; the counter says how many mappings were made.
+#[cfg(feature = "nat-traversal")]
+async fn forgetful_nat(
+    outside: SocketAddr,
+    idle: Duration,
+) -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    let inner = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = inner.local_addr().unwrap();
+    let mappings = Arc::new(AtomicU64::new(0));
+    let made = mappings.clone();
+    let task = tokio::spawn(async move {
+        let (in_tx, mut in_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+        let mut inside: Option<SocketAddr> = None;
+        // The current mapping: its outside socket, its number, when it was
+        // last used outbound, and the task reading it.
+        let mut mapping: Option<(Arc<UdpSocket>, u64, Instant, tokio::task::JoinHandle<()>)> = None;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            tokio::select! {
+                r = inner.recv_from(&mut buf) => {
+                    let Ok((n, from)) = r else { return };
+                    inside = Some(from);
+                    let now = Instant::now();
+                    if mapping.as_ref().is_some_and(|m| now.duration_since(m.2) > idle) {
+                        if let Some((_, _, _, reader)) = mapping.take() {
+                            reader.abort();
+                        }
+                    }
+                    if mapping.is_none() {
+                        let ext = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                        let id = made.fetch_add(1, Ordering::Relaxed) + 1;
+                        let reader = {
+                            let ext = ext.clone();
+                            let tx = in_tx.clone();
+                            tokio::spawn(async move {
+                                let mut b = vec![0u8; 65536];
+                                while let Ok((n, from)) = ext.recv_from(&mut b).await {
+                                    // Address-and-port filtering: only the
+                                    // outside address this mapping is for.
+                                    if from == outside {
+                                        let _ = tx.send((id, b[..n].to_vec()));
+                                    }
+                                }
+                            })
+                        };
+                        mapping = Some((ext, id, now, reader));
+                    }
+                    let m = mapping.as_mut().expect("just made");
+                    m.2 = now;
+                    let _ = m.0.send_to(&buf[..n], outside).await;
+                }
+                Some((id, pkt)) = in_rx.recv() => {
+                    let now = Instant::now();
+                    let alive = mapping
+                        .as_ref()
+                        .is_some_and(|m| m.1 == id && now.duration_since(m.2) <= idle);
+                    if let (true, Some(inside)) = (alive, inside) {
+                        let _ = inner.send_to(&pkt, inside).await;
+                    }
+                }
+            }
+        }
+    });
+    (addr, mappings, task)
+}
+
+/// A receiver behind a NAT that forgets idle mappings within a second stays
+/// reachable through its relay, because its registration is refreshed more
+/// often than that (RFC 8445 section 11) — while an identical receiver that
+/// refreshes only every half minute, as a lease alone would ask, has become
+/// unreachable by the time a sender comes along. And a receiver whose
+/// refreshes are too far apart for its NAT notices the mapping change, and
+/// brings them closer together until the mapping holds.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keepalives_keep_a_receiver_behind_a_forgetful_nat_reachable() {
+    use sharp256::relay::server::{Config, Relay};
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let file = make_file(&src, "kept-alive.bin", 256 << 10, 0x4b41);
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            lease: Duration::from_secs(60),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_id = relay.id();
+    let relay_task = tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+    let idle = Duration::from_millis(800);
+    let (nat_a, made_a, task_a) = forgetful_nat(relay_addr, idle).await;
+    let (nat_b, made_b, task_b) = forgetful_nat(relay_addr, idle).await;
+    let (nat_c, made_c, task_c) = forgetful_nat(relay_addr, idle).await;
+    let behind = |nat: SocketAddr, keepalive: Duration| {
+        move |cfg: &mut ReceiverConfig| {
+            cfg.relays = vec![format!("{}@{}", relay_id, nat)];
+            cfg.nat_keepalive = keepalive;
+        }
+    };
+    let out_a = out.join("a");
+    let out_b = out.join("b");
+    let out_c = out.join("c");
+    let a = start_receiver(&out_a, &state, behind(nat_a, Duration::from_millis(250))).await;
+    let b = start_receiver(&out_b, &state, behind(nat_b, Duration::from_secs(30))).await;
+    let mut c = start_receiver(&out_c, &state, behind(nat_c, Duration::from_millis(1200))).await;
+
+    // Long enough idle for every mapping that is not kept alive to lapse.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Kept alive: a sender given nothing but the relay gets through.
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let mut to_a = sender_cfg(&file, dead_addr, a.id, &state);
+    to_a.relays = vec![relay_addr.to_string()];
+    tokio::time::timeout(Duration::from_secs(30), run_sender(to_a))
+        .await
+        .expect("in time")
+        .expect("a receiver kept alive is reachable through its relay");
+    assert_same(&file, &out_a.join("kept-alive.bin"));
+    assert_eq!(made_a.load(Ordering::Relaxed), 1, "A's mapping lapsed");
+
+    // Not kept alive: the relay introduces the sender to a mapping that is
+    // gone, and nothing comes of it.
+    let mut to_b = sender_cfg(&file, dead_addr, b.id, &state);
+    to_b.relays = vec![relay_addr.to_string()];
+    to_b.transport.handshake_timeout = Duration::from_secs(3);
+    let failed = tokio::time::timeout(Duration::from_secs(30), run_sender(to_b))
+        .await
+        .expect("gives up in time");
+    assert!(
+        failed.is_err(),
+        "B was reachable although its mapping had lapsed"
+    );
+
+    // Refreshed too rarely for its NAT: the relay saw C at a new address,
+    // the refreshes came closer together, and then the mapping held.
+    let mut changes = 0;
+    while let Ok(ev) = c.events.try_recv() {
+        if matches!(ev, TransferEvent::RelayRegistered { .. }) {
+            changes += 1;
+        }
+    }
+    assert!(
+        changes >= 2,
+        "C's mapping never lapsed: {} registration(s)",
+        changes
+    );
+    let settled = made_c.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        made_c.load(Ordering::Relaxed),
+        settled,
+        "C's refreshes never came close enough together to keep its mapping"
+    );
+    let _ = made_b;
+
+    for t in [task_a, task_b, task_c] {
+        t.abort();
+    }
+    stop_receiver(a).await;
+    stop_receiver(b).await;
+    stop_receiver(c).await;
+    cancel.cancel();
+    relay_task.abort();
+}

@@ -35,26 +35,37 @@ pub const FLOOR: Duration = Duration::from_secs(5);
 /// is of one mapping at one moment, and some margin is cheap.
 pub const CEILING: Duration = Duration::from_secs(60);
 
+/// One policy for every refresh that goes through the same NAT mapping —
+/// the STUN keepalives and each relay registration of one socket — so that
+/// what one of them learns, the others act on.
+pub type SharedKeepalive = std::sync::Arc<parking_lot::Mutex<Keepalive>>;
+
 /// How often to refresh one mapping, and what has been learned about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keepalive {
     interval: Duration,
+    floor: Duration,
 }
 
 impl Default for Keepalive {
     fn default() -> Self {
-        Self { interval: DEFAULT }
+        Self::new(DEFAULT)
     }
 }
 
 impl Keepalive {
-    /// Starts from a measured lifetime when one is known.
-    pub fn new(lifetime: Option<Duration>) -> Self {
-        let mut k = Self::default();
-        if let Some(l) = lifetime {
-            k.lifetime_measured(l);
-        }
-        k
+    /// Starts at `interval` (RFC 8445 section 11: "Tr SHOULD be
+    /// configurable"). An interval below [`FLOOR`] takes the floor down to
+    /// a quarter of it: whoever sets one knows their network, and there is
+    /// still room to adapt.
+    pub fn new(interval: Duration) -> Self {
+        let interval = interval.max(Duration::from_millis(10));
+        let floor = if interval >= FLOOR {
+            FLOOR
+        } else {
+            interval / 4
+        };
+        Self { interval, floor }
     }
 
     /// The interval, without jitter.
@@ -73,13 +84,13 @@ impl Keepalive {
 
     /// A mapping measured to last `lifetime`: refresh at half of it.
     pub fn lifetime_measured(&mut self, lifetime: Duration) {
-        self.interval = (lifetime / 2).clamp(FLOOR, CEILING);
+        self.interval = (lifetime / 2).clamp(self.floor, CEILING.max(self.floor));
     }
 
     /// The mapping changed although it was being refreshed: the refreshes
     /// were too far apart. Returns whether the interval got shorter.
     pub fn mapping_changed(&mut self) -> bool {
-        let shorter = (self.interval / 2).max(FLOOR);
+        let shorter = (self.interval / 2).max(self.floor);
         let changed = shorter < self.interval;
         self.interval = shorter;
         changed
@@ -102,7 +113,8 @@ mod tests {
 
     #[test]
     fn a_measurement_sets_half_its_lifetime_within_bounds() {
-        let mut k = Keepalive::new(Some(Duration::from_secs(60)));
+        let mut k = Keepalive::default();
+        k.lifetime_measured(Duration::from_secs(60));
         assert_eq!(k.interval(), Duration::from_secs(30));
         k.lifetime_measured(Duration::from_secs(600));
         assert_eq!(k.interval(), CEILING);
@@ -120,5 +132,19 @@ mod tests {
             k.mapping_changed()
         });
         assert_eq!(k.interval(), FLOOR);
+    }
+
+    /// A configured interval below the floor takes the floor down with it.
+    #[test]
+    fn a_short_configured_interval_lowers_the_floor() {
+        let mut k = Keepalive::new(Duration::from_millis(200));
+        assert_eq!(k.interval(), Duration::from_millis(200));
+        assert!(k.mapping_changed());
+        assert_eq!(k.interval(), Duration::from_millis(100));
+        assert!(k.mapping_changed());
+        assert!(!k.mapping_changed());
+        assert_eq!(k.interval(), Duration::from_millis(50));
+        k.lifetime_measured(Duration::from_millis(60));
+        assert_eq!(k.interval(), Duration::from_millis(50));
     }
 }
