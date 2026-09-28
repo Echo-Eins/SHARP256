@@ -106,6 +106,19 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   the address the relay saw. Each side of an allocated port binds itself
   with a ticket, from whatever address its NAT gives it there, and only
   those two addresses are carried.
+- Registering an identity with a relay is the owner's to do: the two sides
+  already know each other's long-term public keys, so a static
+  Diffie-Hellman between them is a secret only those two can compute, and
+  the registration carries a MAC under a key derived from it covering the
+  whole message. Without it anyone who knew a published ID could register it
+  and have senders put through to them. A relay is written `ID@host:port`
+  for a receiver; a sender, which claims no identity there, may write the
+  address alone.
+- A receiver may register as private (`--relay-private`), and the relay then
+  tells neither side where the other is. There is no direct path to try and
+  everything goes through the relay: it costs its bandwidth and gives up the
+  direct path, and it is the only arrangement in which a relay actually
+  hides anyone.
 
 ### Directories
 - A directory is sent as one stream: a manifest (structure, sizes, Unix

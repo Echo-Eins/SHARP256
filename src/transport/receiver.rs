@@ -253,7 +253,7 @@ impl Receiver {
         // introduced to it, and carried if the introduction is not enough.
         // Their control messages arrive on this same socket.
         #[cfg(feature = "nat-traversal")]
-        let relays = spawn_relay_clients(&shared);
+        let relays = spawn_relay_clients(&shared).await;
 
         let socket = shared.socket.clone();
         let cancel = shared.cancel.clone();
@@ -689,48 +689,78 @@ struct RelayClient {
 
 /// Registers this receiver with every configured relay, in the background.
 #[cfg(feature = "nat-traversal")]
-fn spawn_relay_clients(shared: &Arc<Shared>) -> Vec<RelayClient> {
+async fn spawn_relay_clients(shared: &Arc<Shared>) -> Vec<RelayClient> {
     let mut out = Vec::new();
     for name in &shared.cfg.relays {
-        // A relay is named by address, not by identity: it is not trusted
-        // with anything, so there is nothing to authenticate it for.
-        let Ok(addr) = name.parse::<SocketAddr>() else {
-            tracing::warn!("relay \"{}\" is not a <host>:<port> address", name);
-            continue;
+        // Registering means proving we own our identity against the relay's
+        // public key, so a receiver has to be told which relay it is talking
+        // to — `ID@host:port`. Without that there is nothing to prove
+        // against, and anyone who knew our published ID could register it
+        // here instead of us.
+        let (relay_id, host) = match crate::relay::parse_relay(name) {
+            Ok((Some(id), host)) => (id, host),
+            Ok((None, _)) => {
+                tracing::warn!(
+                    "relay \"{}\" has no identity; write it as <relay ID>@<host>:<port>",
+                    name
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("relay \"{}\": {}", name, e);
+                continue;
+            }
+        };
+        let addr = match crate::address::resolve(&host).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("relay \"{}\": cannot resolve {}: {}", name, host, e);
+                continue;
+            }
         };
         let (tx, rx) = mpsc::channel(32);
         let socket = shared.socket.udp();
-        let id = shared.identity.id();
+        let identity = shared.identity.clone();
+        let private = shared.cfg.relay_private;
         let cancel = shared.cancel.clone();
         let events = shared.cfg.events.clone();
         tokio::spawn(async move {
-            crate::relay::client::serve(socket, addr, id, rx, cancel, move |observed| {
-                // Deliberately *not* published as an address to hand a
-                // sender. It is this receiver's NAT mapping towards that
-                // relay's control port, and under the NAT a relay exists to
-                // get around — the kind that uses a different port for every
-                // destination — it is by definition not the mapping anybody
-                // else would arrive at. A sender reaches us here by naming
-                // the relay, not by naming this.
-                tracing::info!(
-                    "registered with the relay at {} (it sees us at {}); senders reach us \
-                     through it with --relay {}",
-                    addr,
-                    observed,
-                    addr
-                );
-                emit(
-                    &events,
-                    TransferEvent::Reachability {
-                        advertised: None,
-                        address: None,
-                        summary: format!(
-                            "registered with the relay at {}; senders can use --relay {}",
-                            addr, addr
-                        ),
-                    },
-                );
-            })
+            crate::relay::client::serve(
+                socket,
+                addr,
+                relay_id,
+                identity,
+                private,
+                rx,
+                cancel,
+                move |observed| {
+                    // Deliberately *not* published as an address to hand a
+                    // sender. It is this receiver's NAT mapping towards that
+                    // relay's control port, and under the NAT a relay exists
+                    // to get around — the kind that uses a different port for
+                    // every destination — it is by definition not the mapping
+                    // anybody else would arrive at. A sender reaches us here
+                    // by naming the relay, not by naming this.
+                    tracing::info!(
+                        "registered with the relay at {} (it sees us at {}); senders reach us \
+                         through it with --relay {}",
+                        addr,
+                        observed,
+                        addr
+                    );
+                    emit(
+                        &events,
+                        TransferEvent::Reachability {
+                            advertised: None,
+                            address: None,
+                            summary: format!(
+                                "registered with the relay at {}; senders can use --relay {}",
+                                addr, addr
+                            ),
+                        },
+                    );
+                },
+            )
             .await;
         });
         out.push(RelayClient { addr, tx });

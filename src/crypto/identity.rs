@@ -133,6 +133,20 @@ impl Identity {
         &self.secret
     }
 
+    /// The X25519 shared secret between this identity and `other`.
+    ///
+    /// Both sides compute the same value from their long-term keys alone,
+    /// with no exchange at all. That is exactly what makes it unsuitable for
+    /// a session — there is no forward secrecy and nothing fresh in it, which
+    /// is why transfers use the Noise handshake instead. It is the right tool
+    /// for proving to a party that already knows your public key that you
+    /// hold the private one, which is what registering with a relay needs.
+    pub fn shared_secret(&self, other: &SharpId) -> Zeroizing<[u8; KEY_LEN]> {
+        let sk = x25519_dalek::StaticSecret::from(*self.secret());
+        let pk = x25519_dalek::PublicKey::from(*other.as_bytes());
+        Zeroizing::new(sk.diffie_hellman(&pk).to_bytes())
+    }
+
     /// Default location of the identity file in the per-user data directory.
     pub fn default_path() -> Option<PathBuf> {
         dirs::data_dir().map(|d| d.join("sharp-256").join("identity.key"))

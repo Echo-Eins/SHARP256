@@ -12,8 +12,8 @@
 //! registration made from any other socket would describe a way in that
 //! does not exist.
 
-use super::{Message, Refusal, TOKEN_LEN};
-use crate::crypto::SharpId;
+use super::{Message, Refusal, PROOF_LEN, TOKEN_LEN};
+use crate::crypto::{Identity, SharpId};
 use crate::nat::stun::is_usable_server_address;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,9 +48,10 @@ const HANDLED_REMEMBERED: usize = 64;
 /// What a relay introduction is worth: two more addresses to try.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Introduction {
-    /// Where the receiver appears to be. Both ends push outwards at once,
-    /// so this often works and costs the relay nothing.
-    pub peer: SocketAddr,
+    /// Where the receiver appears to be, when the relay will say. Both ends
+    /// push outwards at once, so this often works and costs the relay
+    /// nothing. `None` when the receiver asked to stay hidden.
+    pub peer: Option<SocketAddr>,
     /// The relay's port for this pair. Slower and not free for whoever runs
     /// the relay, but it works when nothing else does.
     pub relayed: SocketAddr,
@@ -85,6 +86,14 @@ pub async fn connect(
             // The relay wants us to prove we receive where we say we do.
             Some(Message::Challenge { token: t }) => token = t,
             Some(Message::Allocated { port, peer, ticket }) => {
+                // The relay may decline to say where the receiver is,
+                // because the receiver asked it not to. There is then no
+                // direct path to offer, only the relayed one.
+                let peer = if peer.ip().is_unspecified() {
+                    None
+                } else {
+                    Some(peer)
+                };
                 let relayed = SocketAddr::new(relay.ip(), port);
                 // Tell the allocated port which side we are. This is also
                 // what opens our NAT towards it, and the address it sees
@@ -109,14 +118,23 @@ pub async fn connect(
 ///
 /// `incoming` carries the relay's datagrams, handed over by whoever owns the
 /// socket's receive loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     socket: Arc<UdpSocket>,
     relay: SocketAddr,
-    id: SharpId,
+    relay_id: SharpId,
+    identity: Identity,
+    private: bool,
     mut incoming: mpsc::Receiver<Incoming>,
     cancel: CancellationToken,
     on_registered: impl Fn(SocketAddr) + Send + 'static,
 ) {
+    let id = identity.id();
+    // A secret only this receiver and this relay can work out, from their
+    // long-term keys and nothing else. It is what turns "I am sh-…" into
+    // something the relay can check.
+    let key = super::auth_key(&identity, &relay_id, &id, &relay_id);
+    let flags = if private { super::REGISTER_PRIVATE } else { 0 };
     let mut token = [0u8; TOKEN_LEN];
     let mut registered = false;
     let mut next_send = Instant::now();
@@ -133,8 +151,16 @@ pub async fn serve(
     loop {
         let now = Instant::now();
         if now >= next_send {
-            let msg = Message::Register { id, token };
-            if socket.send_to(&msg.encode(), relay).await.is_err() {
+            let msg = signed(
+                &key,
+                Message::Register {
+                    id,
+                    token,
+                    flags,
+                    proof: [0; PROOF_LEN],
+                },
+            );
+            if socket.send_to(&msg, relay).await.is_err() {
                 return;
             }
             next_send = now + if registered { lease / 2 } else { retry };
@@ -152,7 +178,14 @@ pub async fn serve(
                 // lease runs out, which is the difference between a sender
                 // failing over in a moment and failing over in two minutes.
                 if registered {
-                    let bye = Message::Bye { id, token }.encode();
+                    let bye = signed(
+                        &key,
+                        Message::Bye {
+                            id,
+                            token,
+                            proof: [0; PROOF_LEN],
+                        },
+                    );
                     let _ = socket.send_to(&bye, relay).await;
                 }
                 return;
@@ -216,7 +249,15 @@ pub async fn serve(
                 // have our first datagram leave after the sender's had
                 // already been dropped by our NAT.
                 tokio::spawn(async move {
-                    tokio::join!(announce(&socket, relayed, ticket), punch(&socket, peer));
+                    // An unspecified peer means the relay was asked not to
+                    // say where the other side is — either it asked to stay
+                    // hidden, or we did — so there is nothing to punch
+                    // towards and the pair meets at the relay's port.
+                    if peer.ip().is_unspecified() {
+                        announce(&socket, relayed, ticket).await;
+                    } else {
+                        tokio::join!(announce(&socket, relayed, ticket), punch(&socket, peer));
+                    }
                 });
             }
             Some(Message::Error { code }) => {
@@ -229,6 +270,16 @@ pub async fn serve(
             _ => {}
         }
     }
+}
+
+/// Encodes a message and fills in its proof, which covers everything in
+/// front of it.
+fn signed(key: &[u8; 32], msg: Message) -> Vec<u8> {
+    let mut bytes = msg.encode();
+    let split = bytes.len() - PROOF_LEN;
+    let proof = super::proof_for(key, &bytes[..split]);
+    bytes[split..].copy_from_slice(&proof);
+    bytes
 }
 
 /// Says which side of an allocation we are, repeatedly: the first may be

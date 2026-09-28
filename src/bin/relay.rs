@@ -14,8 +14,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use sharp256::crypto::Identity;
 use sharp256::relay::server::{Config, Relay};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +53,13 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     idle: u64,
 
+    /// Identity file. A relay has a long-term key of its own, which is how
+    /// a receiver registering here proves it owns the identity it claims:
+    /// the two work out a shared secret from their keys alone. Created on
+    /// first use if it does not exist.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
     /// Log level (error, warn, info, debug, trace).
     #[arg(long, default_value = "info")]
     log: String,
@@ -61,8 +70,17 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     sharp256::init_logging(&args.log);
 
+    let path = args
+        .identity
+        .clone()
+        .or_else(|| Identity::default_path().map(|p| p.with_file_name("relay.key")))
+        .context("no per-user data directory for the identity file")?;
+    let identity = Identity::load_or_create(&path)
+        .with_context(|| format!("cannot use identity file {}", path.display()))?;
+
     let cfg = Config {
         bind: args.bind,
+        identity: identity.clone(),
         max_registrations: args.max_registrations,
         max_allocations: args.max_pairs,
         rate: args.rate,
@@ -78,7 +96,9 @@ async fn main() -> Result<()> {
     let addr = relay.local_addr()?;
     println!("{}", sharp256::system_info());
     println!("Relay listening on {}", addr);
-    println!("Receivers: --relay {}", addr);
+    // A receiver has to know which relay it is registering with; a sender
+    // claims no identity of its own and so needs only the address.
+    println!("Receivers: --relay {}@{}", identity.id(), addr);
     println!("Senders:   --relay {}", addr);
 
     let stopper = cancel.clone();

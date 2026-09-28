@@ -776,19 +776,45 @@ relay does two things at once:
 The sender takes both as candidates, after its own: the direct one first,
 the relayed one last, so a relay is only used when it has to be.
 
-The relay is trusted with nothing. It carries sealed transport packets, so
-it cannot read them, cannot alter one without the AEAD rejecting it, and
-cannot inject one without the peers' keys; it cannot impersonate a peer,
-because completing a handshake takes that peer's private key; and it decides
-nothing about who may send to whom, since the receiver still admits or
-refuses a sender by its identity. The worst a hostile relay achieves is
-refusing to carry the traffic. Registering an identity is therefore not
-worth guarding heavily — somebody registering an identity that is not theirs
-gets senders connected to them and then fails the handshake. What *is*
-guarded is what a stranger could be made to suffer: a registration is
-accepted only once it echoes a token derived from the address the relay saw,
-so a forged source address cannot point the relay's traffic at somebody who
-never asked for it.
+A relay is written `ID@host:port` for a receiver and `host:port` for a
+sender, because only the receiver claims an identity there.
+
+**Registering is the owner's to do.** A receiver proves it holds the private
+key for the identity it registers: the two sides already know each other's
+long-term public keys — the receiver is given the relay's in its address,
+and the relay reads the receiver's out of the registration — so a static
+Diffie-Hellman between them is a secret only those two can compute, with
+nothing to exchange first. The registration carries a MAC under a key
+derived from it, covering the whole message. That construction has no
+forward secrecy and nothing fresh in it, which is exactly why transfers use
+the Noise handshake instead; it is the right tool for proving to somebody
+who knows your public key that you hold the private one. Without it, anyone
+who knew a published ID could register it and have senders put through to
+them — the handshake would fail, but the transfer would fail with it.
+
+**The relay is trusted with nothing else.** It carries sealed transport
+packets, so it cannot read them, cannot alter one without the AEAD rejecting
+it, and cannot inject one without the peers' keys; it cannot impersonate a
+peer, because completing a handshake takes that peer's private key; and it
+decides nothing about who may send to whom, since the receiver still admits
+or refuses a sender by its identity. The worst a hostile relay achieves is
+refusing to carry the traffic.
+
+A registration is also accepted only once it echoes a token derived from the
+address the relay saw, so a forged source address cannot point the relay's
+traffic at somebody who never asked for it. The token is a keyed hash of
+that address, so no table of pending registrations exists to fill up.
+Registrations and ports each have a share per source address, an idle pair
+is reclaimed, and a receiver says goodbye on the way out so that senders are
+not sent to a dead address for the rest of the lease.
+
+**Hiding where a receiver is.** By default the relay tells each side where
+the other appears to be, which is what lets them meet directly and leaves
+the relay carrying nothing. A receiver that would rather not be described
+registers as private: the relay then tells neither side anything about the
+other, there is no direct path to try, and everything goes through the
+relay. It costs the relay's bandwidth and gives up the direct path, and it
+is the only arrangement in which a relay actually hides anyone.
 
 This is also the honest answer to hiding one's own address from a peer: run
 the traffic through a relay you control. Forging a source address is not an

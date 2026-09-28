@@ -210,9 +210,18 @@ impl Sender {
         let (found_tx, found_rx) = mpsc::unbounded_channel();
         let mut inboxes = Vec::new();
         for name in &self.cfg.relays {
-            let Ok(addr) = name.parse::<SocketAddr>() else {
-                tracing::warn!("relay \"{}\" is not a <host>:<port> address", name);
-                continue;
+            // A sender claims no identity of its own here, so it needs
+            // none of the relay's: the address alone is enough, and an
+            // identity written with it is simply ignored.
+            let addr = match crate::relay::parse_relay(name)
+                .map_err(|e| e.to_string())
+                .and_then(|(_, host)| host.parse::<SocketAddr>().map_err(|e| e.to_string()))
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!("relay \"{}\": {}", name, e);
+                    continue;
+                }
             };
             let (tx, mut rx) = mpsc::channel(32);
             let socket = self.socket.udp();
@@ -222,16 +231,26 @@ impl Sender {
             tokio::spawn(async move {
                 match crate::relay::client::connect(socket, addr, target, &mut rx, &cancel).await {
                     Ok(i) => {
-                        tracing::info!(
-                            "relay {} says the receiver is at {}, and will carry the transfer \
-                             on {}",
-                            addr,
-                            i.peer,
-                            i.relayed
-                        );
+                        match i.peer {
+                            Some(peer) => tracing::info!(
+                                "relay {} says the receiver is at {}, and will carry the \
+                                 transfer on {}",
+                                addr,
+                                peer,
+                                i.relayed
+                            ),
+                            None => tracing::info!(
+                                "relay {} will not say where the receiver is, and will carry \
+                                 the transfer on {}",
+                                addr,
+                                i.relayed
+                            ),
+                        }
                         // Where the receiver appears to be first: if that
                         // works the relay carries nothing.
-                        let _ = found.send(i.peer);
+                        if let Some(peer) = i.peer {
+                            let _ = found.send(peer);
+                        }
                         let _ = found.send(i.relayed);
                     }
                     // A relay that cannot help is not a failure: the

@@ -2231,6 +2231,7 @@ async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
     .await
     .expect("the relay binds");
     let relay_addr = relay.local_addr().unwrap();
+    let relay_id = relay.id();
     let relay_task = tokio::spawn(async move {
         let _ = relay.run().await;
     });
@@ -2240,7 +2241,7 @@ async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
     // nothing to anybody but the relay.
     let (receiver_mapping, refused, mapping_task) = one_way_mapping(relay_addr).await;
     let r = start_receiver(&out, &state, |cfg| {
-        cfg.relays = vec![receiver_mapping.to_string()];
+        cfg.relays = vec![format!("{}@{}", relay_id, receiver_mapping)];
     })
     .await;
     // Let the registration, which travels through the mapping, complete.
@@ -2403,6 +2404,7 @@ async fn a_lost_introduction_is_repeated() {
     .await
     .expect("the relay binds");
     let relay_addr = relay.local_addr().unwrap();
+    let relay_id = relay.id();
     let relay_task = tokio::spawn(async move {
         let _ = relay.run().await;
     });
@@ -2441,7 +2443,7 @@ async fn a_lost_introduction_is_repeated() {
     });
 
     let r = start_receiver(&out, &state, |cfg| {
-        cfg.relays = vec![mapping.to_string()];
+        cfg.relays = vec![format!("{}@{}", relay_id, mapping)];
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;

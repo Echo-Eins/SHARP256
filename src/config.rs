@@ -220,6 +220,11 @@ pub struct ReceiverConfig {
     /// sealed end to end, and a sender is still admitted on the strength of
     /// its identity.
     pub relays: Vec<String>,
+    /// Ask the relays not to tell senders where this receiver is. Everything
+    /// then goes through the relay: it costs its bandwidth and gives up the
+    /// direct path, and it is the only arrangement in which a relay actually
+    /// hides anyone.
+    pub relay_private: bool,
     pub accept: AcceptPolicy,
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
@@ -249,6 +254,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("state_dir", &self.state_dir)
             .field("nat_traversal", &self.nat_traversal)
             .field("relays", &self.relays)
+            .field("relay_private", &self.relay_private)
             .field("accept", &self.accept)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
@@ -272,6 +278,7 @@ impl ReceiverConfig {
             state_dir: None,
             nat_traversal: false,
             relays: Vec::new(),
+            relay_private: false,
             accept: AcceptPolicy::AcceptAll,
             identity: None,
             psk: None,

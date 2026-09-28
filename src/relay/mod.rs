@@ -43,8 +43,9 @@
 pub mod client;
 pub mod server;
 
-use crate::crypto::SharpId;
+use crate::crypto::{Identity, SharpId};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use subtle::ConstantTimeEq;
 
 /// Every relay control message starts with this. Data the relay forwards
 /// never does: a SHARP packet begins with a random connection id, and the
@@ -54,6 +55,56 @@ pub const MAGIC: [u8; 8] = crate::protocol::constants::RESERVED_CID.to_be_bytes(
 pub const HEADER_LEN: usize = MAGIC.len() + 1;
 /// A token proving the holder receives at the address it claims.
 pub const TOKEN_LEN: usize = 16;
+/// Proof that a registration is made by whoever owns the identity it
+/// claims.
+pub const PROOF_LEN: usize = 16;
+
+/// A registration asks the relay to send people to us. Whoever owns the
+/// identity is the only one who should be able to ask.
+///
+/// The two sides already know each other's long-term public keys — the peer
+/// is given the relay's in its address, and the relay reads the peer's out
+/// of the registration — so a static Diffie-Hellman between them is a
+/// secret only those two can compute, with nothing to exchange first. That
+/// is useless for a session, having no forward secrecy and nothing fresh in
+/// it, which is why transfers use a proper handshake; it is exactly right
+/// for proving to someone who knows your public key that you hold the
+/// private one.
+///
+/// Both sides derive the same key: the public keys go into it in a fixed
+/// order, peer first, so it does not matter which of the two is computing.
+pub fn auth_key(ours: &Identity, theirs: &SharpId, peer: &SharpId, relay: &SharpId) -> [u8; 32] {
+    let dh = ours.shared_secret(theirs);
+    let mut material = [0u8; 96];
+    material[..32].copy_from_slice(&dh[..]);
+    material[32..64].copy_from_slice(peer.as_bytes());
+    material[64..].copy_from_slice(relay.as_bytes());
+    blake3::derive_key("sharp256 relay v1 registration", &material)
+}
+
+/// The proof carried by a message, over everything in it that precedes it.
+pub fn proof_for(key: &[u8; 32], signed: &[u8]) -> [u8; PROOF_LEN] {
+    let mut out = [0u8; PROOF_LEN];
+    out.copy_from_slice(&blake3::keyed_hash(key, signed).as_bytes()[..PROOF_LEN]);
+    out
+}
+
+/// Whether `pkt` carries a proof that matches `key`. The proof covers the
+/// whole message before it, so nothing in it can be altered in flight.
+pub fn proof_is_good(key: &[u8; 32], pkt: &[u8]) -> bool {
+    let Some(split) = pkt.len().checked_sub(PROOF_LEN) else {
+        return false;
+    };
+    let (signed, given) = pkt.split_at(split);
+    bool::from(proof_for(key, signed).ct_eq(given))
+}
+
+/// Registration flags.
+/// The receiver's address is not to be disclosed to anyone asking for it;
+/// everything goes through the relay instead. It costs the relay's
+/// bandwidth and gives up the direct path, and it is the only way the relay
+/// actually hides where you are.
+pub const REGISTER_PRIVATE: u8 = 0x01;
 /// Longest control message. Everything here is far smaller.
 pub const MAX_MESSAGE: usize = 128;
 
@@ -135,6 +186,10 @@ pub enum Message {
     Register {
         id: SharpId,
         token: [u8; TOKEN_LEN],
+        /// See [`REGISTER_PRIVATE`].
+        flags: u8,
+        /// Proof that this is the identity's owner asking.
+        proof: [u8; PROOF_LEN],
     },
     /// Relay → peer: "prove you receive where you say you do" — repeat the
     /// registration with this token.
@@ -194,7 +249,30 @@ pub enum Message {
     Bye {
         id: SharpId,
         token: [u8; TOKEN_LEN],
+        proof: [u8; PROOF_LEN],
     },
+}
+
+/// Splits how a relay is written down.
+///
+/// A receiver must be given the relay's identity — `ID@host:port` — because
+/// registering means proving ownership of *our* identity against *its*
+/// public key, and there is nothing to prove against without it. A sender
+/// only asks to be put through, claims no identity of its own, and so may
+/// write the address alone.
+pub fn parse_relay(s: &str) -> Result<(Option<SharpId>, String), String> {
+    let s = s.trim();
+    let (id, host) = match s.rsplit_once('@') {
+        Some((id, host)) => {
+            let id: SharpId = id.parse().map_err(|e| format!("relay ID: {}", e))?;
+            (Some(id), host)
+        }
+        None => (None, s),
+    };
+    if host.is_empty() || !host.contains(':') {
+        return Err(format!("\"{}\" is not <host>:<port>", host));
+    }
+    Ok((id, host.to_string()))
 }
 
 /// True when a datagram is a relay control message rather than traffic.
@@ -240,10 +318,17 @@ impl Message {
         let mut out = Vec::with_capacity(HEADER_LEN + 56);
         out.extend_from_slice(&MAGIC);
         match self {
-            Message::Register { id, token } => {
+            Message::Register {
+                id,
+                token,
+                flags,
+                proof,
+            } => {
                 out.push(Kind::Register as u8);
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(token);
+                out.push(*flags);
+                out.extend_from_slice(proof);
             }
             Message::Challenge { token } => {
                 out.push(Kind::Challenge as u8);
@@ -280,10 +365,11 @@ impl Message {
                 out.extend_from_slice(ticket);
             }
             Message::Punch => out.push(Kind::Punch as u8),
-            Message::Bye { id, token } => {
+            Message::Bye { id, token, proof } => {
                 out.push(Kind::Bye as u8);
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(token);
+                out.extend_from_slice(proof);
             }
         }
         debug_assert!(out.len() <= MAX_MESSAGE);
@@ -308,9 +394,26 @@ impl Message {
                 let id = SharpId::from_public(key);
                 pos = 32 + TOKEN_LEN;
                 match kind {
-                    Kind::Register => Message::Register { id, token },
+                    Kind::Register => {
+                        let flags = *body.get(pos)?;
+                        pos += 1;
+                        let proof: [u8; PROOF_LEN] =
+                            body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
+                        pos += PROOF_LEN;
+                        Message::Register {
+                            id,
+                            token,
+                            flags,
+                            proof,
+                        }
+                    }
                     Kind::Connect => Message::Connect { target: id, token },
-                    _ => Message::Bye { id, token },
+                    _ => {
+                        let proof: [u8; PROOF_LEN] =
+                            body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
+                        pos += PROOF_LEN;
+                        Message::Bye { id, token, proof }
+                    }
                 }
             }
             Kind::Challenge => {
@@ -378,15 +481,93 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_is_written_with_or_without_its_identity() {
+        let id = Identity::generate().id();
+        let (got, host) = parse_relay(&format!("{}@203.0.113.9:5560", id)).unwrap();
+        assert_eq!(got, Some(id));
+        assert_eq!(host, "203.0.113.9:5560");
+        // A sender claims no identity, so it needs none of the relay's.
+        let (got, host) = parse_relay("relay.example:5560").unwrap();
+        assert_eq!(got, None);
+        assert_eq!(host, "relay.example:5560");
+        let (_, host) = parse_relay(&format!(" {}@[2001:db8::1]:5560 ", id)).unwrap();
+        assert_eq!(host, "[2001:db8::1]:5560");
+        assert!(parse_relay("sh-nonsense@1.2.3.4:1").is_err());
+        assert!(parse_relay("no-port").is_err());
+        assert!(parse_relay(&format!("{}@", id)).is_err());
+    }
+
+    /// Only the identity's owner can make a proof the relay will take, and
+    /// the proof covers the whole message, so nothing in it can be changed
+    /// on the way.
+    #[test]
+    fn a_registration_proof_is_the_owners_alone() {
+        let relay = Identity::generate();
+        let owner = Identity::generate();
+        let (rid, oid) = (relay.id(), owner.id());
+
+        // Both sides reach the same key from their long-term keys alone.
+        let by_owner = auth_key(&owner, &rid, &oid, &rid);
+        let by_relay = auth_key(&relay, &oid, &oid, &rid);
+        assert_eq!(by_owner, by_relay);
+
+        let mut bytes = Message::Register {
+            id: oid,
+            token: [4; TOKEN_LEN],
+            flags: REGISTER_PRIVATE,
+            proof: [0; PROOF_LEN],
+        }
+        .encode();
+        let split = bytes.len() - PROOF_LEN;
+        let proof = proof_for(&by_owner, &bytes[..split]);
+        bytes[split..].copy_from_slice(&proof);
+        assert!(proof_is_good(&by_relay, &bytes));
+        assert_eq!(
+            Message::decode(&bytes),
+            Some(Message::Register {
+                id: oid,
+                token: [4; TOKEN_LEN],
+                flags: REGISTER_PRIVATE,
+                proof,
+            })
+        );
+
+        // Somebody who merely knows the published identity cannot make one.
+        let impostor = Identity::generate();
+        let theirs = auth_key(&impostor, &rid, &oid, &rid);
+        assert!(!proof_is_good(&theirs, &bytes));
+
+        // Nor can any byte of the message be altered afterwards.
+        for i in 0..split {
+            let mut tampered = bytes.clone();
+            tampered[i] ^= 1;
+            assert!(
+                !proof_is_good(&by_relay, &tampered),
+                "byte {} slipped through",
+                i
+            );
+        }
+        // Nor the proof itself.
+        let mut tampered = bytes.clone();
+        tampered[split] ^= 1;
+        assert!(!proof_is_good(&by_relay, &tampered));
+        assert!(!proof_is_good(&by_relay, &bytes[..split]));
+    }
+
+    #[test]
     fn every_message_survives_the_wire() {
         let id = Identity::generate().id();
         roundtrip(Message::Register {
             id,
             token: [0; TOKEN_LEN],
+            flags: 0,
+            proof: [0; PROOF_LEN],
         });
         roundtrip(Message::Register {
             id,
             token: [7; TOKEN_LEN],
+            flags: REGISTER_PRIVATE,
+            proof: [1; PROOF_LEN],
         });
         roundtrip(Message::Challenge {
             token: [9; TOKEN_LEN],
@@ -423,6 +604,7 @@ mod tests {
         roundtrip(Message::Bye {
             id,
             token: [2; TOKEN_LEN],
+            proof: [3; PROOF_LEN],
         });
     }
 
@@ -435,6 +617,8 @@ mod tests {
         let good = Message::Register {
             id,
             token: [1; TOKEN_LEN],
+            flags: 0,
+            proof: [1; PROOF_LEN],
         }
         .encode();
 

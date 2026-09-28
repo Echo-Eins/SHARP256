@@ -25,12 +25,23 @@ struct Args {
     #[arg(long)]
     no_nat: bool,
 
-    /// Register with a relay at <host>:<port>, so senders that cannot reach
-    /// this receiver directly can still be put through. May be repeated.
-    /// The relay is not trusted with anything: transfers stay sealed end to
-    /// end and senders are still admitted by their identity.
-    #[arg(long = "relay", value_name = "HOST:PORT")]
+    /// Register with a relay, written as <relay ID>@<host>:<port>, so that
+    /// senders which cannot reach this receiver directly can still be put
+    /// through. May be repeated. The relay's identity is needed because
+    /// registering means proving ownership of this receiver's identity
+    /// against it — without that, anyone who knew the published ID could
+    /// register it there instead. The relay is trusted with nothing else:
+    /// transfers stay sealed end to end and senders are still admitted by
+    /// their identity.
+    #[arg(long = "relay", value_name = "ID@HOST:PORT")]
     relays: Vec<String>,
+
+    /// Ask the relays not to tell senders this receiver's address, so that
+    /// everything goes through the relay. It costs the relay's bandwidth
+    /// and gives up the direct path, and it is the only arrangement in
+    /// which a relay actually hides where you are.
+    #[arg(long)]
+    relay_private: bool,
 
     /// Replace existing files with the same name instead of writing "name (1)"
     #[arg(long)]
@@ -98,6 +109,7 @@ async fn main() -> Result<()> {
     cfg.max_sessions = args.max_sessions.max(1);
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
     cfg.relays = args.relays.clone();
+    cfg.relay_private = args.relay_private;
     cfg.state_dir = args.state_dir.clone();
     if let Some(c) = args.chunk_size {
         cfg.transport.max_chunk = c;

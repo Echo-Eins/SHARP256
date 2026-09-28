@@ -21,7 +21,7 @@
 //!   presented its tickets, and forgets it when it goes quiet.
 
 use super::{is_control, Message, Refusal, TOKEN_LEN};
-use crate::crypto::SharpId;
+use crate::crypto::{Identity, SharpId};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::io;
@@ -41,9 +41,14 @@ const TOKEN_LIFETIME: Duration = Duration::from_secs(120);
 /// Datagram buffer: enough for a jumbo frame.
 const BUF_LEN: usize = 9216;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bind: SocketAddr,
+    /// The relay's own long-term identity. Receivers are given its public
+    /// half in the relay's address and prove ownership of theirs against
+    /// it; it authenticates nothing else, and the relay is trusted with
+    /// nothing else.
+    pub identity: Identity,
     /// Identities that may be registered at once.
     pub max_registrations: usize,
     /// Pairs that may be carried at once.
@@ -55,10 +60,25 @@ pub struct Config {
     pub idle: Duration,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind", &self.bind)
+            .field("id", &self.identity.id())
+            .field("max_registrations", &self.max_registrations)
+            .field("max_allocations", &self.max_allocations)
+            .field("rate", &self.rate)
+            .field("lease", &self.lease)
+            .field("idle", &self.idle)
+            .finish()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:5560".parse().expect("valid address"),
+            identity: Identity::generate(),
             max_registrations: 4096,
             max_allocations: 256,
             rate: 10.0,
@@ -194,6 +214,11 @@ impl RateLimiter {
 struct Registration {
     addr: SocketAddr,
     expires: Instant,
+    /// The owner asked not to have its address handed out. Senders are then
+    /// told nothing about where it is and everything goes through the relay,
+    /// which costs bandwidth and gives up the direct path — and is the only
+    /// arrangement in which the relay actually hides anyone.
+    private: bool,
 }
 
 impl Registration {
@@ -223,6 +248,7 @@ struct Allocation {
 /// A running relay.
 pub struct Relay {
     socket: Arc<UdpSocket>,
+    identity: Identity,
     cfg: Config,
     cancel: CancellationToken,
     tokens: TokenJar,
@@ -243,6 +269,7 @@ impl Relay {
         let (cfg_rate, cfg_burst) = (cfg.rate, cfg.burst);
         Ok(Self {
             socket: Arc::new(socket),
+            identity: cfg.identity.clone(),
             cfg,
             cancel,
             tokens: TokenJar::new(),
@@ -256,6 +283,11 @@ impl Relay {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// What receivers write to register here: `ID@host:port`.
+    pub fn id(&self) -> SharpId {
+        self.identity.id()
     }
 
     /// Serves until cancelled.
@@ -295,7 +327,7 @@ impl Relay {
                     if !self.limiter.allow(from, now) {
                         continue;
                     }
-                    self.on_message(msg, from, now).await;
+                    self.on_message(msg, from, &buf[..n], now).await;
                 }
                 _ = cancel.cancelled() => {
                     for a in self.allocations.drain(..) {
@@ -312,15 +344,44 @@ impl Relay {
         let _ = self.socket.send_to(&msg.encode(), to).await;
     }
 
-    async fn on_message(&mut self, msg: Message, from: SocketAddr, now: Instant) {
+    /// Whether a message carries a proof that only the identity's owner
+    /// could have made. Both sides work the key out from their long-term
+    /// keys alone, so there is nothing to exchange and nothing to store.
+    fn owns(&self, id: &SharpId, raw: &[u8]) -> bool {
+        let key = super::auth_key(&self.identity, id, id, &self.identity.id());
+        super::proof_is_good(&key, raw)
+    }
+
+    async fn on_message(&mut self, msg: Message, from: SocketAddr, raw: &[u8], now: Instant) {
         match msg {
-            Message::Register { id, token } => {
+            Message::Register {
+                id,
+                token,
+                flags,
+                proof: _,
+            } => {
                 // An unproven address gets a token and nothing else: a
                 // registration from a forged source would otherwise point
                 // this relay's traffic at somebody who never asked for it.
                 if !self.tokens.accepts(&token, from, now) {
                     let token = self.tokens.issue(from, now);
                     self.reply(from, Message::Challenge { token }).await;
+                    return;
+                }
+                // And an unproven *identity* gets nothing at all. Without
+                // this, anyone who knew a receiver's published ID could
+                // register it here and have senders put through to them
+                // instead — the handshake would fail, but the transfer
+                // would fail with it.
+                if !self.owns(&id, raw) {
+                    tracing::debug!("relay: {} cannot prove it owns {}", from, id.short());
+                    self.reply(
+                        from,
+                        Message::Error {
+                            code: Refusal::BadToken,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 let known = self
@@ -362,6 +423,7 @@ impl Relay {
                     Registration {
                         addr: from,
                         expires: now + self.cfg.lease,
+                        private: flags & super::REGISTER_PRIVATE != 0,
                     },
                 );
                 if !known {
@@ -393,6 +455,10 @@ impl Relay {
                     return;
                 };
                 let receiver = reg.addr;
+                // An owner that asked to stay hidden is not described to
+                // the caller; there is then no direct path to try and the
+                // pair meets at the relay's port.
+                let disclose = !reg.private;
                 let share = (self.cfg.max_allocations / 4).max(2);
                 let mine = self
                     .allocations
@@ -422,11 +488,19 @@ impl Relay {
                         // Each side is told where the other appears to be,
                         // so they can try a direct path first and leave the
                         // relay carrying nothing.
+                        let hidden = SocketAddr::new(
+                            if receiver.is_ipv6() {
+                                std::net::Ipv6Addr::UNSPECIFIED.into()
+                            } else {
+                                std::net::Ipv4Addr::UNSPECIFIED.into()
+                            },
+                            0,
+                        );
                         self.reply(
                             from,
                             Message::Allocated {
                                 port,
-                                peer: receiver,
+                                peer: if disclose { receiver } else { hidden },
                                 ticket: sender_ticket,
                             },
                         )
@@ -435,7 +509,7 @@ impl Relay {
                             receiver,
                             Message::Incoming {
                                 port,
-                                peer: from,
+                                peer: if disclose { from } else { hidden },
                                 ticket: receiver_ticket,
                             },
                         )
@@ -459,11 +533,12 @@ impl Relay {
                     }
                 }
             }
-            Message::Bye { id, token } => {
-                // Only from the address that holds the registration, and
-                // only with a token proving that address: otherwise anyone
-                // who knew an identity could evict its owner.
-                if !self.tokens.accepts(&token, from, now) {
+            Message::Bye { id, token, .. } => {
+                // Only from the address that holds the registration, with a
+                // token proving that address and a proof of the identity:
+                // otherwise anyone who knew an identity could evict its
+                // owner.
+                if !self.tokens.accepts(&token, from, now) || !self.owns(&id, raw) {
                     return;
                 }
                 if self.registrations.get(&id).is_some_and(|r| r.addr == from) {
@@ -784,7 +859,7 @@ mod wire_tests {
         }
     }
 
-    async fn start_relay() -> (SocketAddr, CancellationToken) {
+    async fn start_relay() -> (SocketAddr, SharpId, CancellationToken) {
         let cancel = CancellationToken::new();
         let cfg = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -793,10 +868,71 @@ mod wire_tests {
         };
         let relay = Relay::bind(cfg, cancel.clone()).await.expect("binds");
         let addr = relay.local_addr().unwrap();
+        let id = relay.id();
         tokio::spawn(async move {
             let _ = relay.run().await;
         });
-        (addr, cancel)
+        (addr, id, cancel)
+    }
+
+    /// Encodes a message and fills in its proof.
+    fn signed(key: &[u8; 32], msg: Message) -> Vec<u8> {
+        let mut bytes = msg.encode();
+        let split = bytes.len() - crate::relay::PROOF_LEN;
+        let proof = crate::relay::proof_for(key, &bytes[..split]);
+        bytes[split..].copy_from_slice(&proof);
+        bytes
+    }
+
+    /// Asks for a fresh address token, ignoring anything else already
+    /// queued on the socket — an introduction, say, which arrives unbidden
+    /// and would otherwise be mistaken for the answer.
+    async fn token_for(sock: &UdpSocket, relay: SocketAddr, id: SharpId) -> [u8; TOKEN_LEN] {
+        let ask = Message::Register {
+            id,
+            token: [0; TOKEN_LEN],
+            flags: 0,
+            proof: [0; crate::relay::PROOF_LEN],
+        };
+        sock.send_to(&ask.encode(), relay).await.expect("send");
+        for _ in 0..8 {
+            match recv_message(sock, Duration::from_secs(2)).await {
+                Some(Message::Challenge { token }) => return token,
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        panic!("the relay never issued a token");
+    }
+
+    /// Registers, answering the relay's challenge and proving ownership.
+    async fn register(
+        sock: &UdpSocket,
+        relay: SocketAddr,
+        relay_id: &SharpId,
+        identity: &Identity,
+        flags: u8,
+    ) -> Option<Message> {
+        let id = identity.id();
+        let key = crate::relay::auth_key(identity, relay_id, &id, relay_id);
+        let mut token = [0u8; TOKEN_LEN];
+        for _ in 0..2 {
+            let msg = signed(
+                &key,
+                Message::Register {
+                    id,
+                    token,
+                    flags,
+                    proof: [0; crate::relay::PROOF_LEN],
+                },
+            );
+            sock.send_to(&msg, relay).await.ok()?;
+            match recv_message(sock, Duration::from_secs(2)).await? {
+                Message::Challenge { token: t } => token = t,
+                other => return Some(other),
+            }
+        }
+        None
     }
 
     /// The addresses a pair uses on an allocated port are not the ones the
@@ -805,8 +941,9 @@ mod wire_tests {
     /// the ticket it was given, and that is what binds it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_side_binds_itself_with_its_ticket_from_wherever_it_is() {
-        let (relay, cancel) = start_relay().await;
-        let id = Identity::generate().id();
+        let (relay, relay_id, cancel) = start_relay().await;
+        let owner = Identity::generate();
+        let id = owner.id();
 
         // The two control sockets: as far as the relay can see, this is
         // where the peers are.
@@ -815,17 +952,20 @@ mod wire_tests {
 
         // A registration is only accepted once it echoes a token bound to
         // the address the relay saw, so a forged source gets nowhere.
+        let key = crate::relay::auth_key(&owner, &relay_id, &id, &relay_id);
         let first = ask(
             &rc,
             relay,
             Message::Register {
                 id,
                 token: [0; TOKEN_LEN],
+                flags: 0,
+                proof: crate::relay::proof_for(&key, &[]),
             },
         )
         .await;
         assert!(matches!(first, Some(Message::Challenge { .. })));
-        let registered = with_token(&rc, relay, |token| Message::Register { id, token }).await;
+        let registered = register(&rc, relay, &relay_id, &owner, 0).await;
         let Some(Message::Registered { observed, .. }) = registered else {
             panic!("expected a registration, got {:?}", registered);
         };
@@ -946,7 +1086,7 @@ mod wire_tests {
     /// and saying so beats leaving it to a timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connecting_to_an_unregistered_identity_is_refused() {
-        let (relay, cancel) = start_relay().await;
+        let (relay, _relay_id, cancel) = start_relay().await;
         let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = Identity::generate().id();
         let answer = with_token(&sc, relay, |token| Message::Connect { target, token }).await;
@@ -967,7 +1107,7 @@ mod wire_tests {
     /// control port cannot be used to find out what is listening.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rubbish_on_the_control_port_is_not_answered() {
-        let (relay, cancel) = start_relay().await;
+        let (relay, _relay_id, cancel) = start_relay().await;
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for junk in [&b""[..], b"hello?", b"SHRELAY1", &[0u8; 64][..]] {
             sock.send_to(junk, relay).await.unwrap();
@@ -987,46 +1127,51 @@ mod wire_tests {
     /// keep being pointed there until the lease ran out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_receiver_that_says_goodbye_is_forgotten() {
-        let (relay, cancel) = start_relay().await;
-        let id = Identity::generate().id();
+        let (relay, relay_id, cancel) = start_relay().await;
+        let owner = Identity::generate();
+        let id = owner.id();
         let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let mut token = [0u8; TOKEN_LEN];
-        match ask(&rc, relay, Message::Register { id, token }).await {
-            Some(Message::Challenge { token: t }) => token = t,
-            other => panic!("expected a challenge, got {:?}", other),
-        }
         assert!(matches!(
-            ask(&rc, relay, Message::Register { id, token }).await,
+            register(&rc, relay, &relay_id, &owner, 0).await,
             Some(Message::Registered { .. })
         ));
 
-        // Somebody else's goodbye is not taken: it would evict the owner.
-        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut stolen = [0u8; TOKEN_LEN];
-        if let Some(Message::Challenge { token: t }) =
-            ask(&stranger, relay, Message::Bye { id, token: stolen }).await
-        {
-            stolen = t;
-        }
-        stranger
-            .send_to(&Message::Bye { id, token: stolen }.encode(), relay)
-            .await
-            .unwrap();
+        // Somebody who merely knows the identity cannot end its
+        // registration: the proof is the owner's to make.
+        let impostor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let wrong_key = crate::relay::auth_key(&Identity::generate(), &relay_id, &id, &relay_id);
+        let stolen = token_for(&impostor, relay, Identity::generate().id()).await;
+        let forged = signed(
+            &wrong_key,
+            Message::Bye {
+                id,
+                token: stolen,
+                proof: [0; crate::relay::PROOF_LEN],
+            },
+        );
+        impostor.send_to(&forged, relay).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let still_there =
             with_token(&sc, relay, |token| Message::Connect { target: id, token }).await;
         assert!(
             matches!(still_there, Some(Message::Allocated { .. })),
-            "a stranger's goodbye evicted the owner: {:?}",
+            "a stranger ended somebody else's registration: {:?}",
             still_there
         );
 
-        // The owner's own goodbye is.
-        rc.send_to(&Message::Bye { id, token }.encode(), relay)
-            .await
-            .unwrap();
+        // The owner's own goodbye is taken.
+        let key = crate::relay::auth_key(&owner, &relay_id, &id, &relay_id);
+        let token = token_for(&rc, relay, id).await;
+        let bye = signed(
+            &key,
+            Message::Bye {
+                id,
+                token,
+                proof: [0; crate::relay::PROOF_LEN],
+            },
+        );
+        rc.send_to(&bye, relay).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let gone = with_token(&sc, relay, |token| Message::Connect { target: id, token }).await;
@@ -1043,18 +1188,127 @@ mod wire_tests {
         cancel.cancel();
     }
 
+    /// Registering an identity is the owner's to do. Without a proof of it,
+    /// anyone who knew a published ID could register it here and have
+    /// senders put through to them: the handshake would fail, but the
+    /// transfer would fail with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_identity_can_only_be_registered_by_its_owner() {
+        let (relay, relay_id, cancel) = start_relay().await;
+        let owner = Identity::generate();
+        let id = owner.id();
+
+        // The attacker knows the published identity and nothing else.
+        let impostor = Identity::generate();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let wrong = crate::relay::auth_key(&impostor, &relay_id, &id, &relay_id);
+        let mut token = [0u8; TOKEN_LEN];
+        for _ in 0..2 {
+            let msg = signed(
+                &wrong,
+                Message::Register {
+                    id,
+                    token,
+                    flags: 0,
+                    proof: [0; crate::relay::PROOF_LEN],
+                },
+            );
+            sock.send_to(&msg, relay).await.unwrap();
+            match recv_message(&sock, Duration::from_secs(2)).await {
+                Some(Message::Challenge { token: t }) => token = t,
+                other => {
+                    assert!(
+                        matches!(
+                            other,
+                            Some(Message::Error {
+                                code: Refusal::BadToken
+                            })
+                        ),
+                        "an identity was registered without proof: {:?}",
+                        other
+                    );
+                    break;
+                }
+            }
+        }
+        // Nobody can be put through to it, because nobody registered it.
+        let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let answer = with_token(&sc, relay, |token| Message::Connect { target: id, token }).await;
+        assert!(
+            matches!(
+                answer,
+                Some(Message::Error {
+                    code: Refusal::Unknown
+                })
+            ),
+            "got {:?}",
+            answer
+        );
+
+        // The owner registers it without trouble.
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            register(&rc, relay, &relay_id, &owner, 0).await,
+            Some(Message::Registered { .. })
+        ));
+        cancel.cancel();
+    }
+
+    /// A receiver that asks to stay hidden is not described to the caller:
+    /// there is then no direct path to try, and the pair meets at the
+    /// relay's port. It costs the relay's bandwidth, and it is the only
+    /// arrangement in which a relay actually hides anyone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_private_registration_does_not_disclose_where_it_is() {
+        let (relay, relay_id, cancel) = start_relay().await;
+        let owner = Identity::generate();
+        let id = owner.id();
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            register(
+                &rc,
+                relay,
+                &relay_id,
+                &owner,
+                crate::relay::REGISTER_PRIVATE
+            )
+            .await,
+            Some(Message::Registered { .. })
+        ));
+
+        let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let answer = with_token(&sc, relay, |token| Message::Connect { target: id, token }).await;
+        let Some(Message::Allocated { peer, port, .. }) = answer else {
+            panic!("expected an allocation, got {:?}", answer);
+        };
+        assert!(port != 0, "a port is still set aside");
+        assert!(
+            peer.ip().is_unspecified() && peer.port() == 0,
+            "the caller was told where the receiver is: {}",
+            peer
+        );
+        // And the receiver is told nothing about the caller either.
+        let Some(Message::Incoming { peer, .. }) = recv_message(&rc, Duration::from_secs(2)).await
+        else {
+            panic!("the receiver was not introduced");
+        };
+        assert!(peer.ip().is_unspecified() && peer.port() == 0);
+        cancel.cancel();
+    }
+
     /// One address holding both tickets is a pair talking to itself. A
     /// datagram put into that would be forwarded back to where it came
     /// from, and each hop would refresh the idle timer that should have
     /// reclaimed the port — one packet, carried for ever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_address_cannot_hold_both_sides() {
-        let (relay, cancel) = start_relay().await;
-        let id = Identity::generate().id();
+        let (relay, relay_id, cancel) = start_relay().await;
+        let owner = Identity::generate();
+        let id = owner.id();
         let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(matches!(
-            with_token(&rc, relay, |token| Message::Register { id, token }).await,
+            register(&rc, relay, &relay_id, &owner, 0).await,
             Some(Message::Registered { .. })
         ));
         let Some(Message::Allocated {
