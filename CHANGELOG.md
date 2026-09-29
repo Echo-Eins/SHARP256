@@ -373,6 +373,15 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   interval (not merely within the lease), a relay that reports a new
   address shortens it for everyone, and a relay that stays silent for a
   whole lease is registered with again, on its next address if it has one.
+- A shorter interval takes effect at once. Learning that the NAT forgets
+  sooner — its mapping's lifetime measured, or a mapping seen to change —
+  used to apply only from the refresh after the one already planned by the
+  old interval, so the mapping lapsed once more: behind a NAT that forgets in
+  eight seconds, the laboratory's `timeout` saw the receiver's flow to its
+  relay missing for ten seconds after the receiver had adapted (found once
+  that scenario judged the samples after the adaptation rather than the
+  last few). The refresh already planned is brought forward, for the relay
+  registrations and for the STUN keepalive alike.
 
 ### IPv6
 - IPv6 and IPv4 by default: receiver, sender and relay bind one dual-stack

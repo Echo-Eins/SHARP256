@@ -387,8 +387,28 @@ pub async fn serve(
     // When the relay last confirmed the registration, and where it saw us.
     let mut confirmed_at = Instant::now();
     let mut observed: Option<SocketAddr> = None;
+    // When the last refresh left, while registered — what the NAT counts
+    // its memory of the mapping from — and the interval the next one was
+    // planned by.
+    let mut refreshed_at = Instant::now();
+    let mut planned = keepalive.lock().interval();
     loop {
         let now = Instant::now();
+        // A shorter interval learnt meanwhile — the mapping's lifetime was
+        // measured, or another refresh saw the mapping change — applies to
+        // the refresh already planned, not only to those after it: the NAT
+        // forgets on its own schedule, and a refresh planned by the old
+        // interval would come after it had.
+        if registered {
+            let interval = keepalive.lock().interval();
+            if interval < planned {
+                planned = interval;
+                let due = refreshed_at + keepalive.lock().next().min(lease / 2);
+                if due < next_send {
+                    next_send = due;
+                }
+            }
+        }
         // A whole lease without a confirmation: the relay has let the
         // registration go, or cannot hear us. Start over.
         if registered && now.saturating_duration_since(confirmed_at) > lease {
@@ -426,6 +446,8 @@ pub async fn serve(
                 Ok(_) => {
                     send_failures = 0;
                     if registered {
+                        refreshed_at = now;
+                        planned = keepalive.lock().interval();
                         next_send = now + keepalive.lock().next().min(lease / 2);
                     } else {
                         unanswered += 1;
@@ -449,7 +471,11 @@ pub async fn serve(
                 }
             }
         }
-        let wait = next_send.saturating_duration_since(Instant::now());
+        // Woken at least this often, to see whether the interval has
+        // become shorter (above).
+        let wait = next_send
+            .saturating_duration_since(Instant::now())
+            .min(crate::nat::keepalive::FLOOR);
         let msg = tokio::select! {
             m = incoming.recv() => m,
             _ = tokio::time::sleep(wait) => continue,
@@ -538,8 +564,12 @@ pub async fn serve(
                     Some(_) => {}
                 }
                 observed = Some(seen);
+                if !registered {
+                    refreshed_at = Instant::now();
+                }
                 registered = true;
                 retry = Duration::from_millis(500);
+                planned = keepalive.lock().interval();
                 next_send = Instant::now() + keepalive.lock().next().min(lease / 2);
             }
             Message::Incoming {

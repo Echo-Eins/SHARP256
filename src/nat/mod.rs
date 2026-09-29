@@ -1499,6 +1499,11 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
                     let seen = reply.response.mapped;
                     if behaviour.mapped != Some(seen) {
                         let shorter = keepalive.lock().mapping_changed();
+                        // The mapping is new: keep it from the start, by
+                        // the new interval.
+                        if shorter {
+                            next_keepalive = Instant::now();
+                        }
                         tracing::info!(
                             "NAT: the address we are seen at changed ({} -> {}){}",
                             behaviour
@@ -1555,7 +1560,14 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
                 match r {
                     Ok(Some(l)) => {
                         let mut k = keepalive.lock();
+                        let before = k.interval();
                         k.lifetime_measured(l);
+                        // A keepalive planned by the old interval may come
+                        // after the NAT has forgotten: one now, and the new
+                        // interval from there.
+                        if k.interval() < before {
+                            next_keepalive = next_keepalive.min(Instant::now());
+                        }
                         tracing::info!(
                             "NAT: an idle mapping lasts at least {:?} here; keeping ours alive \
                              every {:?}",
