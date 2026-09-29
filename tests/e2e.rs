@@ -2460,6 +2460,78 @@ async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
     stop_receiver(r).await;
 }
 
+/// Two people starting at about the same time: the sender asks the relay for
+/// a receiver that is not registered yet, and is put through when it is.
+/// Giving up on the relay at the first "unknown" left a sender with nothing
+/// but the receiver's address, which the receiver's NAT turns away until
+/// the receiver has been introduced to it.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_that_starts_before_its_receiver_is_put_through_when_it_registers() {
+    use sharp256::relay::server::{Config, Relay};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 256 << 10;
+    let file = make_file(&src, "early-bird.bin", size, 0xEA51);
+
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_id = relay.id();
+    let relay_task = tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+    let (receiver_mapping, refused, mapping_task) = one_way_mapping(relay_addr).await;
+
+    // The receiver's identity is known before it runs, as a published ID is.
+    let receiver_identity = Identity::generate();
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let mut scfg = sender_cfg(&file, dead_addr, receiver_identity.id(), &state);
+    scfg.relays = vec![relay_addr.to_string()];
+    let sender = tokio::spawn(run_sender(scfg));
+
+    // Long enough for the sender to have been told, at least once, that the
+    // relay knows nobody by that ID.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !sender.is_finished(),
+        "the sender is still waiting for its receiver"
+    );
+    let r = start_receiver(&out, &state, |cfg| {
+        cfg.identity = Some(receiver_identity.clone());
+        cfg.relays = vec![format!("{}@{}", relay_id, receiver_mapping)];
+    })
+    .await;
+
+    let summary = tokio::time::timeout(Duration::from_secs(60), sender)
+        .await
+        .expect("put through in time")
+        .expect("the sender task ends")
+        .expect("the transfer completes through the relay");
+    assert_eq!(summary.file_size, size as u64);
+    assert_same(&file, &out.join("early-bird.bin"));
+    assert!(
+        refused.load(Ordering::Relaxed) > 0,
+        "the direct address was never tried, so this proved nothing"
+    );
+
+    mapping_task.abort();
+    cancel.cancel();
+    relay_task.abort();
+    stop_receiver(r).await;
+}
+
 /// A relay is a fallback, not a toll gate. Configuring one — even several
 /// that do not answer at all — must not slow down a transfer whose direct
 /// path works, because the introduction runs alongside the connectivity
