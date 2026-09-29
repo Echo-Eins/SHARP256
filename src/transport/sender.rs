@@ -1216,8 +1216,11 @@ type RelayInbox = (SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>);
 type RelayInboxes = Arc<parking_lot::RwLock<Vec<RelayInbox>>>;
 /// How long a relay that does not answer is asked again for, and the pauses
 /// between asks (doubling up to the last).
+#[cfg(feature = "nat-traversal")]
 const RELAY_PATIENCE: Duration = Duration::from_secs(60);
+#[cfg(feature = "nat-traversal")]
 const RELAY_RETRY: Duration = Duration::from_secs(1);
+#[cfg(feature = "nat-traversal")]
 const RELAY_RETRY_MAX: Duration = Duration::from_secs(8);
 /// How long a relay's name may take to resolve before it is given up.
 #[cfg(feature = "nat-traversal")]

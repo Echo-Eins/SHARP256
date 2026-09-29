@@ -2358,7 +2358,14 @@ async fn one_way_mapping(
     let task = tokio::spawn(async move {
         let mut inside: Option<SocketAddr> = None;
         let mut buf = vec![0u8; 65536];
-        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+        loop {
+            // An error is not the end of the mapping: on Windows an ICMP
+            // "port unreachable" for what it forwarded to a relay that is not
+            // there yet comes back as a receive error, once.
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            };
             if from == only_from {
                 // Inbound, and only from the address this mapping was
                 // opened towards.
