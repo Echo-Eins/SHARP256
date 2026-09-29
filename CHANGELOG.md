@@ -436,8 +436,8 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   commit, each with one method switched off by a one-line change: port
   prediction (a window of the named port alone) and the birthday method (no
   extra sockets, no spray). The pairs that need them connect on the commit's
-  own binaries and fail on the builds without (`docs/evidence/nat/
-  mutation.log`).
+  own binaries and fail on the builds without
+  (`docs/evidence/nat/mutation.log`).
 - **Reports** name the family a measurement is for; IPv6 gateways are found
   and pinholes reported; the relay answers a question from the address it was
   asked at (it has several on one interface with IPv6).

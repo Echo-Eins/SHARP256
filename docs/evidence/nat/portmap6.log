@@ -1,0 +1,661 @@
+# natlab evidence: portmap6
+# commit:    47364fb2f362bc8bb234ce996c110b8ea20e1ed9
+# binaries:  5e148638cfc6000a sharp-sender, 952411569419b74c sharp-receiver
+# date:      2026-09-29T21:18:36Z
+# kernel:    Linux 7.0.0-34-generic (a QEMU virtual machine, emulated CPU; IPv6 on)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.12.3
+# env:       
+# command:   python3 /lab/natlab.py portmap6
+
+receiver asks by   daemon   result
+miniupnpd[23119]: system uptime is 4369 seconds
+
+miniupnpd[23119]: mnl_socket bound, port_id=23119
+
+miniupnpd[23119]: Reloading rules from lease file
+
+miniupnpd[23119]: could not open lease file: /tmp/natlab.0aos6sal/upnp.leases
+
+miniupnpd[23119]: version 2.3.4 starting NAT-PMP/PCP ext if wan BOOTID=1790716738
+
+miniupnpd[23119]: specific IPv6 ext if wan
+
+miniupnpd[23119]: Listening for NAT-PMP/PCP traffic on port 5351
+
+miniupnpd[23119]: PCP request received from 10.2.0.2:38641 60bytes
+
+miniupnpd[23119]: UPnP permission rule 0 matched : port mapping accepted
+
+miniupnpd[23119]: Check protocol udp for port 5555 on ext_if wan 11.2.0.1, 0100020B
+
+miniupnpd[23119]: timestamp entry added (5555, 17, 7971)
+
+miniupnpd[23119]: PCP MAP: added mapping UDP 5555->10.2.0.2:5555 'PCP MAP 3312d2a72a9cc79362ffae8d'
+
+miniupnpd[23119]: table_cb(0x7ffd3c3d3a10, 0x7ffd3c3d4a30) miniupnpd miniupnpd 2
+
+miniupnpd[23119]: rule with label 'PCP MAP 3312d2a72a9cc79362ffae8d' is not a IGD pinhole
+
+miniupnpd[23119]: ReceiveNATPMPOrPCPPacket: packet destination: 2a0e:aa00:2:1::1 scope_id=6
+
+miniupnpd[23119]: PCP request received from [2a0e:aa00:2:1::2]:52267 60bytes
+
+miniupnpd[23119]: get_src_for_route_to ([2a0e:aa00:2:1::2]:52267)
+
+miniupnpd[23119]: get_lan_for_peer() looking for LAN interface index=6
+
+miniupnpd[23119]: ifname=lan index=6 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23119]: PCP MAP: added mapping UDP 5555->2a0e:aa00:2:1::2:5555 'PCP MAP 4f311e239c06ae617969abf5'
+
+miniupnpd[23119]: table_cb(0x7ffd3c3d3a10, 0x7ffd3c3d4a30) miniupnpd miniupnpd 2
+
+miniupnpd[23119]: table_cb(0x7ffd3c3d3c18, 0x7ffd3c3d4a30) miniupnpd miniupnpd 2
+
+miniupnpd[23119]: rule with label 'PCP MAP 3312d2a72a9cc79362ffae8d' is not a IGD pinhole
+
+pcp                yes      ok   the sender got in through a PCP MAP (via [2a0e:aa00:2:1::2]:5555) in 0.9s
+miniupnpd[23119]: shutting down MiniUPnPd
+
+miniupnpd[23273]: system uptime is 4401 seconds
+
+miniupnpd[23273]: mnl_socket bound, port_id=23273
+
+miniupnpd[23273]: Reloading rules from lease file
+
+miniupnpd[23273]: could not open lease file: /tmp/natlab.92fhng2z/upnp.leases
+
+miniupnpd[23273]: version 2.3.4 starting NAT-PMP/PCP ext if wan BOOTID=1790716770
+
+miniupnpd[23273]: specific IPv6 ext if wan
+
+miniupnpd[23273]: Listening for NAT-PMP/PCP traffic on port 5351
+
+miniupnpd[23273]: PCP request received from 10.2.0.2:59118 60bytes
+
+miniupnpd[23273]: UPnP permission rule 0 matched : port mapping accepted
+
+miniupnpd[23273]: Check protocol udp for port 5555 on ext_if wan 11.2.0.1, 0100020B
+
+miniupnpd[23273]: timestamp entry added (5555, 17, 8004)
+
+miniupnpd[23273]: PCP MAP: added mapping UDP 5555->10.2.0.2:5555 'PCP MAP fba3785d2acfbf8577dbd1e3'
+
+miniupnpd[23273]: table_cb(0x7fffad9bff10, 0x7fffad9c0f30) miniupnpd miniupnpd 2
+
+miniupnpd[23273]: rule with label 'PCP MAP fba3785d2acfbf8577dbd1e3' is not a IGD pinhole
+
+miniupnpd[23273]: ReceiveNATPMPOrPCPPacket: packet destination: 2001:1::1 scope_id=16
+
+miniupnpd[23273]: PCP request received from [2a0e:aa00:2:1::2]:44123 60bytes
+
+miniupnpd[23273]: get_src_for_route_to ([2a0e:aa00:2:1::2]:44123)
+
+miniupnpd[23273]: get_lan_for_peer() looking for LAN interface index=16
+
+miniupnpd[23273]: ifname=lan index=16 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23273]: PCP MAP: added mapping UDP 5555->2a0e:aa00:2:1::2:5555 'PCP MAP 7b4b1b590d6e4afd7ccf9993'
+
+miniupnpd[23273]: table_cb(0x7fffad9bff10, 0x7fffad9c0f30) miniupnpd miniupnpd 2
+
+miniupnpd[23273]: table_cb(0x7fffad9c0118, 0x7fffad9c0f30) miniupnpd miniupnpd 2
+
+miniupnpd[23273]: rule with label 'PCP MAP fba3785d2acfbf8577dbd1e3' is not a IGD pinhole
+
+pcp-anycast        yes      ok   the sender got in through a PCP MAP asked at 2001:1::1 (via [2a0e:aa00:2:1::2]:5555) in 0.9s
+miniupnpd[23273]: shutting down MiniUPnPd
+
+miniupnpd[23430]: system uptime is 4435 seconds
+
+miniupnpd[23430]: mnl_socket bound, port_id=23430
+
+miniupnpd[23430]: Reloading rules from lease file
+
+miniupnpd[23430]: could not open lease file: /tmp/natlab.0x1ckf38/upnp.leases
+
+miniupnpd[23430]: version 2.3.4 starting UPnP-IGD ext if wan BOOTID=1790716804
+
+miniupnpd[23430]: specific IPv6 ext if wan
+
+miniupnpd[23430]: HTTP listening on port 33745
+
+miniupnpd[23430]: HTTP IPv6 address given to control points : [2a0e:aa00:2:1::1]
+
+miniupnpd[23430]: level=0 type=8
+
+miniupnpd[23430]: ifindex = 26  10.2.0.1
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2 (ver=2)
+
+miniupnpd[23430]: SSDP M-SEARCH from 10.2.0.2:35722 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to 10.2.0.2:35722 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2 (ver=2)
+
+miniupnpd[23430]: SSDP M-SEARCH from [::ffff:10.2.0.2]:35722 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [::ffff:10.2.0.2]:35722 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: level=0 type=8
+
+miniupnpd[23430]: ifindex = 26  10.2.0.1
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1 (ver=1)
+
+miniupnpd[23430]: SSDP M-SEARCH from 10.2.0.2:35722 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to 10.2.0.2:35722 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1 (ver=1)
+
+miniupnpd[23430]: SSDP M-SEARCH from [::ffff:10.2.0.2]:35722 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [::ffff:10.2.0.2]:35722 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: get_lan_for_peer() looking for LAN interface index=26
+
+miniupnpd[23430]: ifname=lan index=26 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2 (ver=2)
+
+miniupnpd[23430]: SSDP M-SEARCH from [fe80::c14:b3ff:fee3:a302%lan]:49657 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [fe80::c14:b3ff:fee3:a302%lan]:49657 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://[2a0e:aa00:2:1::1]:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: get_lan_for_peer() looking for LAN interface index=26
+
+miniupnpd[23430]: ifname=lan index=26 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1 (ver=1)
+
+miniupnpd[23430]: SSDP M-SEARCH from [fe80::c14:b3ff:fee3:a302%lan]:49657 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [fe80::c14:b3ff:fee3:a302%lan]:49657 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://[2a0e:aa00:2:1::1]:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: get_src_for_route_to ([2a0e:aa00:2:1::2]:49657)
+
+miniupnpd[23430]: get_lan_for_peer() looking for LAN interface index=26
+
+miniupnpd[23430]: ifname=lan index=26 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2 (ver=2)
+
+miniupnpd[23430]: SSDP M-SEARCH from [2a0e:aa00:2:1::2]:49657 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [2a0e:aa00:2:1::2]:49657 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://[2a0e:aa00:2:1::1]:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: get_src_for_route_to ([2a0e:aa00:2:1::2]:49657)
+
+miniupnpd[23430]: get_lan_for_peer() looking for LAN interface index=26
+
+miniupnpd[23430]: ifname=lan index=26 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1 (ver=1)
+
+miniupnpd[23430]: SSDP M-SEARCH from [2a0e:aa00:2:1::2]:49657 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [2a0e:aa00:2:1::2]:49657 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://[2a0e:aa00:2:1::1]:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: get_src_for_route_to ([2a0e:aa00:2:1::2]:49853)
+
+miniupnpd[23430]: get_lan_for_peer() looking for LAN interface index=26
+
+miniupnpd[23430]: ifname=lan index=26 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23430]: HTTP REQUEST from [2a0e:aa00:2:1::2]:49853 : GET /rootDesc.xml (HTTP/1.0)
+
+miniupnpd[23430]: Host: [fe80::70c3:95ff:fe93:a254]:33745
+
+miniupnpd[23430]: get_src_for_route_to ([2a0e:aa00:2:1::2]:36413)
+
+miniupnpd[23430]: get_lan_for_peer() looking for LAN interface index=26
+
+miniupnpd[23430]: ifname=lan index=26 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23430]: HTTP REQUEST from [2a0e:aa00:2:1::2]:36413 : POST /ctl/IP6FCtl (HTTP/1.0)
+
+miniupnpd[23430]: Host: [fe80::70c3:95ff:fe93:a254]:33745
+
+miniupnpd[23430]: SOAPAction: urn:schemas-upnp-org:service:WANIPv6FirewallControl:1#GetFirewallStatus
+
+miniupnpd[23430]: get_src_for_route_to ([2a0e:aa00:2:1::2]:44107)
+
+miniupnpd[23430]: get_lan_for_peer() looking for LAN interface index=26
+
+miniupnpd[23430]: ifname=lan index=26 str=10.2.0.1 addr=0a020001 mask=ffffff00
+
+miniupnpd[23430]: HTTP REQUEST from [2a0e:aa00:2:1::2]:44107 : POST /ctl/IP6FCtl (HTTP/1.0)
+
+miniupnpd[23430]: Host: [fe80::70c3:95ff:fe93:a254]:33745
+
+miniupnpd[23430]: SOAPAction: urn:schemas-upnp-org:service:WANIPv6FirewallControl:1#AddPinhole
+
+miniupnpd[23430]: AddPinhole: (inbound) from []:0 to [2a0e:aa00:2:1::2]:5555 with proto 17 during 3600 sec
+
+miniupnpd[23430]: table_cb(0x7fff59c92700, 0x7fff59c93720) miniupnpd miniupnpd 2
+
+miniupnpd[23430]: level=0 type=8
+
+miniupnpd[23430]: ifindex = 26  10.2.0.1
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2 (ver=2)
+
+miniupnpd[23430]: SSDP M-SEARCH from 10.2.0.2:50066 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to 10.2.0.2:50066 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2 (ver=2)
+
+miniupnpd[23430]: SSDP M-SEARCH from [::ffff:10.2.0.2]:50066 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [::ffff:10.2.0.2]:50066 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:2
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: level=0 type=8
+
+miniupnpd[23430]: ifindex = 26  10.2.0.1
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1 (ver=1)
+
+miniupnpd[23430]: SSDP M-SEARCH from 10.2.0.2:50066 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to 10.2.0.2:50066 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: Received UDP Packet (IPv6)
+
+miniupnpd[23430]: ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1 (ver=1)
+
+miniupnpd[23430]: SSDP M-SEARCH from [::ffff:10.2.0.2]:50066 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+miniupnpd[23430]: Single search found
+
+miniupnpd[23430]: SendSSDPResponse(): 0 bytes to [::ffff:10.2.0.2]:50066 ST: HTTP/1.1 200 OK
+
+CACHE-CONTROL: max-age=120
+
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+USN: uuid:6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b12::urn:schemas-upnp-org:device:InternetGatewayDevice:1
+
+EXT:
+
+SERVER: Debian/7.0.0-34-generic UPnP/1.1 MiniUPnPd/2.3.4
+
+LOCATION: http://10.2.0.1:33745/rootDesc.xml
+
+OPT: "http://schemas.upnp.org/upnp/1/0/"; ns=01
+
+01-NLS: 1790716804
+
+BOOTID.UPNP.ORG: 1790716804
+
+CONFIGID.UPNP.ORG: 1337
+
+
+
+
+
+miniupnpd[23430]: HTTP REQUEST from [::ffff:10.2.0.2]:45152 : GET /rootDesc.xml (HTTP/1.0)
+
+miniupnpd[23430]: Host: 10.2.0.1:33745
+
+miniupnpd[23430]: HTTP REQUEST from [::ffff:10.2.0.2]:45166 : POST /ctl/IPConn (HTTP/1.0)
+
+miniupnpd[23430]: Host: 10.2.0.1:33745
+
+miniupnpd[23430]: SOAPAction: urn:schemas-upnp-org:service:WANIPConnection:2#AddPortMapping
+
+miniupnpd[23430]: AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP for: SHARP-256 receiver leaseduration=3600 rhost=
+
+miniupnpd[23430]: UPnP permission rule 0 matched : port mapping accepted
+
+miniupnpd[23430]: Check protocol udp for port 5555 on ext_if wan 11.2.0.1, 0100020B
+
+miniupnpd[23430]: redirecting port 5555 to 10.2.0.2:5555 protocol UDP for: SHARP-256 receiver
+
+miniupnpd[23430]: timestamp entry added (5555, 17, 8041)
+
+miniupnpd[23430]: table_cb(0x7fff59c92700, 0x7fff59c93720) miniupnpd miniupnpd 2
+
+miniupnpd[23430]: table_cb(0x7fff59c92914, 0x7fff59c93720) miniupnpd miniupnpd 2
+
+miniupnpd[23430]: rule with label 'SHARP-256 receiver' is not a IGD pinhole
+
+miniupnpd[23430]: rule with label 'SHARP-256 receiver' is not a IGD pinhole
+
+miniupnpd[23430]: HTTP REQUEST from [::ffff:10.2.0.2]:45182 : POST /ctl/IPConn (HTTP/1.0)
+
+miniupnpd[23430]: Host: 10.2.0.1:33745
+
+miniupnpd[23430]: SOAPAction: urn:schemas-upnp-org:service:WANIPConnection:2#GetExternalIPAddress
+
+miniupnpd[23430]: rule with label 'SHARP-256 receiver' is not a IGD pinhole
+
+upnp               yes      ok   the sender got in through UPnP AddPinhole (via [2a0e:aa00:2:1::2]:5555) in 1.0s
+miniupnpd[23430]: rule with label 'SHARP-256 receiver' is not a IGD pinhole
+
+miniupnpd[23430]: ProcessInterfaceWatchNotify RTM_DELADDR index=29 fam=2
+
+miniupnpd[23430]:  - 29 - 11.2.0.1 type=1
+
+miniupnpd[23430]:  - 29 - 11.2.0.1 type=2
+
+miniupnpd[23430]:  - 29 - wan type=3
+
+miniupnpd[23430]:  - 29 - *unknown* type=8
+
+miniupnpd[23430]:  - 29 - valid=4294967295 preferred=4294967295 type=6
+
+miniupnpd[23430]: rule with label 'SHARP-256 receiver' is not a IGD pinhole
+
+miniupnpd[23430]: rule with label 'SHARP-256 receiver' is not a IGD pinhole
+
+miniupnpd[23430]: shutting down MiniUPnPd
+
+nothing            none     ok   the sender was stopped by the firewall (via [2a0e:aa00:2:1::2]:5555) in 25.0s
+
+# exit status: 0

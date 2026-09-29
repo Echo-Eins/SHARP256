@@ -1,0 +1,485 @@
+# note:      a run from BEFORE the fix of 1b4f84a (a direct path is kept while it is heard from),
+#            kept to show what the scenario catches: 10 of 18 sessions ended on the TURN server
+#            although the direct path was open both ways (the conntrack tables below say so)
+# natlab evidence: ipv6-turn-long
+# commit:    068fe71e4dbb4464c25a778a93ab6a3efa305ac3
+# binaries:  3ea1ef8186325548 sharp-sender, 6e69f649510b70a4 sharp-receiver
+# date:      2026-09-29T12:04:54Z
+# kernel:    Linux 7.0.0-34-generic (a QEMU virtual machine, emulated CPU; IPv6 on)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.12.3
+# env:       NATLAB_SIZE_MB=60 NATLAB_MAX_RATE=20M (twice CI's 30 MB: the emulated CPU hands the sender's card over later)
+# command:   python3 /lab/natlab.py v6 --via turn --timeout 150 -v
+
+scenario                                       A firewall   B firewall   result
+IPv6 only                                      open6        open6        ok   direct-v6     26.8s as expected
+IPv6 only                                      open6        stateful6    ok   direct-v6 (from turn)  32.5s as expected
+IPv6 only                                      open6        restricted6  ok   turn          34.4s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=60436 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=60436 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:f::10 sport=58725 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:1:1::2 sport=3480 dport=58725 [ASSURED] mark=0 use=1
+--- conntrack in RB
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=60436 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=60436 dport=5555 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49542 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49542 [ASSURED] mark=0 use=1
+udp      17 106 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=51560 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=3480 dport=51560 [ASSURED] mark=0 use=1
+--- sender.log
+-29T12:07:38.292457Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.304284Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.315375Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.323305Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.324768Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.329413Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.334191Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.348653Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:43127 proven; sending there now
+[2m2026-09-29T12:07:38.621540Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:43127); validating it
+[2m2026-09-29T12:07:38.626350Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [2a0e:aa00:2:1::2]:5555 proven; sending there now
+[2m2026-09-29T12:07:38.626624Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:43127 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:07:38.643641Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:43127 proven; sending there now
+[2m2026-09-29T12:07:38.725088Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 32.89s (15.3 Mbit/s avg), 234.15 KiB retransmitted, 16 loss events, BLAKE3 2771d2a5873c6b8006b37faf20eac5a65bb1e5f132ff7b7c32657f098b52fc98
+
+--- receiver.log
+:60436); validating it
+[2m2026-09-29T12:07:38.314338Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49542 (was [2a0e:aa00:1:1::2]:60436); validating it
+[2m2026-09-29T12:07:38.319372Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49542 (was [2a0e:aa00:1:1::2]:60436); validating it
+[2m2026-09-29T12:07:38.324471Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49542 (was [2a0e:aa00:1:1::2]:60436); validating it
+[2m2026-09-29T12:07:38.330320Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 66274d88446cbe6560a9e639f797148c: all 62914560 bytes received; verifying
+[2m2026-09-29T12:07:38.331301Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49542 (was [2a0e:aa00:1:1::2]:60436); validating it
+[2m2026-09-29T12:07:38.343041Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49542 proven; moving the session there
+[2m2026-09-29T12:07:38.619369Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:60436 (was [2a0e:aa00:f::10]:49542); validating it
+[2m2026-09-29T12:07:38.625308Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:1:1::2]:60436 proven; moving the session there
+[2m2026-09-29T12:07:38.635747Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49542 (was [2a0e:aa00:1:1::2]:60436); validating it
+[2m2026-09-29T12:07:38.653136Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49542 proven; moving the session there
+[2m2026-09-29T12:07:38.718043Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 66274d88446cbe6560a9e639f797148c stored as /tmp/natlab.rvo_zp0c/out/payload.bin (BLAKE3 2771d2a5873c6b8006b37faf20eac5a65bb1e5f132ff7b7c32657f098b52fc98); confirming with sender
+[2m2026-09-29T12:07:38.731548Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 66274d88446cbe6560a9e639f797148c finished: /tmp/natlab.rvo_zp0c/out/payload.bin in 33.03s, avg 15.2 Mbit/s
+Received /tmp/natlab.rvo_zp0c/out/payload.bin in 33.03s (15.2 Mbit/s avg), BLAKE3 2771d2a5873c6b8006b37faf20eac5a65bb1e5f132ff7b7c32657f098b52fc98
+
+IPv6 only                                      stateful6    open6        ok   direct-v6     27.4s as expected
+IPv6 only                                      stateful6    stateful6    ok   turn          34.7s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=46009 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=46009 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:f::10 sport=39723 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:1:1::2 sport=3480 dport=39723 [ASSURED] mark=0 use=1
+--- conntrack in RB
+udp      17 105 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=48634 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=3480 dport=48634 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49429 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49429 dport=5555 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=46009 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=46009 dport=5555 [ASSURED] mark=0 use=1
+--- sender.log
+:transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.553174Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.570557Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.571351Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.580747Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.584537Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.585385Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.593597Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.600281Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.610041Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.620456Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:35927 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:09:32.629388Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:35927 proven; sending there now
+[2m2026-09-29T12:09:32.937479Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 29.64s (17.0 Mbit/s avg), 316.46 KiB retransmitted, 28 loss events, BLAKE3 eba2cd0e4afacae6d173fe99d6657ea4c090af024306d90f5faf5ecef6f4fc27
+
+--- receiver.log
+2:09:32.581358Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.582328Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.592312Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.593547Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.600314Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.607680Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.609520Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.616718Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 772edff49d11d755ab4efe50bc3cd1ae: all 62914560 bytes received; verifying
+[2m2026-09-29T12:09:32.617271Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49429 (was [2a0e:aa00:1:1::2]:46009); validating it
+[2m2026-09-29T12:09:32.626532Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49429 proven; moving the session there
+[2m2026-09-29T12:09:32.926180Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 772edff49d11d755ab4efe50bc3cd1ae stored as /tmp/natlab.63klq2uh/out/payload.bin (BLAKE3 eba2cd0e4afacae6d173fe99d6657ea4c090af024306d90f5faf5ecef6f4fc27); confirming with sender
+[2m2026-09-29T12:09:32.947998Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 772edff49d11d755ab4efe50bc3cd1ae finished: /tmp/natlab.63klq2uh/out/payload.bin in 29.75s, avg 16.9 Mbit/s
+Received /tmp/natlab.63klq2uh/out/payload.bin in 29.75s (16.9 Mbit/s avg), BLAKE3 eba2cd0e4afacae6d173fe99d6657ea4c090af024306d90f5faf5ecef6f4fc27
+
+IPv6 only                                      stateful6    restricted6  ok   turn          31.4s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 118 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:f::10 sport=33373 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:1:1::2 sport=3480 dport=33373 [ASSURED] mark=0 use=1
+udp      17 2 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:f::10 sport=56350 dport=49537 [UNREPLIED] src=2a0e:aa00:f::10 dst=2a0e:aa00:1:1::2 sport=49537 dport=56350 mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=56350 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=56350 [ASSURED] mark=0 use=1
+--- conntrack in RB
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=56350 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=56350 dport=5555 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49511 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49511 [ASSURED] mark=0 use=1
+udp      17 109 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=42806 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=3480 dport=42806 [ASSURED] mark=0 use=1
+--- sender.log
+:transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:28.973658Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:28.983759Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:28.998151Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:28.999094Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:29.003502Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:29.015725Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:29.017997Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:29.025264Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:29.028655Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:29.030142Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:53591 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:10:29.040237Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:53591 proven; sending there now
+[2m2026-09-29T12:10:29.345979Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 29.49s (17.1 Mbit/s avg), 430.06 KiB retransmitted, 23 loss events, BLAKE3 e262a5598aae646a60869d434935e913b70e429ba0bb146ac90947a2b1920eb8
+
+--- receiver.log
+2:10:29.010967Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.014296Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.018458Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.019499Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.022429Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.026587Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.027677Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.030702Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 04859b1de3d842ffd4f4f465316136d5: all 62914560 bytes received; verifying
+[2m2026-09-29T12:10:29.031518Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49511 (was [2a0e:aa00:1:1::2]:56350); validating it
+[2m2026-09-29T12:10:29.039680Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49511 proven; moving the session there
+[2m2026-09-29T12:10:29.340128Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 04859b1de3d842ffd4f4f465316136d5 stored as /tmp/natlab.l0yyksee/out/payload.bin (BLAKE3 e262a5598aae646a60869d434935e913b70e429ba0bb146ac90947a2b1920eb8); confirming with sender
+[2m2026-09-29T12:10:29.356199Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 04859b1de3d842ffd4f4f465316136d5 finished: /tmp/natlab.l0yyksee/out/payload.bin in 29.70s, avg 16.9 Mbit/s
+Received /tmp/natlab.l0yyksee/out/payload.bin in 29.70s (16.9 Mbit/s avg), BLAKE3 e262a5598aae646a60869d434935e913b70e429ba0bb146ac90947a2b1920eb8
+
+IPv6 only                                      restricted6  open6        ok   direct-v6     26.8s as expected
+IPv6 only                                      restricted6  stateful6    ok   turn          35.2s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=52996 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=52996 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:f::10 sport=40827 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:1:1::2 sport=3480 dport=40827 [ASSURED] mark=0 use=1
+--- conntrack in RB
+udp      17 104 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=51223 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=3480 dport=51223 [ASSURED] mark=0 use=1
+udp      17 116 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=52996 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=52996 dport=5555 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49288 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49288 dport=5555 [ASSURED] mark=0 use=1
+--- sender.log
+:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.658988Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.660360Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.660682Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.673552Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.677664Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.681129Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.686747Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.697270Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.698161Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.708506Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:33988 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:12:17.724678Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:33988 proven; sending there now
+100.0%   60.00 MiB     13.9 Mbit/s  rtt  22.25 ms  cwnd 67.33 KiB  retx 285.16 KiB  eta 0s
+[2m2026-09-29T12:12:18.086101Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 31.07s (16.2 Mbit/s avg), 285.16 KiB retransmitted, 21 loss events, BLAKE3 8015a7573b72a559a942f082c2b59457e5e70813984c6b9cb23a33ee2b5458e2
+
+--- receiver.log
+2:12:17.670987Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.682348Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.685141Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.685643Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.692121Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.693109Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.695311Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.697575Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 75018659794c69e12d94e09e265aef87: all 62914560 bytes received; verifying
+[2m2026-09-29T12:12:17.702591Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49288 (was [2a0e:aa00:1:1::2]:52996); validating it
+[2m2026-09-29T12:12:17.720084Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49288 proven; moving the session there
+[2m2026-09-29T12:12:18.069466Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 75018659794c69e12d94e09e265aef87 stored as /tmp/natlab.88h75lub/out/payload.bin (BLAKE3 8015a7573b72a559a942f082c2b59457e5e70813984c6b9cb23a33ee2b5458e2); confirming with sender
+[2m2026-09-29T12:12:18.096992Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 75018659794c69e12d94e09e265aef87 finished: /tmp/natlab.88h75lub/out/payload.bin in 31.16s, avg 16.2 Mbit/s
+Received /tmp/natlab.88h75lub/out/payload.bin in 31.16s (16.2 Mbit/s avg), BLAKE3 8015a7573b72a559a942f082c2b59457e5e70813984c6b9cb23a33ee2b5458e2
+
+IPv6 only                                      restricted6  restricted6  ok   turn          29.8s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 1 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:f::10 sport=32908 dport=49402 [UNREPLIED] src=2a0e:aa00:f::10 dst=2a0e:aa00:1:1::2 sport=49402 dport=32908 mark=0 use=1
+udp      17 118 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:f::10 sport=38009 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:1:1::2 sport=3480 dport=38009 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=32908 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=32908 [ASSURED] mark=0 use=1
+--- conntrack in RB
+udp      17 111 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=46075 dport=3480 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=3480 dport=46075 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49419 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49419 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=32908 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=32908 dport=5555 [ASSURED] mark=0 use=1
+--- sender.log
+:transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.541310Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.553502Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.566429Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.587218Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.588748Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.589979Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.613237Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.637164Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.642861Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.661492Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57038 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:13:13.670592Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:57038 proven; sending there now
+[2m2026-09-29T12:13:14.014341Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 28.91s (17.4 Mbit/s avg), 397.60 KiB retransmitted, 28 loss events, BLAKE3 d851fa96548fb4337b7edca9863eba6f5d270abb630322028133881e7768e4b1
+
+--- receiver.log
+2:13:13.583842Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.593785Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.597542Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.602468Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.633472Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.637356Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.641498Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.652123Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer e01f8bd19da1f597a576700119240f8d: all 62914560 bytes received; verifying
+[2m2026-09-29T12:13:13.654024Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49419 (was [2a0e:aa00:1:1::2]:32908); validating it
+[2m2026-09-29T12:13:13.670504Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49419 proven; moving the session there
+[2m2026-09-29T12:13:14.005669Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer e01f8bd19da1f597a576700119240f8d stored as /tmp/natlab.wjeqptaz/out/payload.bin (BLAKE3 d851fa96548fb4337b7edca9863eba6f5d270abb630322028133881e7768e4b1); confirming with sender
+[2m2026-09-29T12:13:14.024137Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer e01f8bd19da1f597a576700119240f8d finished: /tmp/natlab.wjeqptaz/out/payload.bin in 29.01s, avg 17.3 Mbit/s
+Received /tmp/natlab.wjeqptaz/out/payload.bin in 29.01s (17.3 Mbit/s avg), BLAKE3 d851fa96548fb4337b7edca9863eba6f5d270abb630322028133881e7768e4b1
+
+dual stack, both IPv4 NATs symmetric-random    open6        open6        ok   direct-v6     26.8s as expected
+dual stack, both IPv4 NATs symmetric-random    open6        stateful6    ok   turn          39.0s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 27 src=10.1.0.2 dst=10.2.0.2 sport=44068 dport=5555 [UNREPLIED] src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=14202 mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=44068 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=44068 [ASSURED] mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=11.2.0.1 sport=44068 dport=13016 [UNREPLIED] src=11.2.0.1 dst=11.1.0.1 sport=13016 dport=56677 mark=0 use=1
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=56752 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=17890 [ASSURED] mark=0 use=1
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=51447 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=30424 [ASSURED] mark=0 use=1
+--- conntrack in RB
+udp      17 113 src=10.2.0.2 dst=11.9.0.10 sport=45513 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=63379 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=24445 [UNREPLIED] src=11.1.0.1 dst=11.2.0.1 sport=24445 dport=15350 mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=10.1.0.2 sport=5555 dport=44068 [UNREPLIED] src=10.1.0.2 dst=11.2.0.1 sport=44068 dport=24139 mark=0 use=1
+udp      17 98 src=10.2.0.2 dst=11.9.0.10 sport=36862 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=51907 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49302 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49302 dport=5555 [ASSURED] mark=0 use=1
+udp      17 117 src=10.2.0.2 dst=11.9.0.10 sport=5555 dport=49307 src=11.9.0.10 dst=11.2.0.1 sport=49307 dport=39224 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=44068 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=44068 dport=5555 [ASSURED] mark=0 use=1
+--- sender.log
+15:11.383539Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [::ffff:127.0.0.1]:41103); validating it
+[2m2026-09-29T12:15:11.389155Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [::ffff:127.0.0.1]:41103); validating it
+[2m2026-09-29T12:15:11.397053Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [::ffff:127.0.0.1]:41103); validating it
+[2m2026-09-29T12:15:11.405505Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [::ffff:127.0.0.1]:41103); validating it
+[2m2026-09-29T12:15:11.414044Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [::ffff:127.0.0.1]:41103); validating it
+[2m2026-09-29T12:15:11.426754Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [::ffff:127.0.0.1]:41103); validating it
+[2m2026-09-29T12:15:11.437745Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [::ffff:127.0.0.1]:41103); validating it
+[2m2026-09-29T12:15:11.445524Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:51944 proven; sending there now
+[2m2026-09-29T12:15:11.492488Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:51944); validating it
+[2m2026-09-29T12:15:11.496667Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [2a0e:aa00:2:1::2]:5555 proven; sending there now
+[2m2026-09-29T12:15:11.496854Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51944 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:15:11.506174Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:51944 proven; sending there now
+[2m2026-09-29T12:15:11.723452Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 33.82s (14.9 Mbit/s avg), 302.55 KiB retransmitted, 23 loss events, BLAKE3 6bf31027b366176af84cf0ce8b0812030c1b7e047d174b3edf0352c964d5bffa
+
+--- receiver.log
+00:f::10]:49302); validating it
+[2m2026-09-29T12:15:11.407646Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49307 (was [2a0e:aa00:f::10]:49302); validating it
+[2m2026-09-29T12:15:11.421316Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49307 (was [2a0e:aa00:f::10]:49302); validating it
+[2m2026-09-29T12:15:11.435305Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49307 (was [2a0e:aa00:f::10]:49302); validating it
+[2m2026-09-29T12:15:11.441948Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [::ffff:11.9.0.10]:49307 proven; moving the session there
+[2m2026-09-29T12:15:11.442160Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49302 (was [::ffff:11.9.0.10]:49307); validating it
+[2m2026-09-29T12:15:11.457349Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49302 proven; moving the session there
+[2m2026-09-29T12:15:11.491061Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:44068 (was [2a0e:aa00:f::10]:49302); validating it
+[2m2026-09-29T12:15:11.496247Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:1:1::2]:44068 proven; moving the session there
+[2m2026-09-29T12:15:11.501306Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49302 (was [2a0e:aa00:1:1::2]:44068); validating it
+[2m2026-09-29T12:15:11.509187Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49302 proven; moving the session there
+[2m2026-09-29T12:15:11.717245Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer e9db18b777b3e71e9a339fe297c1d84b stored as /tmp/natlab.tcl5ia3h/out/payload.bin (BLAKE3 6bf31027b366176af84cf0ce8b0812030c1b7e047d174b3edf0352c964d5bffa); confirming with sender
+[2m2026-09-29T12:15:11.733127Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer e9db18b777b3e71e9a339fe297c1d84b finished: /tmp/natlab.tcl5ia3h/out/payload.bin in 33.93s, avg 14.8 Mbit/s
+Received /tmp/natlab.tcl5ia3h/out/payload.bin in 33.93s (14.8 Mbit/s avg), BLAKE3 6bf31027b366176af84cf0ce8b0812030c1b7e047d174b3edf0352c964d5bffa
+
+dual stack, both IPv4 NATs symmetric-random    open6        restricted6  ok   turn          37.3s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=55926 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=55926 [ASSURED] mark=0 use=1
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=48312 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=38941 [ASSURED] mark=0 use=1
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=50865 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=21128 [ASSURED] mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=11.2.0.1 sport=55926 dport=8035 [UNREPLIED] src=11.2.0.1 dst=11.1.0.1 sport=8035 dport=37047 mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=10.2.0.2 sport=55926 dport=5555 [UNREPLIED] src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=21486 mark=0 use=1
+--- conntrack in RB
+udp      17 29 src=10.2.0.2 dst=10.1.0.2 sport=5555 dport=55926 [UNREPLIED] src=10.1.0.2 dst=11.2.0.1 sport=55926 dport=37841 mark=0 use=1
+udp      17 117 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49482 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49482 [ASSURED] mark=0 use=1
+udp      17 115 src=10.2.0.2 dst=11.9.0.10 sport=34330 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=6147 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=55926 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=55926 dport=5555 [ASSURED] mark=0 use=1
+udp      17 101 src=10.2.0.2 dst=11.9.0.10 sport=60724 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=49373 [ASSURED] mark=0 use=1
+udp      17 117 src=10.2.0.2 dst=11.9.0.10 sport=5555 dport=49301 src=11.9.0.10 dst=11.2.0.1 sport=49301 dport=35162 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=27730 [UNREPLIED] src=11.1.0.1 dst=11.2.0.1 sport=27730 dport=3542 mark=0 use=1
+--- sender.log
+nder[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57438 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:16:17.667890Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:58989 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:16:17.668593Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57438 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:16:17.678404Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:57438 proven; sending there now
+[2m2026-09-29T12:16:17.678617Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:58989 (was [::ffff:127.0.0.1]:57438); validating it
+[2m2026-09-29T12:16:17.686511Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:57438); validating it
+[2m2026-09-29T12:16:17.689715Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:58989 proven; sending there now
+[2m2026-09-29T12:16:17.690399Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57438 (was [::ffff:127.0.0.1]:58989); validating it
+[2m2026-09-29T12:16:17.692166Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:58989); validating it
+[2m2026-09-29T12:16:17.696591Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [2a0e:aa00:2:1::2]:5555 proven; sending there now
+[2m2026-09-29T12:16:17.699187Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:57438 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:16:17.707684Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:57438 proven; sending there now
+100.0%   60.00 MiB     12.1 Mbit/s  rtt  11.33 ms  cwnd 39.59 KiB  retx 456.72 KiB  eta 0s
+[2m2026-09-29T12:16:17.977914Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 35.24s (14.3 Mbit/s avg), 456.72 KiB retransmitted, 42 loss events, BLAKE3 73959d64bc7af9b509fe6f1f600fbceb3f801f0905622b282d4e99dd81900ced
+
+--- receiver.log
+560 bytes received; verifying
+[2m2026-09-29T12:16:17.667649Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49482 (was [2a0e:aa00:1:1::2]:55926); validating it
+[2m2026-09-29T12:16:17.668427Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49301 (was [2a0e:aa00:1:1::2]:55926); validating it
+[2m2026-09-29T12:16:17.676675Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49482 proven; moving the session there
+[2m2026-09-29T12:16:17.678758Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49301 (was [2a0e:aa00:f::10]:49482); validating it
+[2m2026-09-29T12:16:17.684593Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:55926 (was [2a0e:aa00:f::10]:49482); validating it
+[2m2026-09-29T12:16:17.688392Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [::ffff:11.9.0.10]:49301 proven; moving the session there
+[2m2026-09-29T12:16:17.688596Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:55926 (was [::ffff:11.9.0.10]:49301); validating it
+[2m2026-09-29T12:16:17.695048Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:1:1::2]:55926 proven; moving the session there
+[2m2026-09-29T12:16:17.695251Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49482 (was [2a0e:aa00:1:1::2]:55926); validating it
+[2m2026-09-29T12:16:17.705609Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49482 proven; moving the session there
+[2m2026-09-29T12:16:17.972597Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 57629679e63a00ac7a86225ef0e5e770 stored as /tmp/natlab.aj0vd8ku/out/payload.bin (BLAKE3 73959d64bc7af9b509fe6f1f600fbceb3f801f0905622b282d4e99dd81900ced); confirming with sender
+[2m2026-09-29T12:16:17.984555Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 57629679e63a00ac7a86225ef0e5e770 finished: /tmp/natlab.aj0vd8ku/out/payload.bin in 35.41s, avg 14.2 Mbit/s
+Received /tmp/natlab.aj0vd8ku/out/payload.bin in 35.41s (14.2 Mbit/s avg), BLAKE3 73959d64bc7af9b509fe6f1f600fbceb3f801f0905622b282d4e99dd81900ced
+
+dual stack, both IPv4 NATs symmetric-random    stateful6    open6        ok   direct-v6     27.0s as expected
+dual stack, both IPv4 NATs symmetric-random    stateful6    stateful6    ok   turn          47.3s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=38273 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=53743 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=53949 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=53949 [ASSURED] mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=11.2.0.1 sport=53949 dport=52955 [UNREPLIED] src=11.2.0.1 dst=11.1.0.1 sport=52955 dport=34950 mark=0 use=1
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=45976 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=49928 [ASSURED] mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=10.2.0.2 sport=53949 dport=5555 [UNREPLIED] src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=45814 mark=0 use=1
+--- conntrack in RB
+udp      17 115 src=10.2.0.2 dst=11.9.0.10 sport=45354 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=50109 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=10.1.0.2 sport=5555 dport=53949 [UNREPLIED] src=10.1.0.2 dst=11.2.0.1 sport=53949 dport=51951 mark=0 use=1
+udp      17 115 src=10.2.0.2 dst=11.9.0.10 sport=54028 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=48920 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=53949 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=53949 dport=5555 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49441 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49441 dport=5555 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=41491 [UNREPLIED] src=11.1.0.1 dst=11.2.0.1 sport=41491 dport=17181 mark=0 use=1
+udp      17 117 src=10.2.0.2 dst=11.9.0.10 sport=5555 dport=49527 src=11.9.0.10 dst=11.2.0.1 sport=49527 dport=38822 [ASSURED] mark=0 use=1
+--- sender.log
+here now
+[2m2026-09-29T12:18:25.563551Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:56724 (was [::ffff:127.0.0.1]:45164); validating it
+[2m2026-09-29T12:18:25.572350Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:56724 (was [::ffff:127.0.0.1]:45164); validating it
+[2m2026-09-29T12:18:25.583059Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:56724 (was [::ffff:127.0.0.1]:45164); validating it
+[2m2026-09-29T12:18:25.593589Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:56724 (was [::ffff:127.0.0.1]:45164); validating it
+[2m2026-09-29T12:18:25.609530Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:56724 (was [::ffff:127.0.0.1]:45164); validating it
+[2m2026-09-29T12:18:25.620245Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:56724 proven; sending there now
+[2m2026-09-29T12:18:25.622503Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:45164 (was [::ffff:127.0.0.1]:56724); validating it
+[2m2026-09-29T12:18:25.633171Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:45164 proven; sending there now
+[2m2026-09-29T12:18:25.749364Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:45164); validating it
+[2m2026-09-29T12:18:25.753268Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [2a0e:aa00:2:1::2]:5555 proven; sending there now
+[2m2026-09-29T12:18:25.757278Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:45164 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:18:25.769627Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:45164 proven; sending there now
+[2m2026-09-29T12:18:25.944829Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 40.04s (12.6 Mbit/s avg), 453.24 KiB retransmitted, 44 loss events, BLAKE3 d39c663c2530594f414030d90aadb4aa72f3b0721d685db4cf0c377330fb0786
+
+--- receiver.log
+ession there
+[2m2026-09-29T12:18:25.567585Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49441 (was [::ffff:11.9.0.10]:49527); validating it
+[2m2026-09-29T12:18:25.576375Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49441 (was [::ffff:11.9.0.10]:49527); validating it
+[2m2026-09-29T12:18:25.588272Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49441 (was [::ffff:11.9.0.10]:49527); validating it
+[2m2026-09-29T12:18:25.601136Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49441 (was [::ffff:11.9.0.10]:49527); validating it
+[2m2026-09-29T12:18:25.617630Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49441 (was [::ffff:11.9.0.10]:49527); validating it
+[2m2026-09-29T12:18:25.630583Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49441 proven; moving the session there
+[2m2026-09-29T12:18:25.746514Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:53949 (was [2a0e:aa00:f::10]:49441); validating it
+[2m2026-09-29T12:18:25.754074Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:1:1::2]:53949 proven; moving the session there
+[2m2026-09-29T12:18:25.762177Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49441 (was [2a0e:aa00:1:1::2]:53949); validating it
+[2m2026-09-29T12:18:25.772964Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49441 proven; moving the session there
+[2m2026-09-29T12:18:25.938565Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer b4dbbd7db2b2ec3696681698005e4311 stored as /tmp/natlab.rl5y69lh/out/payload.bin (BLAKE3 d39c663c2530594f414030d90aadb4aa72f3b0721d685db4cf0c377330fb0786); confirming with sender
+[2m2026-09-29T12:18:25.954279Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer b4dbbd7db2b2ec3696681698005e4311 finished: /tmp/natlab.rl5y69lh/out/payload.bin in 40.16s, avg 12.5 Mbit/s
+Received /tmp/natlab.rl5y69lh/out/payload.bin in 40.16s (12.5 Mbit/s avg), BLAKE3 d39c663c2530594f414030d90aadb4aa72f3b0721d685db4cf0c377330fb0786
+
+dual stack, both IPv4 NATs symmetric-random    stateful6    restricted6  ok   direct-v6 (from turn)  40.1s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  open6        ok   direct-v6     27.0s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  stateful6    ok   turn          43.5s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=56570 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=26397 [ASSURED] mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=11.2.0.1 sport=53425 dport=40173 [UNREPLIED] src=11.2.0.1 dst=11.1.0.1 sport=40173 dport=32470 mark=0 use=1
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=33270 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=15446 [ASSURED] mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=10.2.0.2 sport=53425 dport=5555 [UNREPLIED] src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=13877 mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=53425 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=53425 [ASSURED] mark=0 use=1
+--- conntrack in RB
+udp      17 119 src=10.2.0.2 dst=11.9.0.10 sport=43908 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=34505 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=53425 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=53425 dport=5555 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=45544 [UNREPLIED] src=11.1.0.1 dst=11.2.0.1 sport=45544 dport=23664 mark=0 use=1
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49402 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49402 dport=5555 [ASSURED] mark=0 use=1
+udp      17 119 src=10.2.0.2 dst=11.9.0.10 sport=45567 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=49715 [ASSURED] mark=0 use=1
+udp      17 117 src=10.2.0.2 dst=11.9.0.10 sport=5555 dport=49318 src=11.9.0.10 dst=11.2.0.1 sport=49318 dport=11934 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=10.1.0.2 sport=5555 dport=53425 [UNREPLIED] src=10.1.0.2 dst=11.2.0.1 sport=53425 dport=42631 mark=0 use=1
+--- sender.log
+29T12:21:36.414243Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:52909 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:21:36.414824Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51380 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:21:36.424847Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:52909 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:21:36.430074Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:52909 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:21:36.434393Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:52909 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:21:36.443303Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51380 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:21:36.449015Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:52909 proven; sending there now
+[2m2026-09-29T12:21:36.458842Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51380 (was [::ffff:127.0.0.1]:52909); validating it
+[2m2026-09-29T12:21:36.462750Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:52909); validating it
+[2m2026-09-29T12:21:36.468719Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [2a0e:aa00:2:1::2]:5555 proven; sending there now
+[2m2026-09-29T12:21:36.469315Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:51380 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:21:36.491262Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:51380 proven; sending there now
+[2m2026-09-29T12:21:36.758671Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 37.52s (13.4 Mbit/s avg), 368.62 KiB retransmitted, 35 loss events, BLAKE3 d35cdccd26b5b3da4893de92cc9369ef38798fa13f12df40e6d87234a1574cdd
+
+--- receiver.log
+1:1::2]:53425); validating it
+[2m2026-09-29T12:21:36.435537Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49318 (was [2a0e:aa00:1:1::2]:53425); validating it
+[2m2026-09-29T12:21:36.452283Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49402 proven; moving the session there
+[2m2026-09-29T12:21:36.453730Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49318 (was [2a0e:aa00:f::10]:49402); validating it
+[2m2026-09-29T12:21:36.460641Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:53425 (was [2a0e:aa00:f::10]:49402); validating it
+[2m2026-09-29T12:21:36.464884Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [::ffff:11.9.0.10]:49318 proven; moving the session there
+[2m2026-09-29T12:21:36.465089Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49402 (was [::ffff:11.9.0.10]:49318); validating it
+[2m2026-09-29T12:21:36.465898Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:53425 (was [::ffff:11.9.0.10]:49318); validating it
+[2m2026-09-29T12:21:36.470596Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:1:1::2]:53425 proven; moving the session there
+[2m2026-09-29T12:21:36.477883Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49402 (was [2a0e:aa00:1:1::2]:53425); validating it
+[2m2026-09-29T12:21:36.488015Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49402 proven; moving the session there
+[2m2026-09-29T12:21:36.751675Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 90f2f44d42ebf35ecefd3042254b8a97 stored as /tmp/natlab.y8vstmf_/out/payload.bin (BLAKE3 d35cdccd26b5b3da4893de92cc9369ef38798fa13f12df40e6d87234a1574cdd); confirming with sender
+[2m2026-09-29T12:21:36.766200Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 90f2f44d42ebf35ecefd3042254b8a97 finished: /tmp/natlab.y8vstmf_/out/payload.bin in 37.63s, avg 13.4 Mbit/s
+Received /tmp/natlab.y8vstmf_/out/payload.bin in 37.63s (13.4 Mbit/s avg), BLAKE3 d35cdccd26b5b3da4893de92cc9369ef38798fa13f12df40e6d87234a1574cdd
+
+dual stack, both IPv4 NATs symmetric-random    restricted6  restricted6  ok   turn          38.6s UNEXPECTED
+cards exchanged by hand after 2s
+--- conntrack in RA
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=41855 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=25604 [ASSURED] mark=0 use=1
+udp      17 117 src=10.1.0.2 dst=11.9.0.10 sport=49939 dport=3480 src=11.9.0.10 dst=11.1.0.1 sport=3480 dport=36990 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=39075 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=39075 [ASSURED] mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=11.2.0.1 sport=39075 dport=47917 [UNREPLIED] src=11.2.0.1 dst=11.1.0.1 sport=47917 dport=7520 mark=0 use=1
+udp      17 27 src=10.1.0.2 dst=10.2.0.2 sport=39075 dport=5555 [UNREPLIED] src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=24238 mark=0 use=1
+--- conntrack in RB
+udp      17 117 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:1:1::2 sport=5555 dport=39075 src=2a0e:aa00:1:1::2 dst=2a0e:aa00:2:1::2 sport=39075 dport=5555 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=10.1.0.2 sport=5555 dport=39075 [UNREPLIED] src=10.1.0.2 dst=11.2.0.1 sport=39075 dport=17599 mark=0 use=1
+udp      17 100 src=10.2.0.2 dst=11.9.0.10 sport=43295 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=41338 [ASSURED] mark=0 use=1
+udp      17 114 src=10.2.0.2 dst=11.9.0.10 sport=34004 dport=3480 src=11.9.0.10 dst=11.2.0.1 sport=3480 dport=54166 [ASSURED] mark=0 use=1
+udp      17 117 src=2a0e:aa00:f::10 dst=2a0e:aa00:2:1::2 sport=49235 dport=5555 src=2a0e:aa00:2:1::2 dst=2a0e:aa00:f::10 sport=5555 dport=49235 [ASSURED] mark=0 use=1
+udp      17 117 src=10.2.0.2 dst=11.9.0.10 sport=5555 dport=49599 src=11.9.0.10 dst=11.2.0.1 sport=49599 dport=35175 [ASSURED] mark=0 use=1
+udp      17 29 src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=47430 [UNREPLIED] src=11.1.0.1 dst=11.2.0.1 sport=47430 dport=42150 mark=0 use=1
+--- sender.log
+r claims address [::ffff:127.0.0.1]:44083 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:22:41.450443Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:44083 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:22:41.451474Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:47347 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:22:41.468495Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:44083 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:22:41.469158Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:47347 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:22:41.477378Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:47347 proven; sending there now
+[2m2026-09-29T12:22:41.491358Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:47347); validating it
+[2m2026-09-29T12:22:41.495269Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:44083 (was [::ffff:127.0.0.1]:47347); validating it
+[2m2026-09-29T12:22:41.501285Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [2a0e:aa00:2:1::2]:5555 (was [::ffff:127.0.0.1]:47347); validating it
+[2m2026-09-29T12:22:41.506664Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [2a0e:aa00:2:1::2]:5555 proven; sending there now
+[2m2026-09-29T12:22:41.510487Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver claims address [::ffff:127.0.0.1]:44083 (was [2a0e:aa00:2:1::2]:5555); validating it
+[2m2026-09-29T12:22:41.518463Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver address [::ffff:127.0.0.1]:44083 proven; sending there now
+100.0%   60.00 MiB         0 bit/s  rtt  38.06 ms  cwnd 123.64 KiB  retx 544.81 KiB  eta -
+[2m2026-09-29T12:22:41.804113Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m receiver reported completion; whole-file hash matches
+
+Done: 60.00 MiB in 37.09s (13.6 Mbit/s avg), 544.81 KiB retransmitted, 38 loss events, BLAKE3 74ff731e69687d6b3e91afe6a0db009f61e4e0b4dc142b502efeb5e49abc9946
+
+--- receiver.log
+75); validating it
+[2m2026-09-29T12:22:41.455652Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer eaa324e86bf4345e215310a553e16ebd: all 62914560 bytes received; verifying
+[2m2026-09-29T12:22:41.456617Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49599 (was [2a0e:aa00:1:1::2]:39075); validating it
+[2m2026-09-29T12:22:41.458039Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:f::10]:49235 (was [2a0e:aa00:1:1::2]:39075); validating it
+[2m2026-09-29T12:22:41.475933Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:f::10]:49235 proven; moving the session there
+[2m2026-09-29T12:22:41.481710Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49599 (was [2a0e:aa00:f::10]:49235); validating it
+[2m2026-09-29T12:22:41.485441Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [2a0e:aa00:1:1::2]:39075 (was [2a0e:aa00:f::10]:49235); validating it
+[2m2026-09-29T12:22:41.496484Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [2a0e:aa00:1:1::2]:39075 proven; moving the session there
+[2m2026-09-29T12:22:41.504325Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49599 (was [2a0e:aa00:1:1::2]:39075); validating it
+[2m2026-09-29T12:22:41.510660Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender claims address [::ffff:11.9.0.10]:49599 (was [2a0e:aa00:1:1::2]:39075); validating it
+[2m2026-09-29T12:22:41.521016Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m sender address [::ffff:11.9.0.10]:49599 proven; moving the session there
+[2m2026-09-29T12:22:41.797187Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer eaa324e86bf4345e215310a553e16ebd stored as /tmp/natlab.9o39d3lf/out/payload.bin (BLAKE3 74ff731e69687d6b3e91afe6a0db009f61e4e0b4dc142b502efeb5e49abc9946); confirming with sender
+[2m2026-09-29T12:22:41.809299Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer eaa324e86bf4345e215310a553e16ebd finished: /tmp/natlab.9o39d3lf/out/payload.bin in 37.19s, avg 13.5 Mbit/s
+Received /tmp/natlab.9o39d3lf/out/payload.bin in 37.19s (13.5 Mbit/s avg), BLAKE3 74ff731e69687d6b3e91afe6a0db009f61e4e0b4dc142b502efeb5e49abc9946
+
+
+8 of 18 as they must be
+
+# exit status: 1

@@ -1,0 +1,277 @@
+# natlab evidence: portmap-anycast, on the binaries from before PCP was asked at its anycast address
+# commit:    binaries built from 1b4f84a1b22dfdd947e1446baf313e18098f71cb; the scenario as committed in 90f477519ee6a4b32ea580f7c968f8cb7636f89f
+# binaries:  6c1b8aa1f2a05bc2 sharp-sender, 5b9302b13b250a7d sharp-receiver
+# date:      2026-09-29T15:08:19Z
+# kernel:    Linux 6.18.44-fc-v37 (a container; IPv6 disabled in its kernel)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# python:    Python 3.11.15
+# command:   SHARP_BIN_DIR=<those binaries> python3 scripts/natlab/natlab.py portmap --anycast
+
+receiver asks by   receiver NAT       sender behind      result
+pcp at 192.0.0.9   port_restricted    open               FAIL the receiver was granted no forward
+Receiver ID: sh-neucbyoqphoepluel7lsrldqibeaquhvcjh4zva4t62pjxf4dqj7wu4u
+Senders use: sh-neucbyoqphoepluel7lsrldqibeaquhvcjh4zva4t62pjxf4dqj7wu4u@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:08:20.849594Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-neucbyoqphoepluel7lsrldqibeaquhvcjh4zva4t62pjxf4dqj7wu4u listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:08:23.858677Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one p
+Network: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinnin
+Your card:   shc1-aebgvo6um5usqihb2b45yr5oqrp5okfmobaeqccq6uje7tgudsp3j5g4xqobgaqbaqk3gcycaaaqabavwmfaeaacaeaqgaiaaaaqajxyp5ua
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-neucbyoqphoepluel7lsrldqibeaquhvcjh4zva4t62pjxf4dqj7wu4u@11.2.0.1:5555,10.2.0.2:5555
+--- miniupnpd
+miniupnpd[4511]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[4511]: system uptime is 596 seconds
+miniupnpd[4511]: mnl_socket bound, port_id=4511
+miniupnpd[4511]: Reloading rules from lease file
+miniupnpd[4511]: could not open lease file: /tmp/natlab.n_1c_x8e/upnp.leases
+miniupnpd[4511]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694499
+miniupnpd[4511]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   port_restricted    full_cone          FAIL the receiver was granted no forward
+Receiver ID: sh-cbwdjlheokkqkhj7gy7zozxo4v6eioxj2cvd5da5p6uwnu6jbeipyox7
+Senders use: sh-cbwdjlheokkqkhj7gy7zozxo4v6eioxj2cvd5da5p6uwnu6jbeipyox7@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:08:47.554138Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-cbwdjlheokkqkhj7gy7zozxo4v6eioxj2cvd5da5p6uwnu6jbeipyox7 listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:08:50.568527Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one p
+Network: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinnin
+Your card:   shc1-aebgvo6uqiigynfm4rzjkbi5h43d7f3g53sxyrb25hikupumdv72szwtzeeraaqbaqk3gcycaaaqabavwmfaeaacaeaqgaiaaaaqbv7sww2a
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-cbwdjlheokkqkhj7gy7zozxo4v6eioxj2cvd5da5p6uwnu6jbeipyox7@11.2.0.1:5555,10.2.0.2:5555
+--- miniupnpd
+miniupnpd[5191]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[5191]: system uptime is 622 seconds
+miniupnpd[5191]: mnl_socket bound, port_id=5191
+miniupnpd[5191]: Reloading rules from lease file
+miniupnpd[5191]: could not open lease file: /tmp/natlab.yq8jb5h5/upnp.leases
+miniupnpd[5191]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694526
+miniupnpd[5191]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   port_restricted    restricted         FAIL the receiver was granted no forward
+Receiver ID: sh-lcr4kymymwzkyhknyxr7dl5bwhyj7ppij75shyq7ikesol6bxi63qq37
+Senders use: sh-lcr4kymymwzkyhknyxr7dl5bwhyj7ppij75shyq7ikesol6bxi63qq37@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:09:14.284354Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-lcr4kymymwzkyhknyxr7dl5bwhyj7ppij75shyq7ikesol6bxi63qq37 listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:09:17.314204Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one p
+Network: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinnin
+Your card:   shc1-aebgvo6utvmkhrlbtbs3fla5jxc6h4npugy7bh555bh7wi7cd5bisjzpyg5d2aqbaqk3gcycaaaqabavwmfaeaacaeaqgaiaaaaqatiw7zya
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-lcr4kymymwzkyhknyxr7dl5bwhyj7ppij75shyq7ikesol6bxi63qq37@11.2.0.1:5555,10.2.0.2:5555
+--- miniupnpd
+miniupnpd[5799]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[5799]: system uptime is 649 seconds
+miniupnpd[5799]: mnl_socket bound, port_id=5799
+miniupnpd[5799]: Reloading rules from lease file
+miniupnpd[5799]: could not open lease file: /tmp/natlab.4kfbu3qn/upnp.leases
+miniupnpd[5799]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694553
+miniupnpd[5799]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   port_restricted    port_restricted    FAIL the receiver was granted no forward
+Receiver ID: sh-vylwzdjianllfdpbu3w3lcs3r4rflrkuuwqnqmexuqti22km4egs75xa
+Senders use: sh-vylwzdjianllfdpbu3w3lcs3r4rflrkuuwqnqmexuqti22km4egs75xa@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:09:41.026039Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-vylwzdjianllfdpbu3w3lcs3r4rflrkuuwqnqmexuqti22km4egs75xa listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:09:44.037504Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one p
+Network: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinnin
+Your card:   shc1-aebgvo6uxcxbo3enfabvnmun4gto3nmklohsevofkss2bwbqs6scndljjtqq2aqbaqk3gcycaaaqabavwmfaeaacaeaqgaiaaaaqbofepwja
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-vylwzdjianllfdpbu3w3lcs3r4rflrkuuwqnqmexuqti22km4egs75xa@11.2.0.1:5555,10.2.0.2:5555
+--- miniupnpd
+miniupnpd[6182]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[6182]: system uptime is 676 seconds
+miniupnpd[6182]: mnl_socket bound, port_id=6182
+miniupnpd[6182]: Reloading rules from lease file
+miniupnpd[6182]: could not open lease file: /tmp/natlab.7m9ev_8r/upnp.leases
+miniupnpd[6182]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694580
+miniupnpd[6182]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   port_restricted    symmetric_seq      FAIL the receiver was granted no forward
+Receiver ID: sh-qxozawooommdnoagp5l7urd6saavbd6b5cf5dmsluwsbrgzbw4uaf7aj
+Senders use: sh-qxozawooommdnoagp5l7urd6saavbd6b5cf5dmsluwsbrgzbw4uaf7aj@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:10:07.800531Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-qxozawooommdnoagp5l7urd6saavbd6b5cf5dmsluwsbrgzbw4uaf7aj listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:10:10.811240Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one p
+Network: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinnin
+Your card:   shc1-aebgvo6u2kc53eczzzzrqnvyaz7vp6sep2iacuepyhuixunsjos2ige3eg3sqaqbaqk3gcycaaaqabavwmfaeaacaeaqgaiaaaaqad5j37bq
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-qxozawooommdnoagp5l7urd6saavbd6b5cf5dmsluwsbrgzbw4uaf7aj@11.2.0.1:5555,10.2.0.2:5555
+--- miniupnpd
+miniupnpd[6346]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[6346]: system uptime is 703 seconds
+miniupnpd[6346]: mnl_socket bound, port_id=6346
+miniupnpd[6346]: Reloading rules from lease file
+miniupnpd[6346]: could not open lease file: /tmp/natlab.5keclqfp/upnp.leases
+miniupnpd[6346]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694606
+miniupnpd[6346]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   port_restricted    symmetric_random   FAIL the receiver was granted no forward
+Receiver ID: sh-xlhocczccnbiwbo23ca475z6fgvrssk4j7jfbvctse5brv27luugga6f
+Senders use: sh-xlhocczccnbiwbo23ca475z6fgvrssk4j7jfbvctse5brv27luugga6f@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:10:34.489180Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-xlhocczccnbiwbo23ca475z6fgvrssk4j7jfbvctse5brv27luugga6f listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:10:37.501410Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one p
+Network: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinnin
+Your card:   shc1-aebgvo6u5w5m5yileijufcyf3lmidt7xhyu2wgkjlrh5eugukoituggxl5osqaqbaqk3gcycaaaqabavwmfaeaacaeaqgaiaaaaqblbbxeea
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-xlhocczccnbiwbo23ca475z6fgvrssk4j7jfbvctse5brv27luugga6f@11.2.0.1:5555,10.2.0.2:5555
+--- miniupnpd
+miniupnpd[6731]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[6731]: system uptime is 729 seconds
+miniupnpd[6731]: mnl_socket bound, port_id=6731
+miniupnpd[6731]: Reloading rules from lease file
+miniupnpd[6731]: could not open lease file: /tmp/natlab.3wq48q7a/upnp.leases
+miniupnpd[6731]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694633
+miniupnpd[6731]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   symmetric_random   open               FAIL the receiver was granted no forward
+Receiver ID: sh-knm3a2k7n6mgczh47esn4c5tjlzoueoa53yut4ta3xaerde3pjok7n2c
+Senders use: sh-knm3a2k7n6mgczh47esn4c5tjlzoueoa53yut4ta3xaerde3pjok7n2c@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:11:01.222211Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-knm3a2k7n6mgczh47esn4c5tjlzoueoa53yut4ta3xaerde3pjok7n2c listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:11:03.232264Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: behind a symmetric NAT (seen at 11.2.0.1:60558 right now, but the port changes per destination): a sender behind 
+Network: behind a symmetric NAT (seen at 11.2.0.1:60558 right now, but the port changes per destination): a sender behind a simple NAT can still find it by trying very many ports; against another symm
+Your card:   shc1-aebgvo6va5jvtmdjl5xzqyle7t4sjxqlwnfpf2qrydxpcspsmdo4asemtn5fyaqbatwi4cycaaaqabavwmfaeaacaebqgayaaaaabnt6oz7a
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-knm3a2k7n6mgczh47esn4c5tjlzoueoa53yut4ta3xaerde3pjok7n2c@10.2.0.2:5555,11.2.0.1:60558
+--- miniupnpd
+miniupnpd[6893]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[6893]: system uptime is 756 seconds
+miniupnpd[6893]: mnl_socket bound, port_id=6893
+miniupnpd[6893]: Reloading rules from lease file
+miniupnpd[6893]: could not open lease file: /tmp/natlab.8u14k9kk/upnp.leases
+miniupnpd[6893]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694660
+miniupnpd[6893]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   symmetric_random   full_cone          FAIL the receiver was granted no forward
+Receiver ID: sh-p53jw4qupferqhjmbrzgdpw5soiaaz5pyvlxb6owwjxy6p6iwzan6ocx
+Senders use: sh-p53jw4qupferqhjmbrzgdpw5soiaaz5pyvlxb6owwjxy6p6iwzan6ocx@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:11:27.917785Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-p53jw4qupferqhjmbrzgdpw5soiaaz5pyvlxb6owwjxy6p6iwzan6ocx listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:11:29.925314Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: behind a symmetric NAT (seen at 11.2.0.1:56500 right now, but the port changes per destination): a sender behind 
+Network: behind a symmetric NAT (seen at 11.2.0.1:56500 right now, but the port changes per destination): a sender behind a simple NAT can still find it by trying very many ports; against another symm
+Your card:   shc1-aebgvo6vef7xng3scr4usga5fqgheyn63wjzaadhv7cvo4hz22zg7dz7zc3eaaqbatolicycaaaqabavwmfaeaacaebqgayaaaaaagjt24ka
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-p53jw4qupferqhjmbrzgdpw5soiaaz5pyvlxb6owwjxy6p6iwzan6ocx@10.2.0.2:5555,11.2.0.1:56500
+--- miniupnpd
+miniupnpd[7056]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[7056]: system uptime is 783 seconds
+miniupnpd[7056]: mnl_socket bound, port_id=7056
+miniupnpd[7056]: Reloading rules from lease file
+miniupnpd[7056]: could not open lease file: /tmp/natlab.5c_jhfx1/upnp.leases
+miniupnpd[7056]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694686
+miniupnpd[7056]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   symmetric_random   restricted         FAIL the receiver was granted no forward
+Receiver ID: sh-ewfrge7jxpprnlr3yhfk7psphvoyope2liokk2es2oakfyl5eud7ckyt
+Senders use: sh-ewfrge7jxpprnlr3yhfk7psphvoyope2liokk2es2oakfyl5eud7ckyt@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:11:54.633954Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-ewfrge7jxpprnlr3yhfk7psphvoyope2liokk2es2oakfyl5eud7ckyt listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:11:56.641638Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: behind a symmetric NAT (seen at 11.2.0.1:60243 right now, but the port changes per destination): a sender behind 
+Network: behind a symmetric NAT (seen at 11.2.0.1:60243 right now, but the port changes per destination): a sender behind a simple NAT can still find it by trying very many ports; against another symm
+Your card:   shc1-aebgvo6vhqsyweyt5g556fvohpa4vl56j46v3bz4tjnbzjlisljybixbpusqoaqbatvvgcycaaaqabavwmfaeaacaebqgayaaaaaa74b45iq
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-ewfrge7jxpprnlr3yhfk7psphvoyope2liokk2es2oakfyl5eud7ckyt@10.2.0.2:5555,11.2.0.1:60243
+--- miniupnpd
+miniupnpd[7145]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[7145]: system uptime is 810 seconds
+miniupnpd[7145]: mnl_socket bound, port_id=7145
+miniupnpd[7145]: Reloading rules from lease file
+miniupnpd[7145]: could not open lease file: /tmp/natlab.319atme5/upnp.leases
+miniupnpd[7145]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694713
+miniupnpd[7145]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   symmetric_random   port_restricted    FAIL the receiver was granted no forward
+Receiver ID: sh-7wvw2rcoezn4ce7yzj7z6b5f5ayhtpzoiwegi3zuw6wdtchmjfr2ezvx
+Senders use: sh-7wvw2rcoezn4ce7yzj7z6b5f5ayhtpzoiwegi3zuw6wdtchmjfr2ezvx@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:12:21.324516Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-7wvw2rcoezn4ce7yzj7z6b5f5ayhtpzoiwegi3zuw6wdtchmjfr2ezvx listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:12:23.332247Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: behind a symmetric NAT (seen at 11.2.0.1:35676 right now, but the port changes per destination): a sender behind 
+Network: behind a symmetric NAT (seen at 11.2.0.1:35676 right now, but the port changes per destination): a sender behind a simple NAT can still find it by trying very many ports; against another symm
+Your card:   shc1-aebgvo6vk762w3kejytfxqit7dfh7hyhuxuda6n7fzcyqzdpgs32yomi5rewgaqbasfvycycaaaqabavwmfaeaacaebqgayaaaaaaeiouyoa
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-7wvw2rcoezn4ce7yzj7z6b5f5ayhtpzoiwegi3zuw6wdtchmjfr2ezvx@10.2.0.2:5555,11.2.0.1:35676
+--- miniupnpd
+miniupnpd[7453]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[7453]: system uptime is 836 seconds
+miniupnpd[7453]: mnl_socket bound, port_id=7453
+miniupnpd[7453]: Reloading rules from lease file
+miniupnpd[7453]: could not open lease file: /tmp/natlab.lckzyqxf/upnp.leases
+miniupnpd[7453]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694740
+miniupnpd[7453]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   symmetric_random   symmetric_seq      FAIL the receiver was granted no forward
+Receiver ID: sh-k5ofs3hftil4epd2nez4ha4mzr7jgiosnfalzxeoa6jdakcum5w66ks6
+Senders use: sh-k5ofs3hftil4epd2nez4ha4mzr7jgiosnfalzxeoa6jdakcum5w66ks6@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:12:48.084938Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-k5ofs3hftil4epd2nez4ha4mzr7jgiosnfalzxeoa6jdakcum5w66ks6 listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:12:50.095593Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: behind a symmetric NAT (seen at 11.2.0.1:29870 right now, but the port changes per destination): a sender behind 
+Network: behind a symmetric NAT (seen at 11.2.0.1:29870 right now, but the port changes per destination): a sender behind a simple NAT can still find it by trying very many ports; against another symm
+Your card:   shc1-aebgvo6vojlvywlm4wnbpqr4pjuthq4drtgh5ezb2juubpg4rydzembikrtw2aqbar2k4cycaaaqabavwmfaeaacaebqgayaaaaaa4m5vbqq
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-k5ofs3hftil4epd2nez4ha4mzr7jgiosnfalzxeoa6jdakcum5w66ks6@10.2.0.2:5555,11.2.0.1:29870
+--- miniupnpd
+miniupnpd[7615]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[7615]: system uptime is 863 seconds
+miniupnpd[7615]: mnl_socket bound, port_id=7615
+miniupnpd[7615]: Reloading rules from lease file
+miniupnpd[7615]: could not open lease file: /tmp/natlab.aaao4e79/upnp.leases
+miniupnpd[7615]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694767
+miniupnpd[7615]: Listening for NAT-PMP/PCP traffic on port 5351
+
+pcp at 192.0.0.9   symmetric_random   symmetric_random   FAIL the receiver was granted no forward
+Receiver ID: sh-psl7i7mcdypmebactew3xate6tlsnsfwxyoqhg6jaw6punavijkhztvp
+Senders use: sh-psl7i7mcdypmebactew3xate6tlsnsfwxyoqhg6jaw6punavijkhztvp@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T15:13:14.848672Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-psl7i7mcdypmebactew3xate6tlsnsfwxyoqhg6jaw6punavijkhztvp listening on 0.0.0.0:5555 (up to 
+Listening:   0.0.0.0:5555
+[2m2026-09-29T15:13:16.855722Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: behind a symmetric NAT (seen at 11.2.0.1:62032 right now, but the port changes per destination): a sender behind 
+Network: behind a symmetric NAT (seen at 11.2.0.1:62032 right now, but the port changes per destination): a sender behind a simple NAT can still find it by trying very many ports; against another symm
+Your card:   shc1-aebgvo6vrr6jp5d5qipb5qqeakms3o4cmt2nojwiw27b2a43zec3z6rucvbfiaqbatzfacycaaaqabavwmfaeaacaebqgayaaaaaa2bqx74q
+             (give it to the sender: sharp-sender <file> <card>; paste the card or the addresses it prints here, and press Enter)
+Senders use: sh-psl7i7mcdypmebactew3xate6tlsnsfwxyoqhg6jaw6punavijkhztvp@10.2.0.2:5555,11.2.0.1:62032
+--- miniupnpd
+miniupnpd[7779]: it is advised to use network interface name instead of 192.0.0.9/0
+miniupnpd[7779]: system uptime is 890 seconds
+miniupnpd[7779]: mnl_socket bound, port_id=7779
+miniupnpd[7779]: Reloading rules from lease file
+miniupnpd[7779]: could not open lease file: /tmp/natlab.rauhu4ly/upnp.leases
+miniupnpd[7779]: version 2.3.4 starting NAT-PMP/PCP ext if cw BOOTID=1790694793
+miniupnpd[7779]: Listening for NAT-PMP/PCP traffic on port 5351
+
+
+# exit status: 1

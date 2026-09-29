@@ -1,0 +1,21 @@
+# natlab evidence: oracle
+# commit:    47364fb2f362bc8bb234ce996c110b8ea20e1ed9
+# binaries:  5e148638cfc6000a sharp-sender, 952411569419b74c sharp-receiver
+# date:      2026-09-29T20:06:02Z
+# kernel:    Linux 6.18.44-fc-v37 (a container; IPv6 disabled in its kernel)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.11.15
+# env:       
+# command:   python3 scripts/natlab/natlab.py oracle
+
+kind               measured mapping                             measured filtering             verdict
+open               none                                         none                           ok  ['4000', '4000', '4000', '4000']
+full_cone          endpoint-independent                         endpoint-independent           ok  ['4000', '4000', '4000', '4000']
+restricted         endpoint-independent                         address-dependent              ok  ['4000', '4000', '4000', '4000']
+port_restricted    endpoint-independent                         address-and-port-dependent     ok  ['4000', '4000', '4000', '4000']
+symmetric_seq      address-and-port-dependent, sequential       address-and-port-dependent     ok  ['40000', '40001', '40002', '40003']
+symmetric_random   address-and-port-dependent, random           address-and-port-dependent     ok  ['26264', '52447', '1275', '32567']
+
+# exit status: 0

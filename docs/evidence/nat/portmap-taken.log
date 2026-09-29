@@ -1,0 +1,31 @@
+# natlab evidence: portmap-taken
+# commit:    8e1fc0c875f106844679c468fd746ef9ba44c146
+# binaries:  5e148638cfc6000a sharp-sender, 952411569419b74c sharp-receiver
+# date:      2026-09-29T21:04:32Z
+# kernel:    Linux 6.18.44-fc-v37 (a container; IPv6 disabled in its kernel)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.11.15
+# env:       
+# command:   python3 scripts/natlab/natlab.py portmap --taken
+
+receiver asks by   receiver NAT       sender behind      result
+pcp                port_restricted    port_restricted    ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (pcp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "PCP MAP: added mapping UDP 5556->10.2.0.2:5555"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+pcp                port_restricted    symmetric_random   ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (pcp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "PCP MAP: added mapping UDP 5556->10.2.0.2:5555"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+pcp                symmetric_random   port_restricted    ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (pcp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "PCP MAP: added mapping UDP 5556->10.2.0.2:5555"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+pcp                symmetric_random   symmetric_random   ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (pcp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "PCP MAP: added mapping UDP 5556->10.2.0.2:5555"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+natpmp             port_restricted    port_restricted    ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (natpmp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "NAT-PMP port mapping request : 5555->10.2.0.2:5555 udp", "port 5555 protocol udp already in use"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+natpmp             port_restricted    symmetric_random   ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (natpmp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "NAT-PMP port mapping request : 5555->10.2.0.2:5555 udp", "port 5555 protocol udp already in use"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+natpmp             symmetric_random   port_restricted    ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (natpmp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "NAT-PMP port mapping request : 5555->10.2.0.2:5555 udp", "port 5555 protocol udp already in use"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+natpmp             symmetric_random   symmetric_random   ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (natpmp: 5555 -> 10.2.0.2:6000, result 0, port 5555); the daemon: "NAT-PMP port mapping request : 5555->10.2.0.2:5555 udp", "port 5555 protocol udp already in use"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+upnp               port_restricted    port_restricted    ok   via 11.2.0.1:5556 in 0.2s; 5555 taken first (upnp (IGDv2): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:2#AddAnyPortMapping"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+upnp               port_restricted    symmetric_random   ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (upnp (IGDv2): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:2#AddAnyPortMapping"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+upnp               symmetric_random   port_restricted    ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (upnp (IGDv2): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:2#AddAnyPortMapping"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+upnp               symmetric_random   symmetric_random   ok   via 11.2.0.1:5556 in 0.1s; 5555 taken first (upnp (IGDv2): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:2#AddAnyPortMapping"; the router: "th dport 5556 dnat ip to 10.2.0.2:5555"
+upnp-v1            port_restricted    port_restricted    ok   via 11.2.0.1:50149 in 0.1s; 5555 taken first (upnp (IGDv1): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:1#AddPortMapping"; the router: "th dport 50149 dnat ip to 10.2.0.2:5555"
+upnp-v1            port_restricted    symmetric_random   ok   via 11.2.0.1:57367 in 0.1s; 5555 taken first (upnp (IGDv1): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:1#AddPortMapping"; the router: "th dport 57367 dnat ip to 10.2.0.2:5555"
+upnp-v1            symmetric_random   port_restricted    ok   via 11.2.0.1:35443 in 0.1s; 5555 taken first (upnp (IGDv1): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:1#AddPortMapping"; the router: "th dport 35443 dnat ip to 10.2.0.2:5555"
+upnp-v1            symmetric_random   symmetric_random   ok   via 11.2.0.1:51890 in 0.1s; 5555 taken first (upnp (IGDv1): 5555 -> 10.2.0.99:5555); the daemon: "AddPortMapping: ext port 5555 to 10.2.0.2:5555 protocol UDP", "port 5555 UDP (rhost '') already redirected to 10.2.0.99:5555", "WANIPConnection:1#AddPortMapping"; the router: "th dport 51890 dnat ip to 10.2.0.2:5555"
+
+# exit status: 0

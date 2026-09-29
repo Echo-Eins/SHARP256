@@ -1,0 +1,27 @@
+# natlab evidence: portmap-anycast
+# commit:    8e1fc0c875f106844679c468fd746ef9ba44c146
+# binaries:  5e148638cfc6000a sharp-sender, 952411569419b74c sharp-receiver
+# date:      2026-09-29T21:03:37Z
+# kernel:    Linux 6.18.44-fc-v37 (a container; IPv6 disabled in its kernel)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.11.15
+# env:       
+# command:   python3 scripts/natlab/natlab.py portmap --anycast
+
+receiver asks by   receiver NAT       sender behind      result
+pcp at 192.0.0.9   port_restricted    open               ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   port_restricted    full_cone          ok   via 11.2.0.1:5555 in 0.2s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   port_restricted    restricted         ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   port_restricted    port_restricted    ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   port_restricted    symmetric_seq      ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   port_restricted    symmetric_random   ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   symmetric_random   open               ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   symmetric_random   full_cone          ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   symmetric_random   restricted         ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   symmetric_random   port_restricted    ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   symmetric_random   symmetric_seq      ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+pcp at 192.0.0.9   symmetric_random   symmetric_random   ok   via 11.2.0.1:5555 in 0.1s; the daemon: "PCP MAP: added mapping UDP 5555->10.2.0.2:5555"; the router: "th dport 5555 dnat ip to 10.2.0.2:5555"
+
+# exit status: 0

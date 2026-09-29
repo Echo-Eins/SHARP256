@@ -1,0 +1,35 @@
+# natlab evidence: ipv6-isolated-turn
+# commit:    47364fb2f362bc8bb234ce996c110b8ea20e1ed9
+# binaries:  5e148638cfc6000a sharp-sender, 952411569419b74c sharp-receiver
+# date:      2026-09-29T21:07:01Z
+# kernel:    Linux 7.0.0-34-generic (a QEMU virtual machine, emulated CPU; IPv6 on)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.12.3
+# env:       NATLAB_SIZE_MB=20
+# command:   python3 /lab/natlab.py v6 --via turn --isolate --timeout 60 -v
+
+scenario                                       A firewall   B firewall   result
+IPv6 only                                      open6        open6        ok   turn           8.8s as expected
+IPv6 only                                      open6        stateful6    ok   turn          11.9s as expected
+IPv6 only                                      open6        restricted6  ok   turn           9.2s as expected
+IPv6 only                                      stateful6    open6        ok   turn           9.6s as expected
+IPv6 only                                      stateful6    stateful6    ok   turn          13.7s as expected
+IPv6 only                                      stateful6    restricted6  ok   turn          10.3s as expected
+IPv6 only                                      restricted6  open6        ok   turn           9.0s as expected
+IPv6 only                                      restricted6  stateful6    ok   turn          15.0s as expected
+IPv6 only                                      restricted6  restricted6  ok   turn           9.4s as expected
+dual stack, both IPv4 NATs symmetric-random    open6        open6        ok   turn          19.2s as expected
+dual stack, both IPv4 NATs symmetric-random    open6        stateful6    ok   turn          13.5s as expected
+dual stack, both IPv4 NATs symmetric-random    open6        restricted6  ok   turn          15.9s as expected
+dual stack, both IPv4 NATs symmetric-random    stateful6    open6        ok   turn          11.9s as expected
+dual stack, both IPv4 NATs symmetric-random    stateful6    stateful6    ok   turn          16.4s as expected
+dual stack, both IPv4 NATs symmetric-random    stateful6    restricted6  ok   turn          13.5s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  open6        ok   turn          27.8s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  stateful6    ok   turn          20.8s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  restricted6  ok   turn          14.9s as expected
+
+18 of 18 as they must be
+
+# exit status: 0

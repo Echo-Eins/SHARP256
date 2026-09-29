@@ -1,0 +1,35 @@
+# natlab evidence: ipv6-direct-only
+# commit:    47364fb2f362bc8bb234ce996c110b8ea20e1ed9
+# binaries:  5e148638cfc6000a sharp-sender, 952411569419b74c sharp-receiver
+# date:      2026-09-29T20:06:39Z
+# kernel:    Linux 7.0.0-34-generic (a QEMU virtual machine, emulated CPU; IPv6 on)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.12.3
+# env:       
+# command:   python3 /lab/natlab.py v6 --direct-only -v
+
+scenario                                       A firewall   B firewall   result
+IPv6 only                                      open6        open6        ok   direct-v6      1.2s as expected
+IPv6 only                                      open6        stateful6    ok   direct-v6      1.0s as expected
+IPv6 only                                      open6        restricted6  ok   direct-v6      1.2s as expected
+IPv6 only                                      stateful6    open6        ok   direct-v6      0.8s as expected
+IPv6 only                                      stateful6    stateful6    ok   direct-v6      2.6s as expected
+IPv6 only                                      stateful6    restricted6  ok   direct-v6      2.4s as expected
+IPv6 only                                      restricted6  open6        ok   direct-v6      1.2s as expected
+IPv6 only                                      restricted6  stateful6    ok   direct-v6      2.2s as expected
+IPv6 only                                      restricted6  restricted6  ok   direct-v6      2.2s as expected
+dual stack, both IPv4 NATs symmetric-random    open6        open6        ok   direct-v6      1.0s as expected
+dual stack, both IPv4 NATs symmetric-random    open6        stateful6    ok   direct-v6      1.0s as expected
+dual stack, both IPv4 NATs symmetric-random    open6        restricted6  ok   direct-v6      1.0s as expected
+dual stack, both IPv4 NATs symmetric-random    stateful6    open6        ok   direct-v6      1.4s as expected
+dual stack, both IPv4 NATs symmetric-random    stateful6    stateful6    ok   direct-v6      1.0s as expected
+dual stack, both IPv4 NATs symmetric-random    stateful6    restricted6  ok   direct-v6      1.0s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  open6        ok   direct-v6      1.0s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  stateful6    ok   direct-v6      1.2s as expected
+dual stack, both IPv4 NATs symmetric-random    restricted6  restricted6  ok   direct-v6      0.8s as expected
+
+18 of 18 as they must be
+
+# exit status: 0

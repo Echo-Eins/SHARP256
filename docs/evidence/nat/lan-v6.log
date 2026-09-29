@@ -1,0 +1,17 @@
+# natlab evidence: lan-v6
+# commit:    47364fb2f362bc8bb234ce996c110b8ea20e1ed9
+# binaries:  5e148638cfc6000a sharp-sender, 952411569419b74c sharp-receiver
+# date:      2026-09-29T21:21:12Z
+# kernel:    Linux 7.0.0-34-generic (a QEMU virtual machine, emulated CPU; IPv6 on)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# miniupnpd: miniupnpd 2.3.4 Jan 10 2024
+# coturn:    4.6.1
+# python:    Python 3.12.3
+# env:       
+# command:   python3 /lab/natlab.py lan --v6
+
+announced and asked for: ok - via [2a0e:aa00:9::2]:5555 in 0.9s, as wanted
+announced but not asked for: ok - found nobody in 0.3s, as wanted
+asked for but not announced: ok - found nobody in 3.4s, as wanted
+
+# exit status: 0

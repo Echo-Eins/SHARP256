@@ -3,7 +3,7 @@
 docs/NAT.md shows.
 
     scripts/natlab/grid.py docs/evidence/nat/matrix-relay-carries.log
-    scripts/natlab/grid.py docs/evidence/nat/ipv6-firewalls-direct-only.log
+    scripts/natlab/grid.py docs/evidence/nat/ipv6-direct-only.log
 
 Rows are the sender's NAT (or firewall), columns the receiver's. A cell is
 D (a direct path), D↑ (began through a relay or a TURN server and moved to

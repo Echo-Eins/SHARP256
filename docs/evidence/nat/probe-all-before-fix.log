@@ -1,0 +1,52 @@
+# natlab evidence: probe-all-before-fix
+# commit:    8e1fc0c875f106844679c468fd746ef9ba44c146 (the laboratory); binaries of 0af7882, before the filtering fix
+# binaries:  0bba07be54cf9d6c sharp-sender, fcde90a4eefffcae sharp-receiver
+# date:      2026-09-29T21:27:55Z
+# kernel:    Linux 6.18.44-fc-v37 (a container; IPv6 disabled in its kernel)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# python:    Python 3.11.15
+# env:       SHARP_BIN_DIR=<a build of 0af7882>
+# command:   python3 scripts/natlab/natlab.py probe --all --wait 12
+
+host A behind      host B behind      punch test                                   what each host said of its network
+open               open               a packet got through both ways   as expected both true
+open               full_cone          a packet got through both ways   as expected both true
+open               restricted         a packet got through both ways   as expected host B WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.2.0.1:43522; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+open               port_restricted    a packet got through both ways   as expected both true
+open               symmetric_seq      a packet got through both ways   as expected both true
+open               symmetric_random   a packet got through both ways   as expected both true
+full_cone          open               a packet got through both ways   as expected both true
+full_cone          full_cone          a packet got through both ways   as expected both true
+full_cone          restricted         a packet got through both ways   as expected host B WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.2.0.1:53410; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+full_cone          port_restricted    a packet got through both ways   as expected both true
+full_cone          symmetric_seq      a packet got through both ways   as expected both true
+full_cone          symmetric_random   a packet got through both ways   as expected both true
+restricted         open               a packet got through both ways   as expected host A WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.1.0.1:40926; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+restricted         full_cone          a packet got through both ways   as expected host A WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.1.0.1:54453; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+restricted         restricted         a packet got through both ways   as expected host A WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.1.0.1:47232; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"; host B WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.2.0.1:40581; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+restricted         port_restricted    a packet got through both ways   as expected host A WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.1.0.1:55246; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+restricted         symmetric_seq      a packet got through both ways   as expected host A WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.1.0.1:44102; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+restricted         symmetric_random   a packet got through both ways   as expected host A WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.1.0.1:40037; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+port_restricted    open               a packet got through both ways   as expected both true
+port_restricted    full_cone          a packet got through both ways   as expected both true
+port_restricted    restricted         a packet got through both ways   as expected host B WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.2.0.1:37798; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+port_restricted    port_restricted    a packet got through both ways   as expected both true
+port_restricted    symmetric_seq      a packet got through both ways   as expected both true
+port_restricted    symmetric_random   a packet got through both ways   as expected both true
+symmetric_seq      open               a packet got through both ways   as expected both true
+symmetric_seq      full_cone          a packet got through both ways   as expected both true
+symmetric_seq      restricted         a packet got through both ways   as expected host B WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.2.0.1:40456; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+symmetric_seq      port_restricted    a packet got through both ways   as expected both true
+symmetric_seq      symmetric_seq      nothing got through              as expected both true
+symmetric_seq      symmetric_random   nothing got through              as expected both true
+symmetric_random   open               a packet got through both ways   as expected both true
+symmetric_random   full_cone          a packet got through both ways   as expected both true
+symmetric_random   restricted         a packet got through both ways   as expected host B WRONG: IPv4, no word of ['lets in packets from hosts it was sent to']: "your address as the internet sees it: 11.2.0.1:52602; one port for every destination; lets in packets from anyone; no hairpinning (two hosts behind this NAT cannot use each other's outside address); reachable once the address is known"
+symmetric_random   port_restricted    a packet got through both ways   as expected both true
+symmetric_random   symmetric_seq      nothing got through              as expected both true
+symmetric_random   symmetric_random   nothing got through              as expected both true
+
+36 of 36 as the theory says they must
+60 of 72 reports of a host's own network true to the laboratory
+
+# exit status: 1

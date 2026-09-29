@@ -1,0 +1,103 @@
+# natlab evidence: fallback, with the binaries from before the fix
+# commit:    none — binaries built at 08:27 UTC on 2026-09-29 from 398f2ae plus that morning's uncommitted
+#            work (typed addresses), before the review fixes of c3eacfc; kept to show review item 2
+# binaries:  19b95cad29c24ab9 sharp-sender, fe4a78261f82471e sharp-receiver
+# date:      2026-09-29T09:29:45Z to 09:35:07Z
+# kernel:    Linux 6.18.44-fc-v37 (a container; IPv6 disabled in its kernel)
+# command:   SHARP_BIN_DIR=<those binaries> python3 scripts/natlab/natlab.py fallback  (the scenario as committed in c3eacfc)
+
+sender behind      receiver behind    via    result
+port_restricted    port_restricted    relay  ok   delivered in 43.2s; direct after 4.6s, then cut; carried by the relay again 22.1s later (after the cut: relay)
+symmetric_random   port_restricted    relay  FAIL NOT delivered in 150.1s; direct after 4.9s, then cut; never carried again (after the cut: nothing)
+--- what the sender said of its path
+[2m2026-09-29T09:30:37.987001Z[0m [32m INFO[0m [2msharp256::nat::punch[0m[2m:[0m punching towards 11.2.0.1:5555: very many sockets of ours at the peer's one address (our NAT draws ports at random)
+[2m2026-09-29T09:30:38.452539Z[0m [32m INFO[0m [2msharp256::nat::birthday[0m[2m:[0m birthday: 11.2.0.1:5555 reached one of our 256 sockets, which is at 0.0.0.0:38378
+[2m2026-09-29T09:30:38.453246Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m the receiver's NAT let 11.2.0.1:5555 through to 0.0.0.0:38378; carrying on from there
+[2m2026-09-29T09:30:38.453277Z[0m [32m INFO[0m [2msharp256::transport::sender[0m[2m:[0m the receiver's NAT let a datagram through from 11.2.0.1:5555; answering it there
+Connected to 11.2.0.1:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+[2m2026-09-29T09:30:58.578268Z[0m [33m WARN[0m [2msharp256::transport::sender[0m[2m:[0m no packets from 11.2.0.1:5555 for 20.000088924s; pausing and probing
+receiver published sh-oqmextjooxadwlhkjktddnl7mtvc5ah7pfvcuy4ep34di5i47zpppd23@11.2.0.1:5555,10.2.0.2:5555
+--- conntrack in RA
+ipv4     2 udp      17 116 src=10.1.0.2 dst=11.2.0.1 sport=38378 dport=5555 src=11.2.0.1 dst=11.1.0.1 sport=5555 dport=32022 [ASSURED] mark=0 zone=0 use=2
+ipv4     2 udp      17 26 src=10.1.0.2 dst=10.2.0.2 sport=38378 dport=5555 [UNREPLIED] src=10.2.0.2 dst=11.1.0.1 sport=5555 dport=47141 mark=0 zone=0 use=2
+ipv4     2 udp      17 18 src=10.1.0.2 dst=11.9.0.10 sport=38378 dport=55259 [UNREPLIED] src=11.9.0.10 dst=11.1.0.1 sport=55259 dport=48908 mark=0 zone=0 use=2
+--- conntrack in RB
+ipv4     2 udp      17 118 src=10.2.0.2 dst=11.9.0.10 sport=5555 dport=3478 src=11.9.0.10 dst=11.2.0.1 sport=3478 dport=5555 [ASSURED] mark=0 zone=0 use=2
+ipv4     2 udp      17 118 src=10.2.0.2 dst=11.9.0.10 sport=5555 dport=5560 src=11.9.0.10 dst=11.2.0.1 sport=5560 dport=5555 [ASSURED] mark=0 zone=0 use=2
+--- sender.log
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+  0.6%  252.23 KiB         0 bit/s  rtt   1.53 ms  cwnd  1.00 KiB  retx 20.18 KiB  eta -  [stalled]
+
+--- receiver.log
+SHARP-256 v0.5.0 (protocol v3) on linux x86_64 with 4 CPU threads
+Output:      /tmp/natlab.ew6p3cpj/out
+Receiver ID: sh-oqmextjooxadwlhkjktddnl7mtvc5ah7pfvcuy4ep34di5i47zpppd23
+Senders use: sh-oqmextjooxadwlhkjktddnl7mtvc5ah7pfvcuy4ep34di5i47zpppd23@<this host>:5555
+Accepting:   any sender that knows the receiver ID (restrict with --allow)
+Press Ctrl-C to stop.
+
+[2m2026-09-29T09:30:34.774142Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m receiver sh-oqmextjooxadwlhkjktddnl7mtvc5ah7pfvcuy4ep34di5i47zpppd23 listening on 0.0.0.0:5555 (up to 64 datagrams per send), output /tmp/natlab.ew6p3cpj/out
+Listening:   0.0.0.0:5555
+[2m2026-09-29T09:30:34.776410Z[0m [32m INFO[0m [2msharp256::relay::client[0m[2m:[0m relay 11.9.0.10:5560 reached; it sees us at 11.2.0.1:5555
+[2m2026-09-29T09:30:34.776431Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m registered with the relay at 11.9.0.10:5560 (it sees us at 11.2.0.1:5555); senders reach us through it with --relay 11.9.0.10:5560
+Relay:       registered with 11.9.0.10:5560; senders can add --relay 11.9.0.10:5560
+[2m2026-09-29T09:30:37.785198Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinning; reachable by punching (both sides send at the same time))
+Network: seen from outside at 11.2.0.1:5555, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, lets in only what we sent to exactly, no hairpinning; reachable by punching (both sides send at the same time))
+Your card:   shc1-aebgvo4fhv2bqs6nfz24aozm5jfkmmnvp5soulua754wuktdqr7pqndvdt7f4aqbaqk3gcycaaaqabavwmfaeaacaeaqgaiaaaaqcsmjnwadipfdgwjg7gdk5ebqj4q6uh7gm3q7am27esicxmiuhqkiaqk3qcyjaafn7g7p6y
+             (give it to the sender: sharp-sender <file> <card>)
+Senders use: sh-oqmextjooxadwlhkjktddnl7mtvc5ah7pfvcuy4ep34di5i47zpppd23@11.2.0.1:5555,10.2.0.2:5555
+[2m2026-09-29T09:30:37.990920Z[0m [32m INFO[0m [2msharp256::relay::client[0m[2m:[0m relay 11.9.0.10:5560 is introducing 11.1.0.1:23894
+[2m2026-09-29T09:30:37.991088Z[0m [32m INFO[0m [2msharp256::nat::punch[0m[2m:[0m punching towards 11.1.0.1:23894: very many ports at the peer, which opens very many sockets at us
+Incoming from 11.1.0.1:32022 (sh-4uan4cdukyjbb5653gxdnsl35uz4a7jlaasyt3v4pgboriveibng2x2q): payload.bin (40.00 MiB)
+[2m2026-09-29T09:30:38.458110Z[0m [32m INFO[0m [2msharp256::transport::receiver[0m[2m:[0m transfer 359ae801b382bd7189931447ced84e2c from 11.1.0.1:32022 (sh-4uan4cdukyjbb5653gxdnsl35uz4a7jlaasyt3v4pgboriveibng2x2q): payload.bin (41943040 bytes) -> /tmp/natlab.ew6p3cpj/out/payload.bin, AES-256-GCM
+[2m2026-09-29T09:30:58.582101Z[0m [33m WARN[0m [2msharp256::transport::receiver[0m[2m:[0m no packets from 11.1.0.1:32022 for 20.00002191s
+No packets from sender for 20.00002191s; keeping state for resume
+[2m2026-09-29T09:31:11.290078Z[0m [32m INFO[0m [2msharp256::nat[0m[2m:[0m NAT: an idle mapping lasts at least 15s here; keeping ours alive every 7.5s
+
+--- relay.log
+SHARP-256 v0.5.0 (protocol v3) on linux x86_64 with 4 CPU threads
+Relay listening on 0.0.0.0:5560
+STUN:      11.9.0.10:3478 11.9.0.10:3479 11.9.0.11:3478 11.9.0.11:3479
+Receivers: --relay sh-jgew3abuhsrtletptbvosaye6ipkd7tgnypqgnpsjeblwekdyfembhqe@<this host>:5560
+Senders:   --relay <this host>:5560
+Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
+Limits:    100.0 Mbit/s per client, no limit per client per hour, no limit in all, no limit per pair
+[2m2026-09-29T09:30:34.209879Z[0m [32m INFO[0m [2msharp256::relay::server[0m[2m:[0m relay listening on 0.0.0.0:5560
+[2m2026-09-29T09:30:34.776293Z[0m [32m INFO[0m [2msharp256::relay::server[0m[2m:[0m relay: sh-oqmextjo… registered at 11.2.0.1:5555
+[2m2026-09-29T09:30:37.986868Z[0m [32m INFO[0m [2msharp256::relay::server[0m[2m:[0m relay: port 55259 carries 11.1.0.1:23894 <-> 11.2.0.1:5555 (sh-oqmextjo…)
+
+port_restricted    port_restricted    turn   ok   delivered in 52.3s; direct after 12.1s, then cut; carried by the turn again 26.1s later (after the cut: turn)
+symmetric_random   port_restricted    turn   ok   delivered in 55.3s; direct after 10.1s, then cut; carried by the turn again 30.1s later (after the cut: turn)

@@ -1,0 +1,68 @@
+# natlab evidence: mutation
+# commit:    8e1fc0c875f106844679c468fd746ef9ba44c146
+# binaries:  5e148638cfc6000a sharp-sender (as committed); c179c392c37335a4 (no prediction); 12d034c0e729bde3 (no birthday method)
+# date:      2026-09-29T21:22:58Z
+# kernel:    Linux 6.18.44-fc-v37 (a container; IPv6 disabled in its kernel)
+# nftables:  nftables v1.0.9 (Old Doc Yak #3)
+# python:    Python 3.11.15
+# command:   python3 scripts/natlab/natlab.py pair|probe ..., once on each set of binaries (below)
+#
+# Does the laboratory notice when a method is gone? Each pair that needs it, on the
+# binaries as committed (control) and on a build of the same commit with the method
+# switched off. The two changes, and nothing else:
+#   diff --git a/src/nat/punch.rs b/src/nat/punch.rs
+#   index 131d92f..f6f3b85 100644
+#   --- a/src/nat/punch.rs
+#   +++ b/src/nat/punch.rs
+#   @@ -148,8 +148,9 @@ fn predicted(base: u16, step: i16) -> Vec<u16> {
+#                out.push(p as u16);
+#            }
+#        };
+#   -    (1..=PREDICT_WINDOW as i32).for_each(&mut add);
+#   -    (1..=PREDICT_BEHIND as i32).for_each(|m| add(-m));
+#   +    // MUTANT: no prediction.
+#   +    (1..=0i32).for_each(&mut add);
+#   +    (1..=0i32).for_each(|m| add(-m));
+#        out
+#    }
+#    
+#   diff --git a/src/nat/punch.rs b/src/nat/punch.rs
+#   index 131d92f..b10f577 100644
+#   --- a/src/nat/punch.rs
+#   +++ b/src/nat/punch.rs
+#   @@ -175,7 +175,7 @@ pub fn plan(mine: &NatHints, theirs: &NatHints, base: SocketAddr) -> Plan {
+#                verdict: Verdict::BirthdayHard,
+#                ports: vec![port],
+#                spray: 0,
+#   -            sockets: BIRTHDAY_SOCKETS,
+#   +            sockets: 0, // MUTANT: no birthday sockets
+#            },
+#            (_, Ports::Stable | Ports::Preserved) => direct(Verdict::Direct),
+#            (_, Ports::Sequential(step)) => Plan {
+#   @@ -204,7 +204,7 @@ pub fn plan(mine: &NatHints, theirs: &NatHints, base: SocketAddr) -> Plan {
+#            (_, Ports::Random) => Plan {
+#                verdict: Verdict::BirthdayEasy,
+#                ports: vec![port],
+#   -            spray: BIRTHDAY_PROBES,
+#   +            spray: 0, // MUTANT: no birthday spray
+#                sockets: 0,
+#            },
+#        }
+
+case                                                     binaries           result                                       verdict
+pair symmetric_seq port_restricted --via card            as committed       OK via direct-via-nat in 4.4s                as it must
+pair symmetric_seq port_restricted --via card            no prediction      FAILED via none in 49.3s                     as it must
+pair port_restricted symmetric_seq --via card            as committed       OK via direct-via-nat in 5.4s                as it must
+pair port_restricted symmetric_seq --via card            no prediction      FAILED via none in 50.3s                     as it must
+probe symmetric_seq port_restricted --wait 15            as committed       a packet got through both ways               as it must
+probe symmetric_seq port_restricted --wait 15            no prediction      nothing got through                          as it must
+pair symmetric_random port_restricted --via card         as committed       OK via direct-via-nat in 4.4s                as it must
+pair symmetric_random port_restricted --via card         no birthday        FAILED via none in 49.3s                     as it must
+pair port_restricted symmetric_random --via card         as committed       OK via direct-via-nat in 5.4s                as it must
+pair port_restricted symmetric_random --via card         no birthday        FAILED via none in 50.3s                     as it must
+probe symmetric_random port_restricted --wait 15         as committed       a packet got through both ways               as it must
+probe symmetric_random port_restricted --wait 15         no birthday        nothing got through                          as it must
+
+12 of 12 as they must be: each control connects, each mutant does not
+
+# exit status: 0
