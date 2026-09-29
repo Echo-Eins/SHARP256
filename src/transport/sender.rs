@@ -222,7 +222,6 @@ impl Sender {
         &self,
         found_tx: mpsc::UnboundedSender<Found>,
         puncher: Arc<crate::nat::punch::Puncher>,
-        discovery_done: CancellationToken,
     ) -> RelayInboxes {
         let inboxes: RelayInboxes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let reach = crate::address::Reach::of(&self.socket.udp());
@@ -244,7 +243,6 @@ impl Sender {
             let inboxes = inboxes.clone();
             let identity = self.identity.clone();
             let puncher = puncher.clone();
-            let discovery_done = discovery_done.clone();
             tokio::spawn(async move {
                 // Only for a relay that asks, and only if we know its
                 // identity to prove ours against.
@@ -254,13 +252,7 @@ impl Sender {
                 // not worth holding the introduction up for long: the tests
                 // take a round trip or two, and without them the receiver
                 // simply treats our NAT as an easy one.
-                let mut hints = puncher.subscribe();
-                tokio::select! {
-                    _ = hints.wait_for(|h| h.is_known()) => {}
-                    _ = discovery_done.cancelled() => {}
-                    _ = tokio::time::sleep(HINTS_WAIT) => {}
-                }
-                let ours = puncher.mine().primary();
+                let ours = puncher.hints_when_known().await.primary();
                 // A name is resolved like the receiver's own: as a hint.
                 let resolved = tokio::select! {
                     r = tokio::time::timeout(
@@ -569,43 +561,82 @@ impl Sender {
                 }),
             ),
         );
+        // With a relay, or the receiver's card: what our own NAT does is
+        // told to the receiver (through the relay, or on the card we give
+        // it), and the punches are aimed by both.
         #[cfg(feature = "nat-traversal")]
-        let discovery_done = CancellationToken::new();
+        let meeting = self.cfg.peer_card.is_some();
         #[cfg(feature = "nat-traversal")]
-        let stun_inbox = if self.cfg.nat_traversal && !self.cfg.relays.is_empty() {
+        let nat_cancel = self.cancel.child_token();
+        #[cfg(feature = "nat-traversal")]
+        let nat_task = if self.cfg.nat_traversal && (!self.cfg.relays.is_empty() || meeting) {
             let mut c = crate::nat::NatConfig {
-                enable_port_mapping: false,
-                maintain: false,
+                // A card is only useful to the peer if we can be reached:
+                // ask the router for a port, and look after it until we are
+                // done — and give it back.
+                enable_port_mapping: meeting,
+                maintain: meeting,
                 ..crate::nat::NatConfig::default()
             };
             if !self.cfg.stun_servers.is_empty() {
                 c.stun_servers = self.cfg.stun_servers.clone();
             }
+            let events = self.cfg.events.clone();
+            let id = self.identity.id();
+            let relay_refs = literal_relays(&self.cfg.relays);
             crate::nat::spawn_discovery(
                 self.socket.udp(),
                 c,
                 Default::default(),
                 hints_tx,
-                self.cancel.clone(),
-                |_| {},
+                nat_cancel.clone(),
+                move |r| {
+                    emit(
+                        &events,
+                        TransferEvent::ContactCard {
+                            card: r
+                                .card(&id, crate::nat::card::Role::Sender, &relay_refs)
+                                .to_text(),
+                            summary: r.describe(),
+                        },
+                    )
+                },
             )
-            .map(|t| {
-                // Told when the tests are over, so that an introduction
-                // does not wait for hints that are not coming.
-                let (done, stun) = (discovery_done.clone(), t.stun_responses);
-                tokio::spawn(async move {
-                    let _ = t.task.await;
-                    done.cancel();
-                });
-                stun
-            })
         } else {
-            discovery_done.cancel();
             None
         };
         #[cfg(feature = "nat-traversal")]
-        let relay_inboxes =
-            self.spawn_relay_introductions(found_tx.clone(), puncher, discovery_done);
+        let (stun_inbox, nat_done) = match nat_task {
+            Some(t) => {
+                // Told when the tests are over, so that a punch does not
+                // wait for hints that are not coming.
+                let (puncher, stun) = (puncher.clone(), t.stun_responses);
+                let done = tokio::spawn(async move {
+                    let _ = t.task.await;
+                    puncher.settle();
+                });
+                (Some(stun), Some(done))
+            }
+            None => {
+                puncher.settle();
+                (None, None)
+            }
+        };
+        // Punching towards every address on the receiver's card, at once
+        // and for as long as its user may take to hand over ours.
+        #[cfg(feature = "nat-traversal")]
+        if let Some(card) = &self.cfg.peer_card {
+            for (addr, hints) in card.punch_targets() {
+                let (puncher, cancel) = (puncher.clone(), self.cancel.clone());
+                tokio::spawn(async move {
+                    puncher
+                        .run_for(addr, hints, crate::nat::punch::MEET_DURATION, &cancel)
+                        .await;
+                });
+            }
+        }
+        #[cfg(feature = "nat-traversal")]
+        let relay_inboxes = self.spawn_relay_introductions(found_tx.clone(), puncher);
         #[cfg(not(feature = "nat-traversal"))]
         let relay_inboxes = RelayInboxes::default();
         let unresolved = self.spawn_name_resolution(reach, found_tx.clone());
@@ -637,6 +668,14 @@ impl Sender {
             engine.hits = Some(hits_rx);
         }
         let result = engine.run(hash_task).await;
+        // The NAT task gives back the port it asked the router for.
+        #[cfg(feature = "nat-traversal")]
+        {
+            nat_cancel.cancel();
+            if let Some(done) = nat_done {
+                let _ = tokio::time::timeout(Duration::from_secs(4), done).await;
+            }
+        }
 
         // Tell the receiver why the transfer ends, so that it releases the
         // session (keeping its resume state) at once instead of timing out.
@@ -901,6 +940,22 @@ enum Found {
     Named(SocketAddr),
 }
 
+/// The relays written with an identity and an address literal, as a card
+/// names them.
+#[cfg(feature = "nat-traversal")]
+fn literal_relays(relays: &[String]) -> Vec<crate::nat::card::RelayRef> {
+    relays
+        .iter()
+        .filter_map(|r| {
+            let (Some(id), host) = crate::relay::parse_relay(r).ok()? else {
+                return None;
+            };
+            let addr = crate::address::dns::parse_literal(&host)?;
+            Some(crate::nat::card::RelayRef { id, addr })
+        })
+        .collect()
+}
+
 /// A socket a birthday meeting was made at; there is no such thing without
 /// NAT traversal.
 #[cfg(feature = "nat-traversal")]
@@ -915,9 +970,6 @@ type RelayInboxes = Arc<parking_lot::RwLock<Vec<RelayInbox>>>;
 /// How long a relay's name may take to resolve before it is given up.
 #[cfg(feature = "nat-traversal")]
 const RELAY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long an introduction waits for our own NAT tests, at most.
-#[cfg(feature = "nat-traversal")]
-const HINTS_WAIT: Duration = Duration::from_millis(1500);
 
 /// Who we are, whom we talk to, and the shared secret.
 struct Peer {
@@ -1146,6 +1198,11 @@ impl Engine {
         events: Option<EventCallback>,
         cancel: CancellationToken,
     ) -> Self {
+        // Where the receiver may show up from: whatever it was said to be at.
+        let peer_ips = candidates
+            .iter()
+            .map(|a| crate::address::canonical(*a).ip())
+            .collect();
         let now = Instant::now();
         let chunk = cfg.max_chunk;
         let cc = Cubic::new(chunk, cfg.initial_cwnd_chunks, cfg.max_cwnd_bytes);
@@ -1186,7 +1243,7 @@ impl Engine {
             found_rx,
             unresolved,
             answered_at: None,
-            peer_ips: std::collections::HashSet::new(),
+            peer_ips,
             #[cfg(feature = "nat-traversal")]
             reflexive: std::collections::HashMap::new(),
             probes_sent: 0,

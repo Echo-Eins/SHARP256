@@ -125,6 +125,16 @@ pub enum TransferEvent {
         /// The whole address to hand a sender, `ID@host:port,…`, listing
         /// every candidate address this receiver may be reached at.
         address: Option<String>,
+        /// This host's contact card, `shc1-…`: what to give a peer on
+        /// another network so that it can aim at this host (see
+        /// `nat::card`). Written as often as the tests find something new.
+        card: Option<String>,
+        summary: String,
+    },
+    /// Sender side: the same, for the sender, once its NAT tests are done —
+    /// the card to hand the receiver's user.
+    ContactCard {
+        card: String,
         summary: String,
     },
     /// Receiver side: a relay has taken this receiver's registration, so

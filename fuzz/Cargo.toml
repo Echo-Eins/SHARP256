@@ -96,3 +96,10 @@ path = "fuzz_targets/upnp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "card"
+path = "fuzz_targets/card.rs"
+test = false
+doc = false
+bench = false

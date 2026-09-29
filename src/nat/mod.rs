@@ -31,12 +31,13 @@ pub mod birthday;
 pub mod card;
 pub mod keepalive;
 pub mod portmap;
+pub mod probe;
 pub mod punch;
 pub mod stun;
 pub mod stunserver;
 pub mod upnp;
 
-use self::behaviour::{Behaviour, Reachable};
+use self::behaviour::{Allocation, Behaviour, Reachable};
 use self::upnp::UpnpMapping;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -616,6 +617,57 @@ impl Reachability {
         out
     }
 
+    /// The contact card of a host with this reachability: everything a
+    /// peer on another network needs to start sending at us at the same
+    /// moment we start sending at it (see [`card`]).
+    ///
+    /// Unlike [`Reachability::candidates`], which keeps back an address that
+    /// would tell a stranger nothing, the card lists the address a STUN
+    /// server saw even behind a NAT that numbers ports per destination: it
+    /// is the base from which the peer works out the port to aim at, and the
+    /// hints say how.
+    pub fn card(
+        &self,
+        id: &crate::crypto::SharpId,
+        role: card::Role,
+        relays: &[card::RelayRef],
+    ) -> card::Card {
+        use card::{Candidate as Cand, Kind};
+        let mut c = card::Card::new(role, *id);
+        let port = self.local_addr.port();
+        let mut add = |addr: SocketAddr, kind: Kind| {
+            if addr.port() != 0
+                && !addr.ip().is_unspecified()
+                && c.candidates.len() < card::MAX_CANDIDATES
+                && !c.candidates.iter().any(|x| x.addr == addr)
+            {
+                c.candidates.push(Cand { kind, addr });
+            }
+        };
+        if let Some(a) = self.upnp_addr {
+            add(a, Kind::PortMapped);
+        }
+        // Global IPv6 first: no NAT to get through, so where the peer has
+        // it too it is the shortest way.
+        if let Some(m) = self.behaviour6.and_then(|b| b.mapped) {
+            add(m, Kind::Mapped);
+        }
+        for ip in self.host.iter().filter(|ip| ip.is_ipv6()) {
+            add(SocketAddr::new(*ip, port), Kind::Host);
+        }
+        if let Some(p) = self.public_addr {
+            add(p, Kind::Mapped);
+        }
+        for ip in self.host.iter().filter(|ip| ip.is_ipv4()) {
+            add(SocketAddr::new(*ip, port), Kind::Host);
+        }
+        let hints = self.hints();
+        c.v4 = (hints.v4.mapping != 0).then_some(hints.v4);
+        c.v6 = (hints.v6.mapping != 0).then_some(hints.v6);
+        c.relays = relays.iter().take(card::MAX_RELAYS).copied().collect();
+        c
+    }
+
     /// The candidates as a sender writes them: `ID@host:port,host:port,…`.
     pub fn address_string(&self, id: &crate::crypto::SharpId) -> Option<String> {
         let list: Vec<String> = self
@@ -667,13 +719,26 @@ impl Reachability {
                 p,
                 self.behaviour.describe()
             ),
-            (Some(p), Reachable::OnlyByRelay) => format!(
-                "behind a symmetric NAT (seen at {} right now, but the port changes per \
-                 destination): senders outside this network need a port forward to local port {}, \
-                 or a relay",
-                p,
-                self.local_addr.port()
-            ),
+            (Some(p), Reachable::OnlyByRelay) => {
+                let how = match self.behaviour.allocation {
+                    Allocation::Sequential => {
+                        "a sender behind a simple NAT can still aim at the ports it hands out \
+                         next"
+                    }
+                    Allocation::Random => {
+                        "a sender behind a simple NAT can still find it by trying very many ports"
+                    }
+                    _ => "a sender behind a simple NAT may still get through by trying ports",
+                };
+                format!(
+                    "behind a symmetric NAT (seen at {} right now, but the port changes per \
+                     destination): {}; against another symmetric NAT it needs a relay, or a \
+                     port forward to local port {}",
+                    p,
+                    how,
+                    self.local_addr.port()
+                )
+            }
             (Some(p), _) => format!(
                 "public IP {}, NAT behaviour not determined; senders outside this network may \
                  need a port forward to local port {}",
@@ -1497,6 +1562,82 @@ garbage line
     }
 
     /// A loopback socket has nothing to offer anyone else.
+    fn id() -> crate::crypto::SharpId {
+        crate::crypto::Identity::generate().id()
+    }
+
+    /// The card lists what a peer can send to, best first, and says what
+    /// each family's NAT does: a symmetric NAT's address is on it too, as
+    /// the base to aim from.
+    #[test]
+    fn the_card_lists_addresses_best_first_and_carries_what_the_nat_does() {
+        let mut r = reach(
+            Behaviour {
+                mapped: Some("203.0.113.9:40000".parse().unwrap()),
+                allocation: Allocation::Sequential,
+                alloc_step: 2,
+                ..nat(
+                    Mapping::AddressAndPortDependent,
+                    Filtering::AddressAndPortDependent,
+                )
+            },
+            Some("203.0.113.9:5555"),
+            Some("203.0.113.9:40000"),
+        );
+        r.host = vec![
+            "2001:db8::5".parse().unwrap(),
+            "192.168.1.5".parse().unwrap(),
+        ];
+        r.behaviour6 = Some(Behaviour {
+            mapped: Some("[2001:db8::5]:5555".parse().unwrap()),
+            open_internet: true,
+            ..nat(
+                Mapping::EndpointIndependent,
+                Filtering::AddressAndPortDependent,
+            )
+        });
+        let c = r.card(&id(), card::Role::Receiver, &[]);
+        let addrs: Vec<String> = c.candidates.iter().map(|c| c.addr.to_string()).collect();
+        assert_eq!(
+            addrs,
+            [
+                "203.0.113.9:5555",
+                "[2001:db8::5]:5555",
+                "203.0.113.9:40000",
+                "192.168.1.5:5555",
+            ],
+            "the router's forward, IPv6, the mapped address, the LAN"
+        );
+        let v4 = c.v4.expect("IPv4 hints");
+        assert_eq!(v4.mapping, 3);
+        assert_eq!(v4.allocation, Allocation::Sequential);
+        assert_eq!(v4.delta, 2);
+        assert_eq!(c.v6.expect("IPv6 hints").mapping, 4, "no translation");
+        // And it survives being written down and read back.
+        assert_eq!(card::Card::from_text(&c.to_text()).unwrap(), c);
+    }
+
+    #[test]
+    fn a_carriers_address_space_is_a_carrier_grade_nat() {
+        let behind = |ip: &str| {
+            reach(
+                Behaviour {
+                    mapped: Some(format!("{}:40000", ip).parse().unwrap()),
+                    ..nat(Mapping::EndpointIndependent, Filtering::AddressDependent)
+                },
+                None,
+                Some(&format!("{}:40000", ip)),
+            )
+            .hints()
+            .v4
+            .cgn
+        };
+        assert!(behind("100.64.7.7"));
+        assert!(behind("100.127.255.254"));
+        assert!(!behind("100.128.0.1"));
+        assert!(!behind("203.0.113.7"));
+    }
+
     #[test]
     fn loopback_is_never_a_candidate() {
         let r = Reachability {

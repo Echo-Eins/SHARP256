@@ -87,6 +87,11 @@ name = "sharp-relay"
 path = "src/bin/relay.rs"
 required-features = ["nat-traversal"]
 
+[[bin]]
+name = "sharp-probe"
+path = "src/bin/probe.rs"
+required-features = ["nat-traversal"]
+
 # Cryptography and hashing in dependencies are painfully slow unoptimised;
 # debug builds of this crate stay debuggable while tests run at usable speed.
 [profile.dev.package."*"]

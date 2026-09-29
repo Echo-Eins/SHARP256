@@ -166,6 +166,13 @@ pub struct SenderConfig {
     /// Servers for those tests; empty = the built-in list. A
     /// `sharp-relay --stun` is one.
     pub stun_servers: Vec<String>,
+    /// The receiver's contact card, when the sender was given one instead
+    /// of an address (see `nat::card`): the sender then also punches
+    /// towards every address on it, aimed by what it says the receiver's
+    /// NAT does, for as long as it takes the receiver's user to be handed
+    /// the sender's own.
+    #[cfg(feature = "nat-traversal")]
+    pub peer_card: Option<crate::nat::card::Card>,
     pub events: Option<EventCallback>,
 }
 
@@ -227,8 +234,33 @@ impl SenderConfig {
             relays: Vec::new(),
             nat_traversal: false,
             stun_servers: Vec::new(),
+            #[cfg(feature = "nat-traversal")]
+            peer_card: None,
             events: None,
         }
+    }
+
+    /// A sender for the receiver a contact card describes: its identity,
+    /// every address on it in the order the card lists them, and the relays
+    /// it names (which need no address of their own to be asked).
+    #[cfg(feature = "nat-traversal")]
+    pub fn for_card(card: crate::nat::card::Card, file_path: PathBuf) -> Self {
+        let addrs: Vec<SocketAddr> = card.punch_targets().into_iter().map(|(a, _)| a).collect();
+        let peer = addrs
+            .first()
+            .copied()
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let mut cfg = Self::new(peer, card.id, file_path);
+        cfg.alternate_peers = addrs.get(1..).unwrap_or_default().to_vec();
+        cfg.relays = card
+            .relays
+            .iter()
+            .map(|r| format!("{}@{}", r.id, r.addr))
+            .collect();
+        cfg.peer_card = Some(card);
+        // The receiver's user may take a while to be handed ours.
+        cfg.transport.handshake_timeout = crate::nat::punch::MEET_DURATION;
+        cfg
     }
 }
 

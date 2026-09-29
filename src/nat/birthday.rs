@@ -111,10 +111,10 @@ pub async fn meet(
             let _ = s.send_to(&msg, base).await;
         }
         round += 1;
-        let gap = if round < 4 {
-            Duration::from_millis(150)
-        } else {
-            Duration::from_millis(500)
+        let gap = match round {
+            0..=3 => Duration::from_millis(150),
+            _ if start.elapsed() < Duration::from_secs(20) => Duration::from_millis(500),
+            _ => Duration::from_secs(2),
         };
         if start.elapsed() + gap >= duration {
             break None;

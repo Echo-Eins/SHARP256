@@ -188,6 +188,27 @@ impl Behaviour {
         }
     }
 
+    /// What the NAT means for a peer trying to reach this host, in words.
+    pub fn reachable_text(&self) -> &'static str {
+        match self.reachable() {
+            Reachable::Directly => "reachable directly",
+            Reachable::OncePublished => "reachable once the address is known",
+            Reachable::ByPunching => "reachable by punching (both sides send at the same time)",
+            Reachable::OnlyByRelay => match self.allocation {
+                Allocation::Sequential => {
+                    "reachable by aiming at the ports it hands out next (from a peer with a \
+                     simple NAT); two such NATs need a relay"
+                }
+                Allocation::Random => {
+                    "reachable by the birthday method (from a peer with a simple NAT); two such \
+                     NATs need a relay"
+                }
+                _ => "needs a relay against a NAT of the same kind; reachable by trying many ports from a simple one",
+            },
+            Reachable::Unknown => "reachability unknown",
+        }
+    }
+
     /// One line for a human.
     pub fn describe(&self) -> String {
         if self.open_internet {
@@ -214,13 +235,7 @@ impl Behaviour {
             Filtering::AddressAndPortDependent => "lets in only what we sent to exactly",
             Filtering::Unknown => "unknown filtering",
         };
-        let outlook = match self.reachable() {
-            Reachable::Directly => "reachable directly",
-            Reachable::OncePublished => "reachable once the address is published",
-            Reachable::ByPunching => "reachable by punching (both sides send at once)",
-            Reachable::OnlyByRelay => "needs a relay",
-            Reachable::Unknown => "reachability unknown",
-        };
+        let outlook = self.reachable_text();
         format!(
             "NAT: {}, {}{}; {}",
             mapping,

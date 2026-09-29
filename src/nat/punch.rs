@@ -208,6 +208,9 @@ pub fn plan(mine: &NatHints, theirs: &NatHints, base: SocketAddr) -> Plan {
 pub struct Puncher {
     socket: Arc<UdpSocket>,
     mine: watch::Receiver<FamilyHints>,
+    /// Cancelled when what this end's NAT does will not become known any
+    /// better than it is: the tests are over, or were never going to run.
+    settled: CancellationToken,
     last_spray: parking_lot::Mutex<Option<Instant>>,
     /// What to do with the socket a birthday meeting was made at. Without
     /// one, an end whose NAT draws ports at random can only punch from the
@@ -218,6 +221,15 @@ pub struct Puncher {
 /// Takes over a socket that a peer got through to (see [`super::birthday`]).
 pub type HitHandler = Arc<dyn Fn(Hit) + Send + Sync>;
 
+/// How long a punch waits for this end's own NAT tests, at most. They take
+/// a round trip or two for what matters here (how ports are numbered); the
+/// filtering tests after them are slower and are not waited for.
+pub const HINTS_WAIT: Duration = Duration::from_millis(1500);
+/// How long a punch goes on when it is waiting for a person to hand the
+/// other side a card: the other side may take minutes to do it, and the
+/// holes have to be open when it does.
+pub const MEET_DURATION: Duration = Duration::from_secs(300);
+
 impl Puncher {
     /// `mine` follows what this end's own NAT tests found; until they have,
     /// nothing is known and the peer is treated as easy to reach.
@@ -225,6 +237,7 @@ impl Puncher {
         Self {
             socket,
             mine,
+            settled: CancellationToken::new(),
             last_spray: parking_lot::Mutex::new(None),
             on_hit: None,
         }
@@ -242,7 +255,19 @@ impl Puncher {
         // Kept alive by the receiver; a closed channel is read as its last
         // value, which is what this wants.
         drop(tx);
-        Self::new(socket, rx)
+        let p = Self::new(socket, rx);
+        p.settled.cancel();
+        p
+    }
+
+    /// Says that what is known of this end's NAT is all there will be.
+    pub fn settle(&self) {
+        self.settled.cancel();
+    }
+
+    /// The token [`Puncher::settle`] cancels.
+    pub fn settled(&self) -> CancellationToken {
+        self.settled.clone()
     }
 
     /// What this end's NAT is known to do, in each address family.
@@ -253,6 +278,19 @@ impl Puncher {
     /// Follows what this end's NAT is known to do, as it becomes known.
     pub fn subscribe(&self) -> watch::Receiver<FamilyHints> {
         self.mine.clone()
+    }
+
+    /// What this end's NAT is known to do once it is — or, at the longest,
+    /// after [`HINTS_WAIT`], or when it is clear it never will be.
+    pub async fn hints_when_known(&self) -> FamilyHints {
+        let mut rx = self.mine.clone();
+        tokio::select! {
+            _ = rx.wait_for(|h| h.is_known()) => {}
+            _ = self.settled.cancelled() => {}
+            _ = tokio::time::sleep(HINTS_WAIT) => {}
+        }
+        let known = *rx.borrow();
+        known
     }
 
     /// Punches towards `base` for [`PUNCH_DURATION`], or until `cancel`, so
@@ -268,14 +306,30 @@ impl Puncher {
     /// few dozen at most unless the hints ask for a spray, and one spray
     /// per [`SPRAY_SPACING`].
     pub async fn run(&self, base: SocketAddr, theirs: NatHints, cancel: &CancellationToken) {
+        self.run_for(base, theirs, PUNCH_DURATION, cancel).await
+    }
+
+    /// [`Puncher::run`] for as long as `duration`: the same schedule again
+    /// every [`SPRAY_SPACING`], with fresh ports where the plan sprays.
+    pub async fn run_for(
+        &self,
+        base: SocketAddr,
+        theirs: NatHints,
+        duration: Duration,
+        cancel: &CancellationToken,
+    ) {
         let Ok(local) = self.socket.local_addr() else {
+            return;
+        };
+        // Written the way this socket sends to it.
+        let Some(base) = crate::address::Reach::of(&self.socket).native(base) else {
             return;
         };
         if !crate::address::class::is_sendable_hint(base, local) {
             tracing::debug!("punch: {} is not worth sending to", base);
             return;
         }
-        let mine = self.mine().for_addr(&base);
+        let mine = self.hints_when_known().await.for_addr(&base);
         let plan = plan(&mine, &theirs, base);
         tracing::info!("punching towards {}: {}", base, plan.verdict.describe());
         let mut spray = plan.spray;
@@ -289,16 +343,6 @@ impl Puncher {
                 *last = Some(now);
             }
         }
-        // Ports to probe once each, spread over the first rounds, so that
-        // the peer's side of it is open for some of them whenever it opens.
-        let mut random: Vec<u16> = Vec::new();
-        if spray > 0 {
-            let mut all: Vec<u16> = DYNAMIC_PORTS.collect();
-            all.shuffle(&mut rand::thread_rng());
-            all.retain(|p| !plan.ports.contains(p));
-            all.truncate(spray);
-            random = all;
-        }
         let aux = async {
             let Some(handler) = &self.on_hit else {
                 return;
@@ -307,11 +351,35 @@ impl Puncher {
                 return;
             }
             let sockets = birthday::open_sockets(&self.socket, plan.sockets);
-            if let Some(hit) = birthday::meet(sockets, base, PUNCH_DURATION, cancel).await {
+            if let Some(hit) = birthday::meet(sockets, base, duration, cancel).await {
                 handler(hit);
             }
         };
-        tokio::join!(self.send_rounds(base, &plan.ports, &random, cancel), aux);
+        let passes = async {
+            let start = Instant::now();
+            loop {
+                // Ports to probe once each, spread over the pass's first
+                // rounds, so that the peer's side of it is open for some of
+                // them whenever it opens.
+                let mut random: Vec<u16> = Vec::new();
+                if spray > 0 {
+                    let mut all: Vec<u16> = DYNAMIC_PORTS.collect();
+                    all.shuffle(&mut rand::thread_rng());
+                    all.retain(|p| !plan.ports.contains(p));
+                    all.truncate(spray);
+                    random = all;
+                }
+                self.send_rounds(base, &plan.ports, &random, cancel).await;
+                if cancel.is_cancelled() || start.elapsed() + SPRAY_SPACING >= duration {
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(SPRAY_SPACING - PUNCH_DURATION.min(SPRAY_SPACING)) => {}
+                    _ = cancel.cancelled() => return,
+                }
+            }
+        };
+        tokio::join!(passes, aux);
     }
 
     /// The punches from the socket the transfer uses: to each of `ports`

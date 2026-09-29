@@ -114,7 +114,7 @@ class Lab:
 
     # ----- processes ------------------------------------------------------
 
-    def spawn(self, ns, args, log, env=None):
+    def spawn(self, ns, args, log, env=None, stdin=None):
         f = open(os.path.join(self.dir, log), "w")
         e = dict(os.environ)
         e.update(env or {})
@@ -122,6 +122,7 @@ class Lab:
             self.prefix(ns) + args,
             stdout=f,
             stderr=subprocess.STDOUT,
+            stdin=stdin if stdin is not None else subprocess.DEVNULL,
             env=e,
             start_new_session=True,
         )
@@ -447,8 +448,14 @@ def classify(connected, topo, relay_port):
     return f"direct({ip})"
 
 
-def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=False, verbose=False):
+def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=False, verbose=False,
+             via="relay", human_delay=2.0):
     """One real transfer, sender behind `a_nat`, receiver behind `b_nat`.
+
+    `via` is how the two find each other: "relay" (a relay introduces them)
+    or "card" (no relay: the receiver's card is given to the sender, and —
+    `human_delay` seconds later, the time a person takes to paste it — the
+    sender's card is given to the receiver; only a STUN server is shared).
     Returns (ok, path, seconds, detail)."""
     lab = Lab(keep=keep)
     try:
@@ -476,6 +483,8 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         if not m:
             return False, "none", 0, "the relay did not start:\n" + lab.log("relay.log")
         rid = m.group(1)
+        if via == "card":
+            return transfer_by_cards(lab, topo, d, human_delay, timeout, verbose)
         data = os.path.join(d, "payload.bin")
         with open(data, "wb") as f:
             f.write(os.urandom(1 << 20))
@@ -532,9 +541,134 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         lab.close()
 
 
+def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose):
+    """The part of `transfer` that needs no relay: two people, two cards."""
+    data = os.path.join(d, "payload.bin")
+    with open(data, "wb") as f:
+        f.write(os.urandom(1 << 20))
+    want = hashlib.sha256(open(data, "rb").read()).hexdigest()
+    os.makedirs(f"{d}/out", exist_ok=True)
+    recv = lab.spawn(
+        "B",
+        [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
+         "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
+         "--log-level", "info"],
+        "receiver.log",
+        stdin=subprocess.PIPE,
+    )
+    m = wait_for(lab, "receiver.log", r"Your card:\s+(shc1-\S+)", 30)
+    if not m:
+        return False, "none", 0, "the receiver printed no card:\n" + lab.log("receiver.log")
+    rcard = m.group(1)
+    start = time.time()
+    sender = lab.spawn(
+        "A",
+        [f"{BIN}/sharp-sender", data, rcard, "--headless", "--stun", f"{S1}:3478",
+         "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+        "sender.log",
+    )
+    # The sender may be done before it has a card to give: a receiver that
+    # can be reached as it stands needs nothing from the sender.
+    m = None
+    end = time.time() + 30
+    while time.time() < end and sender.poll() is None:
+        m = re.search(r"Your card: (shc1-\S+)", lab.log("sender.log"))
+        if m:
+            break
+        time.sleep(0.2)
+    if m and sender.poll() is None:
+        # A person carries it across.
+        time.sleep(human_delay)
+        recv.stdin.write((m.group(1) + "\n").encode())
+        recv.stdin.flush()
+    elif sender.poll() is None:
+        sender.kill()
+        return False, "none", 0, "the sender printed no card:\n" + lab.log("sender.log")
+    try:
+        sender.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        sender.kill()
+    took = time.time() - start
+    log = lab.log("sender.log")
+    conn = re.search(r"Connected to (\S+)", log)
+    path = classify(conn.group(1) if conn else None, topo, 5560)
+    got = None
+    for name in os.listdir(f"{d}/out"):
+        if not name.endswith(".sharp-part"):
+            got = hashlib.sha256(open(f"{d}/out/{name}", "rb").read()).hexdigest()
+    ok = got == want
+    detail = f"cards exchanged by hand after {human_delay:.0f}s"
+    if verbose or not ok:
+        for gw in ("RA", "RB"):
+            ct = lab.x(gw, "cat", "/proc/net/nf_conntrack", check=False).stdout
+            detail += f"\n--- conntrack in {gw}\n" + "\n".join(l[:170] for l in ct.splitlines() if "udp" in l)
+        detail += "\n--- sender.log\n" + log[-2500:] + "\n--- receiver.log\n" + lab.log("receiver.log")[-2500:]
+    return ok, path, took, detail
+
+
+def cmd_probe(args):
+    """`sharp-probe` on both hosts of a pair: each prints what it sees and
+    its card, the cards are swapped by hand (through standard input), and
+    each says whether a packet from the other arrived."""
+    lab = Lab(keep=False)
+    try:
+        topo = Topo(lab, args.a, args.b, None, None)
+        d = lab.dir
+        lab.spawn(
+            "S",
+            [f"{BIN}/sharp-relay", "--bind", "0.0.0.0:5560", "--stun", S1, "--stun", S2,
+             "--identity", f"{d}/relay.key", "--log", "info"],
+            "relay.log",
+        )
+        if not wait_for(lab, "relay.log", r"Receivers: --relay", 10):
+            print("the relay (and its STUN server) did not start")
+            return 1
+        procs, cards = {}, {}
+        for ns, name, extra in (("A", "a", []), ("B", "b", ["--receiver"])):
+            procs[name] = lab.spawn(
+                ns,
+                [f"{BIN}/sharp-probe", "--stun", f"{S1}:3478", "--no-port-mapping", "--stdin",
+                 "--identity", f"{d}/{name}.key", "--wait", str(args.wait), "--log-level", "info", *extra],
+                f"probe_{name}.log",
+                stdin=subprocess.PIPE,
+            )
+        for name in ("a", "b"):
+            m = wait_for(lab, f"probe_{name}.log", r"^(shc1-\S+)$", 40) if False else None
+            end = time.time() + 40
+            while time.time() < end and not m:
+                m = re.search(r"^(shc1-\S+)$", lab.log(f"probe_{name}.log"), re.M)
+                time.sleep(0.2)
+            if not m:
+                print(f"host {name.upper()} printed no card:\n" + lab.log(f"probe_{name}.log")[-1500:])
+                return 1
+            cards[name] = m.group(1)
+            report = lab.log(f"probe_{name}.log").split("Your card")[0]
+            print(f"--- host {name.upper()} behind {args.a if name == 'a' else args.b}\n{report.split('Measuring')[-1]}")
+        # Each is handed the other's card, one after the other, as two people would.
+        for name, other in (("a", "b"), ("b", "a")):
+            procs[name].stdin.write((cards[other] + "\n").encode())
+            procs[name].stdin.flush()
+        for p in procs.values():
+            try:
+                p.wait(timeout=args.wait + 30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        codes = [procs[n].returncode for n in ("a", "b")]
+        for name in ("a", "b"):
+            tail = lab.log(f"probe_{name}.log").split("Sending at")[-1]
+            print(f"--- punch test, host {name.upper()}\nSending at{tail[-700:]}")
+        want_ok, _ = expected(args.a, args.b, False, "card")
+        ok = all(c == 0 for c in codes)
+        print(f"punch test: {'a packet got through both ways' if ok else 'nothing got through'} "
+              f"({'as expected' if ok == want_ok else 'UNEXPECTED'})")
+        return 0 if ok == want_ok else 1
+    finally:
+        lab.close()
+
+
 def cmd_pair(args):
     ok, path, took, detail = transfer(args.a, args.b, args.a_cgn, args.b_cgn, carry=not args.direct_only,
-                                      verbose=args.verbose, keep=args.keep)
+                                      verbose=args.verbose, keep=args.keep, via=args.via)
     print(f"sender behind {args.a}{'+cgn:' + args.a_cgn if args.a_cgn else ''}, receiver behind {args.b}: "
           f"{'OK' if ok else 'FAILED'} via {path} in {took:.1f}s")
     print(detail)
@@ -548,10 +682,12 @@ def cmd_pair(args):
 HARD = {"symmetric_seq", "symmetric_random"}
 
 
-def expected(a, b, carry):
-    """(connects, path) as the engine is meant to behave for this pair."""
+def expected(a, b, carry, via="relay"):
+    """(connects, path) as the engine is meant to behave for this pair.
+    Cards name no relay (unless the receiver was started with one), so two
+    hard NATs have nothing to fall back on there."""
     if a in HARD and b in HARD:
-        return (True, "relay") if carry else (False, "none")
+        return (True, "relay") if carry and via == "relay" else (False, "none")
     return True, "direct"
 
 
@@ -569,8 +705,8 @@ def cmd_matrix(args):
     print(f"{'sender behind':18} {'receiver behind':18} {'result':30} verdict")
     for a in kinds:
         for b in kinds:
-            ok, path, took, detail = transfer(a, b, carry=carry, timeout=args.timeout)
-            want_ok, want_path = expected(a, b, carry)
+            ok, path, took, detail = transfer(a, b, carry=carry, timeout=args.timeout, via=args.via)
+            want_ok, want_path = expected(a, b, carry, args.via)
             met = ok == want_ok and (
                 not ok or (path == "relay") == (want_path == "relay") and (want_path == "relay" or is_direct(path))
             )
@@ -627,15 +763,23 @@ def main():
     pair.add_argument("-v", "--verbose", action="store_true")
     pair.add_argument("--keep", action="store_true")
     pair.add_argument("--direct-only", action="store_true", help="the relay may introduce but not carry")
+    pair.add_argument("--via", choices=["relay", "card"], default="relay",
+                      help="how the two find each other: a relay, or cards handed over by hand")
+    probe = sub.add_parser("probe")
+    probe.add_argument("a", choices=list(NAT_KINDS))
+    probe.add_argument("b", choices=list(NAT_KINDS))
+    probe.add_argument("--wait", type=int, default=20)
     matrix = sub.add_parser("matrix")
     matrix.add_argument("kinds", nargs="*", help="a subset of: " + " ".join(NAT_KINDS))
     matrix.add_argument("--markdown", help="write the results as a table to this file")
     matrix.add_argument("--allow-failures", action="store_true")
     matrix.add_argument("--direct-only", action="store_true", help="the relay may introduce but not carry")
+    matrix.add_argument("--via", choices=["relay", "card"], default="relay",
+                        help="how the two find each other: a relay, or cards handed over by hand")
     matrix.add_argument("--timeout", type=int, default=30)
     args = ap.parse_args()
     sh("ip", "link", "set", "lo", "up")
-    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "matrix": cmd_matrix}[args.cmd](args))
+    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix}[args.cmd](args))
 
 
 if __name__ == "__main__":

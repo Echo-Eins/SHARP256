@@ -173,7 +173,7 @@ impl ReceiverApp {
                         sh.relays.push(relay);
                     }
                 }
-                TransferEvent::IncomingRequest { .. } => {}
+                TransferEvent::IncomingRequest { .. } | TransferEvent::ContactCard { .. } => {}
             }
         }));
 

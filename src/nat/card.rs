@@ -287,6 +287,24 @@ impl Card {
         Duration::from_secs(now.saturating_sub(self.created))
     }
 
+    /// The addresses worth punching towards, each with what the NAT in
+    /// front of it does: everything but the relays' ports, which are
+    /// somewhere to be carried and not somewhere to be reached.
+    pub fn punch_targets(&self) -> Vec<(SocketAddr, NatHints)> {
+        let mut out: Vec<(SocketAddr, NatHints)> = Vec::new();
+        for c in &self.candidates {
+            if c.kind != Kind::Relayed && !out.iter().any(|(a, _)| *a == c.addr) {
+                out.push((
+                    c.addr,
+                    self.hints_for(&c.addr)
+                        .copied()
+                        .unwrap_or(NatHints::unknown()),
+                ));
+            }
+        }
+        out
+    }
+
     /// The NAT hints for the family of `addr`.
     pub fn hints_for(&self, addr: &SocketAddr) -> Option<&NatHints> {
         if crate::address::canonical(*addr).is_ipv6() {
@@ -415,6 +433,20 @@ impl Card {
         let check = blake3::hash(&body);
         body.extend_from_slice(&check.as_bytes()[..CHECK_LEN]);
         format!("{}{}", PREFIX, base32_encode(&body))
+    }
+
+    /// A card as a command line gives it: the text itself, or `@path` to a
+    /// file that holds it.
+    pub fn from_arg(arg: &str) -> Result<Self, String> {
+        let arg = arg.trim();
+        match arg.strip_prefix('@') {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read {}: {}", path, e))?;
+                Self::from_text(&text).map_err(|e| format!("{}: {}", path, e))
+            }
+            None => Self::from_text(arg).map_err(|e| e.to_string()),
+        }
     }
 
     /// Reads a card as text, however a chat wrapped it.

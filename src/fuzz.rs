@@ -222,6 +222,25 @@ pub fn relay_message(data: &[u8]) {
     }
 }
 
+/// A contact card, as a person pastes it: from bytes, and as text.
+#[cfg(feature = "nat-traversal")]
+pub fn card(data: &[u8]) {
+    use crate::nat::card::Card;
+    if let Ok(c) = Card::decode(data) {
+        assert_eq!(c.encode().as_slice(), data, "two encodings of one card");
+        assert_eq!(
+            Card::from_text(&c.to_text()).as_ref(),
+            Ok(&c),
+            "a card does not survive being written as text"
+        );
+        // Whatever it says, asking it for addresses must not panic.
+        let _ = c.punch_targets();
+        let _ = c.hints_for(&"203.0.113.1:1".parse().expect("literal"));
+    }
+    // Text: anything at all, of which a card is a tiny part.
+    let _ = Card::from_text(&String::from_utf8_lossy(data));
+}
+
 /// STUN, as a receiver reads it from servers it did not choose — and as
 /// the tests' servers read requests.
 #[cfg(feature = "nat-traversal")]
@@ -291,6 +310,8 @@ pub const TARGETS: &[(&str, Target)] = &[
     #[cfg(feature = "nat-traversal")]
     ("relay_message", relay_message),
     #[cfg(feature = "nat-traversal")]
+    ("card", card),
+    #[cfg(feature = "nat-traversal")]
     ("stun", stun),
     #[cfg(feature = "nat-traversal")]
     ("portmap", portmap),
@@ -355,6 +376,8 @@ pub fn seeds(target: &str) -> Vec<Vec<u8>> {
         }
         #[cfg(feature = "nat-traversal")]
         "relay_message" => seed_relay(),
+        #[cfg(feature = "nat-traversal")]
+        "card" => seed_cards(),
         #[cfg(feature = "nat-traversal")]
         "stun" => {
             let tid = [9u8; 12];
@@ -427,6 +450,44 @@ fn seed_frames() -> Vec<Vec<u8>> {
             out
         })
         .collect()
+}
+
+#[cfg(feature = "nat-traversal")]
+fn seed_cards() -> Vec<Vec<u8>> {
+    use crate::nat::card::{Candidate, Card, Kind, NatHints, RelayRef, Role};
+    let id = fixture().receiver;
+    let mut full = Card::new(Role::Receiver, id);
+    full.created = 1_700_000_000;
+    full.candidates = vec![
+        Candidate {
+            kind: Kind::Mapped,
+            addr: "203.0.113.9:40000".parse().expect("literal"),
+        },
+        Candidate {
+            kind: Kind::Host,
+            addr: "[2001:db8::5]:5555".parse().expect("literal"),
+        },
+        Candidate {
+            kind: Kind::Relayed,
+            addr: "198.51.100.1:41000".parse().expect("literal"),
+        },
+    ];
+    full.v4 = Some(NatHints {
+        mapping: 3,
+        filtering: 3,
+        allocation: crate::nat::behaviour::Allocation::Sequential,
+        delta: 2,
+        hairpin: Some(false),
+        cgn: true,
+    });
+    full.v6 = Some(NatHints::unknown());
+    full.relays = vec![RelayRef {
+        id,
+        addr: "198.51.100.1:5560".parse().expect("literal"),
+    }];
+    let mut bare = Card::new(Role::Sender, id);
+    bare.created = 1_700_000_000;
+    vec![full.encode(), bare.encode()]
 }
 
 #[cfg(feature = "nat-traversal")]
@@ -589,6 +650,10 @@ mod tests {
         #[cfg(feature = "nat-traversal")]
         for m in seeds("relay_message") {
             assert!(crate::relay::Message::decode(&m).is_some());
+        }
+        #[cfg(feature = "nat-traversal")]
+        for c in seeds("card") {
+            assert!(crate::nat::card::Card::decode(&c).is_ok());
         }
     }
 

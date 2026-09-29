@@ -67,6 +67,17 @@ struct Args {
     #[arg(long = "stun", value_name = "HOST:PORT")]
     stun: Vec<String>,
 
+    /// The contact card (shc1-…) of a sender on another network, or @FILE
+    /// with one in it; repeat it for several. The receiver starts sending
+    /// at every address on the card at once, which is what lets a sender
+    /// behind a NAT that drops unasked packets get in, and it accepts only
+    /// the senders whose cards it was given. Cards can also be pasted into
+    /// the running receiver, one per line; those do not restrict who may
+    /// send. The receiver's own card is printed as soon as its NAT tests
+    /// are done
+    #[arg(long = "peer-card", value_name = "CARD|@FILE")]
+    peer_cards: Vec<String>,
+
     /// Replace existing files with the same name instead of writing "name (1)"
     #[arg(long)]
     overwrite: bool,
@@ -148,6 +159,29 @@ async fn main() -> Result<()> {
     if let Some(path) = &args.authorized_senders {
         allowed.extend(load_id_list(path).with_context(|| format!("{}", path.display()))?);
     }
+    // The senders whose cards were given are the ones expected.
+    #[cfg(feature = "nat-traversal")]
+    let peer_cards: Vec<sharp256::nat::card::Card> = args
+        .peer_cards
+        .iter()
+        .map(|c| {
+            sharp256::nat::card::Card::from_arg(c)
+                .map_err(|e| anyhow::anyhow!("--peer-card: {}", e))
+        })
+        .collect::<Result<_>>()?;
+    #[cfg(feature = "nat-traversal")]
+    for card in &peer_cards {
+        if card.role != sharp256::nat::card::Role::Sender {
+            anyhow::bail!(
+                "--peer-card: that is a receiver's card; a receiver is given the sender's"
+            );
+        }
+        allowed.insert(card.id);
+    }
+    #[cfg(not(feature = "nat-traversal"))]
+    if !args.peer_cards.is_empty() {
+        anyhow::bail!("this build has no NAT traversal, so it cannot use contact cards");
+    }
     if !allowed.is_empty() || args.authorized_senders.is_some() {
         cfg.allowed_senders = Some(allowed);
     }
@@ -159,10 +193,29 @@ async fn main() -> Result<()> {
             return sharp256::gui::run_receiver_gui(cfg);
         }
     }
+    #[cfg(feature = "nat-traversal")]
+    return run_headless(cfg, peer_cards).await;
+    #[cfg(not(feature = "nat-traversal"))]
     run_headless(cfg).await
 }
 
-async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
+#[cfg(feature = "nat-traversal")]
+async fn run_headless(
+    cfg: ReceiverConfig,
+    peer_cards: Vec<sharp256::nat::card::Card>,
+) -> Result<()> {
+    run_receiver(cfg, peer_cards).await
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+async fn run_headless(cfg: ReceiverConfig) -> Result<()> {
+    run_receiver(cfg).await
+}
+
+async fn run_receiver(
+    mut cfg: ReceiverConfig,
+    #[cfg(feature = "nat-traversal")] peer_cards: Vec<sharp256::nat::card::Card>,
+) -> Result<()> {
     let id = cfg.identity.as_ref().map(|i| i.id()).expect("identity set");
     println!("{}", system_info());
     std::fs::create_dir_all(&cfg.output_dir)?;
@@ -183,6 +236,7 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
     }
     println!("Press Ctrl-C to stop.\n");
 
+    let last_card: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     cfg.events = Some(Arc::new(move |ev: TransferEvent| match ev {
         TransferEvent::IncomingRequest {
             peer,
@@ -239,8 +293,19 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
             summary,
             advertised,
             address,
+            card,
         } => {
             println!("Network: {}", summary);
+            // The card to give a sender on another network. Said again only
+            // when it changes.
+            if let Some(card) = card {
+                let mut last = last_card.lock().unwrap_or_else(|e| e.into_inner());
+                if last.as_deref() != Some(card.as_str()) {
+                    println!("Your card:   {}", card);
+                    println!("             (give it to the sender: sharp-sender <file> <card>)");
+                    *last = Some(card);
+                }
+            }
             // Every address a sender might reach us at, best first: the
             // sender tries each in turn and the handshake decides.
             if let Some(full) = address {
@@ -277,6 +342,15 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
     // has no IPv6.
     println!("Listening:   {}", receiver.local_addr()?);
     let cancel = receiver.cancel_token();
+    // Cards given now, and cards pasted while it runs.
+    #[cfg(feature = "nat-traversal")]
+    {
+        let cards = receiver.peer_cards();
+        for card in peer_cards {
+            let _ = cards.send(card);
+        }
+        std::thread::spawn(move || read_pasted_cards(cards));
+    }
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             println!("\nShutting down...");
@@ -285,4 +359,37 @@ async fn run_headless(mut cfg: ReceiverConfig) -> Result<()> {
     });
     receiver.run().await?;
     Ok(())
+}
+
+/// Reads contact cards pasted into the terminal, one per line, and hands
+/// them to the running receiver. Anything else is ignored, so a receiver
+/// started with its input closed or redirected simply never hears from
+/// here.
+#[cfg(feature = "nat-traversal")]
+fn read_pasted_cards(cards: tokio::sync::mpsc::UnboundedSender<sharp256::nat::card::Card>) {
+    use std::io::BufRead;
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { return };
+        let line = line.trim();
+        if !line
+            .get(..4)
+            .is_some_and(|h| h.eq_ignore_ascii_case("shc1"))
+        {
+            continue;
+        }
+        match sharp256::nat::card::Card::from_text(line) {
+            Ok(card) if card.role == sharp256::nat::card::Role::Sender => {
+                println!(
+                    "Card of {}: sending at its {} address(es); it may take a moment",
+                    card.id,
+                    card.punch_targets().len()
+                );
+                if cards.send(card).is_err() {
+                    return;
+                }
+            }
+            Ok(_) => println!("That is a receiver's card; a receiver is given the sender's."),
+            Err(e) => println!("That card cannot be read: {}", e),
+        }
+    }
 }

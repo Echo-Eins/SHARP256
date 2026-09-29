@@ -122,10 +122,37 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     if !file.exists() {
         anyhow::bail!("no such file or folder: {}", file.display());
     }
-    let (receiver_id, hosts) =
-        sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?;
+    // A contact card (shc1-…) instead of an address: everything the
+    // receiver's program knows about how to reach it.
+    let looks_like_card = receiver
+        .trim_start()
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("shc1"));
+    #[cfg(feature = "nat-traversal")]
+    let card = if looks_like_card {
+        let card = sharp256::nat::card::Card::from_arg(&receiver)
+            .map_err(|e| anyhow::anyhow!("the receiver's card: {}", e))?;
+        if card.role != sharp256::nat::card::Role::Receiver {
+            anyhow::bail!("that is a sender's card; give the sender the receiver's card instead");
+        }
+        Some(card)
+    } else {
+        None
+    };
+    #[cfg(feature = "nat-traversal")]
+    let card_id = card.as_ref().map(|c| c.id);
+    #[cfg(not(feature = "nat-traversal"))]
+    let card_id: Option<sharp256::SharpId> = if looks_like_card {
+        anyhow::bail!("this build has no NAT traversal, so it cannot read contact cards")
+    } else {
+        None
+    };
+    let (receiver_id, hosts) = match card_id {
+        Some(id) => (id, Vec::new()),
+        None => sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?,
+    };
     // A receiver reached only through a relay publishes no address.
-    if hosts.is_empty() && args.relays.is_empty() {
+    if card_id.is_none() && hosts.is_empty() && args.relays.is_empty() {
         anyhow::bail!(
             "{} has no address: write it as <ID>@<host>:<port>, or name the relay it \
              registered with using --relay",
@@ -140,11 +167,17 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     // several of its own. The sender tries them all — names resolved while
     // the literal addresses are already being tried — and the handshake
     // decides which one is the receiver.
+    #[cfg(feature = "nat-traversal")]
+    let mut cfg = match card {
+        Some(card) => SenderConfig::for_card(card, file.clone()),
+        None => SenderConfig::for_hosts(&hosts, receiver_id, file.clone()),
+    };
+    #[cfg(not(feature = "nat-traversal"))]
     let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file.clone());
     cfg.bind = args.bind;
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
     cfg.stun_servers = args.stun.clone();
-    cfg.relays = args.relays.clone();
+    cfg.relays.extend(args.relays.iter().cloned());
     cfg.state_dir = args.state_dir.clone();
     cfg.identity = Some(identity);
     if let Some(secret) = &args.secret {
@@ -160,6 +193,7 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
         println!("Rate cap:  {}", format_rate(bps as f64));
     }
 
+    let last_card: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let last_print = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
     cfg.events = Some(Arc::new(move |ev: TransferEvent| match ev {
@@ -200,6 +234,20 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
                     eta,
                     if s.stalled { "  [stalled]" } else { "" }
                 );
+            }
+        }
+        TransferEvent::ContactCard { card, summary } => {
+            // Said again only when it changes: the tests report more than
+            // once as they find things out.
+            let mut last = last_card.lock().unwrap_or_else(|e| e.into_inner());
+            if last.as_deref() != Some(card.as_str()) {
+                println!("Network:   {}", summary);
+                println!("Your card: {}", card);
+                println!(
+                    "           (give it to the receiver: sharp-receiver --peer-card <card>, \
+                     or paste it into the running receiver)"
+                );
+                *last = Some(card);
             }
         }
         TransferEvent::Stalled { since, .. } => {

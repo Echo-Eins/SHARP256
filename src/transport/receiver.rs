@@ -330,7 +330,18 @@ pub struct Receiver {
     aux_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     #[cfg(not(feature = "nat-traversal"))]
     _aux_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    /// Contact cards of peers, handed over while the receiver runs (see
+    /// [`Receiver::peer_cards`]).
+    #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
+    cards_tx: mpsc::UnboundedSender<PeerCard>,
+    cards_rx: mpsc::UnboundedReceiver<PeerCard>,
 }
+
+/// A peer's contact card; there is no such thing without NAT traversal.
+#[cfg(feature = "nat-traversal")]
+type PeerCard = crate::nat::card::Card;
+#[cfg(not(feature = "nat-traversal"))]
+type PeerCard = std::convert::Infallible;
 
 impl Receiver {
     pub async fn new(cfg: ReceiverConfig) -> Result<Self, RecvError> {
@@ -375,8 +386,11 @@ impl Receiver {
         let (routes, aux_rx) = crate::nat::birthday::Routes::new();
         #[cfg(not(feature = "nat-traversal"))]
         let (_aux_tx, aux_rx) = mpsc::channel(1);
+        let (cards_tx, cards_rx) = mpsc::unbounded_channel();
         Ok(Self {
             aux_rx,
+            cards_tx,
+            cards_rx,
             #[cfg(not(feature = "nat-traversal"))]
             _aux_tx,
             shared: Arc::new(Shared {
@@ -399,6 +413,15 @@ impl Receiver {
         self.shared.socket.local_addr()
     }
 
+    /// Where a peer's contact card is handed to this receiver while it
+    /// runs: it starts punching towards every address on the card at once,
+    /// which is what lets a sender behind a NAT that filters unasked
+    /// packets get in (see `nat::card`).
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_cards(&self) -> mpsc::UnboundedSender<crate::nat::card::Card> {
+        self.cards_tx.clone()
+    }
+
     /// Our identity: senders need it to reach us.
     pub fn id(&self) -> SharpId {
         self.shared.identity.id()
@@ -413,6 +436,7 @@ impl Receiver {
     pub async fn run(self) -> Result<(), RecvError> {
         let shared = self.shared;
         let mut aux_rx = self.aux_rx;
+        let mut cards_rx = self.cards_rx;
 
         // NAT discovery runs in the background; its STUN responses arrive on
         // this socket and are handed over below.
@@ -448,6 +472,8 @@ impl Receiver {
         let nat = if shared.cfg.nat_traversal && !shared.cfg.relay_only() {
             let events = shared.cfg.events.clone();
             let id = shared.identity.id();
+            let relay_refs = relay_refs(&shared.cfg.relays);
+            let puncher = puncher.clone();
             crate::nat::spawn_discovery(
                 shared.socket.udp(),
                 {
@@ -464,11 +490,18 @@ impl Receiver {
                 hints_tx,
                 shared.cancel.clone(),
                 move |r| {
+                    // The tests are over: what is known of this NAT is what
+                    // it will be, for the punches that wait for it.
+                    puncher.settle();
                     emit(
                         &events,
                         TransferEvent::Reachability {
                             advertised: r.advertised().map(|a| a.to_string()),
                             address: r.address_string(&id),
+                            card: Some(
+                                r.card(&id, crate::nat::card::Role::Receiver, &relay_refs)
+                                    .to_text(),
+                            ),
                             summary: r.describe(),
                         },
                     )
@@ -477,6 +510,10 @@ impl Receiver {
         } else {
             None
         };
+        #[cfg(feature = "nat-traversal")]
+        if nat.is_none() {
+            puncher.settle();
+        }
 
         // Relays run alongside: each registers this receiver so that a
         // sender who cannot reach any of its addresses can still be
@@ -527,6 +564,12 @@ impl Receiver {
                     }
                 }
                 Some(key) = done_rx.recv() => d.forget(&key),
+                Some(card) = cards_rx.recv() => {
+                    #[cfg(feature = "nat-traversal")]
+                    meet_card(&puncher, &cancel, card);
+                    #[cfg(not(feature = "nat-traversal"))]
+                    match card {}
+                }
                 Some((data, from)) = aux_rx.recv() => {
                     // From a peer met at a socket of its own: routed like
                     // anything the main socket reads.
@@ -973,6 +1016,46 @@ struct RelayClients {
 const RELAY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "nat-traversal")]
 const RELAY_RESOLVE_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Starts punching towards every address of a peer's card, for as long as a
+/// person may take to hand the peer this receiver's own.
+#[cfg(feature = "nat-traversal")]
+fn meet_card(
+    puncher: &Arc<crate::nat::punch::Puncher>,
+    cancel: &CancellationToken,
+    card: crate::nat::card::Card,
+) {
+    let targets = card.punch_targets();
+    tracing::info!(
+        "contact card of {}: punching towards {} address(es)",
+        card.id.short(),
+        targets.len()
+    );
+    for (addr, hints) in targets {
+        let (puncher, cancel) = (puncher.clone(), cancel.clone());
+        tokio::spawn(async move {
+            puncher
+                .run_for(addr, hints, crate::nat::punch::MEET_DURATION, &cancel)
+                .await;
+        });
+    }
+}
+
+/// The relays this receiver is registered with that are written with an
+/// identity and an address, as a card names them.
+#[cfg(feature = "nat-traversal")]
+fn relay_refs(relays: &[String]) -> Vec<crate::nat::card::RelayRef> {
+    relays
+        .iter()
+        .filter_map(|r| {
+            let (Some(id), host) = crate::relay::parse_relay(r).ok()? else {
+                return None;
+            };
+            let addr = crate::address::dns::parse_literal(&host)?;
+            Some(crate::nat::card::RelayRef { id, addr })
+        })
+        .collect()
+}
 
 /// Registers this receiver with every configured relay, in the background.
 #[cfg(feature = "nat-traversal")]
