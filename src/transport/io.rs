@@ -12,7 +12,7 @@
 use crate::transport::socket::{bind_udp, set_dont_fragment};
 use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
 use std::io::{self, IoSliceMut};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::Interest;
@@ -34,6 +34,9 @@ pub struct Received {
     pub from: SocketAddr,
     pub len: usize,
     pub stride: usize,
+    /// The local address the datagrams were sent to, where the system says:
+    /// what a host with several addresses answers *from*.
+    pub dst: Option<IpAddr>,
 }
 
 impl Received {
@@ -183,6 +186,7 @@ impl BatchSocket {
                 from: crate::address::normalize(m.addr),
                 len: m.len,
                 stride: if m.stride == 0 { m.len } else { m.stride },
+                dst: m.dst_ip.map(|ip| ip.to_canonical()),
             };
         }
         Ok(got)
@@ -194,6 +198,95 @@ impl BatchSocket {
 
     pub async fn writable(&self) -> io::Result<()> {
         self.io.writable().await
+    }
+}
+
+/// A UDP socket for a service that answers *from the address it was asked
+/// at*.
+///
+/// A socket bound to the wildcard answers from whichever of the host's
+/// addresses the system likes best, and a peer that sent to another one
+/// discards the answer — or a firewall between them does, since it is no
+/// reply to anything. That is how a host with two addresses on one
+/// interface behaves, and a relay that also runs the STUN server's second
+/// address is exactly such a host. So every datagram is received with the
+/// address it was sent to, and answered with it as the source
+/// (`IP_PKTINFO`, `IPV6_PKTINFO`).
+pub struct PktSocket {
+    io: Arc<UdpSocket>,
+    state: UdpSocketState,
+}
+
+/// One receive: `len` bytes holding datagrams of `stride` bytes each (the
+/// system may hand several from one peer over together).
+#[derive(Debug, Clone, Copy)]
+pub struct PktReceived {
+    pub len: usize,
+    pub stride: usize,
+    pub from: SocketAddr,
+    pub dst: Option<IpAddr>,
+}
+
+impl PktSocket {
+    pub fn new(io: Arc<UdpSocket>) -> io::Result<Self> {
+        let state = UdpSocketState::new((&*io).into())?;
+        Ok(Self { io, state })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.io.local_addr()
+    }
+
+    /// Waits for a datagram (or a run of them) into `buf`.
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<PktReceived> {
+        loop {
+            self.io.readable().await?;
+            let mut meta = [RecvMeta::default()];
+            let mut slices = [IoSliceMut::new(&mut buf[..])];
+            let got = self.io.try_io(Interest::READABLE, || {
+                self.state.recv((&*self.io).into(), &mut slices, &mut meta)
+            });
+            match got {
+                Ok(0) => continue,
+                Ok(_) => {
+                    let m = meta[0];
+                    return Ok(PktReceived {
+                        len: m.len,
+                        stride: if m.stride == 0 { m.len } else { m.stride },
+                        from: crate::address::normalize(m.addr),
+                        dst: m.dst_ip.map(|ip| ip.to_canonical()),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Sends `datagram` to `to`, from `via` where that is known.
+    pub async fn send(
+        &self,
+        to: SocketAddr,
+        via: Option<IpAddr>,
+        datagram: &[u8],
+    ) -> io::Result<()> {
+        loop {
+            self.io.writable().await?;
+            let transmit = Transmit {
+                destination: to,
+                ecn: None,
+                contents: datagram,
+                segment_size: None,
+                src_ip: via,
+            };
+            match self.io.try_io(Interest::WRITABLE, || {
+                self.state.try_send((&*self.io).into(), &transmit)
+            }) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -256,6 +349,7 @@ mod tests {
             from: "127.0.0.1:1".parse().unwrap(),
             len: 10,
             stride: 4,
+            dst: None,
         };
         assert_eq!(r.segments().collect::<Vec<_>>(), vec![0..4, 4..8, 8..10]);
         let single = Received { stride: 10, ..r };
@@ -328,7 +422,8 @@ mod tests {
             Received {
                 from: to,
                 len: 0,
-                stride: 0
+                stride: 0,
+                dst: None
             };
             RECV_BATCH
         ];

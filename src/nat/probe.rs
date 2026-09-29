@@ -202,16 +202,30 @@ impl Probe {
             ),
             None => {}
         }
-        line(
-            "Port forwarding:",
-            match r.upnp_addr {
-                Some(a) => format!("the router granted {} (it is given back when this ends)", a),
-                None if self.options.port_mapping => {
-                    "none: no router answered PCP, NAT-PMP or UPnP, or it refused".to_string()
-                }
-                None => "not asked".to_string(),
-            },
-        );
+        if !self.options.port_mapping {
+            line("Port forwarding:", "not asked".to_string());
+        } else {
+            let mut said = false;
+            for f in &r.forwards {
+                line(
+                    if said { "" } else { "Port forwarding:" },
+                    format!("{} (given back when this ends)", f),
+                );
+                said = true;
+            }
+            // What each protocol said, granted or not: "the router refused"
+            // and "no router answered" are different things to know.
+            for note in &r.mapping_notes {
+                line(if said { "" } else { "Port forwarding:" }, note.clone());
+                said = true;
+            }
+            if !said {
+                line(
+                    "Port forwarding:",
+                    "none: no router answered PCP, NAT-PMP or UPnP".to_string(),
+                );
+            }
+        }
         line("Relays on the card:", self.card.relays.len().to_string());
         out.push_str(&format!(
             "\nYour card (give it to the other side):\n{}\n",

@@ -50,6 +50,12 @@ const SERVICES: [&str; 3] = [
     "urn:schemas-upnp-org:service:WANPPPConnection:1",
 ];
 
+/// The service that opens an IPv6 firewall to a port (UPnP IGD v2,
+/// WANIPv6FirewallControl:1): there is nothing to translate over IPv6, but
+/// the router's firewall drops what nobody inside asked for, and this is how
+/// a host asks for a hole (a "pinhole").
+const FIREWALL_SERVICE: &str = "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1";
+
 /// UPnP error codes worth telling apart (UPnP IGD WANIPConnection:2, 2.5).
 const CONFLICT_IN_MAPPING: u32 = 718;
 const ONLY_PERMANENT_LEASES: u32 = 725;
@@ -291,11 +297,20 @@ pub(crate) fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 /// Finds a port-forwarding service in a device description, preferring the
 /// newest. Its control URL must be on the device that described it.
 pub(crate) fn find_service(description: &str, location: &Url) -> Option<Service> {
+    find_service_of(description, location, &SERVICES)
+}
+
+/// [`find_service`] for any of `kinds`, best first.
+pub(crate) fn find_service_of(
+    description: &str,
+    location: &Url,
+    kinds: &[&'static str],
+) -> Option<Service> {
     let base = element(description, "URLBase")
         .and_then(Url::parse)
         .filter(|b| b.host.ip() == location.host.ip())
         .unwrap_or_else(|| location.clone());
-    for kind in SERVICES {
+    for &kind in kinds {
         for block in description.split("<service>").skip(1) {
             let block = block.split("</service>").next().unwrap_or("");
             if element(block, "serviceType") != Some(kind) {
@@ -591,6 +606,152 @@ impl UpnpMapping {
     }
 }
 
+/// A hole in a router's IPv6 firewall for one UDP port of this host: what a
+/// port forward is where there is no address translation.
+pub struct UpnpPinhole {
+    service: Service,
+    client: std::net::Ipv6Addr,
+    port: u16,
+    /// The router's handle on the pinhole; `None` when its firewall is off
+    /// and there is nothing to open (or to close).
+    unique_id: Option<String>,
+    lease: u32,
+}
+
+impl UpnpPinhole {
+    /// Finds the router and asks it to let packets from anywhere in to
+    /// `client`'s UDP `port`.
+    pub async fn create(client: std::net::Ipv6Addr, port: u16, lease: u32) -> Result<Self> {
+        Self::create_with(SSDP_TARGET, client, port, lease).await
+    }
+
+    /// [`UpnpPinhole::create`], searching at `target` (the tests' simulated
+    /// router listens on loopback).
+    pub async fn create_with(
+        target: SocketAddr,
+        client: std::net::Ipv6Addr,
+        port: u16,
+        lease: u32,
+    ) -> Result<Self> {
+        tokio::time::timeout(CREATE_TIMEOUT, Self::attempt(target, client, port, lease))
+            .await
+            .map_err(|_| anyhow!("UPnP: the router took too long"))?
+    }
+
+    async fn attempt(
+        target: SocketAddr,
+        client: std::net::Ipv6Addr,
+        port: u16,
+        lease: u32,
+    ) -> Result<Self> {
+        let mut last = anyhow!("no UPnP router answered");
+        for location in search(target).await? {
+            let service = match get(&location).await {
+                Ok(desc) => match find_service_of(&desc, &location, &[FIREWALL_SERVICE]) {
+                    Some(s) => s,
+                    None => {
+                        last = anyhow!("{} has no IPv6 firewall control", location.host);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            // A router says whether it has a firewall to open and whether
+            // it lets hosts open it; either "no" is the answer, and the
+            // first is a good one.
+            let mut open = false;
+            if let Ok(status) = soap(&service, "GetFirewallStatus", &[]).await {
+                if element(&status, "FirewallEnabled") == Some("0") {
+                    open = true;
+                } else if element(&status, "InboundPinholeAllowed") == Some("0") {
+                    last = anyhow!(
+                        "{} does not let hosts open its IPv6 firewall",
+                        location.host
+                    );
+                    continue;
+                }
+            }
+            if open {
+                return Ok(Self {
+                    service,
+                    client,
+                    port,
+                    unique_id: None,
+                    lease,
+                });
+            }
+            // The spec's longest lease; anything more is refused.
+            let lease = lease.clamp(1, 86_400);
+            let args = [
+                ("RemoteHost", String::new()),
+                ("RemotePort", "0".to_string()),
+                ("InternalClient", client.to_string()),
+                ("InternalPort", port.to_string()),
+                ("Protocol", "17".to_string()),
+                ("LeaseTime", lease.to_string()),
+            ];
+            match soap(&service, "AddPinhole", &args).await {
+                Ok(answer) => {
+                    let Some(id) = element(&answer, "UniqueID").map(str::to_string) else {
+                        last = anyhow!("the router granted no pinhole handle");
+                        continue;
+                    };
+                    return Ok(Self {
+                        service,
+                        client,
+                        port,
+                        unique_id: Some(id),
+                        lease,
+                    });
+                }
+                Err(e) => last = anyhow!("UPnP pinhole failed: {}", e),
+            }
+        }
+        Err(last)
+    }
+
+    /// Where the host is reachable now: its own address, the port opened.
+    pub fn external_addr(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(self.client), self.port)
+    }
+
+    pub fn lease(&self) -> u32 {
+        self.lease
+    }
+
+    /// Renews the lease (UpdatePinhole).
+    pub async fn refresh(&self) -> Result<()> {
+        let Some(id) = &self.unique_id else {
+            return Ok(());
+        };
+        soap(
+            &self.service,
+            "UpdatePinhole",
+            &[
+                ("UniqueID", id.clone()),
+                ("NewLeaseTime", self.lease.to_string()),
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow!("UPnP pinhole renewal failed: {}", e))
+    }
+
+    /// Closes the pinhole.
+    pub async fn remove(self) -> Result<()> {
+        let Some(id) = self.unique_id else {
+            return Ok(());
+        };
+        soap(&self.service, "DeletePinhole", &[("UniqueID", id)])
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow!("UPnP pinhole removal failed: {}", e))
+    }
+}
+
 /// Local IPv4 address of the interface used to reach `router`.
 fn local_ip_towards(router: Ipv4Addr) -> Result<Ipv4Addr> {
     let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
@@ -686,6 +847,12 @@ mod tests {
         Hang,
         /// Sends a description far larger than any router's.
         Huge,
+        /// An IGD v2 with an IPv6 firewall to open.
+        Pinhole,
+        /// Its firewall refuses hosts that ask.
+        NoPinholes,
+        /// Its firewall is switched off.
+        FirewallOff,
     }
 
     async fn fake_router(behave: Behave, location_host: Option<&str>) -> FakeRouter {
@@ -713,6 +880,9 @@ mod tests {
         let http_task = tokio::spawn(async move {
             let kind = match behave {
                 Behave::ConflictThenAny => "urn:schemas-upnp-org:service:WANIPConnection:2",
+                Behave::Pinhole | Behave::NoPinholes | Behave::FirewallOff => {
+                    "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1"
+                }
                 _ => "urn:schemas-upnp-org:service:WANIPConnection:1",
             };
             loop {
@@ -778,6 +948,45 @@ mod tests {
                         )
                     } else if req.contains("#DeletePortMapping") {
                         reply("200 OK", String::new())
+                    } else if req.contains("#GetFirewallStatus") {
+                        let (enabled, allowed) = match behave {
+                            Behave::NoPinholes => (1, 0),
+                            Behave::FirewallOff => (0, 1),
+                            _ => (1, 1),
+                        };
+                        reply(
+                            "200 OK",
+                            format!(
+                                "<u:GetFirewallStatusResponse><FirewallEnabled>{}\
+                                 </FirewallEnabled><InboundPinholeAllowed>{}\
+                                 </InboundPinholeAllowed></u:GetFirewallStatusResponse>",
+                                enabled, allowed
+                            ),
+                        )
+                    } else if req.contains("#AddPinhole") {
+                        // The arguments a router needs, without the prefix
+                        // the IGD v1 actions use.
+                        let wanted = [
+                            "<RemoteHost>",
+                            "<InternalClient>2001:db8::5<",
+                            "<InternalPort>5555<",
+                            "<Protocol>17<",
+                            "<LeaseTime>",
+                        ];
+                        if wanted.iter().all(|w| req.contains(w)) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            reply(
+                                "200 OK",
+                                "<u:AddPinholeResponse><UniqueID>77</UniqueID></u:AddPinholeResponse>"
+                                    .into(),
+                            )
+                        } else {
+                            reply("500 Internal Server Error", String::new())
+                        }
+                    } else if (req.contains("#UpdatePinhole") || req.contains("#DeletePinhole"))
+                        && req.contains("<UniqueID>77<")
+                    {
+                        reply("200 OK", String::new())
                     } else {
                         reply("404 Not Found", String::new())
                     };
@@ -793,6 +1002,47 @@ mod tests {
     }
 
     const HERE: Option<Ipv4Addr> = Some(Ipv4Addr::LOCALHOST);
+
+    const CLIENT6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+
+    /// An IPv6 firewall is opened to the port, renewed and closed, and the
+    /// host is then reachable at its own address.
+    #[tokio::test]
+    async fn a_router_opens_its_ipv6_firewall_to_a_port() {
+        let r = fake_router(Behave::Pinhole, None).await;
+        let p = UpnpPinhole::create_with(r.ssdp, CLIENT6, 5555, 3600)
+            .await
+            .expect("opened");
+        assert_eq!(p.external_addr(), "[2001:db8::5]:5555".parse().unwrap());
+        assert_eq!(r.adds.load(Ordering::Relaxed), 1);
+        p.refresh().await.expect("renewed");
+        p.remove().await.expect("closed");
+    }
+
+    #[tokio::test]
+    async fn a_firewall_that_is_off_needs_no_pinhole() {
+        let r = fake_router(Behave::FirewallOff, None).await;
+        let p = UpnpPinhole::create_with(r.ssdp, CLIENT6, 5555, 3600)
+            .await
+            .expect("nothing to open");
+        assert_eq!(r.adds.load(Ordering::Relaxed), 0);
+        p.remove().await.expect("nothing to close");
+    }
+
+    #[tokio::test]
+    async fn a_router_that_lets_hosts_open_nothing_is_reported() {
+        let r = fake_router(Behave::NoPinholes, None).await;
+        let e = UpnpPinhole::create_with(r.ssdp, CLIENT6, 5555, 3600)
+            .await
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains("does not let hosts open"), "{}", e);
+        // And an IGD with no IPv6 firewall at all is not mistaken for one.
+        let v1 = fake_router(Behave::Normal, None).await;
+        assert!(UpnpPinhole::create_with(v1.ssdp, CLIENT6, 5555, 3600)
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn a_router_forwards_a_port_and_says_where() {

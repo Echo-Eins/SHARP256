@@ -440,6 +440,11 @@ pub fn parse_literal(s: &str) -> Option<SocketAddr> {
     Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
 }
 
+/// The system's index for the interface called `name`.
+pub fn interface_index_of(name: &str) -> Option<u32> {
+    interface_index(name)
+}
+
 #[cfg(unix)]
 fn interface_index(name: &str) -> Option<u32> {
     let name = std::ffi::CString::new(name).ok()?;

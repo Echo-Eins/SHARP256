@@ -99,6 +99,9 @@ impl Default for NatConfig {
 pub enum PortForward {
     Modern(portmap::Mapping),
     Upnp(UpnpMapping),
+    /// A hole in the router's IPv6 firewall, by UPnP: nothing is translated
+    /// over IPv6, so the address to use is the host's own.
+    Pinhole(upnp::UpnpPinhole),
 }
 
 impl PortForward {
@@ -106,6 +109,16 @@ impl PortForward {
         match self {
             PortForward::Modern(m) => m.protocol().name(),
             PortForward::Upnp(_) => "UPnP-IGD",
+            PortForward::Pinhole(_) => "UPnP-IGD (IPv6 firewall)",
+        }
+    }
+
+    /// Whether this is a forward on the IPv4 side of the router.
+    pub fn is_v4(&self) -> bool {
+        match self {
+            PortForward::Modern(m) => m.internal().is_ipv4(),
+            PortForward::Upnp(_) => true,
+            PortForward::Pinhole(_) => false,
         }
     }
 
@@ -113,6 +126,7 @@ impl PortForward {
         match self {
             PortForward::Modern(m) => m.external_port(),
             PortForward::Upnp(m) => m.external_port(),
+            PortForward::Pinhole(m) => m.external_addr().port(),
         }
     }
 
@@ -121,6 +135,7 @@ impl PortForward {
         match self {
             PortForward::Modern(m) => m.external_addr(),
             PortForward::Upnp(m) => m.external_addr(),
+            PortForward::Pinhole(m) => Some(m.external_addr()),
         }
     }
 
@@ -129,11 +144,19 @@ impl PortForward {
         match self {
             PortForward::Modern(m) => m.lifetime(),
             PortForward::Upnp(m) => m.lease(),
+            PortForward::Pinhole(m) => m.lease(),
         }
     }
 
     pub fn describe(&self) -> String {
         match self {
+            PortForward::Modern(m) if m.internal().is_ipv6() => format!(
+                "{} opens the IPv6 firewall to {} for {} s (router {})",
+                m.protocol().name(),
+                m.internal(),
+                m.lifetime(),
+                m.router()
+            ),
             PortForward::Modern(m) => format!(
                 "{} forwards port {} to {} for {} s (router {})",
                 m.protocol().name(),
@@ -141,6 +164,11 @@ impl PortForward {
                 m.internal(),
                 m.lifetime(),
                 m.router()
+            ),
+            PortForward::Pinhole(m) => format!(
+                "UPnP-IGD opens the IPv6 firewall to {} for {} s",
+                m.external_addr(),
+                m.lease()
             ),
             PortForward::Upnp(m) => format!(
                 "UPnP-IGD forwards port {} to {} for {} s",
@@ -155,6 +183,7 @@ impl PortForward {
         match self {
             PortForward::Modern(m) => m.refresh(lease).await,
             PortForward::Upnp(m) => m.refresh().await,
+            PortForward::Pinhole(m) => m.refresh().await,
         }
     }
 
@@ -162,28 +191,57 @@ impl PortForward {
         match self {
             PortForward::Modern(m) => m.remove().await,
             PortForward::Upnp(m) => m.remove().await,
+            PortForward::Pinhole(m) => m.remove().await,
         }
     }
 }
 
-/// Asks the router for a UDP forward to `local_port`, trying every protocol
-/// routers speak for it. PCP and NAT-PMP come first: they are two small
-/// datagrams against UPnP's multicast discovery followed by HTTP and SOAP,
-/// and they are what most routers made in the last decade implement.
+/// Every forward or firewall opening obtained, and what came of each thing
+/// tried — so that a person told "no port forward" can also be told why.
+#[derive(Default)]
+pub struct Forwards {
+    pub granted: Vec<PortForward>,
+    /// One line for each protocol asked, in words.
+    pub notes: Vec<String>,
+}
+
+/// Asks the routers for what lets a peer in: a UDP forward to `local_addr`'s
+/// port over IPv4, and, where this host has a global IPv6 address, a hole in
+/// the IPv6 firewall — both at once, since each takes a router a few
+/// seconds and neither depends on the other.
+async fn forward_ports(local_addr: SocketAddr, lease: u32) -> Forwards {
+    let ((v4, mut notes), (v6, notes6)) = tokio::join!(
+        forward_port_v4(local_addr, lease),
+        forward_port_v6(local_addr, lease)
+    );
+    notes.extend(notes6);
+    Forwards {
+        granted: v4.into_iter().chain(v6).collect(),
+        notes,
+    }
+}
+
+/// The IPv4 half of [`forward_ports`]: every protocol routers speak for a
+/// forward. PCP and NAT-PMP come first: they are two small datagrams against
+/// UPnP's multicast discovery followed by HTTP and SOAP, and they are what
+/// most routers made in the last decade implement.
 ///
 /// Every router we might be behind is asked at once, from every interface
 /// that might be the one it serves: asking them in turn, each allowed its
 /// full series of retries, could take a minute and a half before UPnP was
 /// even tried — and the receiver's address was not reported until then.
-async fn forward_port(local_addr: SocketAddr, lease: u32) -> Option<PortForward> {
-    // Only IPv4 is forwarded; an IPv6 socket reaches IPv4 only when it is a
-    // dual-stack wildcard.
+async fn forward_port_v4(local_addr: SocketAddr, lease: u32) -> (Option<PortForward>, Vec<String>) {
+    let mut notes: Vec<String> = Vec::new();
+    // An IPv6 socket reaches IPv4 only when it is a dual-stack wildcard.
     let bind_ip = match crate::address::canonical(local_addr).ip() {
-        IpAddr::V4(v4) => Some(v4),
-        IpAddr::V6(v6) if v6.is_unspecified() => Some(std::net::Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => return None,
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(v6) if v6.is_unspecified() => std::net::Ipv4Addr::UNSPECIFIED,
+        IpAddr::V6(_) => {
+            notes.push("IPv4: this socket has no IPv4 address to forward".to_string());
+            return (None, notes);
+        }
     };
-    let ip = bind_ip?;
+    let ip = bind_ip;
     // A socket bound to one address knows which one to claim; a wildcard
     // one has to try each interface it could be reached on.
     let clients = if ip.is_unspecified() {
@@ -196,17 +254,34 @@ async fn forward_port(local_addr: SocketAddr, lease: u32) -> Option<PortForward>
         let router = SocketAddr::new(IpAddr::V4(gw), portmap::PORT);
         for &client in &clients {
             let port = local_addr.port();
-            attempts.spawn(async move { portmap::request_at(router, client, port, lease).await });
+            attempts.spawn(async move {
+                (
+                    router,
+                    portmap::request_at(router, client, port, lease).await,
+                )
+            });
         }
     }
     let mut found = None;
     while let Some(r) = attempts.join_next().await {
         match r {
-            Ok(Ok(m)) => {
+            Ok((router, Ok(m))) => {
+                notes.push(format!(
+                    "IPv4: {} at {} granted external port {}",
+                    m.protocol().name(),
+                    router,
+                    m.external_port()
+                ));
                 found = Some(m);
                 break;
             }
-            Ok(Err(e)) => tracing::debug!("NAT: {}", e),
+            Ok((router, Err(e))) => {
+                tracing::debug!("NAT: {}", e);
+                let note = format!("IPv4: PCP and NAT-PMP at {}: {}", router.ip(), e);
+                if !notes.contains(&note) && notes.len() < 6 {
+                    notes.push(note);
+                }
+            }
             Err(_) => {}
         }
     }
@@ -217,20 +292,109 @@ async fn forward_port(local_addr: SocketAddr, lease: u32) -> Option<PortForward>
         if !attempts.is_empty() {
             tokio::spawn(async move {
                 while let Some(r) = attempts.join_next().await {
-                    if let Ok(Ok(extra)) = r {
+                    if let Ok((_, Ok(extra))) = r {
                         let _ = extra.remove().await;
                     }
                 }
             });
         }
-        return Some(PortForward::Modern(m));
+        return (Some(PortForward::Modern(m)), notes);
     }
     let bind = (!ip.is_unspecified()).then_some(ip);
     match UpnpMapping::create(local_addr.port(), bind, lease, "SHARP-256 receiver").await {
-        Ok(m) => Some(PortForward::Upnp(m)),
+        Ok(m) => {
+            notes.push(format!(
+                "IPv4: UPnP-IGD granted external port {}",
+                m.external_port()
+            ));
+            (Some(PortForward::Upnp(m)), notes)
+        }
         Err(e) => {
             tracing::debug!("NAT: {}", e);
-            None
+            notes.push(format!("IPv4: UPnP-IGD: {}", e));
+            (None, notes)
+        }
+    }
+}
+
+/// The IPv6 half: no address is translated over IPv6, but a router's
+/// firewall drops what nobody inside asked for, and PCP (RFC 6887) and UPnP
+/// IGD v2 both let a host ask it to let a port in.
+async fn forward_port_v6(local_addr: SocketAddr, lease: u32) -> (Option<PortForward>, Vec<String>) {
+    let mut notes: Vec<String> = Vec::new();
+    if !local_addr.is_ipv6() {
+        return (None, notes);
+    }
+    let clients: Vec<std::net::Ipv6Addr> = host_addresses(local_addr, false)
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V6(v6) => Some(v6),
+            IpAddr::V4(_) => None,
+        })
+        .take(2)
+        .collect();
+    if clients.is_empty() {
+        notes.push("IPv6: no global address to ask a firewall to open for".to_string());
+        return (None, notes);
+    }
+    let port = local_addr.port();
+    let mut attempts = tokio::task::JoinSet::new();
+    for router in portmap::gateway_candidates_v6().await {
+        for &client in &clients {
+            attempts.spawn(async move {
+                (
+                    router,
+                    portmap::request_v6_at(router, client, port, lease).await,
+                )
+            });
+        }
+    }
+    let mut found = None;
+    while let Some(r) = attempts.join_next().await {
+        match r {
+            Ok((router, Ok(m))) => {
+                notes.push(format!(
+                    "IPv6: PCP at {} opened its firewall to {}",
+                    router.ip(),
+                    m.internal()
+                ));
+                found = Some(m);
+                break;
+            }
+            Ok((router, Err(e))) => {
+                tracing::debug!("NAT: {}", e);
+                let note = format!("IPv6: PCP at {}: {}", router.ip(), e);
+                if !notes.contains(&note) && notes.len() < 4 {
+                    notes.push(note);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(m) = found {
+        if !attempts.is_empty() {
+            tokio::spawn(async move {
+                while let Some(r) = attempts.join_next().await {
+                    if let Ok((_, Ok(extra))) = r {
+                        let _ = extra.remove().await;
+                    }
+                }
+            });
+        }
+        return (Some(PortForward::Modern(m)), notes);
+    }
+    match upnp::UpnpPinhole::create(clients[0], port, lease).await {
+        Ok(p) => {
+            notes.push(format!(
+                "IPv6: UPnP-IGD opened its firewall to {}",
+                p.external_addr()
+            ));
+            (Some(PortForward::Pinhole(p)), notes)
+        }
+        Err(e) => {
+            tracing::debug!("NAT: {}", e);
+            notes.push(format!("IPv6: UPnP-IGD: {}", e));
+            (None, notes)
         }
     }
 }
@@ -513,6 +677,13 @@ pub struct Reachability {
     /// global IPv6 address: usually no NAT, and what shows is the firewall.
     pub behaviour6: Option<Behaviour>,
     pub upnp_addr: Option<SocketAddr>,
+    /// The address the router's IPv6 firewall was opened to (PCP or UPnP):
+    /// this host's own, on the port.
+    pub pinhole6: Option<SocketAddr>,
+    /// What each forward or firewall opening obtained is, in words.
+    pub forwards: Vec<String>,
+    /// What came of each protocol asked for one, in words.
+    pub mapping_notes: Vec<String>,
     /// The router forwarded a port, but reports an inside address as its
     /// own: it is behind another NAT, and the forward does not reach it
     /// from the internet.
@@ -540,7 +711,15 @@ impl Reachability {
                     Some(IpAddr::V4(v4)) if is_shared_address_space(v4)
                 );
         }
-        let second = self.behaviour6.as_ref().map(card::NatHints::from);
+        let mut second = self.behaviour6.as_ref().map(card::NatHints::from);
+        // A pinhole lets anyone in at the port, which is what an
+        // endpoint-independent filter does.
+        if self.pinhole6.is_some() {
+            let mut h = second.unwrap_or_else(card::NatHints::unknown);
+            h.mapping = 4;
+            h.filtering = 1;
+            second = Some(h);
+        }
         if primary_v6 {
             card::FamilyHints {
                 v4: card::NatHints::unknown(),
@@ -595,6 +774,9 @@ impl Reachability {
         if let Some(a) = self.upnp_addr {
             add(a, CandidateKind::PortForward);
         }
+        if let Some(a) = self.pinhole6 {
+            add(a, CandidateKind::PortForward);
+        }
         // Worth publishing only when the mapping does not change with the
         // destination; otherwise this address is the one *a STUN server*
         // reaches us at and tells a sender nothing.
@@ -647,6 +829,9 @@ impl Reachability {
         if let Some(a) = self.upnp_addr {
             add(a, Kind::PortMapped);
         }
+        if let Some(a) = self.pinhole6 {
+            add(a, Kind::PortMapped);
+        }
         // Global IPv6 first: no NAT to get through, so where the peer has
         // it too it is the shortest way.
         if let Some(m) = self.behaviour6.and_then(|b| b.mapped) {
@@ -695,6 +880,12 @@ impl Reachability {
     }
 
     fn describe_path(&self) -> String {
+        if let (Some(a), None) = (self.pinhole6, self.upnp_addr) {
+            return format!(
+                "reachable over IPv6 at {} (the router's firewall was opened to it)",
+                a
+            );
+        }
         if let Some(a) = self.upnp_addr {
             return format!("reachable from outside at {} (port forward)", a);
         }
@@ -764,20 +955,28 @@ fn reachability(
     local_addr: SocketAddr,
     behaviour: &Behaviour,
     behaviour6: Option<&Behaviour>,
-    forward: Option<&PortForward>,
+    forwards: &Forwards,
     publish_lan: bool,
 ) -> Reachability {
     let public_addr = behaviour.mapped;
-    let (upnp_addr, double_nat) = match forward {
+    let (upnp_addr, double_nat) = match forwards.granted.iter().find(|f| f.is_v4()) {
         Some(f) => forward_address(f, public_addr),
         None => (None, false),
     };
+    let pinhole6 = forwards
+        .granted
+        .iter()
+        .find(|f| !f.is_v4())
+        .and_then(|f| f.external_addr());
     Reachability {
         local_addr,
         public_addr,
         behaviour: *behaviour,
         behaviour6: behaviour6.copied(),
         upnp_addr,
+        pinhole6,
+        forwards: forwards.granted.iter().map(PortForward::describe).collect(),
+        mapping_notes: forwards.notes.clone(),
         double_nat,
         host: host_addresses(local_addr, publish_lan),
     }
@@ -892,16 +1091,17 @@ pub fn spawn_discovery(
         let (enable_mapping, lease) = (config.enable_port_mapping, config.mapping_lease);
         let mapping = async move {
             if enable_mapping {
-                forward_port(local, lease).await
+                forward_ports(local, lease).await
             } else {
-                None
+                Forwards::default()
             }
         };
         tokio::pin!(tests, mapping);
         let mut behaviour: Option<Behaviour> = None;
         let mut behaviour6: Option<Behaviour> = None;
         let mut responses: Option<mpsc::Receiver<stun::Incoming>> = None;
-        let mut forward: Option<Option<PortForward>> = None;
+        let mut forward: Option<Forwards> = None;
+        let none = Forwards::default();
         while behaviour.is_none() || forward.is_none() {
             tokio::select! {
                 (b, b6, rx) = &mut tests, if behaviour.is_none() => {
@@ -909,7 +1109,7 @@ pub fn spawn_discovery(
                         local,
                         &b,
                         b6.as_ref(),
-                        forward.as_ref().and_then(|f| f.as_ref()),
+                        forward.as_ref().unwrap_or(&none),
                         config.publish_lan_addresses,
                     );
                     tracing::info!("NAT: {}", r.describe());
@@ -922,16 +1122,18 @@ pub fn spawn_discovery(
                     responses = Some(rx);
                 }
                 f = &mut mapping, if forward.is_none() => {
-                    if let Some(f) = &f {
-                        tracing::info!("NAT: {}", f.describe());
-                        // Worth saying again only once there is something
-                        // to say it with.
-                        if let Some(b) = &behaviour {
+                    for granted in &f.granted {
+                        tracing::info!("NAT: {}", granted.describe());
+                    }
+                    // Worth saying again only once there is something to
+                    // say it with.
+                    if let Some(b) = &behaviour {
+                        if !f.granted.is_empty() {
                             let r = reachability(
                                 local,
                                 b,
                                 behaviour6.as_ref(),
-                                Some(f),
+                                &f,
                                 config.publish_lan_addresses,
                             );
                             tracing::info!("NAT: {}", r.describe());
@@ -941,8 +1143,10 @@ pub fn spawn_discovery(
                     forward = Some(f);
                 }
                 _ = cancel.cancelled() => {
-                    if let Some(Some(m)) = forward {
-                        let _ = tokio::time::timeout(Duration::from_secs(3), m.remove()).await;
+                    if let Some(f) = forward {
+                        for m in f.granted {
+                            let _ = tokio::time::timeout(Duration::from_secs(3), m.remove()).await;
+                        }
                     }
                     return;
                 }
@@ -1003,7 +1207,7 @@ struct Maintained<F> {
     local: SocketAddr,
     behaviour: Behaviour,
     behaviour6: Option<Behaviour>,
-    forward: Option<PortForward>,
+    forward: Forwards,
     responses: mpsc::Receiver<stun::Incoming>,
     keepalive: keepalive::SharedKeepalive,
     cancel: CancellationToken,
@@ -1037,13 +1241,7 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
         on_result,
     } = m;
     let lan = config.publish_lan_addresses;
-    let mut current = reachability(
-        local,
-        &behaviour,
-        behaviour6.as_ref(),
-        forward.as_ref(),
-        lan,
-    );
+    let mut current = reachability(local, &behaviour, behaviour6.as_ref(), &forward, lan);
     let server = behaviour.tested_with;
     // Worth keeping only when an address resting on the mapping is
     // published: a NAT that changes the port per destination gets nothing
@@ -1066,9 +1264,11 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
     // of half a minute would have left a thirty-second grant dead for half
     // of every cycle.
     let renew_every = forward
-        .as_ref()
+        .granted
+        .iter()
         .map(|f| f.lifetime())
         .filter(|&l| l > 0)
+        .min()
         .map(|l| Duration::from_secs((l as u64 / 2).max(5)));
     let mut next_renewal = renew_every.map(|e| now + e);
     let lifetime = match server {
@@ -1128,14 +1328,14 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
                             }
                         );
                         behaviour.mapped = Some(seen);
-                        current = reachability(local, &behaviour, behaviour6.as_ref(), forward.as_ref(), lan);
+                        current = reachability(local, &behaviour, behaviour6.as_ref(), &forward, lan);
                         on_result(&current);
                     }
                 }
                 next_check = Instant::now() + config.mapping_check;
             }
             _ = at(next_host) => {
-                let fresh = reachability(local, &behaviour, behaviour6.as_ref(), forward.as_ref(), lan);
+                let fresh = reachability(local, &behaviour, behaviour6.as_ref(), &forward, lan);
                 if fresh.candidates() != current.candidates() {
                     tracing::info!("NAT: this host's addresses changed");
                     current = fresh;
@@ -1144,7 +1344,7 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
                 next_host = Instant::now() + config.host_refresh;
             }
             _ = at(next_renewal.unwrap_or(next_host)), if next_renewal.is_some() => {
-                if let Some(f) = &forward {
+                for f in &forward.granted {
                     // Bounded, and interruptible: a router that stops
                     // answering must not keep the receiver from shutting
                     // down.
@@ -1184,7 +1384,7 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
     if let Some(task) = lifetime {
         task.abort();
     }
-    if let Some(f) = forward {
+    for f in forward.granted {
         let how = f.protocol();
         match tokio::time::timeout(Duration::from_secs(3), f.remove()).await {
             Ok(Ok(())) => tracing::info!("NAT: {} port forward given back", how),
@@ -1206,6 +1406,9 @@ mod tests {
             behaviour,
             behaviour6: None,
             upnp_addr: upnp.map(|u| u.parse().unwrap()),
+            pinhole6: None,
+            forwards: Vec::new(),
+            mapping_notes: Vec::new(),
             double_nat: false,
             host: Vec::new(),
         }
@@ -1352,7 +1555,10 @@ mod tests {
                 ..behaviour
             },
             None,
-            Some(&inner("100.64.3.4")),
+            &Forwards {
+                granted: vec![inner("100.64.3.4")],
+                notes: Vec::new(),
+            },
             true,
         );
         assert!(r.double_nat);
@@ -1531,7 +1737,7 @@ garbage line
             local: socket.local_addr().unwrap(),
             behaviour,
             behaviour6: None,
-            forward: None,
+            forward: Forwards::default(),
             responses: rx,
             keepalive: keepalive.clone(),
             cancel: cancel.clone(),
@@ -1646,6 +1852,9 @@ garbage line
             behaviour: Behaviour::default(),
             behaviour6: None,
             upnp_addr: None,
+            pinhole6: None,
+            forwards: Vec::new(),
+            mapping_notes: Vec::new(),
             double_nat: false,
             host: host_addresses("127.0.0.1:5555".parse().unwrap(), true),
         };

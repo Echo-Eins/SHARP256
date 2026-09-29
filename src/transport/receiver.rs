@@ -532,6 +532,7 @@ impl Receiver {
                 from: shared.cfg.bind,
                 len: 0,
                 stride: 0,
+                dst: None,
             };
             RECV_BATCH
         ];
@@ -574,7 +575,7 @@ impl Receiver {
                     // From a peer met at a socket of its own: routed like
                     // anything the main socket reads.
                     let mut buf = data;
-                    let r = Received { from, len: buf.len(), stride: buf.len() };
+                    let r = Received { from, len: buf.len(), stride: buf.len(), dst: None };
                     #[cfg(feature = "nat-traversal")]
                     if side_channel(nat.as_ref(), &relays, &buf, from, buf.len()) {
                         continue;

@@ -24,7 +24,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -85,12 +85,35 @@ pub fn pcp_map_request(
     suggested_external_port: u16,
     lifetime: u32,
 ) -> Vec<u8> {
+    pcp_map_request_for(
+        nonce,
+        IpAddr::V4(client),
+        internal_port,
+        suggested_external_port,
+        lifetime,
+    )
+}
+
+/// [`pcp_map_request`] for a client of either family. An IPv6 client asks
+/// the router to open its firewall to the port (there is no address to
+/// translate: the answer's external address is the client's own).
+pub fn pcp_map_request_for(
+    nonce: &[u8; 12],
+    client: IpAddr,
+    internal_port: u16,
+    suggested_external_port: u16,
+    lifetime: u32,
+) -> Vec<u8> {
     let mut m = Vec::with_capacity(PCP_REQUEST_LEN);
     m.push(PCP_VERSION);
     m.push(PCP_OPCODE_MAP); // R bit clear: a request
     m.extend_from_slice(&[0, 0]); // reserved
     m.extend_from_slice(&lifetime.to_be_bytes());
-    m.extend_from_slice(&client.to_ipv6_mapped().octets());
+    let wire = match client {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+        IpAddr::V6(v6) => v6,
+    };
+    m.extend_from_slice(&wire.octets());
     m.extend_from_slice(nonce);
     m.push(PROTO_UDP);
     m.extend_from_slice(&[0, 0, 0]); // reserved
@@ -319,6 +342,176 @@ fn routing_table_gateways() -> Vec<Ipv4Addr> {
     Vec::new()
 }
 
+/// Where an IPv6 router's PCP server may be: the default gateways of this
+/// host, each with the interface it is reached through (a link-local
+/// gateway means nothing without one).
+///
+/// Read from the routing table where that is a file (Linux), and from the
+/// system's own tools where it is not — `route` on macOS and the BSDs,
+/// `route print` on Windows — a few lines of text with a timeout, at most.
+pub async fn gateway_candidates_v6() -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut add = |gw: SocketAddr| {
+        if !out.iter().any(|g| g.ip() == gw.ip()) && out.len() < 3 {
+            out.push(gw);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    for gw in linux_default_gateways_v6() {
+        add(gw);
+    }
+    #[cfg(not(target_os = "linux"))]
+    for gw in tool_default_gateways_v6().await {
+        add(gw);
+    }
+    out
+}
+
+/// A default gateway's address as a PCP server's: the port is 5351, and a
+/// link-local address carries the interface it was learned on.
+fn v6_gateway(ip: std::net::Ipv6Addr, scope: u32) -> Option<SocketAddr> {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return None;
+    }
+    let link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
+    if link_local && scope == 0 {
+        // Nothing to send it through.
+        return None;
+    }
+    Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+        ip,
+        PORT,
+        0,
+        if link_local { scope } else { 0 },
+    )))
+}
+
+/// The default gateways in the text of `/proc/net/ipv6_route`: 32 hex digits
+/// of destination and a two-digit prefix length, the same for the source,
+/// then the next hop, three counters, the flags and the interface's name.
+/// A default route is a destination of zero with a prefix length of zero
+/// and the gateway flag (0x2).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_ipv6_route(text: &str, index_of: impl Fn(&str) -> u32) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 10 || f[0].len() != 32 || f[4].len() != 32 {
+            continue;
+        }
+        if !f[0].bytes().all(|b| b == b'0') || f[1] != "00" {
+            continue;
+        }
+        let Ok(flags) = u32::from_str_radix(f[8], 16) else {
+            continue;
+        };
+        if flags & 0x2 == 0 || flags & 0x0200_0000 != 0 {
+            // No gateway, or a route the kernel rejects.
+            continue;
+        }
+        let Ok(raw) = u128::from_str_radix(f[4], 16) else {
+            continue;
+        };
+        if let Some(gw) = v6_gateway(std::net::Ipv6Addr::from(raw), index_of(f[9])) {
+            out.push(gw);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_gateways_v6() -> Vec<SocketAddr> {
+    let Ok(text) = std::fs::read_to_string("/proc/net/ipv6_route") else {
+        return Vec::new();
+    };
+    parse_proc_ipv6_route(&text, |name| {
+        crate::address::dns::interface_index_of(name).unwrap_or(0)
+    })
+}
+
+/// What `route -n get -inet6 default` says on macOS and the BSDs: a
+/// `gateway:` line, whose address carries its interface as `%en0`, and an
+/// `interface:` line.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+fn parse_route_get(text: &str, index_of: impl Fn(&str) -> u32) -> Option<SocketAddr> {
+    let mut gateway = None;
+    let mut interface = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("gateway:") {
+            gateway = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("interface:") {
+            interface = Some(v.trim().to_string());
+        }
+    }
+    let gateway = gateway?;
+    let (addr, zone) = match gateway.split_once('%') {
+        Some((a, z)) => (a.to_string(), Some(z.to_string())),
+        None => (gateway, None),
+    };
+    let ip: std::net::Ipv6Addr = addr.parse().ok()?;
+    let scope = zone.or(interface).map(|z| index_of(&z)).unwrap_or(0);
+    v6_gateway(ip, scope)
+}
+
+/// What `route print -6` says on Windows: rows of interface index, metric,
+/// network destination and gateway; the default route's destination is
+/// `::/0`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_route_print(text: &str) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 || f[2] != "::/0" {
+            continue;
+        }
+        let (Ok(index), Ok(ip)) = (f[0].parse::<u32>(), f[3].parse::<std::net::Ipv6Addr>()) else {
+            continue;
+        };
+        if let Some(gw) = v6_gateway(ip, index) {
+            out.push(gw);
+        }
+    }
+    out
+}
+
+/// Asks the system's own tool, for the platforms whose routing table is not
+/// a file. Bounded: a tool that hangs costs two seconds and nothing else.
+#[cfg(not(target_os = "linux"))]
+async fn tool_default_gateways_v6() -> Vec<SocketAddr> {
+    let run = |program: &'static str, args: &'static [&'static str]| async move {
+        let out = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                std::process::Command::new(program).args(args).output()
+            }),
+        )
+        .await
+        .ok()?
+        .ok()?
+        .ok()?;
+        String::from_utf8(out.stdout).ok()
+    };
+    #[cfg(windows)]
+    {
+        match run("route", &["print", "-6"]).await {
+            Some(text) => parse_route_print(&text),
+            None => Vec::new(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match run("route", &["-n", "get", "-inet6", "default"]).await {
+            Some(text) => parse_route_get(&text, |name| {
+                crate::address::dns::interface_index_of(name).unwrap_or(0)
+            })
+            .into_iter()
+            .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 /// The first usable address of every local IPv4 subnet (`x.y.z.1` for the
 /// usual /24), which is where a home router almost always is.
 fn subnet_first_addresses() -> Vec<Ipv4Addr> {
@@ -358,7 +551,7 @@ pub struct Mapping {
     protocol: Protocol,
     /// PCP binds renewals and the removal to this nonce.
     nonce: [u8; 12],
-    client: Ipv4Addr,
+    client: IpAddr,
     internal_port: u16,
     grant: Grant,
 }
@@ -371,7 +564,7 @@ impl Mapping {
             router,
             protocol: Protocol::Pcp,
             nonce: [0; 12],
-            client: Ipv4Addr::new(192, 168, 1, 50),
+            client: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
             internal_port: port,
             grant: Grant {
                 external_port: port,
@@ -399,8 +592,8 @@ impl Mapping {
         self.grant.lifetime
     }
 
-    pub fn internal(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(self.client, self.internal_port)
+    pub fn internal(&self) -> SocketAddr {
+        SocketAddr::new(self.client, self.internal_port)
     }
 
     pub fn router(&self) -> SocketAddr {
@@ -412,7 +605,7 @@ impl Mapping {
         let sock = bound_socket(self.client).await?;
         match self.protocol {
             Protocol::Pcp => {
-                let req = pcp_map_request(
+                let req = pcp_map_request_for(
                     &self.nonce,
                     self.client,
                     self.internal_port,
@@ -438,7 +631,7 @@ impl Mapping {
         match self.protocol {
             Protocol::Pcp => {
                 // RFC 6887 section 15: lifetime 0 with the same nonce.
-                let req = pcp_map_request(&self.nonce, self.client, self.internal_port, 0, 0);
+                let req = pcp_map_request_for(&self.nonce, self.client, self.internal_port, 0, 0);
                 sock.send_to(&req, self.router).await?;
             }
             Protocol::NatPmp => {
@@ -452,12 +645,17 @@ impl Mapping {
     }
 }
 
-async fn bound_socket(client: Ipv4Addr) -> Result<UdpSocket> {
-    // Bound to the interface that faces the router, so the client address in
-    // a PCP request is the one the router will see.
-    let sock = UdpSocket::bind(SocketAddrV4::new(client, 0))
+async fn bound_socket(client: IpAddr) -> Result<UdpSocket> {
+    // Bound to the address the request is about, so the client address in a
+    // PCP request is the one the router will see as its source (RFC 6887
+    // section 8.1: a mismatch is refused).
+    let any: SocketAddr = match client {
+        IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        IpAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+    };
+    let sock = UdpSocket::bind(SocketAddr::new(client, 0))
         .await
-        .or(UdpSocket::bind("0.0.0.0:0").await)?;
+        .or(UdpSocket::bind(any).await)?;
     Ok(sock)
 }
 
@@ -480,7 +678,12 @@ async fn exchange(
         // three tries and re-send the request.
         loop {
             match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, from))) if from == router => return Ok(buf[..n].to_vec()),
+                // The address and port, not the whole socket address: a
+                // link-local router answers with an interface scope the
+                // request may have been written without.
+                Ok(Ok((n, from))) if from.ip() == router.ip() && from.port() == router.port() => {
+                    return Ok(buf[..n].to_vec())
+                }
                 Ok(Ok(_)) => continue,
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => break,
@@ -491,6 +694,34 @@ async fn exchange(
     Err(anyhow!("{} did not answer", router))
 }
 
+/// Asks a router for a firewall opening for `client`, an IPv6 address of
+/// ours: PCP only, since NAT-PMP has no IPv6. There is no translation to be
+/// had over IPv6; what the router grants is that packets from anywhere to
+/// `client`'s port are let in (RFC 6887 section 11.2 and 13.1: the
+/// "external" address it reports is the client's own).
+pub async fn request_v6_at(
+    router: SocketAddr,
+    client: std::net::Ipv6Addr,
+    internal_port: u16,
+    lifetime: u32,
+) -> Result<Mapping> {
+    let client = IpAddr::V6(client);
+    let sock = bound_socket(client).await?;
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let req = pcp_map_request_for(&nonce, client, internal_port, internal_port, lifetime);
+    let pkt = exchange(&sock, router, &req, PCP_MAX_LEN).await?;
+    let grant = pcp_parse_map_response(&pkt, &nonce, internal_port)?;
+    Ok(Mapping {
+        router,
+        protocol: Protocol::Pcp,
+        nonce,
+        client,
+        internal_port,
+        grant,
+    })
+}
+
 /// Asks one router for a UDP port forward, PCP first and NAT-PMP after.
 pub async fn request_at(
     router: SocketAddr,
@@ -498,12 +729,13 @@ pub async fn request_at(
     internal_port: u16,
     lifetime: u32,
 ) -> Result<Mapping> {
+    let client = IpAddr::V4(client);
     let sock = bound_socket(client).await?;
     let mut nonce = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
 
     // PCP: the successor, and its nonce binds the answer to this request.
-    let req = pcp_map_request(&nonce, client, internal_port, internal_port, lifetime);
+    let req = pcp_map_request_for(&nonce, client, internal_port, internal_port, lifetime);
     match exchange(&sock, router, &req, PCP_MAX_LEN).await {
         Ok(pkt) => match pcp_parse_map_response(&pkt, &nonce, internal_port) {
             Ok(grant) => {
@@ -787,7 +1019,7 @@ mod tests {
         assert_eq!(m.protocol(), Protocol::Pcp);
         assert_eq!(m.external_port(), 41000);
         assert_eq!(m.lifetime(), 3600);
-        assert_eq!(m.internal(), SocketAddrV4::new(LOCAL, 5555));
+        assert_eq!(m.internal(), SocketAddr::new(IpAddr::V4(LOCAL), 5555));
         m.refresh(3600).await.expect("the lease renews");
         m.remove().await.expect("the mapping is given back");
         task.abort();
@@ -837,6 +1069,86 @@ mod tests {
         };
         assert!(request_at(router, LOCAL, 5555, 600).await.is_err());
         task.abort();
+    }
+
+    /// A router's default route in the kernel's own format is found, with
+    /// the interface a link-local gateway needs, and nothing else is: not a
+    /// route with no gateway, not a host route, not a rejected one.
+    #[test]
+    fn the_default_gateway_is_read_from_the_kernels_table() {
+        let table = "\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000a0027fffe123456 00000064 00000001 00000000 00000003 eth0
+20010db8000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 20010db8000000000000000000000001 00000400 00000001 00000000 00000003 wlan0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000200 00000001 00000000 02000003 eth1
+";
+        let got = parse_proc_ipv6_route(table, |name| match name {
+            "eth0" => 2,
+            "wlan0" => 3,
+            _ => 0,
+        });
+        assert_eq!(
+            got,
+            vec![
+                "[fe80::a00:27ff:fe12:3456%2]:5351"
+                    .parse::<SocketAddr>()
+                    .unwrap(),
+                "[2001:db8::1]:5351".parse().unwrap(),
+            ]
+        );
+        // A link-local gateway on an interface we cannot name is no use.
+        assert!(parse_proc_ipv6_route(table, |_| 0)
+            .iter()
+            .all(|g| !g.ip().to_string().starts_with("fe80")));
+    }
+
+    #[test]
+    fn the_default_gateway_is_read_from_the_bsd_route_tool() {
+        let text = "   route to: default\ndestination: default\n       mask: default\n    gateway: fe80::1%en0\n  interface: en0\n      flags: <UP,GATEWAY,DONE>\n";
+        let got = parse_route_get(text, |n| if n == "en0" { 4 } else { 0 });
+        assert_eq!(got, Some("[fe80::1%4]:5351".parse().unwrap()));
+        // A global gateway needs no interface, and a v4 one is not ours.
+        let global = "    gateway: 2001:db8::1\n  interface: en0\n";
+        assert_eq!(
+            parse_route_get(global, |_| 0),
+            Some("[2001:db8::1]:5351".parse().unwrap())
+        );
+        assert_eq!(parse_route_get("    gateway: 192.168.1.1\n", |_| 0), None);
+    }
+
+    #[test]
+    fn the_default_gateway_is_read_from_windows_route_print() {
+        let text = "\
+IPv6 Route Table
+===========================================================================
+Active Routes:
+ If Metric Network Destination      Gateway
+ 12    266 ::/0                     fe80::a00:27ff:fe12:3456
+  1    331 ::1/128                  On-link
+ 12    266 2001:db8::/64            On-link
+";
+        assert_eq!(
+            parse_route_print(text),
+            vec!["[fe80::a00:27ff:fe12:3456%12]:5351"
+                .parse::<SocketAddr>()
+                .unwrap()]
+        );
+    }
+
+    /// The PCP request for an IPv6 client carries the address as it is, and
+    /// a router's answer gives the client's own address back.
+    #[test]
+    fn pcp_over_ipv6_names_the_client_and_gets_it_back() {
+        let nonce = [5u8; 12];
+        let client: std::net::Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let req = pcp_map_request_for(&nonce, IpAddr::V6(client), 5555, 5555, 3600);
+        assert_eq!(&req[8..24], &client.octets());
+        let mut resp = pcp_response(&nonce, 0, 3600, 5555, 5555, None);
+        resp[44..60].copy_from_slice(&client.octets());
+        let grant = pcp_parse_map_response(&resp, &nonce, 5555).unwrap();
+        assert_eq!(grant.external_ip, Some(IpAddr::V6(client)));
+        assert_eq!(grant.external_port, 5555);
     }
 
     #[test]

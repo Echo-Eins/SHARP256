@@ -1314,6 +1314,7 @@ impl Engine {
                     from: peer,
                     len: 0,
                     stride: 0,
+                    dst: None,
                 };
                 RX_BUFFERS
             ],
