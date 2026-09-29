@@ -294,6 +294,13 @@ pub fn upnp(data: &[u8]) {
         let _ = u.join("/ctl/IPConn");
     }
     let _ = location.join(&s);
+    // The same over IPv6: addresses in brackets, a zone after them, and the
+    // answers to a search of the IPv6 groups.
+    let location = upnp::Url::parse("http://[fe80::1%25eth0]:5000/rootDesc.xml").expect("literal");
+    let _ = upnp::find_service(&s, &location);
+    let _ = location.join(&s);
+    let _ = upnp::Url::parse(&format!("http://[{}]:80/x", s.trim()));
+    upnp::fuzz_answer_v6(data);
 }
 
 /// Multicast DNS, as a receiver reads questions from anyone on its network
@@ -485,6 +492,10 @@ pub fn seeds(target: &str) -> Vec<Vec<u8>> {
         #[cfg(feature = "nat-traversal")]
         "upnp" => vec![
             b"HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1:5000/rootDesc.xml\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nLOCATION: http://[2001:db8:1::1]:5000/rootDesc.xml\r\n\r\n"
+                .to_vec(),
+            b"HTTP/1.1 200 OK\r\nLOCATION: http://[fe80::1%25eth0]:5000/rootDesc.xml\r\n\r\n"
+                .to_vec(),
             b"HTTP/1.0 200 OK\r\n\r\n<root><URLBase>http://192.168.1.1:5000/</URLBase><device>\
 <service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:2</serviceType>\
 <controlURL>/ctl/IPConn</controlURL></service></device></root>"

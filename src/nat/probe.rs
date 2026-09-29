@@ -16,7 +16,7 @@
 
 use super::behaviour::{Allocation, Behaviour, Filtering, Mapping};
 use super::birthday::Hit;
-use super::card::{Card, FamilyHints, RelayRef, Role};
+use super::card::{Card, FamilyHints, NatHints, RelayRef, Role};
 use super::punch::Puncher;
 use super::{spawn_discovery, NatConfig, Reachability};
 use crate::crypto::SharpId;
@@ -281,10 +281,27 @@ impl Probe {
             }
         }
         line("Relays on the card:", self.card.relays.len().to_string());
+        // What a person can type in place of the card: where the outside
+        // sees this host.
+        let addresses: Vec<String> = self
+            .card
+            .outside_addrs()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        if !addresses.is_empty() {
+            line("Addresses:", addresses.join("  "));
+        }
         out.push_str(&format!(
             "\nYour card (give it to the other side):\n{}\n",
             self.card.to_text()
         ));
+        if !addresses.is_empty() {
+            out.push_str(
+                "\nOr, if a card is more than you want to send, just the addresses above: the \
+                 other side gives them to --peer-addr, or pastes them when asked.\n",
+            );
+        }
         out
     }
 
@@ -292,6 +309,17 @@ impl Probe {
     /// listens for the peer doing the same: the two of you both running
     /// this within `duration` of each other is the test.
     pub async fn punch_test(&mut self, peer: &Card, duration: Duration) -> Outcome {
+        self.punch_test_at(peer.punch_targets(), duration).await
+    }
+
+    /// [`Probe::punch_test`] at `targets`, each with what is known of the NAT
+    /// in front of it: a card's addresses, or a bare address with
+    /// [`NatHints::unknown`].
+    pub async fn punch_test_at(
+        &mut self,
+        targets: Vec<(SocketAddr, NatHints)>,
+        duration: Duration,
+    ) -> Outcome {
         // A peer that got through to a socket of ours other than the main one
         // (the birthday method, for a NAT that draws ports at random) is a way
         // in as much as one that got through to the main one: the transfer
@@ -305,7 +333,6 @@ impl Probe {
                 .with_turns(self.turns.clone()),
         );
         let cancel = self.cancel.child_token();
-        let targets = peer.punch_targets();
         let mut runs = Vec::new();
         for (addr, hints) in &targets {
             let (puncher, cancel, addr, hints) = (puncher.clone(), cancel.clone(), *addr, *hints);

@@ -675,7 +675,9 @@ pub async fn find(id: &SharpId, wait: Duration) -> Vec<SocketAddr> {
                 }
             }
         }
-        if i.v6.iter().any(crate::address::class::is_link_local_v6) {
+        // Any IPv6 address means the network does IPv6 (and so has a
+        // link-local one, which the system's list of addresses leaves out).
+        if !i.v6.is_empty() {
             if let Ok(s) = reusable_socket(true) {
                 let ok = s
                     .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
@@ -709,7 +711,13 @@ pub async fn find(id: &SharpId, wait: Duration) -> Vec<SocketAddr> {
             asked += 1;
             next_ask = tokio::time::Instant::now() + Duration::from_millis(400 * asked as u64);
         }
-        let until = deadline.min(next_ask);
+        // Until the next question — or, once the last has been asked, the
+        // end of the wait.
+        let until = if asked < 3 {
+            deadline.min(next_ask)
+        } else {
+            deadline
+        };
         match tokio::time::timeout_at(until, rx.recv()).await {
             Ok(Some((data, _from, index))) => {
                 let Some(msg) = Message::decode(&data) else {

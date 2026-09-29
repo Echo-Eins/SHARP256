@@ -38,6 +38,53 @@ fn describe_age(age: Duration) -> String {
     format!("{} {}{}", n, unit, if n == 1 { "" } else { "s" })
 }
 
+/// An address of a peer as a person writes it down when there is no card:
+/// `203.0.113.7:47239`, or `[2001:db8::1]:47239` for IPv6 — what a NAT test
+/// on the peer's side prints as the address the internet sees. Only what can
+/// be sent to at all is accepted; whether it is worth sending to from a given
+/// socket is decided where it is sent from.
+pub fn parse_peer_addr(text: &str) -> Result<SocketAddr, String> {
+    let text = text.trim();
+    let addr: SocketAddr = text.parse().map_err(|_| {
+        format!(
+            "'{}' is not IP:PORT (an IPv6 address goes in brackets, [2001:db8::1]:5555)",
+            text
+        )
+    })?;
+    let ip = addr.ip().to_canonical();
+    if addr.port() == 0 {
+        return Err(format!("{}: the port is 0", text));
+    }
+    if ip.is_unspecified() || ip.is_multicast() || ip == IpAddr::V4(Ipv4Addr::BROADCAST) {
+        return Err(format!("{}: that is not an address of a host", text));
+    }
+    Ok(addr)
+}
+
+/// Several addresses in one piece of text, separated by spaces or commas, as
+/// a person copies them off a screen: `203.0.113.7:47239  [2001:db8::1]:5555`.
+/// All of them must be good, and there are at most [`MAX_CANDIDATES`]: each is
+/// an attempt somebody makes.
+pub fn parse_peer_addrs(text: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for word in text.split(|c: char| c.is_whitespace() || c == ',') {
+        if word.is_empty() {
+            continue;
+        }
+        let addr = parse_peer_addr(word)?;
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    if out.is_empty() {
+        return Err("no address".to_string());
+    }
+    if out.len() > MAX_CANDIDATES {
+        return Err(format!("more than {} addresses", MAX_CANDIDATES));
+    }
+    Ok(out)
+}
+
 /// The format version, the first byte of every card.
 const VERSION: u8 = 1;
 const PREFIX: &str = "shc1-";
@@ -365,6 +412,23 @@ impl Card {
         out
     }
 
+    /// The addresses a peer can be given by hand, as `IP:PORT`, when a card
+    /// is more than the moment calls for: where the outside sees this host
+    /// (mapped, forwarded, on a TURN server) and its own global addresses,
+    /// where nothing is translated. An address on the local network is worth
+    /// something only to a peer on it, and the card carries it anyway.
+    pub fn outside_addrs(&self) -> Vec<SocketAddr> {
+        use crate::address::class::{classify, Class};
+        self.candidates
+            .iter()
+            .filter(|c| match c.kind {
+                Kind::Host => classify(c.addr.ip()) == Class::Global,
+                _ => true,
+            })
+            .map(|c| c.addr)
+            .collect()
+    }
+
     /// The NAT hints for the family of `addr`.
     pub fn hints_for(&self, addr: &SocketAddr) -> Option<&NatHints> {
         if crate::address::canonical(*addr).is_ipv6() {
@@ -602,6 +666,98 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use crate::crypto::Identity;
+
+    /// What a person is given to type: where the outside sees the host, not
+    /// its addresses on a local network.
+    #[test]
+    fn the_addresses_to_hand_over_are_the_ones_the_outside_can_use() {
+        let mut c = Card::new(Role::Sender, Identity::generate().id());
+        for (kind, addr) in [
+            (Kind::Mapped, "203.0.113.7:41235"),
+            (Kind::Host, "192.168.1.5:5555"),
+            (Kind::Host, "[2606:4700::5555]:5555"),
+            (Kind::PortMapped, "203.0.113.7:5555"),
+            (Kind::Relayed, "198.51.100.9:50000"),
+            (Kind::Host, "[fd00::5]:5555"),
+        ] {
+            c.candidates.push(Candidate {
+                kind,
+                addr: addr.parse().unwrap(),
+            });
+        }
+        let given: Vec<String> = c.outside_addrs().iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            given,
+            [
+                "203.0.113.7:41235",
+                "[2606:4700::5555]:5555",
+                "203.0.113.7:5555",
+                "198.51.100.9:50000"
+            ]
+        );
+        for a in &given {
+            assert!(parse_peer_addr(a).is_ok(), "{} cannot be typed back in", a);
+        }
+    }
+
+    /// The line a person copies: addresses apart by spaces or commas.
+    #[test]
+    fn several_addresses_are_read_from_one_line() {
+        let got =
+            parse_peer_addrs("203.0.113.7:47239  [2001:db8::1]:5555,10.0.0.2:5555\n").unwrap();
+        assert_eq!(
+            got,
+            [
+                "203.0.113.7:47239".parse().unwrap(),
+                "[2001:db8::1]:5555".parse().unwrap(),
+                "10.0.0.2:5555".parse().unwrap()
+            ]
+        );
+        // Twice is once.
+        assert_eq!(parse_peer_addrs("1.2.3.4:5 1.2.3.4:5").unwrap().len(), 1);
+        // One bad word spoils the line: a typo is not to be half obeyed.
+        assert!(parse_peer_addrs("203.0.113.7:47239 nonsense").is_err());
+        assert!(parse_peer_addrs("").is_err());
+        assert!(parse_peer_addrs(" , ").is_err());
+        let many: Vec<String> = (1..=17).map(|i| format!("203.0.113.{}:5555", i)).collect();
+        assert!(parse_peer_addrs(&many.join(" ")).is_err());
+        assert_eq!(parse_peer_addrs(&many[..16].join(" ")).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn a_bare_address_is_ip_and_port() {
+        for (text, want) in [
+            ("203.0.113.7:47239", "203.0.113.7:47239"),
+            ("  203.0.113.7:47239\n", "203.0.113.7:47239"),
+            ("[2001:db8::1]:5555", "[2001:db8::1]:5555"),
+            ("10.0.0.2:5555", "10.0.0.2:5555"),
+        ] {
+            assert_eq!(
+                parse_peer_addr(text).unwrap(),
+                want.parse().unwrap(),
+                "{}",
+                text
+            );
+        }
+        for bad in [
+            "203.0.113.7",
+            "203.0.113.7:",
+            ":5555",
+            "2001:db8::1:5555",
+            "example.org:5555",
+            "203.0.113.7:0",
+            "203.0.113.7:99999",
+            "0.0.0.0:5555",
+            "[::]:5555",
+            "224.0.0.251:5353",
+            "[ff02::fb]:5353",
+            "255.255.255.255:5555",
+            "[::ffff:224.0.0.1]:5555",
+            "",
+        ] {
+            assert!(parse_peer_addr(bad).is_err(), "{:?} was accepted", bad);
+        }
+    }
 
     fn sample() -> Card {
         let mut c = Card::new(Role::Receiver, Identity::generate().id());

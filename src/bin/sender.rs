@@ -67,6 +67,14 @@ struct Args {
     #[arg(long = "dht-bootstrap", value_name = "HOST:PORT")]
     dht_bootstrap: Vec<String>,
 
+    /// Find out how the internet sees this sender (STUN, and a port forward
+    /// from the router) and print its contact card and addresses, for the
+    /// receiver's user to hand to sharp-receiver (--peer-card, or --peer-addr):
+    /// a receiver given by address is told nothing of this side otherwise.
+    /// With the receiver's own card, --turn or --dht it is done anyway
+    #[arg(long, conflicts_with = "no_nat")]
+    card: bool,
+
     /// Look for the receiver on the local network with multicast DNS: it
     /// has to be started with --announce-lan, and <RECEIVER> may then be its
     /// ID alone. The question tells everybody on the network whom you are
@@ -219,6 +227,11 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     cfg.bind = args.bind;
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
     cfg.find_lan = args.lan && cfg!(feature = "nat-traversal");
+    #[cfg(not(feature = "nat-traversal"))]
+    if args.card {
+        anyhow::bail!("--card needs a build with the nat-traversal feature");
+    }
+    cfg.give_card = args.card;
     #[cfg(feature = "nat-traversal")]
     for t in &args.turn {
         t.parse::<sharp256::nat::turn::Server>()
@@ -307,6 +320,22 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
                     "           (give it to the receiver: sharp-receiver --peer-card <card>, \
                      or paste it into the running receiver)"
                 );
+                // Where the outside sees this host, for a receiver whose user
+                // would rather type an address than a card.
+                #[cfg(feature = "nat-traversal")]
+                {
+                    let addresses = sharp256::nat::card::Card::from_text(&card)
+                        .map(|c| c.outside_addrs())
+                        .unwrap_or_default();
+                    if !addresses.is_empty() {
+                        let list: Vec<String> = addresses.iter().map(|a| a.to_string()).collect();
+                        println!("Addresses: {}", list.join("  "));
+                        println!(
+                            "           (or just these: sharp-receiver --peer-addr <address>, \
+                             or paste one into the running receiver)"
+                        );
+                    }
+                }
                 *last = Some(card);
             }
         }

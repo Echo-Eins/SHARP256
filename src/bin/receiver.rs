@@ -118,6 +118,29 @@ struct Args {
     #[arg(long = "peer-card", value_name = "CARD|@FILE")]
     peer_cards: Vec<String>,
 
+    /// The address of a sender on another network, IP:PORT (an IPv6 address
+    /// in brackets), as its own NAT test (sharp-probe) printed it — for when
+    /// there is no card to hand over. The receiver starts sending there at
+    /// once, as it does for a card, but knows nothing of the NAT in front of
+    /// the address, so every way of getting through is tried in turn, and
+    /// an address says nothing of who is behind it: it restricts nobody.
+    /// Several: repeat it, or separate them with commas; addresses can also
+    /// be pasted into the running receiver, one line at a time
+    #[cfg_attr(
+        feature = "nat-traversal",
+        arg(
+            long = "peer-addr",
+            value_name = "IP:PORT",
+            value_parser = sharp256::nat::card::parse_peer_addr,
+            value_delimiter = ','
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "nat-traversal"),
+        arg(long = "peer-addr", value_name = "IP:PORT", value_delimiter = ',')
+    )]
+    peer_addrs: Vec<std::net::SocketAddr>,
+
     /// Replace existing files with the same name instead of writing "name (1)"
     #[arg(long)]
     overwrite: bool,
@@ -235,7 +258,7 @@ async fn main() -> Result<()> {
         allowed.insert(card.id);
     }
     #[cfg(not(feature = "nat-traversal"))]
-    if !args.peer_cards.is_empty() {
+    if !args.peer_cards.is_empty() || !args.peer_addrs.is_empty() {
         anyhow::bail!("this build has no NAT traversal, so it cannot use contact cards");
     }
     if !allowed.is_empty() || args.authorized_senders.is_some() {
@@ -250,7 +273,7 @@ async fn main() -> Result<()> {
         }
     }
     #[cfg(feature = "nat-traversal")]
-    return run_headless(cfg, peer_cards).await;
+    return run_headless(cfg, peer_cards, args.peer_addrs).await;
     #[cfg(not(feature = "nat-traversal"))]
     run_headless(cfg).await
 }
@@ -259,8 +282,9 @@ async fn main() -> Result<()> {
 async fn run_headless(
     cfg: ReceiverConfig,
     peer_cards: Vec<sharp256::nat::card::Card>,
+    peer_addrs: Vec<std::net::SocketAddr>,
 ) -> Result<()> {
-    run_receiver(cfg, peer_cards).await
+    run_receiver(cfg, peer_cards, peer_addrs).await
 }
 
 #[cfg(not(feature = "nat-traversal"))]
@@ -271,6 +295,7 @@ async fn run_headless(cfg: ReceiverConfig) -> Result<()> {
 async fn run_receiver(
     mut cfg: ReceiverConfig,
     #[cfg(feature = "nat-traversal")] peer_cards: Vec<sharp256::nat::card::Card>,
+    #[cfg(feature = "nat-traversal")] peer_addrs: Vec<std::net::SocketAddr>,
 ) -> Result<()> {
     let id = cfg.identity.as_ref().map(|i| i.id()).expect("identity set");
     println!("{}", system_info());
@@ -398,14 +423,18 @@ async fn run_receiver(
     // has no IPv6.
     println!("Listening:   {}", receiver.local_addr()?);
     let cancel = receiver.cancel_token();
-    // Cards given now, and cards pasted while it runs.
+    // Cards and addresses given now, and those pasted while it runs.
     #[cfg(feature = "nat-traversal")]
     {
         let cards = receiver.peer_cards();
         for card in peer_cards {
             let _ = cards.send(card);
         }
-        std::thread::spawn(move || read_pasted_cards(cards));
+        let addrs = receiver.peer_addrs();
+        for addr in peer_addrs {
+            let _ = addrs.send(addr);
+        }
+        std::thread::spawn(move || read_pasted_peers(cards, addrs));
     }
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -417,35 +446,49 @@ async fn run_receiver(
     Ok(())
 }
 
-/// Reads contact cards pasted into the terminal, one per line, and hands
-/// them to the running receiver. Anything else is ignored, so a receiver
-/// started with its input closed or redirected simply never hears from
-/// here.
+/// Reads contact cards and addresses (IP:PORT) pasted into the terminal, one
+/// per line, and hands them to the running receiver. Anything else is
+/// ignored, so a receiver started with its input closed or redirected simply
+/// never hears from here.
 #[cfg(feature = "nat-traversal")]
-fn read_pasted_cards(cards: tokio::sync::mpsc::UnboundedSender<sharp256::nat::card::Card>) {
+fn read_pasted_peers(
+    cards: tokio::sync::mpsc::UnboundedSender<sharp256::nat::card::Card>,
+    addrs: tokio::sync::mpsc::UnboundedSender<std::net::SocketAddr>,
+) {
     use std::io::BufRead;
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { return };
         let line = line.trim();
-        if !line
+        if line
             .get(..4)
             .is_some_and(|h| h.eq_ignore_ascii_case("shc1"))
         {
-            continue;
-        }
-        match sharp256::nat::card::Card::from_text(line) {
-            Ok(card) if card.role == sharp256::nat::card::Role::Sender => {
-                println!(
-                    "Card of {}: sending at its {} address(es); it may take a moment",
-                    card.id,
-                    card.punch_targets().len()
-                );
-                if cards.send(card).is_err() {
-                    return;
+            match sharp256::nat::card::Card::from_text(line) {
+                Ok(card) if card.role == sharp256::nat::card::Role::Sender => {
+                    println!(
+                        "Card of {}: sending at its {} address(es); it may take a moment",
+                        card.id,
+                        card.punch_targets().len()
+                    );
+                    if cards.send(card).is_err() {
+                        return;
+                    }
                 }
+                Ok(_) => println!("That is a receiver's card; a receiver is given the sender's."),
+                Err(e) => println!("That card cannot be read: {}", e),
             }
-            Ok(_) => println!("That is a receiver's card; a receiver is given the sender's."),
-            Err(e) => println!("That card cannot be read: {}", e),
+        } else if line.contains(':') {
+            match sharp256::nat::card::parse_peer_addrs(line) {
+                Ok(list) => {
+                    for addr in list {
+                        println!("Address {}: sending there; it may take a moment", addr);
+                        if addrs.send(addr).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => println!("That address cannot be used: {}", e),
+            }
         }
     }
 }

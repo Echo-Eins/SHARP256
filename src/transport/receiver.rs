@@ -335,6 +335,11 @@ pub struct Receiver {
     #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
     cards_tx: mpsc::UnboundedSender<PeerCard>,
     cards_rx: mpsc::UnboundedReceiver<PeerCard>,
+    /// Addresses of peers handed over the same way, without a card (see
+    /// [`Receiver::peer_addrs`]).
+    #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
+    addrs_tx: mpsc::UnboundedSender<SocketAddr>,
+    addrs_rx: mpsc::UnboundedReceiver<SocketAddr>,
 }
 
 /// A peer's contact card; there is no such thing without NAT traversal.
@@ -387,10 +392,13 @@ impl Receiver {
         #[cfg(not(feature = "nat-traversal"))]
         let (_aux_tx, aux_rx) = mpsc::channel(1);
         let (cards_tx, cards_rx) = mpsc::unbounded_channel();
+        let (addrs_tx, addrs_rx) = mpsc::unbounded_channel();
         Ok(Self {
             aux_rx,
             cards_tx,
             cards_rx,
+            addrs_tx,
+            addrs_rx,
             #[cfg(not(feature = "nat-traversal"))]
             _aux_tx,
             shared: Arc::new(Shared {
@@ -422,6 +430,15 @@ impl Receiver {
         self.cards_tx.clone()
     }
 
+    /// Where a peer's bare address — the `IP:PORT` a NAT test on its side
+    /// prints — is handed to this receiver while it runs: it starts sending
+    /// there at once, as for a card, but knows nothing of the NAT in front of
+    /// it, so it tries the ways that suit each kind in turn.
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_addrs(&self) -> mpsc::UnboundedSender<SocketAddr> {
+        self.addrs_tx.clone()
+    }
+
     /// Our identity: senders need it to reach us.
     pub fn id(&self) -> SharpId {
         self.shared.identity.id()
@@ -437,6 +454,7 @@ impl Receiver {
         let shared = self.shared;
         let mut aux_rx = self.aux_rx;
         let mut cards_rx = self.cards_rx;
+        let mut addrs_rx = self.addrs_rx;
 
         // NAT discovery runs in the background; its STUN responses arrive on
         // this socket and are handed over below.
@@ -666,6 +684,12 @@ impl Receiver {
                     meet_card(&puncher, &cancel, card);
                     #[cfg(not(feature = "nat-traversal"))]
                     match card {}
+                }
+                Some(addr) = addrs_rx.recv() => {
+                    #[cfg(feature = "nat-traversal")]
+                    meet_addr(&puncher, &cancel, addr);
+                    #[cfg(not(feature = "nat-traversal"))]
+                    let _ = addr;
                 }
                 Some((data, from)) = aux_rx.recv() => {
                     // From a peer met at a socket of its own: routed like
@@ -1143,6 +1167,29 @@ fn meet_card(
                 .await;
         });
     }
+}
+
+/// Starts punching towards a peer's bare address, for as long as a person
+/// may take to hand the peer this receiver's own. Nothing is known of the
+/// NAT in front of it, so the ways that suit each kind are tried in turn.
+#[cfg(feature = "nat-traversal")]
+fn meet_addr(
+    puncher: &Arc<crate::nat::punch::Puncher>,
+    cancel: &CancellationToken,
+    addr: SocketAddr,
+) {
+    tracing::info!("peer address {}: punching towards it", addr);
+    let (puncher, cancel) = (puncher.clone(), cancel.clone());
+    tokio::spawn(async move {
+        puncher
+            .run_for(
+                addr,
+                crate::nat::card::NatHints::unknown(),
+                crate::nat::punch::MEET_DURATION,
+                &cancel,
+            )
+            .await;
+    });
 }
 
 /// The relays this receiver is registered with that are written with an

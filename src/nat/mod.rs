@@ -386,7 +386,7 @@ async fn forward_port_v6(local_addr: SocketAddr, lease: u32) -> (Option<PortForw
         }
         return (Some(PortForward::Modern(m)), notes);
     }
-    match upnp::UpnpPinhole::create(clients[0], port, lease).await {
+    match upnp::UpnpPinhole::create(&clients, port, lease).await {
         Ok(p) => {
             notes.push(format!(
                 "IPv6: UPnP-IGD opened its firewall to {}",

@@ -9,12 +9,14 @@ route: a real node returns the nodes it knows that are closer to the
 infohash, and this one knows none.
 
     dht_node.py --bind 11.9.0.10:6881
+    dht_node.py --bind 11.9.0.10:6881 --bind [2a0e:aa00:f::10]:6881   # both families
 """
 
 import argparse
 import hashlib
 import hmac
 import os
+import selectors
 import socket
 import struct
 import sys
@@ -60,67 +62,86 @@ def bencode(x):
     raise TypeError(x)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bind", required=True)
-    args = ap.parse_args()
-    host, port = args.bind.rsplit(":", 1)
-    host = host.strip("[]")
-    family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.bind((host, int(port)))
-    node_id = os.urandom(20)
-    secret = os.urandom(16)
-    peers = {}  # infohash -> {(ip, port): time}
+class Node:
+    """One DHT node on one address. A real DHT is one network per address
+    family (BEP 32): the IPv4 one holds IPv4 peers and the IPv6 one IPv6
+    peers, and a host with both takes part in both — so each address given
+    here is a node of its own, with its own ID and its own store."""
 
-    def token(ip):
-        return hmac.new(secret, ip.encode(), hashlib.sha1).digest()[:8]
+    def __init__(self, bind):
+        host, port = bind.rsplit(":", 1)
+        host = host.strip("[]")
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        self.sock = socket.socket(family, socket.SOCK_DGRAM)
+        self.sock.bind((host, int(port)))
+        self.bind = bind
+        self.id = os.urandom(20)
+        self.secret = os.urandom(16)
+        self.peers = {}  # infohash -> {(ip, port): time}
 
-    print(f"dht node {node_id.hex()} on {args.bind}", flush=True)
-    while True:
-        data, addr = sock.recvfrom(4096)
+    def token(self, ip):
+        return hmac.new(self.secret, ip.encode(), hashlib.sha1).digest()[:8]
+
+    def serve_one(self):
+        data, addr = self.sock.recvfrom(4096)
         ip, sport = addr[0], addr[1]
         try:
             msg, end = bdecode(data)
             if end != len(data) or msg.get(b"y") != b"q":
-                continue
+                return
             t, q, a = msg[b"t"], msg[b"q"], msg[b"a"]
         except Exception:
-            continue
+            return
 
         def reply(r):
-            sock.sendto(bencode({"t": t, "y": "r", "r": r}), addr)
+            self.sock.sendto(bencode({"t": t, "y": "r", "r": r}), addr)
 
         def error(code, text):
-            sock.sendto(bencode({"t": t, "y": "e", "e": [code, text]}), addr)
+            self.sock.sendto(bencode({"t": t, "y": "e", "e": [code, text]}), addr)
 
         ih = a.get(b"info_hash")
-        print(f"{q.decode(errors='replace')} from {ip}:{sport}" + (f" for {ih.hex()[:8]}" if ih else "") +
+        print(f"{self.bind}: {q.decode(errors='replace')} from {ip}:{sport}" + (f" for {ih.hex()[:8]}" if ih else "") +
               (" (read-only)" if msg.get(b"ro") == 1 else ""), flush=True)
         if q == b"ping":
-            reply({"id": node_id})
+            reply({"id": self.id})
         elif q == b"find_node":
-            reply({"id": node_id, "nodes": b""})
+            reply({"id": self.id, "nodes": b""})
         elif q == b"get_peers" and ih and len(ih) == 20:
-            r = {"id": node_id, "token": token(ip), "nodes": b""}
-            found = peers.get(ih, {})
+            r = {"id": self.id, "token": self.token(ip), "nodes": b""}
+            found = self.peers.get(ih, {})
             if found:
-                # Each in its own family's compact form (BEP 5, BEP 32).
+                # In this address family's compact form (BEP 5, BEP 32).
                 r["values"] = [
                     socket.inet_pton(socket.AF_INET6 if ":" in p[0] else socket.AF_INET, p[0]) + struct.pack(">H", p[1])
                     for p in found
                 ]
             reply(r)
         elif q == b"announce_peer" and ih and len(ih) == 20:
-            if a.get(b"token") != token(ip):
+            if a.get(b"token") != self.token(ip):
                 error(203, "bad token")
-                continue
+                return
             p = sport if a.get(b"implied_port") == 1 else a.get(b"port", 0)
-            peers.setdefault(ih, {})[(ip, p)] = time.time()
-            print(f"  stored {ip}:{p} under {ih.hex()[:8]}", flush=True)
-            reply({"id": node_id})
+            self.peers.setdefault(ih, {})[(ip, p)] = time.time()
+            print(f"  {self.bind}: stored {ip}:{p} under {ih.hex()[:8]}", flush=True)
+            reply({"id": self.id})
         else:
             error(204, "method unknown")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bind", required=True, action="append",
+                    help="an address to serve on, IP:PORT or [IPv6]:PORT; repeat it for both families")
+    args = ap.parse_args()
+    nodes = [Node(b) for b in args.bind]
+    for n in nodes:
+        print(f"dht node {n.id.hex()} on {n.bind}", flush=True)
+    sel = selectors.DefaultSelector()
+    for n in nodes:
+        sel.register(n.sock, selectors.EVENT_READ, n)
+    while True:
+        for key, _ in sel.select():
+            key.data.serve_one()
 
 
 if __name__ == "__main__":

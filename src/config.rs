@@ -173,6 +173,13 @@ pub struct SenderConfig {
     /// the sender's own.
     #[cfg(feature = "nat-traversal")]
     pub peer_card: Option<crate::nat::card::Card>,
+    /// Give the receiver's user this sender's contact card and addresses
+    /// even though the receiver was given by address (which says nothing of
+    /// this side): the NAT tests are run, the router is asked for a port, and
+    /// the result is reported as [`crate::TransferEvent::ContactCard`].
+    /// Done anyway with the receiver's card, a TURN server or the DHT.
+    /// Needs `nat_traversal`.
+    pub give_card: bool,
     /// Ask the local network for the receiver with multicast DNS, once, at
     /// the start (it has to announce itself: `ReceiverConfig::announce_lan`).
     /// A question tells everybody on the network whom this sender is
@@ -257,6 +264,7 @@ impl SenderConfig {
             stun_servers: Vec::new(),
             #[cfg(feature = "nat-traversal")]
             peer_card: None,
+            give_card: false,
             find_lan: false,
             turn_servers: Vec::new(),
             dht: false,

@@ -4,15 +4,15 @@
 //! Run it on the sending host and on the receiving host, on their own
 //! networks. Each prints the address and port the NAT in front of it gives
 //! out, what kind of NAT that is, whether the router would forward a port,
-//! and a contact card. Swap the cards and run it again with `--peer-card`,
-//! both at the same time: it sends at the other side's addresses the way a
-//! transfer would and says whether a packet got through — without a file
-//! being sent.
+//! and a contact card. Swap the cards (or just the addresses) and give the
+//! other side's to it, both at the same time: it sends at the other side's
+//! addresses the way a transfer would and says whether a packet got through
+//! — without a file being sent.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use sharp256::crypto::Identity;
-use sharp256::nat::card::{Card, Role};
+use sharp256::nat::card::{parse_peer_addr, parse_peer_addrs, Card, NatHints, Role};
 use sharp256::nat::probe::{Options, Probe};
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -62,6 +62,19 @@ struct Args {
     #[arg(long = "peer-card", value_name = "CARD|@FILE")]
     peer_card: Option<String>,
 
+    /// The other side's address, IP:PORT (an IPv6 address in brackets), as
+    /// its own test printed it — for when there is no card to hand over.
+    /// The same test as with a card, but nothing is known of the NAT in
+    /// front of the address, so every way of getting through is tried in
+    /// turn. Several: repeat it, or separate them with commas
+    #[arg(
+        long = "peer-addr",
+        value_name = "IP:PORT",
+        value_parser = parse_peer_addr,
+        value_delimiter = ','
+    )]
+    peer_addr: Vec<SocketAddr>,
+
     /// Seconds the test with a peer's card goes on for
     #[arg(long, default_value_t = 120)]
     wait: u64,
@@ -95,7 +108,7 @@ async fn main() -> Result<()> {
     };
     let identity =
         Identity::load_or_create(&path).with_context(|| format!("identity {}", path.display()))?;
-    let mut peer = args
+    let peer = args
         .peer_card
         .as_deref()
         .map(Card::from_arg)
@@ -124,29 +137,66 @@ async fn main() -> Result<()> {
     .context("the tests could not be run")?;
     print!("{}", probe.render());
 
-    // No card yet: ask for one, here, so that the test runs on the socket
-    // that was measured — the address on the card given away is that
-    // socket's, and a second run would be a different one.
-    if peer.is_none() && (args.stdin || std::io::stdin().is_terminal()) {
-        println!(
-            "\nPaste the other side's card and press Enter (or Ctrl-C to stop here). Both sides \
-             should do this within a minute or two of each other:"
-        );
-        peer = read_card().await;
+    // Nobody to test with yet: ask for a card or an address, here, so that
+    // the test runs on the socket that was measured — the address on the
+    // card given away is that socket's, and a second run would be a
+    // different one.
+    let mut targets: Vec<(SocketAddr, NatHints)> = args
+        .peer_addr
+        .iter()
+        .map(|a| (*a, NatHints::unknown()))
+        .collect();
+    let mut whose = args
+        .peer_addr
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(card) = &peer {
+        targets.extend(card.punch_targets());
+        whose = if whose.is_empty() {
+            card.id.to_string()
+        } else {
+            format!("{}, {}", card.id, whose)
+        };
     }
-    let Some(peer) = peer else {
+    if targets.is_empty() && (args.stdin || std::io::stdin().is_terminal()) {
+        println!(
+            "\nPaste the other side's card, or its address (IP:PORT), and press Enter (or Ctrl-C \
+             to stop here). Both sides should do this within a minute or two of each other:"
+        );
+        match read_peer().await {
+            Some(Peer::Card(card)) => {
+                targets = card.punch_targets();
+                whose = card.id.to_string();
+            }
+            Some(Peer::Addrs(addrs)) => {
+                whose = addrs
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                targets = addrs
+                    .into_iter()
+                    .map(|a| (a, NatHints::unknown()))
+                    .collect();
+            }
+            None => {}
+        }
+    }
+    if targets.is_empty() {
         probe.finish().await;
         return Ok(());
-    };
+    }
     println!(
         "\nSending at {} address(es) of {} for up to {} s; the other side has to be running \
          this too...",
-        peer.punch_targets().len(),
-        peer.id,
+        targets.len(),
+        whose,
         args.wait
     );
     let outcome = probe
-        .punch_test(&peer, Duration::from_secs(args.wait))
+        .punch_test_at(targets, Duration::from_secs(args.wait))
         .await;
     probe.finish().await;
     match outcome.heard_from {
@@ -168,8 +218,15 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Reads lines from standard input until one is a card of the other side.
-async fn read_card() -> Option<Card> {
+/// Who the test is with.
+enum Peer {
+    Card(Card),
+    Addrs(Vec<SocketAddr>),
+}
+
+/// Reads lines from standard input until one is a card of the other side,
+/// or its addresses.
+async fn read_peer() -> Option<Peer> {
     tokio::task::spawn_blocking(|| {
         use std::io::BufRead;
         for line in std::io::stdin().lock().lines() {
@@ -178,9 +235,19 @@ async fn read_card() -> Option<Card> {
             if line.is_empty() {
                 continue;
             }
-            match Card::from_text(line) {
-                Ok(card) => return Some(card),
-                Err(e) => println!("That card cannot be read ({}); paste it again:", e),
+            if line
+                .get(..4)
+                .is_some_and(|h| h.eq_ignore_ascii_case("shc1"))
+            {
+                match Card::from_text(line) {
+                    Ok(card) => return Some(Peer::Card(card)),
+                    Err(e) => println!("That card cannot be read ({}); paste it again:", e),
+                }
+            } else {
+                match parse_peer_addrs(line) {
+                    Ok(addrs) => return Some(Peer::Addrs(addrs)),
+                    Err(e) => println!("{}; paste a card or an address again:", e),
+                }
             }
         }
         None

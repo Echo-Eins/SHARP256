@@ -630,10 +630,11 @@ impl Sender {
         // it), and the punches are aimed by both.
         #[cfg(feature = "nat-traversal")]
         let meeting = self.cfg.peer_card.is_some();
-        // A card is given to the peer when we were given theirs, and when
-        // there is a TURN server, whose address only a card can tell.
+        // A card is given to the peer when we were given theirs, when there
+        // is a TURN server, whose address only a card can tell, and when we
+        // were asked to.
         #[cfg(feature = "nat-traversal")]
-        let wants_card = meeting || !self.cfg.turn_servers.is_empty();
+        let wants_card = meeting || !self.cfg.turn_servers.is_empty() || self.cfg.give_card;
         // What discovery finds and what the TURN servers give go on the card
         // together, and the card is given again when either changes.
         #[cfg(feature = "nat-traversal")]

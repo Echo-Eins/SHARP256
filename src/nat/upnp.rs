@@ -1,6 +1,7 @@
 //! UPnP IGD port mapping for the receiver: asks the home router to forward a
 //! UDP port to the receiver's socket so that senders outside the local
-//! network can reach it.
+//! network can reach it — or, over IPv6, where nothing is translated, to open
+//! its firewall to it.
 //!
 //! A small client of its own rather than a general-purpose one, because of
 //! who it talks to. UPnP has no authentication at all: the router is found
@@ -11,28 +12,53 @@
 //! this host's loopback services included — to hang there for ever, or to
 //! read until memory runs out. So here:
 //!
-//! * a device is believed only if it is on a local subnet of ours, and only
-//!   about itself: the description and control URLs must be on the very
-//!   address that answered the search;
+//! * a device is believed only if it is on a local network of ours, and only
+//!   about itself: it is asked at the very address that answered the search
+//!   (the description and control URLs must be on it, and over IPv6 only the
+//!   port and path of the answer's URL are used — a router that answers from
+//!   its link-local address and names its global one is asked at the first);
 //! * every step has its own deadline, and the whole attempt one more;
 //! * every response has a size limit, and anything past it is an error.
 //!
 //! The protocol is the UPnP Device Architecture 1.1 (SSDP discovery, the
 //! device description, SOAP control) with the WANIPConnection:1/2 and
 //! WANPPPConnection:1 services, over HTTP/1.0 so that nothing arrives
-//! chunked.
+//! chunked. A firewall pinhole is asked for over IPv6 — the search goes to
+//! the IPv6 groups on every network, and the request leaves from the address
+//! the pinhole is for, because that is the only one a router lets a host open
+//! a pinhole to (miniupnpd's default, and what the IGD v2 specification
+//! recommends) — and, where a router turns out to answer only over IPv4,
+//! there too.
 
 use anyhow::{anyhow, bail, Result};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+
+use crate::address::class::is_link_local_v6;
 
 /// Where routers listen for searches (UPnP Device Architecture 1.1, 1.3.2).
 pub const SSDP_TARGET: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900));
+/// ... and over IPv6: the link-local and the site-local group (same place).
+const SSDP_GROUPS_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xc),
+    Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0xc),
+];
+/// What is searched for, newest first.
+const SEARCH_TARGETS: [&str; 2] = [
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+];
 /// How long to wait for search answers.
 const SEARCH_WAIT: Duration = Duration::from_secs(2);
+/// How much longer, once a router has answered on one network, the others
+/// are given to answer (a host is often on several, and a router on each).
+const SEARCH_GRACE: Duration = Duration::from_millis(150);
+/// Networks searched over IPv6, at most.
+const MAX_LINKS: usize = 8;
 /// How long one HTTP exchange may take, connecting included.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a whole attempt at a mapping may take.
@@ -60,15 +86,55 @@ const FIREWALL_SERVICE: &str = "urn:schemas-upnp-org:service:WANIPv6FirewallCont
 const CONFLICT_IN_MAPPING: u32 = 718;
 const ONLY_PERMANENT_LEASES: u32 = 725;
 
-/// An `http://a.b.c.d:port/path` URL on one device.
+/// An `http://address:port/path` URL on one device, the address a literal
+/// IPv4 or IPv6 one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Url {
-    host: SocketAddrV4,
+    host: SocketAddr,
     path: String,
+    /// The address requests to the device leave from, where it matters: a
+    /// router lets a host open its IPv6 firewall to that host's own address
+    /// only, as seen on the request.
+    source: Option<IpAddr>,
+}
+
+/// `a.b.c.d[:port]` or `[v6][:port]`. A zone on an IPv6 address
+/// (`%25eth0`, RFC 6874) names an interface of the device's own host, which
+/// means nothing here: it is dropped, and the network is the one the device
+/// answered on.
+fn parse_authority(authority: &str) -> Option<SocketAddr> {
+    if let Some(inner) = authority.strip_prefix('[') {
+        let (addr, rest) = inner.split_once(']')?;
+        let addr = addr.split_once('%').map_or(addr, |(a, _)| a);
+        let ip: Ipv6Addr = addr.parse().ok()?;
+        // A router names itself by its own address, not as an IPv4 one in
+        // disguise.
+        if ip.to_ipv4_mapped().is_some() {
+            return None;
+        }
+        let port = match rest {
+            "" => 80,
+            r => r.strip_prefix(':')?.parse().ok()?,
+        };
+        return Some(SocketAddr::new(IpAddr::V6(ip), port));
+    }
+    Some(match authority.rsplit_once(':') {
+        Some((ip, port)) => SocketAddr::V4(SocketAddrV4::new(ip.parse().ok()?, port.parse().ok()?)),
+        None => SocketAddr::V4(SocketAddrV4::new(authority.parse().ok()?, 80)),
+    })
+}
+
+/// `a.b.c.d:port` or `[v6]:port`, as HTTP's Host header has it: without the
+/// zone a link-local address is given here, which a router has no use for.
+fn authority(host: SocketAddr) -> String {
+    match host {
+        SocketAddr::V4(a) => a.to_string(),
+        SocketAddr::V6(a) => format!("[{}]:{}", a.ip(), a.port()),
+    }
 }
 
 impl Url {
-    /// Only plain HTTP to a literal IPv4 address: a router names itself by
+    /// Only plain HTTP to a literal address: a router names itself by
     /// address, and a name would need a DNS lookup somebody else answers.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         let rest = s.trim().strip_prefix("http://")?;
@@ -76,16 +142,14 @@ impl Url {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
-        let host = match authority.rsplit_once(':') {
-            Some((ip, port)) => SocketAddrV4::new(ip.parse().ok()?, port.parse().ok()?),
-            None => SocketAddrV4::new(authority.parse().ok()?, 80),
-        };
+        let host = parse_authority(authority)?;
         if path.bytes().any(|b| b.is_ascii_control() || b == b' ') {
             return None;
         }
         Some(Self {
             host,
             path: path.to_string(),
+            source: None,
         })
     }
 
@@ -108,6 +172,7 @@ impl Url {
         Some(Self {
             host: self.host,
             path,
+            source: self.source,
         })
     }
 }
@@ -122,7 +187,13 @@ pub(crate) struct Service {
 /// Whether a device at `ip` is one we may believe about itself: on a local
 /// subnet of ours, and an address a router has. Loopback only when the
 /// search itself went to loopback (the tests' simulated router).
-fn believable(ip: Ipv4Addr, search: SocketAddr) -> bool {
+fn believable(ip: IpAddr, search: SocketAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V4(ip) => ip,
+        // Over IPv6 the networks are searched one by one (`answer_v6`); an
+        // IPv6 answer to a search of one address is the tests' loopback.
+        IpAddr::V6(ip) => return ip.is_loopback() && search.ip().is_loopback(),
+    };
     if ip.is_loopback() {
         return search.ip().is_loopback();
     }
@@ -149,26 +220,61 @@ fn on_link(ip: Ipv4Addr) -> bool {
     })
 }
 
-/// Sends an SSDP search and returns the description URLs of the routers
-/// that answered believably, in the order they answered.
-async fn search(target: SocketAddr) -> Result<Vec<Url>> {
-    let sock = UdpSocket::bind(if target.ip().is_loopback() {
-        "127.0.0.1:0"
-    } else {
-        "0.0.0.0:0"
+/// A router found by a search: where to ask it, and — for one found over
+/// IPv6 — which of this host's addresses are on the network it answered on
+/// (a pinhole can be opened for those only).
+#[derive(Debug, Clone)]
+struct Found {
+    url: Url,
+    link: Option<Vec<Ipv6Addr>>,
+}
+
+/// Where a search goes.
+#[derive(Debug, Clone, Copy)]
+enum Reach {
+    /// The networks this host is on.
+    Lan,
+    /// One unicast address: the tests' simulated router on loopback.
+    At(SocketAddr),
+}
+
+/// The search request for `st`, sent to the group or address `host`.
+fn m_search(host: &str, st: &str) -> String {
+    format!(
+        "M-SEARCH * HTTP/1.1\r\nHOST: {}\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: {}\r\n\r\n",
+        host, st
+    )
+}
+
+/// The routers to ask: over IPv4 always, and with `v6` over every network
+/// this host has IPv6 on, those first.
+async fn find_routers(reach: Reach, v6: bool) -> Result<Vec<Found>> {
+    match reach {
+        Reach::At(target) => search_at(target).await,
+        Reach::Lan if !v6 => search_at(SSDP_TARGET).await,
+        Reach::Lan => {
+            let links = links_v6();
+            let (over_v6, over_v4) = tokio::join!(search_links(&links), search_at(SSDP_TARGET));
+            let mut found = over_v6;
+            found.extend(over_v4.unwrap_or_default());
+            Ok(found)
+        }
+    }
+}
+
+/// Sends an SSDP search to `target` and returns the routers that answered
+/// believably, in the order they answered.
+async fn search_at(target: SocketAddr) -> Result<Vec<Found>> {
+    let sock = UdpSocket::bind(match target {
+        SocketAddr::V4(t) if t.ip().is_loopback() => "127.0.0.1:0",
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::1]:0",
     })
     .await?;
     let _ = sock.set_multicast_ttl_v4(2);
-    let mut found: Vec<Url> = Vec::new();
-    for st in [
-        "urn:schemas-upnp-org:device:InternetGatewayDevice:2",
-        "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
-    ] {
-        let msg = format!(
-            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\
-             MAN: \"ssdp:discover\"\r\nMX: 1\r\nST: {}\r\n\r\n",
-            st
-        );
+    let mut found: Vec<Found> = Vec::new();
+    for st in SEARCH_TARGETS {
+        let msg = m_search("239.255.255.250:1900", st);
         sock.send_to(msg.as_bytes(), target).await?;
     }
     let deadline = tokio::time::Instant::now() + SEARCH_WAIT;
@@ -180,9 +286,6 @@ async fn search(target: SocketAddr) -> Result<Vec<Url>> {
             break;
         };
         answers += 1;
-        let IpAddr::V4(from_ip) = from.ip() else {
-            continue;
-        };
         let Ok(text) = std::str::from_utf8(&buf[..n]) else {
             continue;
         };
@@ -192,7 +295,7 @@ async fn search(target: SocketAddr) -> Result<Vec<Url>> {
         // About itself, and from nearby: a device that points us anywhere
         // but its own address — this host's loopback, say, or another
         // machine — is not a router telling us where it lives.
-        if *location.host.ip() != from_ip || !believable(from_ip, target) {
+        if location.host.ip() != from.ip() || !believable(from.ip(), target) {
             tracing::debug!(
                 "UPnP: ignoring {} (answered from {}, not believable)",
                 location.host,
@@ -200,13 +303,199 @@ async fn search(target: SocketAddr) -> Result<Vec<Url>> {
             );
             continue;
         }
-        if !found.contains(&location) {
-            found.push(location);
+        if !found.iter().any(|f| f.url == location) {
+            found.push(Found {
+                url: location,
+                link: None,
+            });
         }
         // The first believable router will do.
         break;
     }
     Ok(found)
+}
+
+/// A network this host has IPv6 on: where an IPv6 search is sent, and what
+/// makes an answer to it believable.
+#[derive(Debug, Clone)]
+struct Link {
+    index: u32,
+    /// This host's addresses there, with their prefix lengths.
+    addrs: Vec<(Ipv6Addr, u32)>,
+}
+
+/// The networks to search over IPv6: those this host has an IPv6 address on.
+/// (The system's list of addresses leaves the link-local ones out, and a
+/// network with only those has nothing a pinhole could be opened for.)
+fn links_v6() -> Vec<Link> {
+    let Ok(all) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut links: Vec<Link> = Vec::new();
+    for i in all {
+        let if_addrs::IfAddr::V6(a) = &i.addr else {
+            continue;
+        };
+        if i.is_loopback() {
+            continue;
+        }
+        let Some(index) = crate::address::dns::interface_index_of(&i.name) else {
+            continue;
+        };
+        let entry = (a.ip, u128::from(a.netmask).leading_ones());
+        match links.iter_mut().find(|l| l.index == index) {
+            Some(l) => l.addrs.push(entry),
+            None => links.push(Link {
+                index,
+                addrs: vec![entry],
+            }),
+        }
+    }
+    links.truncate(MAX_LINKS);
+    links
+}
+
+/// Whether `a` and `b` share their first `len` bits.
+fn same_prefix(a: Ipv6Addr, b: Ipv6Addr, len: u32) -> bool {
+    len > 0 && len <= 128 && (u128::from(a) ^ u128::from(b)) >> (128 - len) == 0
+}
+
+/// Whether `ip` is an address a router on `link` has: not a group or a
+/// nowhere, and either link-local or inside a prefix this host has there.
+fn believable_on(ip: Ipv6Addr, link: &Link) -> bool {
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
+        return false;
+    }
+    is_link_local_v6(&ip)
+        || link
+            .addrs
+            .iter()
+            .any(|&(own, len)| same_prefix(own, ip, len))
+}
+
+/// An IPv6 socket that sends its multicast out of the network `index`.
+fn search_socket_v6(index: u32) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    s.set_only_v6(true)?;
+    s.set_nonblocking(true)?;
+    s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    s.set_multicast_if_v6(index)?;
+    // UPnP Device Architecture 1.1 asks for a hop limit of 4.
+    s.set_multicast_hops_v6(4)?;
+    s.set_multicast_loop_v6(false)?;
+    UdpSocket::from_std(s.into())
+}
+
+/// What one IPv6 answer says, if it is believable: the router that sent it
+/// on `link` is asked at the address it sent it from, at the port and path
+/// its `LOCATION` gives.
+fn answer_v6(data: &[u8], from: SocketAddrV6, link: &Link) -> Option<Found> {
+    let text = std::str::from_utf8(data).ok()?;
+    let location = header(text, "location").and_then(Url::parse)?;
+    let SocketAddr::V6(named) = location.host else {
+        return None;
+    };
+    // Heard on this network (a link-local sender says which it is on), from
+    // an address a router on it has.
+    let here = from.scope_id() == 0 || from.scope_id() == link.index;
+    if !here || !believable_on(*from.ip(), link) {
+        tracing::debug!(
+            "UPnP: ignoring {} (not believable on network {})",
+            from,
+            link.index
+        );
+        return None;
+    }
+    let scope = if is_link_local_v6(from.ip()) {
+        link.index
+    } else {
+        0
+    };
+    if named.ip() != from.ip() {
+        tracing::debug!(
+            "UPnP: {} names {} for its description; asking it at its own address",
+            from.ip(),
+            named.ip()
+        );
+    }
+    Some(Found {
+        url: Url {
+            host: SocketAddr::V6(SocketAddrV6::new(*from.ip(), named.port(), 0, scope)),
+            path: location.path,
+            source: None,
+        },
+        link: Some(link.addrs.iter().map(|(ip, _)| *ip).collect()),
+    })
+}
+
+/// An IPv6 search answer through everything that reads it, as if it came
+/// from a link-local address on a network of this host's: for the fuzz
+/// harness.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn fuzz_answer_v6(data: &[u8]) {
+    let link = Link {
+        index: 3,
+        addrs: vec![
+            (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2), 64),
+            (Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 2), 64),
+        ],
+    };
+    let from = SocketAddrV6::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), 1900, 0, 3);
+    let _ = answer_v6(data, from, &link);
+}
+
+/// Searches every network in `links` over IPv6 and returns the routers that
+/// answered believably, the first at once and the rest within a moment.
+async fn search_links(links: &[Link]) -> Vec<Found> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddrV6, usize)>(64);
+    // Dropped with this function, whatever way it ends.
+    let mut readers = tokio::task::JoinSet::new();
+    for (position, link) in links.iter().enumerate() {
+        let Ok(sock) = search_socket_v6(link.index) else {
+            continue;
+        };
+        let sock = Arc::new(sock);
+        for group in SSDP_GROUPS_V6 {
+            let to = SocketAddr::V6(SocketAddrV6::new(group, 1900, 0, link.index));
+            for st in SEARCH_TARGETS {
+                let msg = m_search(&format!("[{}]:1900", group), st);
+                let _ = sock.send_to(msg.as_bytes(), to).await;
+            }
+        }
+        let tx = tx.clone();
+        readers.spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if let SocketAddr::V6(from) = from {
+                    if tx.send((buf[..n].to_vec(), from, position)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut deadline = tokio::time::Instant::now() + SEARCH_WAIT;
+    let mut found: Vec<Found> = Vec::new();
+    let mut answers = 0;
+    while answers < MAX_ANSWERS {
+        let Ok(Some((data, from, position))) = tokio::time::timeout_at(deadline, rx.recv()).await
+        else {
+            break;
+        };
+        answers += 1;
+        let Some(router) = answer_v6(&data, from, &links[position]) else {
+            continue;
+        };
+        if !found.iter().any(|f| f.url == router.url) {
+            if found.is_empty() {
+                deadline = deadline.min(tokio::time::Instant::now() + SEARCH_GRACE);
+            }
+            found.push(router);
+        }
+    }
+    found
 }
 
 /// The value of an HTTP-style header in `text`, case-insensitively.
@@ -217,11 +506,24 @@ pub(crate) fn header<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// A connection to a device, from the address the device is to see the
+/// requests come from if one was named.
+async fn connect(url: &Url) -> std::io::Result<TcpStream> {
+    match (url.host, url.source) {
+        (SocketAddr::V6(_), Some(source)) => {
+            let socket = TcpSocket::new_v6()?;
+            socket.bind(SocketAddr::new(source, 0))?;
+            socket.connect(url.host).await
+        }
+        _ => TcpStream::connect(url.host).await,
+    }
+}
+
 /// One HTTP/1.0 exchange with a device: sends `request`, reads the answer
 /// up to `max` bytes, returns its status and body.
 async fn http(url: &Url, request: &[u8], max: usize) -> Result<(u16, String)> {
     let exchange = async {
-        let mut stream = TcpStream::connect(SocketAddr::V4(url.host)).await?;
+        let mut stream = connect(url).await?;
         stream.write_all(request).await?;
         let mut data = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
@@ -263,7 +565,8 @@ pub(crate) fn parse_http_answer(data: &[u8]) -> Result<(u16, String)> {
 async fn get(url: &Url) -> Result<String> {
     let request = format!(
         "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        url.path, url.host
+        url.path,
+        authority(url.host)
     );
     let (status, body) = http(url, request.as_bytes(), MAX_DESCRIPTION).await?;
     if status != 200 {
@@ -322,6 +625,18 @@ pub(crate) fn find_service_of(
             if control.host.ip() != location.host.ip() {
                 continue;
             }
+            // Reached the way the description was: the same network, from
+            // the same address.
+            let control = Url {
+                host: match (control.host, location.host) {
+                    (SocketAddr::V6(c), SocketAddr::V6(l)) => {
+                        SocketAddr::V6(SocketAddrV6::new(*c.ip(), c.port(), 0, l.scope_id()))
+                    }
+                    (c, _) => c,
+                },
+                path: control.path,
+                source: location.source,
+            };
             return Some(Service { control, kind });
         }
     }
@@ -356,7 +671,7 @@ async fn soap(
         "POST {} HTTP/1.0\r\nHost: {}\r\nContent-Type: text/xml; charset=\"utf-8\"\r\n\
          SOAPAction: \"{}#{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         service.control.path,
-        service.control.host,
+        authority(service.control.host),
         service.kind,
         action,
         body.len(),
@@ -415,7 +730,7 @@ impl UpnpMapping {
         lease: u32,
         description: &str,
     ) -> Result<Self> {
-        Self::create_with(SSDP_TARGET, local_port, bind_ip, lease, description).await
+        Self::create_in(Reach::Lan, local_port, bind_ip, lease, description).await
     }
 
     /// [`UpnpMapping::create`], searching at `target` (the tests' simulated
@@ -427,23 +742,39 @@ impl UpnpMapping {
         lease: u32,
         description: &str,
     ) -> Result<Self> {
+        Self::create_in(Reach::At(target), local_port, bind_ip, lease, description).await
+    }
+
+    async fn create_in(
+        reach: Reach,
+        local_port: u16,
+        bind_ip: Option<Ipv4Addr>,
+        lease: u32,
+        description: &str,
+    ) -> Result<Self> {
         tokio::time::timeout(
             CREATE_TIMEOUT,
-            Self::attempt(target, local_port, bind_ip, lease, description),
+            Self::attempt(reach, local_port, bind_ip, lease, description),
         )
         .await
         .map_err(|_| anyhow!("UPnP: the router took too long"))?
     }
 
     async fn attempt(
-        target: SocketAddr,
+        reach: Reach,
         local_port: u16,
         bind_ip: Option<Ipv4Addr>,
         lease: u32,
         description: &str,
     ) -> Result<Self> {
         let mut last = anyhow!("no UPnP router answered");
-        for location in search(target).await? {
+        for Found { url: location, .. } in find_routers(reach, false).await? {
+            // A port is forwarded to an IPv4 host: the router is asked over
+            // IPv4.
+            let IpAddr::V4(router) = location.host.ip() else {
+                last = anyhow!("{} is not an IPv4 router", location.host);
+                continue;
+            };
             let service = match get(&location).await {
                 Ok(desc) => match find_service(&desc, &location) {
                     Some(s) => s,
@@ -459,7 +790,7 @@ impl UpnpMapping {
             };
             let local_ip = match bind_ip {
                 Some(ip) if !ip.is_unspecified() => ip,
-                _ => local_ip_towards(*location.host.ip())?,
+                _ => local_ip_towards(router)?,
             };
             let mut m = Self {
                 service,
@@ -619,62 +950,74 @@ pub struct UpnpPinhole {
 }
 
 impl UpnpPinhole {
-    /// Finds the router and asks it to let packets from anywhere in to
-    /// `client`'s UDP `port`.
-    pub async fn create(client: std::net::Ipv6Addr, port: u16, lease: u32) -> Result<Self> {
-        Self::create_with(SSDP_TARGET, client, port, lease).await
+    /// Finds the router and asks it to let packets from anywhere in to the
+    /// UDP `port` of one of `clients`, this host's addresses.
+    pub async fn create(clients: &[Ipv6Addr], port: u16, lease: u32) -> Result<Self> {
+        Self::create_in(Reach::Lan, clients, port, lease).await
     }
 
     /// [`UpnpPinhole::create`], searching at `target` (the tests' simulated
     /// router listens on loopback).
     pub async fn create_with(
         target: SocketAddr,
-        client: std::net::Ipv6Addr,
+        clients: &[Ipv6Addr],
         port: u16,
         lease: u32,
     ) -> Result<Self> {
-        tokio::time::timeout(CREATE_TIMEOUT, Self::attempt(target, client, port, lease))
+        Self::create_in(Reach::At(target), clients, port, lease).await
+    }
+
+    async fn create_in(reach: Reach, clients: &[Ipv6Addr], port: u16, lease: u32) -> Result<Self> {
+        tokio::time::timeout(CREATE_TIMEOUT, Self::attempt(reach, clients, port, lease))
             .await
             .map_err(|_| anyhow!("UPnP: the router took too long"))?
     }
 
-    async fn attempt(
-        target: SocketAddr,
-        client: std::net::Ipv6Addr,
-        port: u16,
-        lease: u32,
-    ) -> Result<Self> {
+    async fn attempt(reach: Reach, clients: &[Ipv6Addr], port: u16, lease: u32) -> Result<Self> {
         let mut last = anyhow!("no UPnP router answered");
-        for location in search(target).await? {
-            let service = match get(&location).await {
-                Ok(desc) => match find_service_of(&desc, &location, &[FIREWALL_SERVICE]) {
-                    Some(s) => s,
+        for found in find_routers(reach, true).await? {
+            // For which of this host's addresses: one on the network the
+            // router answered on, and where that is not known (it answered
+            // over IPv4) the first.
+            let client = match (&found.link, clients.first()) {
+                (Some(there), _) => match clients.iter().find(|c| there.contains(c)) {
+                    Some(c) => *c,
                     None => {
-                        last = anyhow!("{} has no IPv6 firewall control", location.host);
+                        last = anyhow!(
+                            "{} is on a network that has none of this host's addresses",
+                            found.url.host
+                        );
                         continue;
                     }
                 },
-                Err(e) => {
-                    last = e;
-                    continue;
-                }
+                (None, Some(c)) => *c,
+                (None, None) => bail!("no address of this host to open the firewall for"),
             };
-            // A router says whether it has a firewall to open and whether
-            // it lets hosts open it; either "no" is the answer, and the
-            // first is a good one.
-            let mut open = false;
-            if let Ok(status) = soap(&service, "GetFirewallStatus", &[]).await {
-                if element(&status, "FirewallEnabled") == Some("0") {
-                    open = true;
-                } else if element(&status, "InboundPinholeAllowed") == Some("0") {
-                    last = anyhow!(
-                        "{} does not let hosts open its IPv6 firewall",
-                        location.host
-                    );
-                    continue;
-                }
+            let mut location = found.url;
+            // The request leaves from the address the pinhole is for: a
+            // router lets a host open a pinhole to itself only.
+            if location.host.is_ipv6() {
+                location.source = Some(IpAddr::V6(client));
             }
-            if open {
+            match Self::open(&location, client, port, lease).await {
+                Ok(pinhole) => return Ok(pinhole),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// One router's answer to a request for a pinhole for `client`.
+    async fn open(location: &Url, client: Ipv6Addr, port: u16, lease: u32) -> Result<Self> {
+        let desc = get(location).await?;
+        let Some(service) = find_service_of(&desc, location, &[FIREWALL_SERVICE]) else {
+            bail!("{} has no IPv6 firewall control", location.host);
+        };
+        // A router says whether it has a firewall to open and whether it
+        // lets hosts open it; either "no" is the answer, and the first is a
+        // good one.
+        if let Ok(status) = soap(&service, "GetFirewallStatus", &[]).await {
+            if element(&status, "FirewallEnabled") == Some("0") {
                 return Ok(Self {
                     service,
                     client,
@@ -683,34 +1026,36 @@ impl UpnpPinhole {
                     lease,
                 });
             }
-            // The spec's longest lease; anything more is refused.
-            let lease = lease.clamp(1, 86_400);
-            let args = [
-                ("RemoteHost", String::new()),
-                ("RemotePort", "0".to_string()),
-                ("InternalClient", client.to_string()),
-                ("InternalPort", port.to_string()),
-                ("Protocol", "17".to_string()),
-                ("LeaseTime", lease.to_string()),
-            ];
-            match soap(&service, "AddPinhole", &args).await {
-                Ok(answer) => {
-                    let Some(id) = element(&answer, "UniqueID").map(str::to_string) else {
-                        last = anyhow!("the router granted no pinhole handle");
-                        continue;
-                    };
-                    return Ok(Self {
-                        service,
-                        client,
-                        port,
-                        unique_id: Some(id),
-                        lease,
-                    });
-                }
-                Err(e) => last = anyhow!("UPnP pinhole failed: {}", e),
+            if element(&status, "InboundPinholeAllowed") == Some("0") {
+                bail!(
+                    "{} does not let hosts open its IPv6 firewall",
+                    location.host
+                );
             }
         }
-        Err(last)
+        // The spec's longest lease; anything more is refused.
+        let lease = lease.clamp(1, 86_400);
+        let args = [
+            ("RemoteHost", String::new()),
+            ("RemotePort", "0".to_string()),
+            ("InternalClient", client.to_string()),
+            ("InternalPort", port.to_string()),
+            ("Protocol", "17".to_string()),
+            ("LeaseTime", lease.to_string()),
+        ];
+        let answer = soap(&service, "AddPinhole", &args)
+            .await
+            .map_err(|e| anyhow!("UPnP pinhole failed: {}", e))?;
+        let Some(id) = element(&answer, "UniqueID").map(str::to_string) else {
+            bail!("the router granted no pinhole handle");
+        };
+        Ok(Self {
+            service,
+            client,
+            port,
+            unique_id: Some(id),
+            lease,
+        })
     }
 
     /// Where the host is reachable now: its own address, the port opened.
@@ -783,6 +1128,16 @@ mod tests {
             "http://router.local:5000/x",
             "http://192.168.1.1:5000/a b",
             "ftp://192.168.1.1/",
+            // IPv6 literals go in brackets, and are closed and complete.
+            "http://fe80::1:5000/x",
+            "http://[fe80::1/x",
+            "http://[fe80::1]x/",
+            "http://[fe80::1]:/x",
+            "http://[fe80::1]:99999/x",
+            "http://[]:80/x",
+            "http://[router]:80/x",
+            // A router is not an IPv4 address in disguise.
+            "http://[::ffff:192.168.1.1]:5000/x",
         ] {
             assert!(Url::parse(bad).is_none(), "{}", bad);
         }
@@ -793,6 +1148,46 @@ mod tests {
             base.join("http://192.168.1.9:80/x").unwrap().host,
             "192.168.1.9:80".parse().unwrap()
         );
+    }
+
+    /// An IPv6 router's URL: the address in brackets, a port or the default,
+    /// and a zone (`%25eth0`, RFC 6874) that is dropped — it names an
+    /// interface of the router's host, not ours.
+    #[test]
+    fn urls_take_ipv6_addresses_in_brackets() {
+        let u = Url::parse("http://[2001:db8::1]:5000/rootDesc.xml").unwrap();
+        assert_eq!(u.host, "[2001:db8::1]:5000".parse().unwrap());
+        assert_eq!(u.path, "/rootDesc.xml");
+        assert_eq!(
+            Url::parse("http://[2001:db8::1]/x").unwrap().host,
+            "[2001:db8::1]:80".parse().unwrap()
+        );
+        for zoned in [
+            "http://[fe80::1%25eth0]:5000/x",
+            "http://[fe80::1%eth0]:5000/x",
+            "http://[fe80::1%3]:5000/x",
+        ] {
+            let u = Url::parse(zoned).unwrap();
+            assert_eq!(u.host, "[fe80::1]:5000".parse().unwrap(), "{}", zoned);
+            let SocketAddr::V6(v6) = u.host else {
+                panic!("not IPv6")
+            };
+            assert_eq!(v6.scope_id(), 0, "{}", zoned);
+        }
+        let base = Url::parse("http://[2001:db8::1]:5000/dev/desc.xml").unwrap();
+        let ctl = base.join("ctl/IP6FCtl").unwrap();
+        assert_eq!(ctl.host, base.host);
+        assert_eq!(ctl.path, "/dev/ctl/IP6FCtl");
+        assert_eq!(
+            base.join("http://[2001:db8::9]:80/x").unwrap().host,
+            "[2001:db8::9]:80".parse().unwrap()
+        );
+        // The Host header is the address without a zone.
+        assert_eq!(
+            authority("[fe80::1%3]:5000".parse().unwrap()),
+            "[fe80::1]:5000"
+        );
+        assert_eq!(authority("10.0.0.1:80".parse().unwrap()), "10.0.0.1:80");
     }
 
     #[test]
@@ -815,6 +1210,41 @@ mod tests {
         // A control URL on another host is somebody else's.
         assert!(find_service(&desc("http://127.0.0.1:22/"), &location).is_none());
         assert!(find_service(&desc("http://192.168.1.77/x"), &location).is_none());
+    }
+
+    /// The control URL of an IPv6 router is reached on the network the
+    /// description was, from the address it was: a link-local address means
+    /// nothing without the network, and the source is what the router checks
+    /// a pinhole against.
+    #[test]
+    fn an_ipv6_control_url_is_reached_the_way_the_description_was() {
+        let mut location = Url::parse("http://[fe80::1]:5000/desc.xml").unwrap();
+        location.host = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 5000, 0, 7));
+        location.source = Some("2001:db8::5".parse().unwrap());
+        let desc = |control: &str| {
+            format!(
+                "<root><device><serviceList><service>\
+                 <serviceType>{}</serviceType><controlURL>{}</controlURL>\
+                 </service></serviceList></device></root>",
+                FIREWALL_SERVICE, control
+            )
+        };
+        for control in ["/ctl/IP6FCtl", "http://[fe80::1%25eth0]:5000/ctl/IP6FCtl"] {
+            let s = find_service_of(&desc(control), &location, &[FIREWALL_SERVICE]).unwrap();
+            let SocketAddr::V6(host) = s.control.host else {
+                panic!("not IPv6")
+            };
+            assert_eq!(host.scope_id(), 7, "{}", control);
+            assert_eq!(s.control.path, "/ctl/IP6FCtl");
+            assert_eq!(s.control.source, location.source);
+        }
+        // Another address, even one on the same network, is another device.
+        assert!(find_service_of(
+            &desc("http://[fe80::2]:5000/ctl"),
+            &location,
+            &[FIREWALL_SERVICE]
+        )
+        .is_none());
     }
 
     #[test]
@@ -856,9 +1286,20 @@ mod tests {
     }
 
     async fn fake_router(behave: Behave, location_host: Option<&str>) -> FakeRouter {
-        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        fake_router_on("127.0.0.1", CLIENT6_TEXT, behave, location_host).await
+    }
+
+    /// [`fake_router`] on the loopback address `ip`, opening pinholes for
+    /// `client` only.
+    async fn fake_router_on(
+        ip: &'static str,
+        client: &'static str,
+        behave: Behave,
+        location_host: Option<&str>,
+    ) -> FakeRouter {
+        let http = TcpListener::bind((ip, 0)).await.unwrap();
         let http_addr = http.local_addr().unwrap();
-        let ssdp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ssdp = UdpSocket::bind((ip, 0)).await.unwrap();
         let ssdp_addr = ssdp.local_addr().unwrap();
         let location = match location_host {
             Some(h) => format!("http://{}/desc.xml", h),
@@ -967,13 +1408,13 @@ mod tests {
                         // The arguments a router needs, without the prefix
                         // the IGD v1 actions use.
                         let wanted = [
-                            "<RemoteHost>",
-                            "<InternalClient>2001:db8::5<",
-                            "<InternalPort>5555<",
-                            "<Protocol>17<",
-                            "<LeaseTime>",
+                            "<RemoteHost>".to_string(),
+                            format!("<InternalClient>{}<", client),
+                            "<InternalPort>5555<".to_string(),
+                            "<Protocol>17<".to_string(),
+                            "<LeaseTime>".to_string(),
                         ];
-                        if wanted.iter().all(|w| req.contains(w)) {
+                        if wanted.iter().all(|w| req.contains(w.as_str())) {
                             counter.fetch_add(1, Ordering::Relaxed);
                             reply(
                                 "200 OK",
@@ -1004,13 +1445,14 @@ mod tests {
     const HERE: Option<Ipv4Addr> = Some(Ipv4Addr::LOCALHOST);
 
     const CLIENT6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+    const CLIENT6_TEXT: &str = "2001:db8::5";
 
     /// An IPv6 firewall is opened to the port, renewed and closed, and the
     /// host is then reachable at its own address.
     #[tokio::test]
     async fn a_router_opens_its_ipv6_firewall_to_a_port() {
         let r = fake_router(Behave::Pinhole, None).await;
-        let p = UpnpPinhole::create_with(r.ssdp, CLIENT6, 5555, 3600)
+        let p = UpnpPinhole::create_with(r.ssdp, &[CLIENT6], 5555, 3600)
             .await
             .expect("opened");
         assert_eq!(p.external_addr(), "[2001:db8::5]:5555".parse().unwrap());
@@ -1022,7 +1464,7 @@ mod tests {
     #[tokio::test]
     async fn a_firewall_that_is_off_needs_no_pinhole() {
         let r = fake_router(Behave::FirewallOff, None).await;
-        let p = UpnpPinhole::create_with(r.ssdp, CLIENT6, 5555, 3600)
+        let p = UpnpPinhole::create_with(r.ssdp, &[CLIENT6], 5555, 3600)
             .await
             .expect("nothing to open");
         assert_eq!(r.adds.load(Ordering::Relaxed), 0);
@@ -1032,14 +1474,14 @@ mod tests {
     #[tokio::test]
     async fn a_router_that_lets_hosts_open_nothing_is_reported() {
         let r = fake_router(Behave::NoPinholes, None).await;
-        let e = UpnpPinhole::create_with(r.ssdp, CLIENT6, 5555, 3600)
+        let e = UpnpPinhole::create_with(r.ssdp, &[CLIENT6], 5555, 3600)
             .await
             .err()
             .expect("refused");
         assert!(e.to_string().contains("does not let hosts open"), "{}", e);
         // And an IGD with no IPv6 firewall at all is not mistaken for one.
         let v1 = fake_router(Behave::Normal, None).await;
-        assert!(UpnpPinhole::create_with(v1.ssdp, CLIENT6, 5555, 3600)
+        assert!(UpnpPinhole::create_with(v1.ssdp, &[CLIENT6], 5555, 3600)
             .await
             .is_err());
     }
@@ -1127,5 +1569,176 @@ mod tests {
             .err()
             .expect("refused");
         assert!(e.to_string().contains("more than"), "{}", e);
+    }
+
+    /// What is known of one network for the answers below: a global /64 of
+    /// this host's, on interface 3.
+    fn network() -> Link {
+        Link {
+            index: 3,
+            addrs: vec![("2001:db8:1::2".parse().unwrap(), 64)],
+        }
+    }
+
+    fn from6(ip: &str, scope: u32) -> SocketAddrV6 {
+        SocketAddrV6::new(ip.parse().unwrap(), 1900, 0, scope)
+    }
+
+    fn answered(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nLOCATION: {}\r\n\
+             ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2\r\n\r\n",
+            location
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn prefixes_are_compared_bit_by_bit() {
+        let a: Ipv6Addr = "2001:db8:1:2::1".parse().unwrap();
+        assert!(same_prefix(a, "2001:db8:1:2:ffff::9".parse().unwrap(), 64));
+        assert!(!same_prefix(a, "2001:db8:1:3::1".parse().unwrap(), 64));
+        assert!(same_prefix(a, "2001:db8:1:3::1".parse().unwrap(), 48));
+        assert!(same_prefix(a, a, 128));
+        assert!(!same_prefix(a, "2001:db8:1:2::2".parse().unwrap(), 128));
+        // No prefix, or more than an address has, matches nothing.
+        assert!(!same_prefix(a, a, 0));
+        assert!(!same_prefix(a, a, 129));
+    }
+
+    /// A router is believed on the network it answered on, at an address
+    /// there — its link-local one, or one in a prefix this host has — and
+    /// asked at the address that answered, whatever its answer says.
+    #[test]
+    fn an_answer_over_ipv6_is_believed_on_its_own_network_only() {
+        let link = network();
+        let loc = "http://[2001:db8:1::1]:5000/rootDesc.xml";
+        // Answers from its link-local address and names the global one.
+        let f = answer_v6(&answered(loc), from6("fe80::1", 3), &link).expect("believed");
+        assert_eq!(f.url.host, "[fe80::1%3]:5000".parse().unwrap());
+        assert_eq!(f.url.path, "/rootDesc.xml");
+        assert_eq!(
+            f.link.as_deref(),
+            Some(&link.addrs.iter().map(|a| a.0).collect::<Vec<_>>()[..])
+        );
+        // A system that does not say which network a link-local sender is on.
+        let f = answer_v6(&answered(loc), from6("fe80::1", 0), &link).expect("believed");
+        assert_eq!(f.url.host, "[fe80::1%3]:5000".parse().unwrap());
+        // From a global address in this host's prefix, and names itself.
+        let f = answer_v6(&answered(loc), from6("2001:db8:1::1", 0), &link).expect("believed");
+        assert_eq!(f.url.host, "[2001:db8:1::1]:5000".parse().unwrap());
+        // Another network's link-local address, or a prefix this host is not
+        // in, or an address no router has: nobody's word.
+        for (from, scope) in [
+            ("fe80::1", 4),
+            ("2001:db8:2::1", 0),
+            ("::", 0),
+            ("::1", 0),
+            ("ff02::c", 3),
+        ] {
+            assert!(
+                answer_v6(&answered(loc), from6(from, scope), &link).is_none(),
+                "{} on {}",
+                from,
+                scope
+            );
+        }
+        // A description that is not on IPv6, or not HTTP, or not there.
+        for location in [
+            "http://192.168.1.1:5000/rootDesc.xml",
+            "https://[2001:db8:1::1]:5000/rootDesc.xml",
+            "http://router.local:5000/rootDesc.xml",
+        ] {
+            assert!(
+                answer_v6(&answered(location), from6("fe80::1", 3), &link).is_none(),
+                "{}",
+                location
+            );
+        }
+        assert!(answer_v6(b"HTTP/1.1 200 OK\r\n\r\n", from6("fe80::1", 3), &link).is_none());
+        assert!(answer_v6(&[0xff, 0xfe, 0x00], from6("fe80::1", 3), &link).is_none());
+    }
+
+    /// The networks that get an IPv6 search are ones this host has IPv6 on.
+    #[test]
+    fn only_networks_with_ipv6_are_searched() {
+        let links = links_v6();
+        assert!(links.len() <= MAX_LINKS);
+        for l in &links {
+            assert_ne!(l.index, 0);
+            assert!(!l.addrs.is_empty(), "{:?}", l);
+        }
+    }
+
+    fn ipv6_here() -> bool {
+        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("SHARP_REQUIRE_IPV6").is_none(),
+            "this host has no IPv6, and SHARP_REQUIRE_IPV6 is set"
+        );
+        false
+    }
+
+    /// The same exchange over IPv6: search, description, firewall status,
+    /// AddPinhole, renewal and removal, on a router with an IPv6 address.
+    #[tokio::test]
+    async fn a_router_reached_over_ipv6_opens_its_firewall() {
+        if !ipv6_here() {
+            return;
+        }
+        let r = fake_router_on("::1", "::1", Behave::Pinhole, None).await;
+        assert!(r.ssdp.is_ipv6());
+        let p = UpnpPinhole::create_with(r.ssdp, &[Ipv6Addr::LOCALHOST], 5555, 3600)
+            .await
+            .expect("opened");
+        assert_eq!(p.external_addr(), "[::1]:5555".parse().unwrap());
+        assert_eq!(r.adds.load(Ordering::Relaxed), 1);
+        p.refresh().await.expect("renewed");
+        p.remove().await.expect("closed");
+    }
+
+    /// Of this host's addresses the one the router's network has is the one
+    /// a pinhole is for; none of them there is no pinhole.
+    #[tokio::test]
+    async fn a_pinhole_is_for_an_address_on_the_routers_network() {
+        // What `attempt` chooses from, without a network: the tests' router
+        // has no network, so the first address is the one.
+        let r = fake_router(Behave::Pinhole, None).await;
+        let other: Ipv6Addr = "2001:db8::77".parse().unwrap();
+        let p = UpnpPinhole::create_with(r.ssdp, &[CLIENT6, other], 5555, 3600)
+            .await
+            .expect("opened");
+        assert_eq!(p.external_addr().ip(), IpAddr::V6(CLIENT6));
+        // Nothing to open a pinhole for.
+        let e = UpnpPinhole::create_with(r.ssdp, &[], 5555, 3600)
+            .await
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains("no address"), "{}", e);
+    }
+
+    /// A request to an IPv6 router leaves from the address named, and from
+    /// no other: a wrong one is an error here, not a request from somewhere
+    /// else that the router then turns away.
+    #[tokio::test]
+    async fn requests_leave_from_the_address_asked() {
+        if !ipv6_here() {
+            return;
+        }
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let mut url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        url.source = Some(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|(_, from)| from) });
+        connect(&url).await.expect("from ::1");
+        assert_eq!(
+            accepted.await.unwrap().unwrap().ip(),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        // An address of the other family cannot be the source: the request
+        // does not go out from somewhere else.
+        url.source = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(connect(&url).await.is_err());
     }
 }

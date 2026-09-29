@@ -3888,3 +3888,42 @@ async fn a_relay_puts_through_only_the_senders_it_lists() {
         t.abort();
     }
 }
+
+/// What a person has when there is no card: an `IP:PORT` read off the other
+/// side's screen. Handed to the running receiver it is sent at, with no NAT
+/// hints to go by, from the receiver's own socket — the one a NAT in front
+/// of it would have to see the packet leave from.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receiver_sends_at_a_bare_address_it_is_given() {
+    use sharp256::relay::Message;
+
+    init_test_logging();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let mut cfg = ReceiverConfig::new("127.0.0.1:0".parse().unwrap(), out);
+    cfg.state_dir = Some(state);
+    cfg.transport = fast_transport();
+    cfg.identity = Some(Identity::generate());
+    let receiver = Receiver::new(cfg).await.expect("receiver");
+    let receiver_addr = receiver.local_addr().unwrap();
+    let addrs = receiver.peer_addrs();
+    let cancel = receiver.cancel_token();
+    let task = tokio::spawn(async move { receiver.run().await });
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    addrs.send(peer.local_addr().unwrap()).unwrap();
+    let mut buf = [0u8; 2048];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(10), peer.recv_from(&mut buf))
+        .await
+        .expect("something was sent at the address")
+        .unwrap();
+    assert_eq!(from, receiver_addr, "sent from the receiver's own socket");
+    assert!(
+        matches!(Message::decode(&buf[..n]), Some(Message::Punch)),
+        "what arrived is a punch packet"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(15), task).await;
+}
