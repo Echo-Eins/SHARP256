@@ -966,6 +966,29 @@ mod tests {
         }
     }
 
+    /// DPAPI keeps nothing of its own and needs nothing set up: on Windows
+    /// the test runs everywhere, CI included.
+    #[cfg(windows)]
+    #[test]
+    fn windows_seals_and_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let identity = Identity::generate();
+        save(&path, &identity, &NewProtection::Keystore(Backend::Dpapi)).unwrap();
+        let file = IdentityFile::read(&path).unwrap();
+        assert_eq!(file.protection(), Protection::Keystore(Backend::Dpapi));
+        assert_eq!(file.open(None).unwrap().secret(), identity.secret());
+        // Sealed for this identity: the blob does not open another's file.
+        let other = Identity::generate();
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace(&hex_of(identity.public()), &hex_of(other.public()));
+        assert!(IdentityFile::parse(text.as_bytes())
+            .unwrap()
+            .open(None)
+            .is_err());
+    }
+
     /// The operating system's store, for real: needs a Secret Service that
     /// may be written to — `scripts/keystore-test.sh` starts a private one
     /// (gnome-keyring in its own D-Bus session) so that nobody's own
