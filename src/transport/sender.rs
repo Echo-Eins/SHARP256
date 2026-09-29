@@ -277,100 +277,119 @@ impl Sender {
                     return;
                 }
                 let (tx, mut rx) = mpsc::channel(32);
-                for addr in addrs {
-                    // The engine hands over what arrives from the address
-                    // being asked, and only from it.
-                    {
-                        let mut list = inboxes.write();
-                        list.retain(|(_, t)| !t.same_channel(&tx));
-                        list.push((addr, tx.clone()));
-                    }
-                    match crate::relay::client::connect(
-                        socket.clone(),
-                        addr,
-                        target,
-                        &mut rx,
-                        &cancel,
-                        auth,
-                        // Told in the family this relay is reached over,
-                        // with where we can be aimed at in the other.
-                        crate::relay::Hints::told_to(&ours, addr),
-                    )
-                    .await
-                    {
-                        Ok(i) => {
-                            match i.peer {
-                                Some(peer) => tracing::info!(
-                                    "relay {} says the receiver is at {}, and will carry the \
+                // A relay none of whose addresses answered is asked again for
+                // a while: the network may be coming up, or the relay
+                // restarting, and a transfer that has lost its relay for
+                // good at the first hiccup has lost the introduction — the
+                // one way in wherever the receiver's NAT lets nothing in
+                // unasked.
+                let mut pause = RELAY_RETRY;
+                let give_up_at = Instant::now() + RELAY_PATIENCE;
+                loop {
+                    for &addr in &addrs {
+                        // The engine hands over what arrives from the address
+                        // being asked, and only from it.
+                        {
+                            let mut list = inboxes.write();
+                            list.retain(|(_, t)| !t.same_channel(&tx));
+                            list.push((addr, tx.clone()));
+                        }
+                        match crate::relay::client::connect(
+                            socket.clone(),
+                            addr,
+                            target,
+                            &mut rx,
+                            &cancel,
+                            auth,
+                            // Told in the family this relay is reached over,
+                            // with where we can be aimed at in the other.
+                            crate::relay::Hints::told_to(&ours, addr),
+                        )
+                        .await
+                        {
+                            Ok(i) => {
+                                match i.peer {
+                                    Some(peer) => tracing::info!(
+                                        "relay {} says the receiver is at {}, and will carry the \
                                      transfer on {}",
-                                    addr,
-                                    peer,
-                                    i.relayed
-                                ),
-                                None => tracing::info!(
-                                    "relay {} will not say where the receiver is, and will \
+                                        addr,
+                                        peer,
+                                        i.relayed
+                                    ),
+                                    None => tracing::info!(
+                                        "relay {} will not say where the receiver is, and will \
                                      carry the transfer on {}",
-                                    addr,
-                                    i.relayed
-                                ),
+                                        addr,
+                                        i.relayed
+                                    ),
+                                }
+                                // Where the receiver appears to be first: if that
+                                // works the relay carries nothing.
+                                if let Some(peer) = i.peer {
+                                    let _ = found.send(Found::Relay(peer));
+                                }
+                                // Then where it says it is in the other family:
+                                // the path with no NAT in it, when both ends
+                                // have IPv6 — and the only direct one when the
+                                // IPv4 NATs cannot be got through.
+                                if let Some(alt) = i.peer_alt.filter(|_| i.peer.is_some()) {
+                                    tracing::info!(
+                                        "relay {} also says the receiver is at {}",
+                                        addr,
+                                        alt.addr
+                                    );
+                                    let _ = found.send(Found::Relay(alt.addr));
+                                }
+                                let _ = found.send(Found::Carrier(i.relayed));
+                                // Push outwards at where the receiver appears
+                                // to be, aimed by what it says its NAT does,
+                                // while its own punches come the other way.
+                                let aimed =
+                                    i.peer.map(|peer| (peer, i.peer_hints)).into_iter().chain(
+                                        i.peer_alt
+                                            .map(|a| (a.addr, a.nat))
+                                            .filter(|_| i.peer.is_some()),
+                                    );
+                                for (peer, nat) in aimed {
+                                    let Some(peer) = reach.native(peer) else {
+                                        continue;
+                                    };
+                                    let (puncher, cancel) = (puncher.clone(), cancel.clone());
+                                    tokio::spawn(async move {
+                                        puncher.run(peer, nat, &cancel).await;
+                                    });
+                                }
+                                // And bind our side of the relay's port, which
+                                // takes a round trip to it: until then it carries
+                                // nothing of ours.
+                                crate::relay::client::hold(
+                                    socket, i.relayed, i.ticket, &mut rx, &cancel,
+                                )
+                                .await;
+                                return;
                             }
-                            // Where the receiver appears to be first: if that
-                            // works the relay carries nothing.
-                            if let Some(peer) = i.peer {
-                                let _ = found.send(Found::Relay(peer));
+                            // A relay that cannot help is not a failure: the
+                            // addresses we already have may well work. One that
+                            // refused (as opposed to not answering) would refuse
+                            // at its other addresses too.
+                            Err(crate::relay::client::ConnectError::Refused(e)) => {
+                                tracing::info!("relay {}: {}", addr, e);
+                                return;
                             }
-                            // Then where it says it is in the other family:
-                            // the path with no NAT in it, when both ends
-                            // have IPv6 — and the only direct one when the
-                            // IPv4 NATs cannot be got through.
-                            if let Some(alt) = i.peer_alt.filter(|_| i.peer.is_some()) {
-                                tracing::info!(
-                                    "relay {} also says the receiver is at {}",
-                                    addr,
-                                    alt.addr
-                                );
-                                let _ = found.send(Found::Relay(alt.addr));
-                            }
-                            let _ = found.send(Found::Carrier(i.relayed));
-                            // Push outwards at where the receiver appears
-                            // to be, aimed by what it says its NAT does,
-                            // while its own punches come the other way.
-                            let aimed = i.peer.map(|peer| (peer, i.peer_hints)).into_iter().chain(
-                                i.peer_alt
-                                    .map(|a| (a.addr, a.nat))
-                                    .filter(|_| i.peer.is_some()),
-                            );
-                            for (peer, nat) in aimed {
-                                let Some(peer) = reach.native(peer) else {
-                                    continue;
-                                };
-                                let (puncher, cancel) = (puncher.clone(), cancel.clone());
-                                tokio::spawn(async move {
-                                    puncher.run(peer, nat, &cancel).await;
-                                });
-                            }
-                            // And bind our side of the relay's port, which
-                            // takes a round trip to it: until then it carries
-                            // nothing of ours.
-                            crate::relay::client::hold(
-                                socket, i.relayed, i.ticket, &mut rx, &cancel,
-                            )
-                            .await;
+                            Err(e) => tracing::info!("relay {}: {}", addr, e),
+                        }
+                        if cancel.is_cancelled() {
                             return;
                         }
-                        // A relay that cannot help is not a failure: the
-                        // addresses we already have may well work. One that
-                        // refused (as opposed to not answering) would refuse
-                        // at its other addresses too.
-                        Err(crate::relay::client::ConnectError::Refused(e)) => {
-                            tracing::info!("relay {}: {}", addr, e);
-                            return;
-                        }
-                        Err(e) => tracing::info!("relay {}: {}", addr, e),
                     }
-                    if cancel.is_cancelled() {
+                    if Instant::now() + pause >= give_up_at {
                         return;
                     }
+                    tokio::select! {
+                        _ = tokio::time::sleep(pause) => {}
+                        _ = cancel.cancelled() => return,
+                    }
+                    pause = (pause * 2).min(RELAY_RETRY_MAX);
                 }
             });
         }
@@ -1195,6 +1214,11 @@ const AUX_PATIENCE: Duration = Duration::from_secs(20);
 type RelayInbox = (SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>);
 /// Every relay's inbox, added to as each relay's name resolves.
 type RelayInboxes = Arc<parking_lot::RwLock<Vec<RelayInbox>>>;
+/// How long a relay that does not answer is asked again for, and the pauses
+/// between asks (doubling up to the last).
+const RELAY_PATIENCE: Duration = Duration::from_secs(60);
+const RELAY_RETRY: Duration = Duration::from_secs(1);
+const RELAY_RETRY_MAX: Duration = Duration::from_secs(8);
 /// How long a relay's name may take to resolve before it is given up.
 #[cfg(feature = "nat-traversal")]
 const RELAY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
