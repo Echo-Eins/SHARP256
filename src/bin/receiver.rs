@@ -229,6 +229,9 @@ async fn main() -> Result<()> {
                 "--peer-card: that is a receiver's card; a receiver is given the sender's"
             );
         }
+        if let Some(why) = card.staleness() {
+            eprintln!("Warning: --peer-card {}: {}", card.id.short(), why);
+        }
         allowed.insert(card.id);
     }
     #[cfg(not(feature = "nat-traversal"))]

@@ -1126,6 +1126,9 @@ fn meet_card(
     cancel: &CancellationToken,
     card: crate::nat::card::Card,
 ) {
+    if let Some(why) = card.staleness() {
+        tracing::warn!("contact card of {}: {}", card.id.short(), why);
+    }
     let targets = card.punch_targets();
     tracing::info!(
         "contact card of {}: punching towards {} address(es)",

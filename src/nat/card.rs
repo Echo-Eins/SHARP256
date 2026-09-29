@@ -28,6 +28,16 @@ use crate::crypto::SharpId;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// An age in the largest whole unit: "3 hours", "2 days".
+fn describe_age(age: Duration) -> String {
+    let (n, unit) = match age.as_secs() {
+        s if s >= 86400 => (s / 86400, "day"),
+        s if s >= 3600 => (s / 3600, "hour"),
+        s => (s / 60, "minute"),
+    };
+    format!("{} {}{}", n, unit, if n == 1 { "" } else { "s" })
+}
+
 /// The format version, the first byte of every card.
 const VERSION: u8 = 1;
 const PREFIX: &str = "shc1-";
@@ -288,6 +298,30 @@ impl Card {
             v4: None,
             v6: None,
             relays: Vec::new(),
+        }
+    }
+
+    /// A card older than this is worth saying so of: the addresses on it
+    /// were true when it was made, and a NAT forgets a mapping in minutes.
+    pub const STALE_AFTER: Duration = Duration::from_secs(3600);
+
+    /// Words for the person who was given a card that is old, or from the
+    /// future by this clock (so that its age cannot be told); `None` for one
+    /// that is fresh enough.
+    pub fn staleness(&self) -> Option<String> {
+        let made = UNIX_EPOCH + Duration::from_secs(self.created);
+        match SystemTime::now().duration_since(made) {
+            Ok(age) if age >= Self::STALE_AFTER => Some(format!(
+                "this card was made {} ago; the addresses on it may not be true now — ask for a new one if nothing gets through",
+                describe_age(age)
+            )),
+            Ok(_) => None,
+            // More than a minute ahead of this clock: one of the two is wrong.
+            Err(e) if e.duration() > Duration::from_secs(60) => Some(
+                "this card was made in the future by this computer's clock: one of the two clocks is wrong, and the card's age cannot be told"
+                    .to_string(),
+            ),
+            Err(_) => None,
         }
     }
 
@@ -720,5 +754,34 @@ mod tests {
         }
         .is_symmetric());
         assert!(!NatHints::unknown().is_symmetric());
+    }
+
+    #[test]
+    fn an_old_card_is_said_to_be_old() {
+        let mut c = Card::new(Role::Receiver, Identity::generate().id());
+        assert_eq!(c.staleness(), None, "one just made");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        c.created = now - 3 * 3600;
+        assert!(
+            c.staleness().unwrap().contains("3 hours"),
+            "{:?}",
+            c.staleness()
+        );
+        c.created = now - 3599;
+        assert_eq!(c.staleness(), None, "just under the hour");
+        c.created = now - 2 * 86400;
+        assert!(c.staleness().unwrap().contains("2 days"));
+        // A clock that is wrong: cannot say how old, and says so.
+        c.created = now + 3600;
+        assert!(c.staleness().unwrap().contains("future"));
+        c.created = now + 5;
+        assert_eq!(
+            c.staleness(),
+            None,
+            "a few seconds of disagreement is nothing"
+        );
     }
 }

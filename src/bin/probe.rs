@@ -102,6 +102,9 @@ async fn main() -> Result<()> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("--peer-card: {}", e))?;
 
+    if let Some(why) = peer.as_ref().and_then(Card::staleness) {
+        eprintln!("Warning: {}", why);
+    }
     println!("{}", sharp256::system_info());
     println!("Measuring (a few seconds)...\n");
     let mut probe = Probe::start(Options {

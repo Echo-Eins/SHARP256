@@ -173,6 +173,9 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
         if card.role != sharp256::nat::card::Role::Receiver {
             anyhow::bail!("that is a sender's card; give the sender the receiver's card instead");
         }
+        if let Some(why) = card.staleness() {
+            eprintln!("Warning: {}", why);
+        }
         Some(card)
     } else {
         None
