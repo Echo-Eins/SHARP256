@@ -426,7 +426,7 @@ pub async fn discover_family(
             }
         }
         progress(&out);
-        out.filtering = filtering_behaviour(socket, &client, responses, server).await;
+        out.filtering = filtering_on_a_new_mapping(socket, &client, server).await;
     } else if !out.open_internet {
         // Weaker, but the same question: does a different destination get a
         // different external port? Two independent servers stand in for one
@@ -611,6 +611,59 @@ async fn mapping_behaviour(
     (mapping, ports)
 }
 
+/// [`filtering_behaviour`] on a mapping of its own: a new socket of the same
+/// kind as `like`, which when the answers are asked to come from elsewhere
+/// has sent to nothing but the server's primary address — what the tests of
+/// RFC 5780 section 4.4 take for granted. `like` itself would not do: the
+/// mapping tests have sent from it to the server's other address (and, where
+/// the NAT makes a mapping per host, to the primary address at the other
+/// port), and a NAT that filters by address, or by address and port, lets in
+/// from then on what was sent to. Its filter would be read as more open than
+/// it is: "anyone", for a NAT that lets in only the hosts it was sent to.
+async fn filtering_on_a_new_mapping(
+    like: &UdpSocket,
+    client: &StunClient,
+    server: SocketAddr,
+) -> Filtering {
+    let Ok(local) = like.local_addr() else {
+        return Filtering::Unknown;
+    };
+    let fresh = match crate::transport::socket::bind_udp(SocketAddr::new(local.ip(), 0), 64 * 1024)
+    {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            tracing::debug!(
+                "STUN: no socket for the filtering tests ({}); not measured",
+                e
+            );
+            return Filtering::Unknown;
+        }
+    };
+    let (tx, mut rx) = mpsc::channel::<Incoming>(16);
+    let pump = {
+        let fresh = fresh.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                match fresh.recv_from(&mut buf).await {
+                    Ok((n, from)) if super::stun::is_stun_message(&buf[..n]) => {
+                        if tx.send((buf[..n].to_vec(), from)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    // Whatever the system reports on the socket is no answer;
+                    // the tests' own deadlines end the wait.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+    };
+    let out = filtering_behaviour(&fresh, client, &mut rx, server).await;
+    pump.abort();
+    out
+}
+
 /// RFC 5780 section 4.4: which inbound packets get through?
 ///
 /// The subtlety that makes naive implementations wrong: a server that does
@@ -713,6 +766,7 @@ async fn hairpinning(
 mod tests {
     use super::*;
     use crate::nat::stun::{binding_success, is_stun_message, requested_change};
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     // ----- a NAT to measure ------------------------------------------------
@@ -798,13 +852,28 @@ mod tests {
             SocketAddr::new("203.0.113.9".parse().unwrap(), 50_000 + offset)
         }
 
-        /// Would the NAT let a packet from `src` in, given that we had sent
-        /// to `dst`?
-        fn lets_in(&self, dst: SocketAddr, src: SocketAddr) -> bool {
+        /// Would the NAT let a packet from `src` in, on the mapping that a
+        /// request to `dst` went out on? A real filter remembers every
+        /// address the mapping has sent to (`contacted`), not only the last
+        /// one: whatever one test sends leaves a door open for the next.
+        fn lets_in(
+            &self,
+            dst: SocketAddr,
+            src: SocketAddr,
+            contacted: &HashSet<SocketAddr>,
+        ) -> bool {
+            // What that mapping has sent to: everything, where one mapping
+            // serves every destination; that host, or that address, where
+            // the NAT makes one per host or per address.
+            let mut sent = contacted.iter().filter(|c| match self.mapping {
+                Mapping::EndpointIndependent | Mapping::Unknown => true,
+                Mapping::AddressDependent => c.ip() == dst.ip(),
+                Mapping::AddressAndPortDependent => **c == dst,
+            });
             match self.filtering {
                 Filtering::EndpointIndependent | Filtering::Unknown => true,
-                Filtering::AddressDependent => src.ip() == dst.ip(),
-                Filtering::AddressAndPortDependent => src == dst,
+                Filtering::AddressDependent => sent.any(|c| c.ip() == src.ip()),
+                Filtering::AddressAndPortDependent => sent.any(|c| *c == src),
             }
         }
     }
@@ -841,10 +910,16 @@ mod tests {
         let other: SocketAddr = format!("127.0.0.2:{}", pb).parse().ok()?;
         let socks: Vec<Arc<UdpSocket>> = vec![a1, b1, a2, b2].into_iter().map(Arc::new).collect();
 
+        // Every server address each client socket has sent to: what the
+        // simulated NAT's filter remembers, one mapping (at least) per
+        // socket.
+        let contacted: Arc<std::sync::Mutex<HashMap<SocketAddr, HashSet<SocketAddr>>>> =
+            Arc::default();
         let mut tasks = Vec::new();
         for listener in &socks {
             let listener = listener.clone();
             let all = socks.clone();
+            let contacted = contacted.clone();
             tasks.push(tokio::spawn(async move {
                 let dst = listener.local_addr().expect("bound");
                 let mut buf = vec![0u8; 2048];
@@ -874,7 +949,13 @@ mod tests {
                     let src = SocketAddr::new(src_ip, src_port);
                     // ... but only if the simulated NAT would let that
                     // packet back in to the client.
-                    if !sim.lets_in(dst, src) {
+                    let open = {
+                        let mut contacted = contacted.lock().expect("not poisoned");
+                        let sent = contacted.entry(from).or_default();
+                        sent.insert(dst);
+                        sim.lets_in(dst, src, sent)
+                    };
+                    if !open {
                         continue;
                     }
                     let Some(out) = all
