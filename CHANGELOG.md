@@ -215,6 +215,18 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   from the IPv6 routing table (Linux's `/proc/net/ipv6_route`, and the output
   of `route get` on macOS/BSD and `route print` on Windows; the two are read
   by parsers tested on captured output, not run on those systems here).
+- **A carrier's PCP server is asked too.** PCP also goes to its anycast
+  address (RFC 7723: `192.0.0.9`, `2001:1::1`), where the nearest PCP server
+  on the way out answers, whoever runs it: RFC 6888 (REQ-9) asks a
+  carrier-grade NAT to let subscribers map ports and names PCP for it, and
+  with DS-Lite (RFC 6333) the home router translates nothing — the carrier's
+  AFTR does — so asking the default gateway could never get a forward there.
+  NAT-PMP, which has no anycast address, is still asked of the gateway alone.
+  The laboratory's `portmap --anycast` puts miniupnpd on a carrier's NAT,
+  listening at `192.0.0.9` only, behind a home router that only routes:
+  before the change the receiver was granted no forward, after it a sender
+  behind any NAT reaches it through one; `portmap6` does the same over IPv6
+  (`pcp-anycast`, the router's PCP reachable at `2001:1::1` alone).
 - **UPnP pinholes are asked for over IPv6.** The UPnP client used to speak to
   the router over IPv4 only, and miniupnpd — like any router that follows the
   IGD v2 recommendation — lets a host open a pinhole for its own address
@@ -296,7 +308,18 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   than those after the receiver adapted, and a transfer counted as "long"
   (long enough to move off a server) by its rate alone, whatever its size.
   A rule a scenario put in the laboratory's core namespace outlived that
-  scenario and cut the paths of the next one in the same run.
+  scenario and cut the paths of the next one in the same run. The NAT-PMP
+  rows of `portmap` proved PCP: miniupnpd switches the two on together and
+  the receiver asks PCP first, so PCP made every one of those forwards (the
+  daemon's log says so); PCP is now dropped at the router for them, and
+  every row quotes the daemon's line for the request that made its forward.
+- **A carrier-grade NAT in front of the home router is a scenario of its
+  own** (`cgn`, in CI): two NATs in a row, the outer one keeping ports or
+  drawing them at random, on either side. Punching and the birthday method
+  work through both (a random carrier makes the pair as hard as a random
+  home NAT would, and two of them need the relay, which carries them). The
+  laboratory's router behind such a NAT translated to the carrier's address
+  where it named one (a NAT that counts ports up); no scenario had used it.
 - **Multicast DNS did nothing on a network with only IPv6.** The library that
   lists this host's addresses leaves the link-local IPv6 ones out (on purpose:
   it says so in its source), and the question was asked only on networks with

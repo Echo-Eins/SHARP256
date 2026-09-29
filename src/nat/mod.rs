@@ -253,7 +253,11 @@ async fn forward_port_v4(local_addr: SocketAddr, lease: u32) -> (Option<PortForw
         vec![ip]
     };
     let mut attempts = tokio::task::JoinSet::new();
-    for gw in portmap::gateway_candidates() {
+    // The routers, and where a carrier's PCP server answers (RFC 7723).
+    let routers = portmap::gateway_candidates()
+        .into_iter()
+        .chain(std::iter::once(portmap::PCP_ANYCAST));
+    for gw in routers {
         let router = SocketAddr::new(IpAddr::V4(gw), portmap::PORT);
         for &client in &clients {
             let port = local_addr.port();
@@ -280,7 +284,11 @@ async fn forward_port_v4(local_addr: SocketAddr, lease: u32) -> (Option<PortForw
             }
             Ok((router, Err(e))) => {
                 tracing::debug!("NAT: {}", e);
-                let note = format!("IPv4: PCP and NAT-PMP at {}: {}", router.ip(), e);
+                let note = if portmap::is_pcp_anycast(router.ip()) {
+                    format!("IPv4: PCP at the anycast address {}: {}", router.ip(), e)
+                } else {
+                    format!("IPv4: PCP and NAT-PMP at {}: {}", router.ip(), e)
+                };
                 if !notes.contains(&note) && notes.len() < 6 {
                     notes.push(note);
                 }
@@ -342,7 +350,9 @@ async fn forward_port_v6(local_addr: SocketAddr, lease: u32) -> (Option<PortForw
     }
     let port = local_addr.port();
     let mut attempts = tokio::task::JoinSet::new();
-    for router in portmap::gateway_candidates_v6().await {
+    let anycast = SocketAddr::new(IpAddr::V6(portmap::PCP_ANYCAST_V6), portmap::PORT);
+    let routers = portmap::gateway_candidates_v6().await;
+    for router in routers.into_iter().chain(std::iter::once(anycast)) {
         for &client in &clients {
             attempts.spawn(async move {
                 (
@@ -366,7 +376,12 @@ async fn forward_port_v6(local_addr: SocketAddr, lease: u32) -> (Option<PortForw
             }
             Ok((router, Err(e))) => {
                 tracing::debug!("NAT: {}", e);
-                let note = format!("IPv6: PCP at {}: {}", router.ip(), e);
+                let anycast = if portmap::is_pcp_anycast(router.ip()) {
+                    "the anycast address "
+                } else {
+                    ""
+                };
+                let note = format!("IPv6: PCP at {}{}: {}", anycast, router.ip(), e);
                 if !notes.contains(&note) && notes.len() < 4 {
                     notes.push(note);
                 }

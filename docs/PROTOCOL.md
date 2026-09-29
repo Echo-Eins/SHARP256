@@ -895,7 +895,13 @@ will never let it through.
 the peer's behaviour nor on timing. All three protocols routers speak for it
 are tried: PCP (RFC 6887) and NAT-PMP (RFC 6886) first, as two small
 datagrams on UDP port 5351 — every router candidate asked from every
-interface at once, any extra grant given back — then UPnP-IGD. The lease is
+interface at once, any extra grant given back — then UPnP-IGD. PCP is also
+asked at its anycast address (RFC 7723: `192.0.0.9`, and `2001:1::1` for the
+IPv6 firewall), where the nearest PCP server on the way out answers: a
+carrier's NAT, which RFC 6888 asks to let subscribers map ports with PCP —
+with DS-Lite (RFC 6333) the home router translates nothing, and only the
+carrier can forward. NAT-PMP has no anycast address and is asked of the
+default gateway alone. The lease is
 renewed at half its length (each renewal bounded and interruptible) and
 given back on shutdown. A router that reports a private or carrier-grade
 NAT address as its own is itself behind another NAT: its forward is not
@@ -913,19 +919,20 @@ SOAP answer over 16 KiB is an error.
 router's firewall (RFC 6092) drops what nobody inside asked for; PCP `MAP`
 (RFC 6887) and the IGD v2 service `WANIPv6FirewallControl` (`AddPinhole`,
 `UpdatePinhole`, `DeletePinhole`) are how a host asks it for a hole. PCP goes
-to the default gateway; for UPnP the search goes to the IPv6 groups `ff02::c`
-and `ff05::c` (UPnP Device Architecture 1.1, 1.3.2) on every network the host
-has IPv6 on, alongside the IPv4 one. An answer is believed if it came in on
-the network it was asked on, from an address a router has there (link-local,
-or inside a prefix the host has on that network). The router is then asked at
-the address that answered, at the port and path of the answer's `LOCATION` (a
-router that answers from its link-local address and names its global one
-is asked at the first), and the request leaves *from the address the pinhole
-is for*: a router lets a host open a pinhole to itself only — miniupnpd checks
-the address the request comes from against `InternalClient` and, for a
-request that came over IPv4, has no IPv6 address to check and refuses it
-(error 606) — so a pinhole asked for over IPv4 is only tried after the IPv6
-one, for routers that turn out to answer nothing else.
+to the default gateway and to `2001:1::1`; for UPnP the search goes to the
+IPv6 groups `ff02::c` and `ff05::c` (UPnP Device Architecture 1.1, 1.3.2) on
+every network the host has IPv6 on, alongside the IPv4 one. An answer is
+believed if it came in on the network it was asked on, from an address a
+router has there (link-local, or inside a prefix the host has on that
+network). The router is then asked at the address that answered, at the port
+and path of the answer's `LOCATION` (a router that answers from its link-local
+address and names its global one is asked at the first), and the request
+leaves *from the address the pinhole is for*: a router lets a host open a
+pinhole to itself only — miniupnpd checks the address the request comes from
+against `InternalClient` and, for a request that came over IPv4, has no IPv6
+address to check and refuses it (error 606) — so a pinhole asked for over IPv4
+is only tried after the IPv6 one, for routers that turn out to answer nothing
+else.
 
 **Candidates.** Every address that might work is published together, as
 `ID@host:port,host:port,…`: the port forward, the address the world sees the

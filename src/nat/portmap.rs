@@ -13,6 +13,13 @@
 //! and a PCP router usually also answers NAT-PMP, then NAT-PMP if PCP says
 //! nothing or rejects the version.
 //!
+//! PCP is also asked at its anycast address ([`PCP_ANYCAST`], RFC 7723),
+//! where a server that is not this network's router answers: a carrier's
+//! NAT, which RFC 6888 (REQ-9) asks to let subscribers map ports and names
+//! PCP for it — as with DS-Lite, whose AFTR translates for every home behind
+//! it and whose home routers translate nothing. NAT-PMP has no such address:
+//! it is spoken by the default gateway alone (RFC 6886 section 3).
+//!
 //! **What the router says is not trusted.** A PCP or NAT-PMP server is an
 //! unauthenticated box on the local network, and on a network we do not own
 //! anything could answer. A wrong or hostile answer can only produce an
@@ -24,7 +31,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -39,6 +46,18 @@ const PCP_REQUEST_LEN: usize = 60;
 const PCP_RESPONSE_LEN: usize = 60;
 /// Longest PCP message we will read (RFC 6887 section 7).
 const PCP_MAX_LEN: usize = 1100;
+/// The PCP anycast address for IPv4 (RFC 7723): a PCP server anywhere on
+/// the way out, not only the router, can be reached there. On a network with
+/// none the request goes to the default route and nothing answers: three
+/// datagrams, the same as a wrong guess at the router.
+pub const PCP_ANYCAST: Ipv4Addr = Ipv4Addr::new(192, 0, 0, 9);
+/// The PCP anycast address for IPv6 (RFC 7723).
+pub const PCP_ANYCAST_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1);
+
+/// Whether `ip` is a PCP anycast address rather than a router's own.
+pub fn is_pcp_anycast(ip: IpAddr) -> bool {
+    ip == IpAddr::V4(PCP_ANYCAST) || ip == IpAddr::V6(PCP_ANYCAST_V6)
+}
 
 const PMP_VERSION: u8 = 0;
 const PMP_OP_EXTERNAL: u8 = 0;
@@ -722,7 +741,8 @@ pub async fn request_v6_at(
     })
 }
 
-/// Asks one router for a UDP port forward, PCP first and NAT-PMP after.
+/// Asks one router for a UDP port forward, PCP first and NAT-PMP after —
+/// or, at the PCP anycast address, PCP alone.
 pub async fn request_at(
     router: SocketAddr,
     client: Ipv4Addr,
@@ -736,7 +756,7 @@ pub async fn request_at(
 
     // PCP: the successor, and its nonce binds the answer to this request.
     let req = pcp_map_request_for(&nonce, client, internal_port, internal_port, lifetime);
-    match exchange(&sock, router, &req, PCP_MAX_LEN).await {
+    let pcp_failed = match exchange(&sock, router, &req, PCP_MAX_LEN).await {
         Ok(pkt) => match pcp_parse_map_response(&pkt, &nonce, internal_port) {
             Ok(grant) => {
                 return Ok(Mapping {
@@ -748,9 +768,18 @@ pub async fn request_at(
                     grant,
                 })
             }
-            Err(e) => tracing::debug!("port mapping: {} at {}", e, router),
+            Err(e) => {
+                tracing::debug!("port mapping: {} at {}", e, router);
+                e
+            }
         },
-        Err(e) => tracing::debug!("port mapping: {}", e),
+        Err(e) => {
+            tracing::debug!("port mapping: {}", e);
+            e
+        }
+    };
+    if is_pcp_anycast(router.ip()) {
+        return Err(pcp_failed);
     }
 
     // NAT-PMP: older, and what a router that ignored PCP may still answer.
@@ -1163,5 +1192,26 @@ Active Routes:
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), gws.len(), "duplicates in {:?}", gws);
+    }
+
+    /// The anycast addresses are RFC 7723's, and only they are taken for
+    /// one: a router's own address is asked NAT-PMP as well.
+    #[test]
+    fn the_pcp_anycast_addresses_are_the_rfcs() {
+        assert!(is_pcp_anycast("192.0.0.9".parse().unwrap()));
+        assert!(is_pcp_anycast("2001:1::1".parse().unwrap()));
+        for router in [
+            "192.0.0.8",
+            "192.168.1.1",
+            "10.0.0.1",
+            "2001:1::2",
+            "fe80::1",
+        ] {
+            assert!(!is_pcp_anycast(router.parse().unwrap()), "{}", router);
+        }
+        // The internet routes it: it is not an address of this network.
+        use crate::address::class;
+        assert!(class::is_global(IpAddr::V4(PCP_ANYCAST)));
+        assert!(!class::is_inside(IpAddr::V4(PCP_ANYCAST)));
     }
 }
