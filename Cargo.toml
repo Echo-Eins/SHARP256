@@ -51,6 +51,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI and paths
 clap = { version = "4.4", features = ["derive", "env"] }
 dirs = "5.0"
+# Asking for the identity file's passphrase on the terminal without echo
+rpassword = "7"
 
 # Sockets: buffer sizing, path-MTU related options
 socket2 = { version = "0.5", features = ["all"] }
@@ -78,11 +80,15 @@ hmac = { version = "0.12", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The Keychain, where a protected identity file's key is kept on macOS
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"
+
 [target.'cfg(windows)'.dependencies]
 # "winuser" is not used by this crate directly: eframe 0.24 imports
 # winapi::um::winuser for the window icon without enabling that feature
 # itself, so the GUI build on Windows depends on it being enabled here.
-winapi = { version = "0.3.9", features = ["fileapi", "ntdef", "winnt", "winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "netioapi", "inaddr", "in6addr", "minwinbase", "winbase", "winuser", "memoryapi", "sysinfoapi", "processthreadsapi", "winerror"] }
+winapi = { version = "0.3.9", features = ["fileapi", "ntdef", "winnt", "winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "netioapi", "inaddr", "in6addr", "minwinbase", "winbase", "winuser", "memoryapi", "sysinfoapi", "processthreadsapi", "winerror", "dpapi", "wincrypt"] }
 
 [dev-dependencies]
 tempfile = "3"

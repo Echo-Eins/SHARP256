@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use sharp256::crypto::identity::load_id_list;
-use sharp256::crypto::{psk_from_passphrase, Identity, SharpId};
+use sharp256::crypto::{identity_file, psk_from_passphrase, Identity, SharpId};
 use sharp256::progress::{format_bytes, format_rate};
 use sharp256::{init_logging, system_info, Receiver, ReceiverConfig, TransferEvent};
 use std::collections::HashSet;
@@ -170,6 +170,17 @@ struct Args {
     #[arg(long)]
     identity: Option<PathBuf>,
 
+    /// Seal the identity file (the private key in it) with a passphrase, or
+    /// with a key the operating system keeps for this user (the Secret
+    /// Service, the Keychain, DPAPI), or not at all; then exit
+    #[arg(long, value_name = "HOW")]
+    protect_identity: Option<sharp256::crypto::identity_file::ProtectAs>,
+
+    /// Read the identity file's passphrase from this file (its first line);
+    /// or set SHARP256_IDENTITY_PASSPHRASE, or type it when asked
+    #[arg(long, value_name = "FILE")]
+    identity_passphrase_file: Option<PathBuf>,
+
     /// Print this receiver's SHARP ID and exit
     #[arg(long)]
     id: bool,
@@ -196,10 +207,22 @@ async fn main() -> Result<()> {
         Some(p) => p.clone(),
         None => Identity::default_path().context("no per-user data directory")?,
     };
-    let identity = Identity::load_or_create(&identity_path)
+    let passphrase = identity_file::PassphraseFrom {
+        file: args.identity_passphrase_file.as_deref(),
+        ask: true,
+    };
+    if let Some(how) = args.protect_identity {
+        println!(
+            "{}",
+            identity_file::protect(&identity_path, how, &passphrase)?
+        );
+        return Ok(());
+    }
+    // Known without opening the file, which may be sealed.
+    let id = identity_file::id_of(&identity_path)
         .with_context(|| format!("identity {}", identity_path.display()))?;
     if args.id {
-        println!("{}", identity.id());
+        println!("{}", id);
         return Ok(());
     }
 
@@ -231,7 +254,7 @@ async fn main() -> Result<()> {
         cfg.transport.max_chunk = c;
     }
     if let Some(secret) = &args.secret {
-        cfg.psk = Some(psk_from_passphrase(secret, &identity.id()));
+        cfg.psk = Some(psk_from_passphrase(secret, &id));
     }
     let mut allowed: HashSet<SharpId> = args.allow.iter().copied().collect();
     if let Some(path) = &args.authorized_senders {
@@ -266,12 +289,18 @@ async fn main() -> Result<()> {
     if !allowed.is_empty() || args.authorized_senders.is_some() {
         cfg.allowed_senders = Some(allowed);
     }
-    cfg.identity = Some(identity);
+    let gui = !args.headless && cfg!(feature = "gui");
+    match identity_file::open_or_create(&identity_path, &passphrase) {
+        Ok(identity) => cfg.identity = Some(identity),
+        // The window asks for the passphrase itself.
+        Err(identity_file::IdentityError::NeedsPassphrase(_)) if gui => {}
+        Err(e) => return Err(e).with_context(|| format!("identity {}", identity_path.display())),
+    }
 
     if !args.headless {
         #[cfg(feature = "gui")]
         {
-            return sharp256::gui::run_receiver_gui(cfg);
+            return sharp256::gui::run_receiver_gui(cfg, identity_path);
         }
     }
     #[cfg(feature = "nat-traversal")]

@@ -9,6 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// This sender's identity: ready, waiting for its passphrase, or missing.
+enum Me {
+    Ready(Identity),
+    Locked(super::unlock::Unlock),
+    Missing(String),
+}
+
 #[derive(Debug, Clone)]
 enum State {
     Idle,
@@ -24,7 +31,7 @@ pub struct SenderApp {
     bind_addr: String,
     max_rate: String,
     secret: String,
-    identity: Result<Identity, String>,
+    identity: Me,
     state: Arc<Mutex<State>>,
     cancel: Option<CancellationToken>,
     error: Option<String>,
@@ -34,11 +41,17 @@ pub struct SenderApp {
 
 impl SenderApp {
     pub fn new(file: Option<PathBuf>, receiver: Option<String>) -> Self {
-        let identity = Identity::default_path()
-            .ok_or_else(|| "no per-user data directory".to_string())
-            .and_then(|p| {
-                Identity::load_or_create(&p).map_err(|e| format!("{}: {}", p.display(), e))
-            });
+        use crate::crypto::identity_file::{self, IdentityError, PassphraseFrom};
+        let identity = match Identity::default_path() {
+            None => Me::Missing("no per-user data directory".to_string()),
+            Some(p) => match identity_file::open_or_create(&p, &PassphraseFrom::default()) {
+                Ok(identity) => Me::Ready(identity),
+                Err(IdentityError::NeedsPassphrase(id)) => {
+                    Me::Locked(super::unlock::Unlock::new(p, id))
+                }
+                Err(e) => Me::Missing(format!("{}: {}", p.display(), e)),
+            },
+        };
         Self {
             file_path: file,
             receiver_addr: receiver.unwrap_or_default(),
@@ -62,8 +75,12 @@ impl SenderApp {
             return;
         };
         let identity = match &self.identity {
-            Ok(id) => id.clone(),
-            Err(e) => {
+            Me::Ready(id) => id.clone(),
+            Me::Locked(_) => {
+                self.error = Some("Unlock the identity first".into());
+                return;
+            }
+            Me::Missing(e) => {
                 self.error = Some(format!("No identity: {}", e));
                 return;
             }
@@ -186,8 +203,9 @@ impl eframe::App for SenderApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("SHARP-256 File Sender");
-            match &self.identity {
-                Ok(id) => {
+            let mut opened = None;
+            match &mut self.identity {
+                Me::Ready(id) => {
                     ui.horizontal(|ui| {
                         ui.label(format!("This sender: {}", id.id()));
                         if ui.small_button("Copy").clicked() {
@@ -195,9 +213,13 @@ impl eframe::App for SenderApp {
                         }
                     });
                 }
-                Err(e) => {
+                Me::Locked(unlock) => opened = unlock.show(ui),
+                Me::Missing(e) => {
                     ui.colored_label(egui::Color32::RED, format!("No identity: {}", e));
                 }
+            }
+            if let Some(identity) = opened {
+                self.identity = Me::Ready(identity);
             }
             ui.separator();
             ui.add_enabled_ui(!busy, |ui| {

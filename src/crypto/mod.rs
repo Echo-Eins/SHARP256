@@ -11,6 +11,8 @@ mod blake2s;
 mod dudect;
 pub mod handshake;
 pub mod identity;
+pub mod identity_file;
+pub mod keystore;
 pub mod noise;
 pub mod replay;
 pub mod secret;

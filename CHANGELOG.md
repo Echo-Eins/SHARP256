@@ -178,6 +178,21 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - A passphrase or TURN credentials given on the command line are held as
   `SecretText`, which prints as `SecretText(..)`: the programs' arguments
   derive `Debug`, and would have printed them.
+- Identity files can be sealed (`crypto::identity_file`):
+  `--protect-identity passphrase` seals the private key with
+  XChaCha20-Poly1305 under a key Argon2id makes from a passphrase (256 MiB,
+  three passes, written into the file); `--protect-identity keystore` under
+  a random key the operating system keeps for the user — the Secret Service
+  through `secret-tool` on Linux and the BSDs, the Keychain on macOS, DPAPI
+  on Windows; `--protect-identity none` goes back to the old form, which
+  stays the default and is read as before. The public key stays in the
+  clear, so `--id` works without opening the file, and the whole line is
+  what the seal authenticates. The passphrase comes from
+  `--identity-passphrase-file`, `SHARP256_IDENTITY_PASSPHRASE` or the
+  terminal; the sender's and receiver's windows ask for it themselves. A
+  file is replaced whole (written beside it, flushed, renamed, the
+  directory flushed). `scripts/keystore-test.sh` tests the Secret Service
+  against a gnome-keyring of its own, in a private D-Bus session.
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the

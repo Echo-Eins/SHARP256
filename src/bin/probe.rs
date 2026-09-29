@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sharp256::crypto::Identity;
+use sharp256::crypto::{identity_file, Identity};
 use sharp256::nat::card::{parse_peer_addr, parse_peer_addrs, Card, NatHints, Role};
 use sharp256::nat::probe::{Options, Probe};
 use std::io::IsTerminal;
@@ -94,6 +94,17 @@ struct Args {
     #[arg(long)]
     identity: Option<PathBuf>,
 
+    /// Seal the identity file (the private key in it) with a passphrase, or
+    /// with a key the operating system keeps for this user (the Secret
+    /// Service, the Keychain, DPAPI), or not at all; then exit
+    #[arg(long, value_name = "HOW")]
+    protect_identity: Option<sharp256::crypto::identity_file::ProtectAs>,
+
+    /// Read the identity file's passphrase from this file (its first line);
+    /// or set SHARP256_IDENTITY_PASSPHRASE, or type it when asked
+    #[arg(long, value_name = "FILE")]
+    identity_passphrase_file: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "warn")]
     log_level: String,
@@ -107,8 +118,16 @@ async fn main() -> Result<()> {
         Some(p) => p.clone(),
         None => Identity::default_path().context("no per-user data directory")?,
     };
-    let identity =
-        Identity::load_or_create(&path).with_context(|| format!("identity {}", path.display()))?;
+    let passphrase = identity_file::PassphraseFrom {
+        file: args.identity_passphrase_file.as_deref(),
+        ask: true,
+    };
+    if let Some(how) = args.protect_identity {
+        println!("{}", identity_file::protect(&path, how, &passphrase)?);
+        return Ok(());
+    }
+    let identity = identity_file::open_or_create(&path, &passphrase)
+        .with_context(|| format!("identity {}", path.display()))?;
     let peer = args
         .peer_card
         .as_deref()

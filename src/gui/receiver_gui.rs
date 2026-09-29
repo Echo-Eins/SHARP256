@@ -53,22 +53,22 @@ pub struct ReceiverApp {
     shared: Arc<Mutex<Shared>>,
     output_dir: String,
     cancel: CancellationToken,
+    /// The configuration, while the identity file waits for its passphrase.
+    locked: Option<(super::unlock::Unlock, ReceiverConfig)>,
 }
 
 impl ReceiverApp {
-    pub fn new(mut cfg: ReceiverConfig) -> Self {
+    /// A window receiving with `cfg`; if `cfg` has no identity, the one in
+    /// `identity_path` is sealed with a passphrase, which is asked for first.
+    pub fn new(mut cfg: ReceiverConfig, identity_path: std::path::PathBuf) -> Self {
+        let id = match &cfg.identity {
+            Some(identity) => Some(identity.id()),
+            None => crate::crypto::identity_file::id_of(&identity_path).ok(),
+        };
         let shared = Arc::new(Mutex::new(Shared {
             listen: cfg.bind.to_string(),
-            receiver_id: cfg
-                .identity
-                .as_ref()
-                .map(|i| i.id().to_string())
-                .unwrap_or_default(),
-            contact: cfg
-                .identity
-                .as_ref()
-                .map(|i| cfg.contact_hint(&i.id()))
-                .unwrap_or_default(),
+            receiver_id: id.map(|i| i.to_string()).unwrap_or_default(),
+            contact: id.map(|i| cfg.contact_hint(&i)).unwrap_or_default(),
             ..Default::default()
         }));
         let output_dir = cfg.output_dir.display().to_string();
@@ -177,8 +177,25 @@ impl ReceiverApp {
             }
         }));
 
-        let s = shared.clone();
-        let token = cancel.clone();
+        let mut app = Self {
+            shared,
+            output_dir,
+            cancel,
+            locked: None,
+        };
+        match (cfg.identity.is_some(), id) {
+            (false, Some(id)) => {
+                app.locked = Some((super::unlock::Unlock::new(identity_path, id), cfg));
+            }
+            _ => app.start(cfg),
+        }
+        app
+    }
+
+    /// Starts the receiver on a thread of its own.
+    fn start(&mut self, cfg: ReceiverConfig) {
+        let s = self.shared.clone();
+        let token = self.cancel.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -207,17 +224,25 @@ impl ReceiverApp {
                 }
             });
         });
-
-        Self {
-            shared,
-            output_dir,
-            cancel,
-        }
     }
 }
 
 impl eframe::App for ReceiverApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some((unlock, _)) = &mut self.locked {
+            let mut opened = None;
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("SHARP-256 Receiver");
+                ui.separator();
+                opened = unlock.show(ui);
+            });
+            if let Some(identity) = opened {
+                let (_, mut cfg) = self.locked.take().expect("locked");
+                cfg.identity = Some(identity);
+                self.start(cfg);
+            }
+            return;
+        }
         // Incoming requests: one modal at a time.
         let mut decision: Option<(usize, bool)> = None;
         {

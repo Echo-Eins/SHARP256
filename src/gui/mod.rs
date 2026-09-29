@@ -3,6 +3,7 @@
 
 pub mod receiver_gui;
 pub mod sender_gui;
+mod unlock;
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -26,7 +27,9 @@ pub fn run_sender_gui(file: Option<PathBuf>, receiver: Option<String>) -> Result
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }
 
-pub fn run_receiver_gui(cfg: crate::config::ReceiverConfig) -> Result<()> {
+/// Opens the receiver window. Without an identity in `cfg`, the one in
+/// `identity_path` is sealed with a passphrase: the window asks for it.
+pub fn run_receiver_gui(cfg: crate::config::ReceiverConfig, identity_path: PathBuf) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 560.0])
@@ -36,7 +39,7 @@ pub fn run_receiver_gui(cfg: crate::config::ReceiverConfig) -> Result<()> {
     eframe::run_native(
         "SHARP-256 Receiver",
         options,
-        Box::new(move |_cc| Box::new(ReceiverApp::new(cfg))),
+        Box::new(move |_cc| Box::new(ReceiverApp::new(cfg, identity_path))),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }

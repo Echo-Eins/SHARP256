@@ -7,10 +7,11 @@
 //! to reach it at all (see `handshake`), and the ID authenticates the
 //! receiver to the sender.
 
+use crate::crypto::identity_file::{self, IdentityError, IdentityFile};
 use crate::crypto::SecretKey;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use zeroize::{Zeroize, Zeroizing};
@@ -134,7 +135,7 @@ impl Identity {
         Self::from_key(key)
     }
 
-    fn from_key(secret: SecretKey) -> Self {
+    pub(crate) fn from_key(secret: SecretKey) -> Self {
         // StaticSecret wipes its copy when dropped.
         let public =
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret.expose()))
@@ -181,28 +182,27 @@ impl Identity {
         dirs::data_dir().map(|d| d.join("sharp-256").join("identity.key"))
     }
 
-    /// Loads the identity stored at `path`, or creates and stores a new one.
-    /// The file is created readable by its owner only.
+    /// Loads the identity stored at `path`, or creates and stores a new one
+    /// (not sealed, readable by its owner only). A file sealed with a key
+    /// the operating system keeps is opened with it; one sealed with a
+    /// passphrase is refused with a request for it — programs open those
+    /// with `identity_file::open_or_create`.
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
-        // The file holds the private key: its bytes are read into memory
-        // that is wiped afterwards.
-        match fs::read(path).map(Zeroizing::new) {
-            Ok(text) => {
-                warn_if_exposed(path);
-                Self::parse_file(&text).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{} is not a SHARP-256 identity file", path.display()),
-                    )
-                })
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        match IdentityFile::read(path) {
+            Ok(file) => Ok(file.open(None)?),
+            Err(IdentityError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
                 let id = Self::generate();
+                let text = identity_file::render_plain(&id);
                 if let Some(dir) = path.parent() {
                     fs::create_dir_all(dir)?;
                 }
-                match write_private(path, &id.file_text()) {
-                    Ok(()) => Ok(id),
+                match identity_file::write_private(path, &text) {
+                    Ok(()) => {
+                        if let Some(dir) = path.parent() {
+                            identity_file::sync_dir(dir)?;
+                        }
+                        Ok(id)
+                    }
                     // Another process created it first: use theirs.
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                         Self::load_or_create(path)
@@ -210,36 +210,8 @@ impl Identity {
                     Err(e) => Err(e),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
-    }
-
-    /// The file's contents. Written into a buffer of exactly its size, so
-    /// that no copy of the key is left behind in a buffer that grew; the
-    /// hex is made without a branch on the key (see [`hex_encode`]).
-    fn file_text(&self) -> Zeroizing<Vec<u8>> {
-        let head = format!(
-            "# SHARP-256 identity {}\n# Keep this file private: whoever has it can act as this machine.\n",
-            self.id()
-        );
-        let mut text = Zeroizing::new(Vec::with_capacity(head.len() + 2 * KEY_LEN + 1));
-        text.extend_from_slice(head.as_bytes());
-        let mut hex = Zeroizing::new([0u8; 2 * KEY_LEN]);
-        hex_encode(self.secret.expose(), &mut hex[..]);
-        text.extend_from_slice(&*hex);
-        text.push(b'\n');
-        text
-    }
-
-    fn parse_file(text: &[u8]) -> Option<Self> {
-        let line = text
-            .split(|&b| b == b'\n')
-            .map(<[u8]>::trim_ascii)
-            .find(|l| !l.is_empty() && !l.starts_with(b"#"))?;
-        // Decoded straight into its locked place.
-        let mut valid = false;
-        let key = SecretKey::with(|k| valid = hex_decode(line, k));
-        valid.then(|| Self::from_key(key))
     }
 }
 
@@ -269,19 +241,6 @@ pub fn load_id_list(path: &Path) -> io::Result<std::collections::HashSet<SharpId
         ids.insert(id);
     }
     Ok(ids)
-}
-
-fn write_private(path: &Path, text: &[u8]) -> io::Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(text)?;
-    f.sync_all()
 }
 
 /// Lower-case hex of `bytes` into `out` (twice as long), computed without
@@ -330,25 +289,6 @@ pub(crate) fn hex_decode(text: &[u8], out: &mut [u8]) -> bool {
     }
     // -1 has the sign bit; every valid value is 0..=15.
     bad >= 0
-}
-
-fn warn_if_exposed(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            if meta.permissions().mode() & 0o077 != 0 {
-                tracing::warn!(
-                    "{} is readable by other users; restrict it with chmod 600",
-                    path.display()
-                );
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
 }
 
 /// Unpadded lowercase base32 (RFC 4648 alphabet).
@@ -538,11 +478,13 @@ pub(crate) mod tests {
             ),
             format!("# comment\r\n\r\n  {}  \r\n", hex.to_uppercase()),
         ] {
-            let read = Identity::parse_file(text.as_bytes()).expect("an identity file");
+            let read = IdentityFile::parse(text.as_bytes())
+                .and_then(|f| f.open(None))
+                .expect("an identity file");
             assert_eq!(read.id(), id.id());
             assert_eq!(read.secret(), &secret);
         }
-        assert_eq!(&*id.file_text(), format!(
+        assert_eq!(&*identity_file::render_plain(&id), format!(
             "# SHARP-256 identity {}\n# Keep this file private: whoever has it can act as this machine.\n{}\n",
             id.id(),
             hex

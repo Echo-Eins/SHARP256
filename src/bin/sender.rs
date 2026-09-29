@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use sharp256::crypto::{psk_from_passphrase, Identity};
+use sharp256::crypto::{identity_file, psk_from_passphrase, Identity};
 use sharp256::progress::{format_bytes, format_rate, parse_rate, DirectoryInfo};
 use sharp256::{init_logging, system_info, Sender, SenderConfig, TransferEvent};
 use std::net::SocketAddr;
@@ -115,6 +115,17 @@ struct Args {
     #[arg(long)]
     identity: Option<PathBuf>,
 
+    /// Seal the identity file (the private key in it) with a passphrase, or
+    /// with a key the operating system keeps for this user (the Secret
+    /// Service, the Keychain, DPAPI), or not at all; then exit
+    #[arg(long, value_name = "HOW")]
+    protect_identity: Option<sharp256::crypto::identity_file::ProtectAs>,
+
+    /// Read the identity file's passphrase from this file (its first line);
+    /// or set SHARP256_IDENTITY_PASSPHRASE, or type it when asked
+    #[arg(long, value_name = "FILE")]
+    identity_passphrase_file: Option<PathBuf>,
+
     /// Print this machine's SHARP ID and exit
     #[arg(long)]
     id: bool,
@@ -132,12 +143,24 @@ struct Args {
     headless: bool,
 }
 
-fn load_identity(path: &Option<PathBuf>) -> Result<Identity> {
-    let path = match path {
-        Some(p) => p.clone(),
-        None => Identity::default_path().context("no per-user data directory")?,
-    };
-    Identity::load_or_create(&path).with_context(|| format!("identity {}", path.display()))
+fn identity_path(args: &Args) -> Result<PathBuf> {
+    match &args.identity {
+        Some(p) => Ok(p.clone()),
+        None => Identity::default_path().context("no per-user data directory"),
+    }
+}
+
+fn passphrase_from(args: &Args) -> identity_file::PassphraseFrom<'_> {
+    identity_file::PassphraseFrom {
+        file: args.identity_passphrase_file.as_deref(),
+        ask: true,
+    }
+}
+
+fn load_identity(args: &Args) -> Result<Identity> {
+    let path = identity_path(args)?;
+    identity_file::open_or_create(&path, &passphrase_from(args))
+        .with_context(|| format!("identity {}", path.display()))
 }
 
 #[tokio::main]
@@ -145,8 +168,15 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
 
+    if let Some(how) = args.protect_identity {
+        println!(
+            "{}",
+            identity_file::protect(&identity_path(&args)?, how, &passphrase_from(&args))?
+        );
+        return Ok(());
+    }
     if args.id {
-        println!("{}", load_identity(&args.identity)?.id());
+        println!("{}", identity_file::id_of(&identity_path(&args)?)?);
         return Ok(());
     }
     match (&args.file, &args.receiver) {
@@ -212,7 +242,7 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
             receiver
         );
     }
-    let identity = load_identity(&args.identity)?;
+    let identity = load_identity(args)?;
     let sender_id = identity.id();
     println!("{}", system_info());
 
