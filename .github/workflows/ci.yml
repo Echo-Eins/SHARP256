@@ -163,6 +163,8 @@ jobs:
             run: python3 scripts/natlab/natlab.py v6 --direct-only -v
           - name: IPv6 pinholes
             run: python3 scripts/natlab/natlab.py portmap6
+          - name: sharp-probe says what a transfer does, for every pair
+            run: python3 scripts/natlab/natlab.py probe --all --wait 12
           - name: local network, one NAT, forgetful NAT
             run: |
               python3 scripts/natlab/natlab.py lan
@@ -186,7 +188,7 @@ jobs:
           printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
           sudo chmod +x /usr/sbin/policy-rc.d
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nftables iproute2 miniupnpd miniupnpd-nftables coturn python3
+          sudo apt-get install -y --no-install-recommends nftables iproute2 conntrack miniupnpd miniupnpd-nftables coturn python3
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 restricts them through AppArmor by default.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true

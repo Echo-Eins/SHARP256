@@ -41,6 +41,7 @@ client.
     scripts/natlab/natlab.py lan                    # multicast DNS on one network
     scripts/natlab/natlab.py v6                     # IPv6 firewalls, and both families together
     scripts/natlab/natlab.py probe port_restricted symmetric_random   # sharp-probe on both hosts
+    scripts/natlab/natlab.py probe --all --wait 12  # ... for every pair: does its verdict match what a transfer does?
 """
 
 import argparse
@@ -586,6 +587,16 @@ TURN_PORT = 3480
 TURN_USER, TURN_PASSWORD = "alice", "s3cret"
 
 
+def conntrack(lab, ns):
+    """The connection-tracking table of namespace `ns`, as text: the kernel's
+    /proc/net/nf_conntrack where it has one (newer configurations leave it
+    out), else what `conntrack -L` reads through netlink."""
+    r = lab.x(ns, "cat", "/proc/net/nf_conntrack", check=False)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout
+    return lab.x(ns, "conntrack", "-L", "-p", "udp", check=False).stdout
+
+
 def plain(addr):
     """`addr` (ip:port, as a program prints it) with an IPv4 address that a
     dual-stack socket shows in its mapped form, [::ffff:a.b.c.d]:port,
@@ -786,7 +797,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         detail = f"receiver published {address}"
         if verbose or not ok:
             for gw in ("RA", "RB"):
-                ct = lab.x(gw, "cat", "/proc/net/nf_conntrack", check=False).stdout
+                ct = conntrack(lab, gw)
                 detail += f"\n--- conntrack in {gw}\n" + "\n".join(
                     l[:170] for l in ct.splitlines() if "udp" in l
                 )
@@ -878,7 +889,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False):
     end = time.time() + timeout
     while sender.poll() is None and time.time() < end:
         if os.environ.get("NATLAB_SAMPLE"):
-            ct = lab.x("RA", "cat", "/proc/net/nf_conntrack", check=False).stdout
+            ct = conntrack(lab, "RA")
             n = sum(1 for l in ct.splitlines() if "dst=11.2.0.1" in l.split("src=")[1] if "udp" in l)
             samples.append(f"{time.time() - start:.0f}s:{n}")
         time.sleep(2)
@@ -903,7 +914,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False):
     detail = f"cards exchanged by hand after {human_delay:.0f}s" + (f"\nflows at the sender's NAT towards the receiver: {' '.join(samples)}" if samples else "")
     if verbose or not ok:
         for gw in ("RA", "RB"):
-            ct = lab.x(gw, "cat", "/proc/net/nf_conntrack", check=False).stdout
+            ct = conntrack(lab, gw)
             detail += f"\n--- conntrack in {gw}\n" + "\n".join(l[:170] for l in ct.splitlines() if "udp" in l)
         detail += "\n--- sender.log\n" + log[-2500:] + "\n--- receiver.log\n" + lab.log("receiver.log")[-2500:]
     return ok, path, took, detail
@@ -964,7 +975,28 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
 def cmd_probe(args):
     """`sharp-probe` on both hosts of a pair: each prints what it sees and
     its card, the cards are swapped by hand (through standard input), and
-    each says whether a packet from the other arrived."""
+    each says whether a packet from the other arrived. With `--all`, every
+    pair of NAT kinds, one line each."""
+    if not args.all:
+        if not (args.a and args.b):
+            raise SystemExit("name two NAT kinds, or --all")
+        ok, want_ok = probe_pair(args.a, args.b, args.wait)
+        return 0 if ok == want_ok else 1
+    print(f"{'host A behind':18} {'host B behind':18} punch test")
+    bad = 0
+    for a in NAT_KINDS:
+        for b in NAT_KINDS:
+            ok, want_ok = probe_pair(a, b, args.wait, quiet=True)
+            bad += ok != want_ok
+            print(f"{a:18} {b:18} {'a packet got through both ways' if ok else 'nothing got through':32} "
+                  f"{'as expected' if ok == want_ok else 'UNEXPECTED'}", flush=True)
+    print(f"\n{len(NAT_KINDS) ** 2 - bad} of {len(NAT_KINDS) ** 2} as the theory says they must")
+    return 1 if bad else 0
+
+
+def probe_pair(a_nat, b_nat, wait, quiet=False):
+    """One pair; (did a packet get through both ways, did it have to)."""
+    args = argparse.Namespace(a=a_nat, b=b_nat, wait=wait)
     lab = Lab(keep=False)
     try:
         topo = Topo(lab, args.a, args.b, None, None)
@@ -977,7 +1009,7 @@ def cmd_probe(args):
         )
         if not wait_for(lab, "relay.log", r"Receivers: --relay", 10):
             print("the relay (and its STUN server) did not start")
-            return 1
+            return False, True
         procs, cards = {}, {}
         for ns, name, extra in (("A", "a", []), ("B", "b", ["--receiver"])):
             procs[name] = lab.spawn(
@@ -995,10 +1027,11 @@ def cmd_probe(args):
                 time.sleep(0.2)
             if not m:
                 print(f"host {name.upper()} printed no card:\n" + lab.log(f"probe_{name}.log")[-1500:])
-                return 1
+                return False, True
             cards[name] = m.group(1)
             report = lab.log(f"probe_{name}.log").split("Your card")[0]
-            print(f"--- host {name.upper()} behind {args.a if name == 'a' else args.b}\n{report.split('Measuring')[-1]}")
+            if not quiet:
+                print(f"--- host {name.upper()} behind {args.a if name == 'a' else args.b}\n{report.split('Measuring')[-1]}")
         # Each is handed the other's card, one after the other, as two people would.
         for name, other in (("a", "b"), ("b", "a")):
             procs[name].stdin.write((cards[other] + "\n").encode())
@@ -1009,14 +1042,15 @@ def cmd_probe(args):
             except subprocess.TimeoutExpired:
                 p.kill()
         codes = [procs[n].returncode for n in ("a", "b")]
-        for name in ("a", "b"):
-            tail = lab.log(f"probe_{name}.log").split("Sending at")[-1]
-            print(f"--- punch test, host {name.upper()}\nSending at{tail[-700:]}")
         want_ok, _ = expected(args.a, args.b, False, "card")
         ok = all(c == 0 for c in codes)
-        print(f"punch test: {'a packet got through both ways' if ok else 'nothing got through'} "
-              f"({'as expected' if ok == want_ok else 'UNEXPECTED'})")
-        return 0 if ok == want_ok else 1
+        if not quiet:
+            for name in ("a", "b"):
+                tail = lab.log(f"probe_{name}.log").split("Sending at")[-1]
+                print(f"--- punch test, host {name.upper()}\nSending at{tail[-700:]}")
+            print(f"punch test: {'a packet got through both ways' if ok else 'nothing got through'} "
+                  f"({'as expected' if ok == want_ok else 'UNEXPECTED'})")
+        return ok, want_ok
     finally:
         lab.close()
 
@@ -1127,19 +1161,20 @@ def cmd_v6(args):
             for fb in kinds:
                 if args.cell and args.cell != f"{fa},{fb}":
                     continue
-                ok, path, took, detail = transfer(
-                    an, bn, carry=not args.direct_only, timeout=args.timeout, via=args.via,
-                    v6=(fa, fb), v4=has_v4, isolate=args.isolate,
-                )
-                # Both ends have a global IPv6 address and, at worst, a
-                # stateful firewall: a direct path has to open in all nine
-                # combinations, and it has to be the IPv6 one.
-                met = ok and path == "direct-v6"
-                rows.append((name, fa, fb, ok, path, took, met))
-                print(f"{name:46} {fa:12} {fb:12} {'ok  ' if ok else 'FAIL'} {path:12} {took:5.1f}s "
-                      f"{'as expected' if met else 'UNEXPECTED'}", flush=True)
-                if not met and args.verbose:
-                    print(detail)
+                for _ in range(args.repeat):
+                    ok, path, took, detail = transfer(
+                        an, bn, carry=not args.direct_only, timeout=args.timeout, via=args.via,
+                        v6=(fa, fb), v4=has_v4, isolate=args.isolate,
+                    )
+                    # Both ends have a global IPv6 address and, at worst, a
+                    # stateful firewall: a direct path has to open in all nine
+                    # combinations, and it has to be the IPv6 one.
+                    met = ok and path == "direct-v6"
+                    rows.append((name, fa, fb, ok, path, took, met))
+                    print(f"{name:46} {fa:12} {fb:12} {'ok  ' if ok else 'FAIL'} {path:12} {took:5.1f}s "
+                          f"{'as expected' if met else 'UNEXPECTED'}", flush=True)
+                    if not met and args.verbose:
+                        print(detail)
     bad = [r for r in rows if not r[6]]
     print(f"\n{len(rows) - len(bad)} of {len(rows)} as they must be")
     if args.markdown:
@@ -1388,10 +1423,12 @@ def start_miniupnpd6(lab, gw, protocols, lan_v4, lan_v6):
     request over IPv6 opens the firewall for the host it names) are what
     open a way in, and only the protocols in `protocols` are switched on."""
     lab.nft(gw, MINIUPNPD6_TABLE)
+    # The LAN side is named by its interface: the daemon takes an address
+    # only for IPv4, and "the network interface name is mandatory to enable
+    # IPv6" (its own sample configuration).
     conf = f"""ext_ifname=wan
 ext_ifname6=wan
-listening_ip={lan_v4}/24
-listening_ip={lan_v6}
+listening_ip=lan
 ipv6_disable=no
 enable_pcp_pmp={'yes' if 'pcp' in protocols else 'no'}
 enable_upnp={'yes' if 'upnp' in protocols else 'no'}
@@ -1663,9 +1700,11 @@ def cmd_timeout(args):
         adapted_at = None
         while time.time() < end:
             time.sleep(max(1, args.wait // 12))
-            ct = lab.x("RB", "cat", "/proc/net/nf_conntrack", check=False).stdout
+            ct = conntrack(lab, "RB")
             flows = [l for l in ct.splitlines() if "udp" in l and "dst=11.9.0.10" in l.split("src=")[1] and "dport=5560" in l]
             alive.append(len(flows))
+            if len(alive) == 1 and not flows:
+                print("(nothing about the receiver's flow in the conntrack table; it reads:)\n" + ct[:700])
             # Until the receiver has found out how short the NAT's memory is
             # its refreshes may be too far apart: the mapping is allowed to
             # lapse then, and what is asked is that it does not afterwards.
@@ -1744,8 +1783,9 @@ def main():
     pair.add_argument("--via", choices=["relay", "card", "turn", "dht"], default="relay",
                       help="how the two find each other: a relay, or cards handed over by hand")
     probe = sub.add_parser("probe")
-    probe.add_argument("a", choices=list(NAT_KINDS))
-    probe.add_argument("b", choices=list(NAT_KINDS))
+    probe.add_argument("a", nargs="?", choices=list(NAT_KINDS))
+    probe.add_argument("b", nargs="?", choices=list(NAT_KINDS))
+    probe.add_argument("--all", action="store_true", help="every pair of NAT kinds")
     probe.add_argument("--wait", type=int, default=20)
     v6 = sub.add_parser("v6")
     v6.add_argument("--scenario", default=None, help="only the scenarios whose name has this in it")
@@ -1755,6 +1795,7 @@ def main():
     v6.add_argument("--timeout", type=int, default=30)
     v6.add_argument("--markdown")
     v6.add_argument("--cell", default=None, help="only this pair of firewalls, e.g. stateful6,open6")
+    v6.add_argument("--repeat", type=int, default=1, help="each pair this many times (a race shows up in some runs only)")
     v6.add_argument("--allow-failures", action="store_true")
     v6.add_argument("-v", "--verbose", action="store_true")
     lan = sub.add_parser("lan")
