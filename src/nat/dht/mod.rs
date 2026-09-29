@@ -513,12 +513,12 @@ impl Role {
 /// What both ends know, and nobody else need: derived from the receiver's
 /// ID and the shared secret, if there is one. With no secret the key is a
 /// function of the ID alone, and anybody who knows the ID can compute it.
-pub fn rendezvous_key(receiver: &crate::crypto::SharpId, secret: Option<&[u8; 32]>) -> [u8; 32] {
-    let mut material = receiver.as_bytes().to_vec();
-    if let Some(s) = secret {
-        material.extend_from_slice(s);
-    }
-    blake3::derive_key("sharp256 dht rendezvous v1", &material)
+pub fn rendezvous_key(
+    receiver: &crate::crypto::SharpId,
+    secret: Option<&[u8; 32]>,
+) -> zeroize::Zeroizing<[u8; 32]> {
+    let secret: &[u8] = secret.map_or(&[], |s| &s[..]);
+    crate::crypto::derive_secret("sharp256 dht rendezvous v1", &[receiver.as_bytes(), secret])
 }
 
 /// The infohash a role announces under.
@@ -527,10 +527,7 @@ pub fn info_hash(key: &[u8; 32], role: Role) -> NodeId {
         Role::Receiver => b"receiver",
         Role::Sender => b"sender",
     };
-    let hash = blake3::keyed_hash(key, tag);
-    hash.as_bytes()[..20]
-        .try_into()
-        .expect("a hash is longer than an infohash")
+    crate::crypto::keyed_mac(key, &[tag])
 }
 
 /// How long between one round of asking and the next while nobody has
@@ -553,7 +550,7 @@ const LOOKUP_WITHIN: Duration = Duration::from_secs(12);
 /// again when it changes.
 pub fn spawn_rendezvous(
     dht: Dht,
-    key: [u8; 32],
+    key: zeroize::Zeroizing<[u8; 32]>,
     role: Role,
     aims: tokio::sync::watch::Receiver<crate::nat::card::FamilyHints>,
     cancel: CancellationToken,

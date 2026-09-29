@@ -482,7 +482,7 @@ async fn two_ends_meet_through_the_dht() {
     let (send_tx, mut send_seen) = tokio::sync::mpsc::unbounded_channel();
     let receiver = spawn_rendezvous(
         Dht::start(net.bootstrap(), cancel.clone()).unwrap(),
-        key,
+        key.clone(),
         Role::Receiver,
         recv_aims.1.clone(),
         cancel.clone(),

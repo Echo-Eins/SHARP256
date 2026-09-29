@@ -131,12 +131,11 @@ impl Identity {
     }
 
     pub fn from_secret(secret: [u8; KEY_LEN]) -> Self {
-        let sk = x25519_dalek::StaticSecret::from(secret);
-        let public = x25519_dalek::PublicKey::from(&sk).to_bytes();
-        Self {
-            secret: Zeroizing::new(sk.to_bytes()),
-            public,
-        }
+        let secret = Zeroizing::new(secret);
+        // StaticSecret wipes its copy when dropped.
+        let public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret)).to_bytes();
+        Self { secret, public }
     }
 
     pub fn id(&self) -> SharpId {
@@ -181,7 +180,9 @@ impl Identity {
     /// Loads the identity stored at `path`, or creates and stores a new one.
     /// The file is created readable by its owner only.
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
-        match fs::read_to_string(path) {
+        // The file holds the private key: its bytes are read into memory
+        // that is wiped afterwards.
+        match fs::read(path).map(Zeroizing::new) {
             Ok(text) => {
                 warn_if_exposed(path);
                 Self::parse_file(&text).ok_or_else(|| {
@@ -209,29 +210,31 @@ impl Identity {
         }
     }
 
-    fn file_text(&self) -> Zeroizing<String> {
-        let mut hex = String::with_capacity(2 * KEY_LEN);
-        for b in self.secret.iter() {
-            hex.push_str(&format!("{:02x}", b));
-        }
-        Zeroizing::new(format!(
-            "# SHARP-256 identity {}\n# Keep this file private: whoever has it can act as this machine.\n{}\n",
-            self.id(),
-            hex
-        ))
+    /// The file's contents. Written into a buffer of exactly its size, so
+    /// that no copy of the key is left behind in a buffer that grew; the
+    /// hex is made without a branch on the key (see [`hex_encode`]).
+    fn file_text(&self) -> Zeroizing<Vec<u8>> {
+        let head = format!(
+            "# SHARP-256 identity {}\n# Keep this file private: whoever has it can act as this machine.\n",
+            self.id()
+        );
+        let mut text = Zeroizing::new(Vec::with_capacity(head.len() + 2 * KEY_LEN + 1));
+        text.extend_from_slice(head.as_bytes());
+        let mut hex = Zeroizing::new([0u8; 2 * KEY_LEN]);
+        hex_encode(&self.secret[..], &mut hex[..]);
+        text.extend_from_slice(&*hex);
+        text.push(b'\n');
+        text
     }
 
-    fn parse_file(text: &str) -> Option<Self> {
+    fn parse_file(text: &[u8]) -> Option<Self> {
         let line = text
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty() && !l.starts_with('#'))?;
-        if line.len() != 2 * KEY_LEN {
-            return None;
-        }
+            .split(|&b| b == b'\n')
+            .map(<[u8]>::trim_ascii)
+            .find(|l| !l.is_empty() && !l.starts_with(b"#"))?;
         let mut secret = Zeroizing::new([0u8; KEY_LEN]);
-        for (i, byte) in secret.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(line.get(2 * i..2 * i + 2)?, 16).ok()?;
+        if !hex_decode(line, &mut secret[..]) {
+            return None;
         }
         Some(Self::from_secret(*secret))
     }
@@ -265,7 +268,7 @@ pub fn load_id_list(path: &Path) -> io::Result<std::collections::HashSet<SharpId
     Ok(ids)
 }
 
-fn write_private(path: &Path, text: &str) -> io::Result<()> {
+fn write_private(path: &Path, text: &[u8]) -> io::Result<()> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -274,8 +277,56 @@ fn write_private(path: &Path, text: &str) -> io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path)?;
-    f.write_all(text.as_bytes())?;
+    f.write_all(text)?;
     f.sync_all()
+}
+
+/// Lower-case hex of `bytes` into `out` (twice as long), computed without
+/// a branch or a table lookup that depends on the bytes: this is how the
+/// private key is written, and the time it takes must not say what it is.
+/// (`format!("{:02x}")` picks the digit with a branch.)
+fn hex_encode(bytes: &[u8], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), 2 * bytes.len());
+    fn digit(n: u8) -> u8 {
+        // n < 10: '0' + n; otherwise 'a' + n - 10, which is 39 further on.
+        // (9 - n) is negative exactly when n > 9, and its sign, spread
+        // over the byte by the arithmetic shift, selects the 39.
+        let n = n as i16;
+        (n + 0x30 + (((9 - n) >> 8) & 0x27)) as u8
+    }
+    for (b, pair) in bytes.iter().zip(out.chunks_exact_mut(2)) {
+        pair[0] = digit(b >> 4);
+        pair[1] = digit(b & 0x0f);
+    }
+}
+
+/// The bytes written by `text` in hex (either case) into `out`, which it
+/// must fill exactly; false if it is not that. The digits are read without
+/// a branch on their value, for the reason given at [`hex_encode`]; only
+/// whether the whole text was valid is decided at the end.
+fn hex_decode(text: &[u8], out: &mut [u8]) -> bool {
+    if text.len() != 2 * out.len() {
+        return false;
+    }
+    /// The digit's value, or -1: each range adds its offset only when the
+    /// character lies in it — `(lo - c) & (c - hi)` is negative exactly
+    /// then, and its sign bit becomes the mask.
+    fn value(c: u8) -> i16 {
+        let c = c as i16;
+        let mut v: i16 = -1;
+        v += (((0x2f - c) & (c - 0x3a)) >> 8) & (c - 0x2f); // '0'..='9'
+        v += (((0x40 - c) & (c - 0x47)) >> 8) & (c - 0x36); // 'A'..='F'
+        v += (((0x60 - c) & (c - 0x67)) >> 8) & (c - 0x56); // 'a'..='f'
+        v
+    }
+    let mut bad: i16 = 0;
+    for (pair, byte) in text.chunks_exact(2).zip(out.iter_mut()) {
+        let (hi, lo) = (value(pair[0]), value(pair[1]));
+        bad |= hi | lo;
+        *byte = ((hi << 4) | lo) as u8;
+    }
+    // -1 has the sign bit; every valid value is 0..=15.
+    bad >= 0
 }
 
 fn warn_if_exposed(path: &Path) {
@@ -430,6 +481,69 @@ pub(crate) mod tests {
         assert!(typo.parse::<SharpId>().is_err());
         assert_eq!("xx-abc".parse::<SharpId>(), Err(IdError::Prefix));
         assert_eq!("sh-abc".parse::<SharpId>(), Err(IdError::Encoding));
+    }
+
+    /// The branch-free hex is ordinary hex: every byte value is written as
+    /// `format!` would write it and read back, in either case; anything
+    /// that is not a hex digit, anywhere, is refused, and so is a wrong
+    /// length.
+    #[test]
+    fn the_key_is_written_and_read_as_plain_hex() {
+        let all: Vec<u8> = (0..=255).collect();
+        let mut hex = vec![0u8; 512];
+        hex_encode(&all, &mut hex);
+        let expected: String = all.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(hex, expected.as_bytes());
+        let mut back = vec![0u8; 256];
+        assert!(hex_decode(&hex, &mut back));
+        assert_eq!(back, all);
+        assert!(hex_decode(expected.to_uppercase().as_bytes(), &mut back));
+        assert_eq!(back, all);
+        let mut one = [0u8; 1];
+        for c in 0..=255u8 {
+            let valid = c.is_ascii_hexdigit();
+            assert_eq!(
+                hex_decode(&[c, b'0'], &mut one),
+                valid,
+                "{:?} first",
+                c as char
+            );
+            assert_eq!(
+                hex_decode(&[b'0', c], &mut one),
+                valid,
+                "{:?} second",
+                c as char
+            );
+        }
+        assert!(!hex_decode(b"0", &mut one));
+        assert!(!hex_decode(b"000", &mut one));
+        assert!(!hex_decode(b"", &mut one));
+    }
+
+    /// A file written the way identity files always were (`{:02x}` per
+    /// byte, CRLF line ends allowed) is read as the same identity.
+    #[test]
+    fn an_identity_file_from_before_reads_the_same() {
+        let secret: [u8; KEY_LEN] = std::array::from_fn(|i| (i * 29 + 3) as u8);
+        let id = Identity::from_secret(secret);
+        let hex: String = secret.iter().map(|b| format!("{:02x}", b)).collect();
+        for text in [
+            format!(
+                "# SHARP-256 identity {}\n# Keep this file private.\n{}\n",
+                id.id(),
+                hex
+            ),
+            format!("# comment\r\n\r\n  {}  \r\n", hex.to_uppercase()),
+        ] {
+            let read = Identity::parse_file(text.as_bytes()).expect("an identity file");
+            assert_eq!(read.id(), id.id());
+            assert_eq!(read.secret(), &secret);
+        }
+        assert_eq!(&*id.file_text(), format!(
+            "# SHARP-256 identity {}\n# Keep this file private: whoever has it can act as this machine.\n{}\n",
+            id.id(),
+            hex
+        ).as_bytes());
     }
 
     #[test]

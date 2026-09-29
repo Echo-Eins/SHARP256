@@ -123,6 +123,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -137,6 +138,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -266,6 +268,7 @@ dependencies = [
  "blake2",
  "cpufeatures",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -279,6 +282,9 @@ name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "async-broadcast"
@@ -583,6 +589,7 @@ dependencies = [
  "constant_time_eq",
  "memmap2 0.9.5",
  "rayon-core",
+ "zeroize",
 ]
 
 [[package]]
@@ -1528,6 +1535,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -2635,6 +2643,7 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -2647,6 +2656,7 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -3062,11 +3072,14 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "ghash",
  "hmac",
  "if-addrs",
  "libc",
  "md-5",
  "parking_lot",
+ "poly1305",
+ "polyval",
  "quinn-udp",
  "rand",
  "rfd",

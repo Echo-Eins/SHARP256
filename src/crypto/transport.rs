@@ -21,7 +21,7 @@
 //! than AES-GCM's confidentiality bound allows, without any key-update
 //! signalling: both sides compute the key from the packet number.
 
-use crate::crypto::CryptoError;
+use crate::crypto::{derive_secret, CryptoError};
 use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use std::sync::{Arc, RwLock};
@@ -208,10 +208,10 @@ pub struct DirectionKeys {
 
 impl DirectionKeys {
     pub fn new(suite: Suite, secret: &[u8; 32]) -> Self {
-        let iv_full = blake3::derive_key("sharp256 v3 aead iv", secret);
+        let iv_full = derive_secret("sharp256 v3 aead iv", &[secret]);
         let mut iv = [0u8; 12];
         iv.copy_from_slice(&iv_full[..12]);
-        let hp_key = Zeroizing::new(blake3::derive_key("sharp256 v3 header protection", secret));
+        let hp_key = derive_secret("sharp256 v3 header protection", &[secret]);
         Self {
             suite,
             secret: Zeroizing::new(*secret),
@@ -231,10 +231,10 @@ impl DirectionKeys {
                 return a.clone();
             }
         }
-        let mut material = [0u8; 40];
-        material[..32].copy_from_slice(&*self.secret);
-        material[32..].copy_from_slice(&epoch.to_be_bytes());
-        let key = Zeroizing::new(blake3::derive_key("sharp256 v3 aead key", &material));
+        let key = derive_secret(
+            "sharp256 v3 aead key",
+            &[&*self.secret, &epoch.to_be_bytes()],
+        );
         let aead = Arc::new(Aead::new(self.suite, &key));
         if let Ok(mut cache) = self.epochs.write() {
             if cache.len() >= 3 {
@@ -320,12 +320,7 @@ impl SessionKeys {
     /// Derives the session keys from the handshake's split. The initiator
     /// sends with the first key and the responder with the second.
     pub fn derive(split: &crate::crypto::handshake::Split, initiator: bool, suite: Suite) -> Self {
-        let secret = |k: &[u8; 32]| {
-            let mut material = Zeroizing::new([0u8; 64]);
-            material[..32].copy_from_slice(k);
-            material[32..].copy_from_slice(&split.hash);
-            Zeroizing::new(blake3::derive_key("sharp256 v3 traffic secret", &*material))
-        };
+        let secret = |k: &[u8; 32]| derive_secret("sharp256 v3 traffic secret", &[k, &split.hash]);
         let i2r = secret(&split.initiator_to_responder);
         let r2i = secret(&split.responder_to_initiator);
         let (send, recv) = if initiator { (i2r, r2i) } else { (r2i, i2r) };

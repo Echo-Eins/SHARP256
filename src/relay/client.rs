@@ -136,7 +136,7 @@ pub async fn connect(
     // refuse us, or point our punches at whoever they liked.
     let nonce: [u8; NONCE_LEN] = rand::random();
     // Set once the relay has refused us as a stranger.
-    let mut identify: Option<(SharpId, [u8; 32])> = None;
+    let mut identify: Option<(SharpId, zeroize::Zeroizing<[u8; 32]>)> = None;
     // Since when the relay has been saying it does not know the receiver,
     // and how long to pause before asking again.
     let mut unknown: Option<(Instant, Duration)> = None;
@@ -148,15 +148,15 @@ pub async fn connect(
         if cancel.is_cancelled() {
             return Err(ConnectError::Cancelled);
         }
-        let ask = match identify {
+        let ask = match &identify {
             Some((id, key)) => signed(
-                &key,
+                key,
                 Message::ConnectAs {
                     target,
                     token,
                     hints,
                     nonce,
-                    id,
+                    id: *id,
                     proof: [0; PROOF_LEN],
                 },
             ),

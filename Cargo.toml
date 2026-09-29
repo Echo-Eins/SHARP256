@@ -14,16 +14,27 @@ tokio = { version = "1.37", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Integrity: whole-file hashes, MACs and key derivation
-blake3 = { version = "1.5", features = ["mmap", "rayon"] }
+blake3 = { version = "1.5", features = ["mmap", "rayon", "zeroize"] }
 
-# Security: Noise IKpsk2 handshake, AEAD transport, passphrase hardening
+# Security: Noise IKpsk2 handshake, AEAD transport, passphrase hardening.
+#
+# Every crate below that holds key material is built with its `zeroize`
+# feature, so that it wipes the key (AES round keys, the GHASH and Poly1305
+# keys, the ChaCha20 state, Argon2's memory blocks) when it is dropped;
+# without it they stay in freed memory. ghash, polyval and poly1305 are
+# not used directly: they are named only to switch that feature on inside
+# aes-gcm and chacha20poly1305. `crypto::tests` checks at compile time that
+# the types keys are kept in do wipe themselves.
 snow = { version = "=0.9.6", default-features = false, features = ["default-resolver", "risky-raw-split"] }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
-aes = "0.8"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
 chacha20poly1305 = { version = "0.10", default-features = false }
-chacha20 = "0.9"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-argon2 = "0.5"
+poly1305 = { version = "0.8", features = ["zeroize"] }
+chacha20 = { version = "0.9", features = ["zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
 subtle = "2"
 zeroize = "1"
 

@@ -99,6 +99,23 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   guarantee with the mechanism responsible, explicit non-goals and residual
   risks.
 
+### Secret hygiene
+- Every crate that holds a key now wipes it when it is dropped. The
+  `zeroize` features of aes, aes-gcm, ghash, polyval, poly1305, chacha20,
+  argon2, blake3 and x25519-dalek were off, so the AES round keys of every
+  session, the GHASH and Poly1305 keys, the ChaCha20 state of header
+  protection and Argon2's memory stayed behind in freed memory. A test
+  stops compiling if one of them is switched off again.
+- Key derivation and MACs under secret keys — traffic, AEAD and header
+  protection keys, cookies, the relay's proofs, tags and tokens, the DHT
+  rendezvous key — go through helpers that wipe BLAKE3's hasher afterwards
+  and hand keys out in wiping containers; the one-shot calls left the key
+  in a stack slot, and the material of each epoch's key was a plain array.
+  The keys are the same as before, byte for byte.
+- The identity file is read into, and written from, memory that is wiped,
+  and the private key's hex is written and read without a branch on its
+  digits (`format!("{:02x}")` and `from_str_radix` branch on each one).
+
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the
   tests of RFC 5780 run on the transfer socket itself: whether the external

@@ -24,7 +24,7 @@
 
 use crate::crypto::identity::{Identity, SharpId, KEY_LEN};
 use crate::crypto::transport::CID_LEN;
-use crate::crypto::CryptoError;
+use crate::crypto::{derive_secret, keyed_mac, CryptoError};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
@@ -81,8 +81,8 @@ fn cookie_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v3 cookie", public)
 }
 
-fn mac2_key(cookie: &[u8; MAC_LEN]) -> [u8; 32] {
-    blake3::derive_key("sharp256 v3 mac2", cookie)
+fn mac2_key(cookie: &[u8; MAC_LEN]) -> Zeroizing<[u8; 32]> {
+    derive_secret("sharp256 v3 mac2", &[cookie])
 }
 
 fn mac(key: &[u8; 32], data: &[u8]) -> [u8; MAC_LEN] {
@@ -225,7 +225,7 @@ impl Initiator {
         self.last_mac1 = mac(&self.receiver_mac1_key, &out[..end]);
         out[end..end + MAC_LEN].copy_from_slice(&self.last_mac1);
         if let Some(cookie) = cookie {
-            let m2 = mac(&mac2_key(cookie), &out[..end + MAC_LEN]);
+            let m2: [u8; MAC_LEN] = keyed_mac(&mac2_key(cookie), &[&out[..end + MAC_LEN]]);
             out[end + MAC_LEN..].copy_from_slice(&m2);
         }
         Ok(out)
@@ -435,7 +435,7 @@ impl CookieJar {
     pub fn new(own: &SharpId) -> Self {
         Self {
             reply_key: cookie_key(own.as_bytes()),
-            secrets: [Zeroizing::new(random_key()), Zeroizing::new(random_key())],
+            secrets: [random_key(), random_key()],
             born: Instant::now(),
         }
     }
@@ -443,7 +443,7 @@ impl CookieJar {
     fn rotate(&mut self, now: Instant) {
         if now.saturating_duration_since(self.born) >= COOKIE_LIFETIME {
             self.secrets.swap(0, 1);
-            self.secrets[0] = Zeroizing::new(random_key());
+            self.secrets[0] = random_key();
             self.born = now;
         }
     }
@@ -453,10 +453,7 @@ impl CookieJar {
             IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
             IpAddr::V6(v6) => v6.octets(),
         };
-        let mut data = [0u8; 18];
-        data[..16].copy_from_slice(&ip);
-        data[16..].copy_from_slice(&addr.port().to_be_bytes());
-        mac(secret, &data)
+        keyed_mac(secret, &[&ip, &addr.port().to_be_bytes()])
     }
 
     /// Whether the initiation carries a mac2 made with a current cookie for
@@ -470,7 +467,7 @@ impl CookieJar {
         let (msg, mac2) = pkt.split_at(n - MAC_LEN);
         self.secrets.iter().any(|s| {
             let cookie = Self::cookie(s, from);
-            ct_eq(&mac(&mac2_key(&cookie), msg), mac2)
+            ct_eq(&keyed_mac::<MAC_LEN>(&mac2_key(&cookie), &[msg]), mac2)
         })
     }
 
@@ -497,9 +494,9 @@ impl CookieJar {
     }
 }
 
-fn random_key() -> [u8; 32] {
-    let mut k = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut k);
+fn random_key() -> Zeroizing<[u8; 32]> {
+    let mut k = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *k);
     k
 }
 

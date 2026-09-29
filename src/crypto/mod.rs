@@ -14,6 +14,45 @@ pub mod transport;
 pub use identity::{Identity, SharpId};
 pub use transport::{SessionKeys, Suite};
 
+use zeroize::{Zeroize, Zeroizing};
+
+/// BLAKE3's key derivation for material that is secret: the same key as
+/// `blake3::derive_key(context, material.concat())`, without a buffer that
+/// holds the concatenation, and with the hasher — which saw all of the
+/// material — wiped before this returns. The key itself is wiped when the
+/// result is dropped.
+///
+/// `blake3::derive_key` and `blake3::keyed_hash` leave their hasher, and
+/// with it the key or the material, in a stack slot that nothing clears.
+pub(crate) fn derive_secret(context: &str, material: &[&[u8]]) -> Zeroizing<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new_derive_key(context);
+    for part in material {
+        hasher.update(part);
+    }
+    let mut hash = hasher.finalize();
+    let key = Zeroizing::new(*hash.as_bytes());
+    hash.zeroize();
+    hasher.zeroize();
+    key
+}
+
+/// A MAC with BLAKE3 in keyed mode over `parts`, cut to `N` bytes. The MAC
+/// goes on the wire and is no secret; the key is, so the hasher that held
+/// it is wiped before this returns.
+pub(crate) fn keyed_mac<const N: usize>(key: &[u8; 32], parts: &[&[u8]]) -> [u8; N] {
+    const { assert!(N <= 32, "a BLAKE3 hash has 32 bytes") };
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    for part in parts {
+        hasher.update(part);
+    }
+    let mut hash = hasher.finalize();
+    let mut out = [0u8; N];
+    out.copy_from_slice(&hash.as_bytes()[..N]);
+    hash.zeroize();
+    hasher.zeroize();
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CryptoError {
     #[error("malformed packet")]
@@ -71,6 +110,47 @@ pub fn psk_from_passphrase_with_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The helpers compute exactly what the one-shot functions compute:
+    /// no key changes by going through them.
+    #[test]
+    fn derive_secret_and_keyed_mac_are_blake3() {
+        let (a, b) = ([0x11u8; 32], b"and more material".as_slice());
+        let whole = [&a[..], b].concat();
+        assert_eq!(
+            *derive_secret("sharp256 test", &[&a, b]),
+            blake3::derive_key("sharp256 test", &whole)
+        );
+        assert_eq!(
+            *derive_secret("sharp256 test", &[]),
+            blake3::derive_key("sharp256 test", &[])
+        );
+        let key = [0x42u8; 32];
+        let full = blake3::keyed_hash(&key, &whole);
+        assert_eq!(keyed_mac::<32>(&key, &[&a, b]), *full.as_bytes());
+        assert_eq!(keyed_mac::<16>(&key, &[&whole]), full.as_bytes()[..16]);
+    }
+
+    /// Every type a key is kept in wipes it when dropped. This fails to
+    /// compile if a crate's `zeroize` feature is switched off (Cargo.toml)
+    /// or a type is replaced by one that does not.
+    #[test]
+    fn what_holds_keys_wipes_them() {
+        fn wipes<T: zeroize::ZeroizeOnDrop>() {}
+        wipes::<aes::Aes256>();
+        wipes::<chacha20poly1305::ChaCha20Poly1305>();
+        wipes::<chacha20poly1305::XChaCha20Poly1305>();
+        wipes::<chacha20::ChaChaCore<chacha20::cipher::consts::U10>>();
+        wipes::<Zeroizing<[u8; 32]>>();
+        // x25519-dalek wipes its secrets in a Drop of its own without
+        // saying so with the marker: that it can be wiped and has a Drop
+        // is as much as the type system shows.
+        fn wiped_in_its_drop<T: zeroize::Zeroize>() -> bool {
+            std::mem::needs_drop::<T>()
+        }
+        assert!(wiped_in_its_drop::<x25519_dalek::StaticSecret>());
+        assert!(wiped_in_its_drop::<x25519_dalek::SharedSecret>());
+    }
 
     #[test]
     fn psk_depends_on_passphrase_and_receiver() {

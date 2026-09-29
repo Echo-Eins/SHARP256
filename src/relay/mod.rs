@@ -93,23 +93,17 @@ pub fn auth_key(
     theirs: &SharpId,
     peer: &SharpId,
     relay: &SharpId,
-) -> Option<[u8; 32]> {
+) -> Option<zeroize::Zeroizing<[u8; 32]>> {
     let dh = ours.shared_secret(theirs)?;
-    let mut material = zeroize::Zeroizing::new([0u8; 96]);
-    material[..32].copy_from_slice(&dh[..]);
-    material[32..64].copy_from_slice(peer.as_bytes());
-    material[64..].copy_from_slice(relay.as_bytes());
-    Some(blake3::derive_key(
+    Some(crate::crypto::derive_secret(
         "sharp256 relay v1 registration",
-        &material[..],
+        &[&dh[..], peer.as_bytes(), relay.as_bytes()],
     ))
 }
 
 /// The proof carried by a message, over everything in it that precedes it.
 pub fn proof_for(key: &[u8; 32], signed: &[u8]) -> [u8; PROOF_LEN] {
-    let mut out = [0u8; PROOF_LEN];
-    out.copy_from_slice(&blake3::keyed_hash(key, signed).as_bytes()[..PROOF_LEN]);
-    out
+    crate::crypto::keyed_mac(key, &[signed])
 }
 
 /// Whether `pkt` carries a proof that matches `key`. The proof covers the
@@ -132,13 +126,8 @@ pub fn proof_is_good(key: &[u8; 32], pkt: &[u8]) -> bool {
 pub fn relay_tag(key: &[u8; 32], nonce: &[u8; NONCE_LEN], unsigned: &[u8]) -> [u8; TAG_LEN] {
     // A key of its own, so that nothing the relay tags could ever pass for
     // a peer's proof, or the other way round.
-    let own = blake3::derive_key("sharp256 relay v1 relay to peer", key);
-    let mut mac = blake3::Hasher::new_keyed(&own);
-    mac.update(nonce);
-    mac.update(unsigned);
-    let mut out = [0u8; TAG_LEN];
-    out.copy_from_slice(&mac.finalize().as_bytes()[..TAG_LEN]);
-    out
+    let own = crate::crypto::derive_secret("sharp256 relay v1 relay to peer", &[key]);
+    crate::crypto::keyed_mac(&own, &[nonce, unsigned])
 }
 
 /// Encodes a message a relay sends a registered receiver, closed with its
