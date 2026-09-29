@@ -144,23 +144,23 @@ jobs:
           - name: NAT kinds checked by the oracle
             run: python3 scripts/natlab/natlab.py oracle
           - name: every pair through a relay that carries
-            run: python3 scripts/natlab/natlab.py matrix
+            run: python3 scripts/natlab/natlab.py matrix -v
           - name: every pair through a relay that only introduces
-            run: python3 scripts/natlab/natlab.py matrix --direct-only
+            run: python3 scripts/natlab/natlab.py matrix --direct-only -v
           - name: every pair by contact cards, no relay
-            run: python3 scripts/natlab/natlab.py matrix --via card
+            run: python3 scripts/natlab/natlab.py matrix --via card -v
           - name: every pair through a TURN server
-            run: NATLAB_SIZE_MB=100 python3 scripts/natlab/natlab.py matrix --via turn --timeout 60
+            run: NATLAB_SIZE_MB=30 NATLAB_MAX_RATE=20M python3 scripts/natlab/natlab.py matrix --via turn --timeout 90 -v
           - name: every pair through the DHT alone
-            run: python3 scripts/natlab/natlab.py matrix --via dht --timeout 60
+            run: python3 scripts/natlab/natlab.py matrix --via dht --timeout 60 -v
           - name: networks that cannot reach each other, relay
-            run: python3 scripts/natlab/natlab.py matrix --isolate
+            run: python3 scripts/natlab/natlab.py matrix --isolate -v
           - name: networks that cannot reach each other, TURN
-            run: NATLAB_SIZE_MB=20 python3 scripts/natlab/natlab.py matrix --via turn --isolate --timeout 60
+            run: NATLAB_SIZE_MB=20 python3 scripts/natlab/natlab.py matrix --via turn --isolate --timeout 60 -v
           - name: port forwards (PCP, NAT-PMP, UPnP)
             run: python3 scripts/natlab/natlab.py portmap
           - name: IPv6 firewalls, and both families at once
-            run: python3 scripts/natlab/natlab.py v6 --direct-only
+            run: python3 scripts/natlab/natlab.py v6 --direct-only -v
           - name: IPv6 pinholes
             run: python3 scripts/natlab/natlab.py portmap6
           - name: local network, one NAT, forgetful NAT

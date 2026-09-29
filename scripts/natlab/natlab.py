@@ -32,8 +32,8 @@ client.
     scripts/natlab/natlab.py oracle                 # check the NAT kinds themselves
     scripts/natlab/natlab.py matrix                 # every pair, real transfers, through a relay
     scripts/natlab/natlab.py matrix --via card      # ... with two contact cards handed over by "hand"
-    scripts/natlab/natlab.py matrix --via turn      # ... and a TURN server (NATLAB_SIZE_MB=100: long
-                                                    #     enough for a session to move to a direct path)
+    scripts/natlab/natlab.py matrix --via turn      # ... and a TURN server (NATLAB_SIZE_MB=30 NATLAB_MAX_RATE=20M:
+                                                    #     long enough for a session to move to a direct path)
     scripts/natlab/natlab.py matrix --via dht       # ... and the DHT alone: the sender knows only an ID
     scripts/natlab/natlab.py pair port_restricted symmetric_random
     scripts/natlab/natlab.py portmap                # PCP, NAT-PMP, UPnP against miniupnpd
@@ -586,6 +586,18 @@ TURN_PORT = 3480
 TURN_USER, TURN_PASSWORD = "alice", "s3cret"
 
 
+def plain(addr):
+    """`addr` (ip:port, as a program prints it) with an IPv4 address that a
+    dual-stack socket shows in its mapped form, [::ffff:a.b.c.d]:port,
+    written the plain way: which of the two a program prints depends on the
+    kernel it runs on, and what happened does not."""
+    ip, port = addr.rsplit(":", 1)
+    ip = ip.strip("[]")
+    if ip.lower().startswith("::ffff:") and "." in ip:
+        ip = ip[len("::ffff:"):]
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
 def classify(connected, topo, relay_port, turn=False):
     """Which kind of path a session ended up on, from the address it uses."""
     if connected is None:
@@ -778,7 +790,11 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
                 detail += f"\n--- conntrack in {gw}\n" + "\n".join(
                     l[:170] for l in ct.splitlines() if "udp" in l
                 )
-            detail += "\n--- sender.log\n" + log[-1500:] + "\n--- receiver.log\n" + lab.log("receiver.log")[-1500:]
+            detail += (
+                "\n--- sender.log\n" + log[-3500:]
+                + "\n--- receiver.log\n" + lab.log("receiver.log")[-3500:]
+                + "\n--- relay.log\n" + lab.log("relay.log")[-2000:]
+            )
         return ok, path, took, detail
     finally:
         lab.close()
@@ -800,7 +816,9 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False):
         turn_args = ["--turn", f"{TURN_USER}:{TURN_PASSWORD}@{server_arg(topo)}:{TURN_PORT}"]
     data = os.path.join(d, "payload.bin")
     # Small unless asked otherwise: a session carried by a relay is only moved
-    # to a direct path if it lasts long enough for the path to open.
+    # to a direct path if it lasts long enough for the path to open. How long
+    # it lasts is the size over the rate (NATLAB_MAX_RATE, as sharp-sender's
+    # --max-rate takes it), not how fast the machine is.
     size_mb = int(os.environ.get("NATLAB_SIZE_MB", "1"))
     with open(data, "wb") as f:
         for _ in range(size_mb):
@@ -830,6 +848,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False):
     sender = lab.spawn(
         "A",
         [f"{BIN}/sharp-sender", data, rcard, "--headless", *stun_args(topo), *turn_args,
+         *(["--max-rate", os.environ["NATLAB_MAX_RATE"]] if os.environ.get("NATLAB_MAX_RATE") else []),
          "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
         "sender.log",
     )
@@ -1071,6 +1090,8 @@ def cmd_matrix(args):
             rows.append((a, b, ok, path, took, met))
             result = f"{'ok  ' if ok else 'FAIL'} {path:16} {took:5.1f}s"
             print(f"{a:18} {b:18} {result:30} {'as expected' if met else 'UNEXPECTED (wanted ' + want_path + ')'}", flush=True)
+            if not met and args.verbose:
+                print(detail, flush=True)
     failed = [r for r in rows if not r[2]]
     unexpected = [r for r in rows if not r[5]]
     direct = [r for r in rows if r[2] and is_direct(r[3])]
@@ -1189,10 +1210,10 @@ def cmd_lan(args):
                 if not f.endswith(".sharp-part"):
                     got = hashlib.sha256(open(f"{out}/{f}", "rb").read()).hexdigest()
             conn = re.search(r"Connected to (\S+)", lab.log(f"sender-{name}.log"))
-            transferred = got == want and conn is not None and conn.group(1).startswith("10.9.0.2:")
+            transferred = got == want and conn is not None and plain(conn.group(1)).startswith("10.9.0.2:")
             ok = transferred == expect_ok
             results.append(ok)
-            what = f"via {conn.group(1)}" if conn else "found nobody"
+            what = f"via {plain(conn.group(1))}" if conn else "found nobody"
             print(f"{name}: {'ok' if ok else 'FAILED'} - {what} in {took:.1f}s, as {'wanted' if ok else 'NOT wanted'}")
             if not ok:
                 print(lab.log(f"sender-{name}.log")[-1500:])
@@ -1324,7 +1345,7 @@ def cmd_portmap(args):
                         if not name.endswith(".sharp-part"):
                             got = hashlib.sha256(open(f"{d}/out/{name}", "rb").read()).hexdigest()
                     conn = re.search(r"Connected to (\S+)", lab.log("sender.log"))
-                    ok = got == want and conn is not None and conn.group(1) == forwarded
+                    ok = got == want and conn is not None and plain(conn.group(1)) == plain(forwarded)
                     ok_all &= ok
                     print(f"{proto:18} {b_nat:18} {a_nat:18} {'ok  ' if ok else 'FAIL'} via {forwarded} in {took:.1f}s", flush=True)
                     if not ok:
@@ -1386,8 +1407,9 @@ upnp_forward_chain=miniupnpd
 upnp_nat_chain=prerouting_miniupnpd
 upnp_nat_postrouting_chain=postrouting_miniupnpd
 allow 1024-65535 0.0.0.0/0 1024-65535
-allow 1024-65535 ::/0 1024-65535
 """
+    # (No permission rule for IPv6: the daemon's `allow` lines are IPv4 only,
+    # and it takes a line naming `::/0` as an error in the whole file.)
     path = os.path.join(lab.dir, "miniupnpd6.conf")
     with open(path, "w") as f:
         f.write(conf)
@@ -1758,6 +1780,7 @@ def main():
     matrix.add_argument("--via", choices=["relay", "card", "turn", "dht"], default="relay",
                         help="how the two find each other: a relay, or cards handed over by hand")
     matrix.add_argument("--timeout", type=int, default=30)
+    matrix.add_argument("-v", "--verbose", action="store_true", help="the logs of every pair that was not as expected")
     args = ap.parse_args()
     sh("ip", "link", "set", "lo", "up")
     sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "timeout": cmd_timeout, "lan": cmd_lan}[args.cmd](args))
