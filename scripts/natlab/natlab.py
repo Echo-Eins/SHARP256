@@ -39,6 +39,7 @@ client.
     scripts/natlab/natlab.py portmap                # PCP, NAT-PMP, UPnP against miniupnpd
     scripts/natlab/natlab.py portmap6               # IPv6 pinholes (PCP, UPnP IGD2), with a control
     scripts/natlab/natlab.py lan                    # multicast DNS on one network
+    scripts/natlab/natlab.py early                  # a sender that starts before its receiver has registered
     scripts/natlab/natlab.py v6                     # IPv6 firewalls, and both families together
     scripts/natlab/natlab.py probe port_restricted symmetric_random   # sharp-probe on both hosts
     scripts/natlab/natlab.py probe --all --wait 12  # ... for every pair: does its verdict match what a transfer does?
@@ -678,6 +679,31 @@ pidfile={lab.dir}/turnserver.pid
     return p
 
 
+def relay_may_only_introduce(lab, v6):
+    """The relay may introduce two hosts and tell each what the other looks
+    like from outside — but it cannot carry anything: only what a direct path
+    could do is left."""
+    lab.nft("S", """table ip filter {
+  chain in {
+    type filter hook input priority filter;
+    udp dport { 5560, 3478, 3479 } accept
+    ip protocol udp drop
+  }
+}
+""")
+    if v6:
+        lab.nft("S", """table ip6 filter6 {
+  chain in {
+    type filter hook input priority filter;
+    ct state established,related accept
+    udp dport { 5560, 3478, 3479 } accept
+    icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
+    meta l4proto udp drop
+  }
+}
+""")
+
+
 def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=False, verbose=False,
              via="relay", human_delay=2.0, v6=None, v4=True, isolate=False):
     """One real transfer, sender behind `a_nat`, receiver behind `b_nat`.
@@ -714,28 +740,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
             r = lab.x("A", "ping", "-6", "-c", "2", "-W", "2", "2a0e:aa00:2:1::2", check=False)
             print("--- A ping B:", r.stdout[-400:], r.stderr[-300:])
         if not carry:
-            # The relay may introduce the two, and tell them what each looks
-            # like from outside — but it cannot carry anything: only what a
-            # direct path could do is left.
-            lab.nft("S", f"""table ip filter {{
-  chain in {{
-    type filter hook input priority filter;
-    udp dport {{ 5560, 3478, 3479 }} accept
-    ip protocol udp drop
-  }}
-}}
-""")
-            if v6:
-                lab.nft("S", f"""table ip6 filter6 {{
-  chain in {{
-    type filter hook input priority filter;
-    ct state established,related accept
-    udp dport {{ 5560, 3478, 3479 }} accept
-    icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert }} accept
-    meta l4proto udp drop
-  }}
-}}
-""")
+            relay_may_only_introduce(lab, v6)
         relay_stun = ["--stun", S1, "--stun", S2] + (["--stun", S61, "--stun", S62] if v6 else [])
         relay = lab.spawn(
             "S",
@@ -1658,6 +1663,77 @@ def cmd_samenat(args):
     return 0 if ok_all else 1
 
 
+def cmd_early(args):
+    """A sender that asks the relay for a receiver before that receiver has
+    registered — two people starting at about the same time — keeps asking,
+    and is put through once the receiver is there. The relay may only
+    introduce and the receiver's NAT lets in nothing it has not been sent
+    to, so the introduction is the only way and a sender that gave up on the
+    relay at the first "unknown" would never arrive."""
+    ok_all = True
+    print(f"{'sender behind':18} {'receiver behind':18} result")
+    for a_nat, b_nat in (("open", "port_restricted"), ("port_restricted", "restricted"), ("full_cone", "symmetric_random")):
+        lab = Lab()
+        try:
+            topo = Topo(lab, a_nat, b_nat)
+            d = lab.dir
+            relay_may_only_introduce(lab, False)
+            lab.spawn(
+                "S",
+                [f"{BIN}/sharp-relay", "--bind", "0.0.0.0:5560", "--stun", S1, "--stun", S2,
+                 "--identity", f"{d}/relay.key", "--log", "info"],
+                "relay.log",
+            )
+            rid = wait_for(lab, "relay.log", r"Receivers: --relay (sh-\S+?)@", 10).group(1)
+            # The receiver's ID is known before it runs: it is its key's.
+            shown = lab.x("B", f"{BIN}/sharp-receiver", "--identity", f"{d}/r.key", "--id").stdout
+            receiver_id = re.search(r"(sh-[a-z0-9]+)", shown).group(1)
+            data = os.path.join(d, "payload.bin")
+            with open(data, "wb") as f:
+                f.write(os.urandom(1 << 20))
+            want = hashlib.sha256(open(data, "rb").read()).hexdigest()
+            os.makedirs(f"{d}/out", exist_ok=True)
+            start = time.time()
+            sender = lab.spawn(
+                "A",
+                [f"{BIN}/sharp-sender", data, f"{receiver_id}@{S1}:9", "--relay", f"{S1}:5560", "--headless",
+                 "--stun", f"{S1}:3478", "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+                "sender.log",
+            )
+            time.sleep(args.delay)
+            lab.spawn(
+                "B",
+                [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
+                 "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
+                 "--relay", f"{rid}@{S1}:5560", "--log-level", "info"],
+                "receiver.log",
+            )
+            try:
+                sender.wait(timeout=args.timeout)
+            except subprocess.TimeoutExpired:
+                sender.kill()
+            took = time.time() - start
+            got = None
+            for f in os.listdir(f"{d}/out"):
+                if not f.endswith(".sharp-part"):
+                    got = hashlib.sha256(open(f"{d}/out/{f}", "rb").read()).hexdigest()
+            log = lab.log("sender.log")
+            conn = re.search(r"Connected to (\S+)", log)
+            path = classify(conn.group(1) if conn else None, topo, 5560) if got == want else "none"
+            ok = got == want and is_direct(path)
+            ok_all &= ok
+            asked_again = "asking again" in log
+            print(f"{a_nat:18} {b_nat:18} {'ok  ' if ok else 'FAIL'} {path} in {took:.1f}s "
+                  f"(the sender {'asked again' if asked_again else 'did not ask again'} for its receiver, which started "
+                  f"{args.delay:.1f}s after it)", flush=True)
+            if not ok:
+                print(log[-2000:])
+                print(lab.log("receiver.log")[-1500:])
+        finally:
+            lab.close()
+    return 0 if ok_all else 1
+
+
 def cmd_timeout(args):
     """A NAT that forgets a UDP flow after a few seconds: the receiver's
     mapping towards its relay has to be kept alive by what it sends (see
@@ -1801,6 +1877,9 @@ def main():
     lan = sub.add_parser("lan")
     lan.add_argument("--timeout", type=int, default=25)
     sub.add_parser("samenat")
+    early = sub.add_parser("early")
+    early.add_argument("--delay", type=float, default=2.5, help="seconds the receiver starts after the sender")
+    early.add_argument("--timeout", type=int, default=45)
     to = sub.add_parser("timeout")
     to.add_argument("--memory", type=int, default=8, help="seconds the NAT keeps a UDP flow")
     to.add_argument("--wait", type=int, default=60, help="seconds the receiver is left idle")
@@ -1824,7 +1903,7 @@ def main():
     matrix.add_argument("-v", "--verbose", action="store_true", help="the logs of every pair that was not as expected")
     args = ap.parse_args()
     sh("ip", "link", "set", "lo", "up")
-    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "timeout": cmd_timeout, "lan": cmd_lan}[args.cmd](args))
+    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "timeout": cmd_timeout, "lan": cmd_lan, "early": cmd_early}[args.cmd](args))
 
 
 if __name__ == "__main__":
