@@ -180,6 +180,9 @@ struct Shared {
     /// published it (see [`Unwritten`]); held to three quarters of the
     /// budget.
     unwritten_total: AtomicU64,
+    /// Sockets particular peers are answered from.
+    #[cfg(feature = "nat-traversal")]
+    routes: Arc<crate::nat::birthday::Routes>,
 }
 
 /// Replaces the value of `a` with `f` of it, unless `f` says `None`;
@@ -198,6 +201,17 @@ fn update_atomic(a: &AtomicU64, mut f: impl FnMut(u64) -> Option<u64>) -> bool {
 }
 
 impl Shared {
+    /// Sends one datagram to `to` from the socket that peer is reached
+    /// through: the receiver's own, unless the peer had to be met at another
+    /// (see `nat::birthday`).
+    fn send(&self, to: SocketAddr, datagram: &[u8]) -> io::Result<()> {
+        #[cfg(feature = "nat-traversal")]
+        if let Some(sent) = self.routes.send(to, datagram) {
+            return sent;
+        }
+        self.socket.try_send(to, datagram)
+    }
+
     fn queue_budget(&self) -> u64 {
         self.cfg.memory_budget / 4
     }
@@ -309,6 +323,13 @@ const DECLINES_REMEMBERED: usize = 1024;
 
 pub struct Receiver {
     shared: Arc<Shared>,
+    /// Datagrams that reach the receiver through a socket other than its
+    /// own, from a peer that could only be met that way (see
+    /// `nat::birthday`); the sender half keeps the channel open when there
+    /// is nothing to send through it.
+    aux_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    #[cfg(not(feature = "nat-traversal"))]
+    _aux_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
 }
 
 impl Receiver {
@@ -350,7 +371,14 @@ impl Receiver {
                 None
             }
         };
+        #[cfg(feature = "nat-traversal")]
+        let (routes, aux_rx) = crate::nat::birthday::Routes::new();
+        #[cfg(not(feature = "nat-traversal"))]
+        let (_aux_tx, aux_rx) = mpsc::channel(1);
         Ok(Self {
+            aux_rx,
+            #[cfg(not(feature = "nat-traversal"))]
+            _aux_tx,
             shared: Arc::new(Shared {
                 cfg,
                 socket: Arc::new(socket),
@@ -361,6 +389,8 @@ impl Receiver {
                 queued_total: AtomicU64::new(0),
                 receiving: std::sync::atomic::AtomicUsize::new(0),
                 unwritten_total: AtomicU64::new(0),
+                #[cfg(feature = "nat-traversal")]
+                routes,
             }),
         })
     }
@@ -382,6 +412,7 @@ impl Receiver {
     /// Serves transfers until cancelled.
     pub async fn run(self) -> Result<(), RecvError> {
         let shared = self.shared;
+        let mut aux_rx = self.aux_rx;
 
         // NAT discovery runs in the background; its STUN responses arrive on
         // this socket and are handed over below.
@@ -401,11 +432,23 @@ impl Receiver {
         let keepalive: crate::nat::keepalive::SharedKeepalive = Arc::new(parking_lot::Mutex::new(
             crate::nat::keepalive::Keepalive::new(shared.cfg.nat_keepalive),
         ));
+        // What this receiver's NAT does, as its own tests find out: told to
+        // every relay it registers with, and what a punch is aimed by.
+        #[cfg(feature = "nat-traversal")]
+        let (hints_tx, hints_rx) =
+            tokio::sync::watch::channel(crate::nat::card::FamilyHints::unknown());
+        #[cfg(feature = "nat-traversal")]
+        let puncher = Arc::new(
+            crate::nat::punch::Puncher::new(shared.socket.udp(), hints_rx).with_hit_handler({
+                let routes = shared.routes.clone();
+                Arc::new(move |hit| routes.adopt(hit))
+            }),
+        );
         #[cfg(feature = "nat-traversal")]
         let nat = if shared.cfg.nat_traversal && !shared.cfg.relay_only() {
             let events = shared.cfg.events.clone();
             let id = shared.identity.id();
-            crate::nat::spawn_receiver_discovery(
+            crate::nat::spawn_discovery(
                 shared.socket.udp(),
                 {
                     let mut c = crate::nat::NatConfig {
@@ -418,6 +461,7 @@ impl Receiver {
                     c
                 },
                 keepalive.clone(),
+                hints_tx,
                 shared.cancel.clone(),
                 move |r| {
                     emit(
@@ -439,7 +483,7 @@ impl Receiver {
         // introduced to it, and carried if the introduction is not enough.
         // Their control messages arrive on this same socket.
         #[cfg(feature = "nat-traversal")]
-        let relays = spawn_relay_clients(&shared, &keepalive);
+        let relays = spawn_relay_clients(&shared, &keepalive, &puncher);
 
         let socket = shared.socket.clone();
         let cancel = shared.cancel.clone();
@@ -483,6 +527,18 @@ impl Receiver {
                     }
                 }
                 Some(key) = done_rx.recv() => d.forget(&key),
+                Some((data, from)) = aux_rx.recv() => {
+                    // From a peer met at a socket of its own: routed like
+                    // anything the main socket reads.
+                    let mut buf = data;
+                    let r = Received { from, len: buf.len(), stride: buf.len() };
+                    #[cfg(feature = "nat-traversal")]
+                    if side_channel(nat.as_ref(), &relays, &buf, from, buf.len()) {
+                        continue;
+                    }
+                    d.on_received(&mut buf, r, Instant::now());
+                    d.flush();
+                }
                 _ = cancel.cancelled() => {
                     tracing::info!("receiver shutting down; {} active session(s)", d.sessions.len());
                     // Sessions observe the same token; wait until each one has
@@ -667,7 +723,7 @@ impl Dispatcher {
             // Make the sender prove it receives at its address before we
             // spend public-key operations on it.
             if let Some(reply) = self.cookies.reply(pkt, from, now) {
-                let _ = self.shared.socket.try_send(from, &reply);
+                let _ = self.shared.send(from, &reply);
             }
             return;
         }
@@ -845,7 +901,7 @@ impl Dispatcher {
             ack: rejection(init.hello.timestamp, reason, message),
         });
         if let Ok((pkt, _)) = incoming.respond(self.new_cid(), &payload) {
-            let _ = self.shared.socket.try_send(to, &pkt);
+            let _ = self.shared.send(to, &pkt);
         }
     }
 
@@ -923,6 +979,7 @@ const RELAY_RESOLVE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 fn spawn_relay_clients(
     shared: &Arc<Shared>,
     keepalive: &crate::nat::keepalive::SharedKeepalive,
+    puncher: &Arc<crate::nat::punch::Puncher>,
 ) -> RelayClients {
     let list: Arc<parking_lot::RwLock<Vec<RelayClient>>> =
         Arc::new(parking_lot::RwLock::new(Vec::new()));
@@ -955,6 +1012,7 @@ fn spawn_relay_clients(
         let events = shared.cfg.events.clone();
         let list = list.clone();
         let keepalive = keepalive.clone();
+        let puncher = puncher.clone();
         tasks.push(tokio::spawn(async move {
             let Some(addrs) = resolve_relay(&host, reach, &cancel).await else {
                 return;
@@ -973,6 +1031,7 @@ fn spawn_relay_clients(
                 rx,
                 cancel,
                 keepalive,
+                puncher,
                 move |addr: SocketAddr, observed: SocketAddr| {
                     // Deliberately *not* published as an address to hand a
                     // sender. It is this receiver's NAT mapping towards that
@@ -1526,7 +1585,7 @@ impl Session {
         if sec.keys.send.seal(&mut self.tx_buf).is_err() {
             return;
         }
-        if let Err(e) = self.shared.socket.try_send(to, &self.tx_buf) {
+        if let Err(e) = self.shared.send(to, &self.tx_buf) {
             if e.kind() != io::ErrorKind::WouldBlock {
                 tracing::debug!("send {:?} failed: {}", msg.msg_type(), e);
             }
@@ -2101,7 +2160,7 @@ impl Session {
                     auth_failures: 0,
                 });
                 // The answer goes where the question came from, always.
-                if let Err(e) = self.shared.socket.try_send(h.from, &pkt) {
+                if let Err(e) = self.shared.send(h.from, &pkt) {
                     tracing::debug!("sending handshake response failed: {}", e);
                 }
                 // A handshake from an address we have not proven does not
@@ -2144,7 +2203,7 @@ impl Session {
             ack: rejection(h.init.hello.timestamp, reason, message),
         });
         if let Ok((pkt, _)) = h.incoming.respond(h.cid, &payload) {
-            let _ = self.shared.socket.try_send(h.from, &pkt);
+            let _ = self.shared.send(h.from, &pkt);
         }
     }
 

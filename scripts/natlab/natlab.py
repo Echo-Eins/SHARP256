@@ -502,6 +502,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         start = time.time()
         send_args = [
             f"{BIN}/sharp-sender", data, address, "--relay", f"{S1}:5560", "--headless",
+            "--stun", f"{S1}:3478",
             "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info",
         ]
         sender = lab.spawn("A", send_args, "sender.log")
@@ -540,21 +541,56 @@ def cmd_pair(args):
     return 0 if ok else 1
 
 
+# Two NATs that both number their ports per destination cannot be punched
+# through by anything that is worth sending (see src/nat/punch.rs): the
+# ports each end would need to hit are the product of two unknowns. Every
+# other pair is expected to open a direct path.
+HARD = {"symmetric_seq", "symmetric_random"}
+
+
+def expected(a, b, carry):
+    """(connects, path) as the engine is meant to behave for this pair."""
+    if a in HARD and b in HARD:
+        return (True, "relay") if carry else (False, "none")
+    return True, "direct"
+
+
+def is_direct(path):
+    return path.startswith("direct") or path == "lan"
+
+
 def cmd_matrix(args):
     kinds = args.kinds or list(NAT_KINDS)
     for k in kinds:
         if k not in NAT_KINDS:
             raise SystemExit(f"unknown NAT kind {k}; choose from {' '.join(NAT_KINDS)}")
     rows = []
-    print(f"{'sender behind':18} {'receiver behind':18} result")
+    carry = not args.direct_only
+    print(f"{'sender behind':18} {'receiver behind':18} {'result':30} verdict")
     for a in kinds:
         for b in kinds:
-            ok, path, took, detail = transfer(a, b, carry=not args.direct_only, timeout=args.timeout)
-            rows.append((a, b, ok, path, took))
-            print(f"{a:18} {b:18} {'ok  ' if ok else 'FAIL'} {path:16} {took:5.1f}s", flush=True)
+            ok, path, took, detail = transfer(a, b, carry=carry, timeout=args.timeout)
+            want_ok, want_path = expected(a, b, carry)
+            met = ok == want_ok and (
+                not ok or (path == "relay") == (want_path == "relay") and (want_path == "relay" or is_direct(path))
+            )
+            rows.append((a, b, ok, path, took, met))
+            result = f"{'ok  ' if ok else 'FAIL'} {path:16} {took:5.1f}s"
+            print(f"{a:18} {b:18} {result:30} {'as expected' if met else 'UNEXPECTED (wanted ' + want_path + ')'}", flush=True)
     failed = [r for r in rows if not r[2]]
-    print(f"\n{len(rows) - len(failed)} of {len(rows)} pairs connected")
-    return 1 if failed and not args.allow_failures else 0
+    unexpected = [r for r in rows if not r[5]]
+    direct = [r for r in rows if r[2] and is_direct(r[3])]
+    relayed = [r for r in rows if r[2] and r[3] == "relay"]
+    print(f"\n{len(rows) - len(failed)} of {len(rows)} pairs connected: {len(direct)} directly, {len(relayed)} through the relay")
+    print(f"{len(rows) - len(unexpected)} of {len(rows)} as the theory says they must")
+    if args.markdown:
+        with open(args.markdown, "w") as f:
+            f.write("| sender behind | receiver behind | result | path | seconds | as expected |\n|---|---|---|---|---|---|\n")
+            for a, b, ok, path, took, met in rows:
+                f.write(f"| {a} | {b} | {'connected' if ok else 'not connected'} | {path} | {took:.1f} | {'yes' if met else '**NO**'} |\n")
+    if args.allow_failures:
+        return 0
+    return 1 if unexpected else 0
 
 
 def cmd_oracle(args):
@@ -593,6 +629,7 @@ def main():
     pair.add_argument("--direct-only", action="store_true", help="the relay may introduce but not carry")
     matrix = sub.add_parser("matrix")
     matrix.add_argument("kinds", nargs="*", help="a subset of: " + " ".join(NAT_KINDS))
+    matrix.add_argument("--markdown", help="write the results as a table to this file")
     matrix.add_argument("--allow-failures", action="store_true")
     matrix.add_argument("--direct-only", action="store_true", help="the relay may introduce but not carry")
     matrix.add_argument("--timeout", type=int, default=30)

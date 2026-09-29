@@ -107,6 +107,128 @@ impl NatHints {
     pub fn is_symmetric(&self) -> bool {
         matches!(self.mapping, 2 | 3)
     }
+
+    /// Bytes on the wire, in a card and in a relay message.
+    pub const WIRE_LEN: usize = 6;
+
+    pub fn to_bytes(&self) -> [u8; Self::WIRE_LEN] {
+        let d = self.delta.to_be_bytes();
+        [
+            self.mapping,
+            self.filtering,
+            match self.allocation {
+                Allocation::Unknown => 0,
+                Allocation::Preserved => 1,
+                Allocation::Sequential => 2,
+                Allocation::Random => 3,
+            },
+            d[0],
+            d[1],
+            match self.hairpin {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            } | (self.cgn as u8) << 2,
+        ]
+    }
+
+    /// `None` for anything a version of ours would not have written: hints
+    /// come from strangers, and a value we do not know is refused rather
+    /// than guessed at.
+    pub fn from_bytes(raw: &[u8; Self::WIRE_LEN]) -> Option<Self> {
+        let [mapping, filtering, allocation, d0, d1, f] = *raw;
+        if mapping > 4 || filtering > 3 || f & !0b111 != 0 || f & 0b11 == 3 {
+            return None;
+        }
+        Some(Self {
+            mapping,
+            filtering,
+            allocation: match allocation {
+                0 => Allocation::Unknown,
+                1 => Allocation::Preserved,
+                2 => Allocation::Sequential,
+                3 => Allocation::Random,
+                _ => return None,
+            },
+            delta: i16::from_be_bytes([d0, d1]),
+            hairpin: match f & 0b11 {
+                0 => None,
+                1 => Some(false),
+                _ => Some(true),
+            },
+            cgn: f & 0b100 != 0,
+        })
+    }
+}
+
+/// What is known of the NAT (or firewall) in front of each address family.
+/// A host on both has two paths to the same peer, and what punches through
+/// one says nothing about the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FamilyHints {
+    pub v4: NatHints,
+    pub v6: NatHints,
+}
+
+impl FamilyHints {
+    pub const fn unknown() -> Self {
+        Self {
+            v4: NatHints::unknown(),
+            v6: NatHints::unknown(),
+        }
+    }
+
+    /// The hints for the path to `addr`.
+    pub fn for_addr(&self, addr: &SocketAddr) -> NatHints {
+        if crate::address::canonical(*addr).is_ipv6() {
+            self.v6
+        } else {
+            self.v4
+        }
+    }
+
+    /// The one a relay is told: IPv4's when it was measured, where the NATs
+    /// are, and IPv6's otherwise.
+    pub fn primary(&self) -> NatHints {
+        if self.v4.mapping != 0 {
+            self.v4
+        } else {
+            self.v6
+        }
+    }
+
+    /// Whether anything has been measured.
+    pub fn is_known(&self) -> bool {
+        self.v4.mapping != 0 || self.v6.mapping != 0
+    }
+}
+
+impl From<&super::behaviour::Behaviour> for NatHints {
+    fn from(b: &super::behaviour::Behaviour) -> Self {
+        use super::behaviour::{Filtering, Mapping};
+        Self {
+            mapping: if b.open_internet {
+                4
+            } else {
+                match b.mapping {
+                    Mapping::Unknown => 0,
+                    Mapping::EndpointIndependent => 1,
+                    Mapping::AddressDependent => 2,
+                    Mapping::AddressAndPortDependent => 3,
+                }
+            },
+            filtering: match b.filtering {
+                Filtering::Unknown => 0,
+                Filtering::EndpointIndependent => 1,
+                Filtering::AddressDependent => 2,
+                Filtering::AddressAndPortDependent => 3,
+            },
+            allocation: b.allocation,
+            delta: b.alloc_step,
+            hairpin: b.hairpinning,
+            cgn: false,
+        }
+    }
 }
 
 /// A relay the card's owner is registered with.
@@ -196,22 +318,7 @@ impl Card {
         let flags = self.v4.is_some() as u8 | (self.v6.is_some() as u8) << 1;
         out.push(flags);
         for h in [&self.v4, &self.v6].into_iter().flatten() {
-            out.push(h.mapping);
-            out.push(h.filtering);
-            out.push(match h.allocation {
-                Allocation::Unknown => 0,
-                Allocation::Preserved => 1,
-                Allocation::Sequential => 2,
-                Allocation::Random => 3,
-            });
-            out.extend_from_slice(&h.delta.to_be_bytes());
-            out.push(
-                match h.hairpin {
-                    None => 0,
-                    Some(false) => 1,
-                    Some(true) => 2,
-                } | (h.cgn as u8) << 2,
-            );
+            out.extend_from_slice(&h.to_bytes());
         }
         let relays = &self.relays[..self.relays.len().min(MAX_RELAYS)];
         out.push(relays.len() as u8);
@@ -266,35 +373,10 @@ impl Card {
             if !present {
                 return Ok(None);
             }
-            let mapping = r.u8()?;
-            let filtering = r.u8()?;
-            if mapping > 4 || filtering > 3 {
-                return Err(CardError::Damaged("unknown NAT behaviour"));
-            }
-            let allocation = match r.u8()? {
-                0 => Allocation::Unknown,
-                1 => Allocation::Preserved,
-                2 => Allocation::Sequential,
-                3 => Allocation::Random,
-                _ => return Err(CardError::Damaged("unknown port allocation")),
-            };
-            let delta = i16::from_be_bytes(r.take(2)?.try_into().unwrap());
-            let f = r.u8()?;
-            if f & !0b111 != 0 || f & 0b11 == 3 {
-                return Err(CardError::Damaged("unknown NAT flags"));
-            }
-            Ok(Some(NatHints {
-                mapping,
-                filtering,
-                allocation,
-                delta,
-                hairpin: match f & 0b11 {
-                    0 => None,
-                    1 => Some(false),
-                    _ => Some(true),
-                },
-                cgn: f & 0b100 != 0,
-            }))
+            let raw: [u8; NatHints::WIRE_LEN] = r.take(NatHints::WIRE_LEN)?.try_into().unwrap();
+            NatHints::from_bytes(&raw)
+                .map(Some)
+                .ok_or(CardError::Damaged("unknown NAT behaviour"))
         };
         let v4 = hints(flags & 1 != 0)?;
         let v6 = hints(flags & 2 != 0)?;

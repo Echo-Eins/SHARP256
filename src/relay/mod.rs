@@ -44,6 +44,7 @@ pub mod client;
 pub mod server;
 
 use crate::crypto::{Identity, SharpId};
+use crate::nat::card::NatHints;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use subtle::ConstantTimeEq;
 
@@ -224,6 +225,11 @@ pub enum Message {
         /// address could be sent again later — to move the registration
         /// back to an old address, or to turn a private one public.
         stamp: u64,
+        /// What the sender of this knows of its own NAT, for the relay to
+        /// hand to whoever asks for it (see [`NatHints`]). Advice, not
+        /// authority: the proof covers it, but only so that nobody on the
+        /// way can change it.
+        hints: NatHints,
         /// Proof that this is the identity's owner asking.
         proof: [u8; PROOF_LEN],
     },
@@ -242,6 +248,8 @@ pub enum Message {
     Connect {
         target: SharpId,
         token: [u8; TOKEN_LEN],
+        /// The sender's own, for the receiver to be told.
+        hints: NatHints,
     },
     /// Sender → relay: the same, saying who is asking and proving it, for a
     /// relay that serves only identities on its list. The proof is made as
@@ -250,6 +258,7 @@ pub enum Message {
     ConnectAs {
         target: SharpId,
         token: [u8; TOKEN_LEN],
+        hints: NatHints,
         id: SharpId,
         proof: [u8; PROOF_LEN],
     },
@@ -261,6 +270,9 @@ pub enum Message {
         port: u16,
         peer: SocketAddr,
         ticket: [u8; TOKEN_LEN],
+        /// What the receiver said of its NAT when it registered: how to aim
+        /// at it when its address alone is not enough.
+        hints: NatHints,
     },
     /// Relay → receiver: somebody is coming through on this port, and they
     /// appear to be at this address. Send an [`Message::Open`] to the port
@@ -269,6 +281,8 @@ pub enum Message {
         port: u16,
         peer: SocketAddr,
         ticket: [u8; TOKEN_LEN],
+        /// What the sender said of its NAT.
+        hints: NatHints,
     },
     Error {
         code: Refusal,
@@ -377,6 +391,17 @@ fn take_addr(buf: &[u8], pos: &mut usize) -> Option<SocketAddr> {
     }
 }
 
+/// Hints are advice, but they are read like everything else here: a value
+/// this version would not have written is not guessed at, and the message
+/// carrying it is refused (there is one encoding of each message, which the
+/// fuzzing target insists on).
+fn take_hints(buf: &[u8], pos: &mut usize) -> Option<NatHints> {
+    let raw: [u8; NatHints::WIRE_LEN] =
+        buf.get(*pos..*pos + NatHints::WIRE_LEN)?.try_into().ok()?;
+    *pos += NatHints::WIRE_LEN;
+    NatHints::from_bytes(&raw)
+}
+
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 56);
@@ -387,6 +412,7 @@ impl Message {
                 token,
                 flags,
                 stamp,
+                hints,
                 proof,
             } => {
                 out.push(Kind::Register as u8);
@@ -394,6 +420,7 @@ impl Message {
                 out.extend_from_slice(token);
                 out.push(*flags);
                 out.extend_from_slice(&stamp.to_be_bytes());
+                out.extend_from_slice(&hints.to_bytes());
                 out.extend_from_slice(proof);
             }
             Message::Challenge { token } => {
@@ -405,34 +432,53 @@ impl Message {
                 out.extend_from_slice(&lease.to_be_bytes());
                 put_addr(&mut out, *observed);
             }
-            Message::Connect { target, token } => {
+            Message::Connect {
+                target,
+                token,
+                hints,
+            } => {
                 out.push(Kind::Connect as u8);
                 out.extend_from_slice(target.as_bytes());
                 out.extend_from_slice(token);
+                out.extend_from_slice(&hints.to_bytes());
             }
             Message::ConnectAs {
                 target,
                 token,
+                hints,
                 id,
                 proof,
             } => {
                 out.push(Kind::ConnectAs as u8);
                 out.extend_from_slice(target.as_bytes());
                 out.extend_from_slice(token);
+                out.extend_from_slice(&hints.to_bytes());
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(proof);
             }
-            Message::Allocated { port, peer, ticket } => {
+            Message::Allocated {
+                port,
+                peer,
+                ticket,
+                hints,
+            } => {
                 out.push(Kind::Allocated as u8);
                 out.extend_from_slice(&port.to_be_bytes());
                 put_addr(&mut out, *peer);
                 out.extend_from_slice(ticket);
+                out.extend_from_slice(&hints.to_bytes());
             }
-            Message::Incoming { port, peer, ticket } => {
+            Message::Incoming {
+                port,
+                peer,
+                ticket,
+                hints,
+            } => {
                 out.push(Kind::Incoming as u8);
                 out.extend_from_slice(&port.to_be_bytes());
                 put_addr(&mut out, *peer);
                 out.extend_from_slice(ticket);
+                out.extend_from_slice(&hints.to_bytes());
             }
             Message::Error { code } => {
                 out.push(Kind::Error as u8);
@@ -488,6 +534,7 @@ impl Message {
                         pos += 1;
                         let stamp = u64::from_be_bytes(body.get(pos..pos + 8)?.try_into().ok()?);
                         pos += 8;
+                        let hints = take_hints(body, &mut pos)?;
                         let proof: [u8; PROOF_LEN] =
                             body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
                         pos += PROOF_LEN;
@@ -496,10 +543,18 @@ impl Message {
                             token,
                             flags,
                             stamp,
+                            hints,
                             proof,
                         }
                     }
-                    Kind::Connect => Message::Connect { target: id, token },
+                    Kind::Connect => {
+                        let hints = take_hints(body, &mut pos)?;
+                        Message::Connect {
+                            target: id,
+                            token,
+                            hints,
+                        }
+                    }
                     _ => {
                         let stamp = u64::from_be_bytes(body.get(pos..pos + 8)?.try_into().ok()?);
                         pos += 8;
@@ -519,6 +574,7 @@ impl Message {
                 let target: [u8; 32] = body.get(0..32)?.try_into().ok()?;
                 let token: [u8; TOKEN_LEN] = body.get(32..32 + TOKEN_LEN)?.try_into().ok()?;
                 pos = 32 + TOKEN_LEN;
+                let hints = take_hints(body, &mut pos)?;
                 let id: [u8; 32] = body.get(pos..pos + 32)?.try_into().ok()?;
                 pos += 32;
                 let proof: [u8; PROOF_LEN] = body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
@@ -526,6 +582,7 @@ impl Message {
                 Message::ConnectAs {
                     target: SharpId::from_public(target),
                     token,
+                    hints,
                     id: SharpId::from_public(id),
                     proof,
                 }
@@ -550,10 +607,21 @@ impl Message {
                 let peer = take_addr(body, &mut pos)?;
                 let ticket: [u8; TOKEN_LEN] = body.get(pos..pos + TOKEN_LEN)?.try_into().ok()?;
                 pos += TOKEN_LEN;
+                let hints = take_hints(body, &mut pos)?;
                 if kind == Kind::Allocated {
-                    Message::Allocated { port, peer, ticket }
+                    Message::Allocated {
+                        port,
+                        peer,
+                        ticket,
+                        hints,
+                    }
                 } else {
-                    Message::Incoming { port, peer, ticket }
+                    Message::Incoming {
+                        port,
+                        peer,
+                        ticket,
+                        hints,
+                    }
                 }
             }
             Kind::Error => {
@@ -601,6 +669,50 @@ mod tests {
         assert_eq!(Message::decode(&bytes).as_ref(), Some(&m));
     }
 
+    /// The hints a message carries survive the wire, and a value this
+    /// version would not write is refused.
+    #[test]
+    fn hints_ride_along_and_invalid_ones_are_refused() {
+        use crate::nat::behaviour::Allocation;
+        let hints = NatHints {
+            mapping: 3,
+            filtering: 2,
+            allocation: Allocation::Sequential,
+            delta: -4,
+            hairpin: Some(true),
+            cgn: true,
+        };
+        let id = Identity::generate().id();
+        roundtrip(Message::Connect {
+            target: id,
+            token: [1; TOKEN_LEN],
+            hints,
+        });
+        roundtrip(Message::Allocated {
+            port: 40000,
+            peer: "203.0.113.1:5".parse().unwrap(),
+            ticket: [2; TOKEN_LEN],
+            hints,
+        });
+        roundtrip(Message::Incoming {
+            port: 40001,
+            peer: "[2001:db8::1]:5".parse().unwrap(),
+            ticket: [3; TOKEN_LEN],
+            hints,
+        });
+        // A value this version would not write is refused, not guessed at.
+        let mut bytes = Message::Incoming {
+            port: 1,
+            peer: "203.0.113.1:5".parse().unwrap(),
+            ticket: [3; TOKEN_LEN],
+            hints,
+        }
+        .encode();
+        let at = bytes.len() - NatHints::WIRE_LEN;
+        bytes[at] = 99;
+        assert_eq!(Message::decode(&bytes), None);
+    }
+
     #[test]
     fn a_relay_is_written_with_or_without_its_identity() {
         let id = Identity::generate().id();
@@ -633,6 +745,7 @@ mod tests {
         assert_eq!(by_owner, by_relay);
 
         let mut bytes = Message::Register {
+            hints: NatHints::unknown(),
             id: oid,
             token: [4; TOKEN_LEN],
             flags: REGISTER_PRIVATE,
@@ -647,6 +760,7 @@ mod tests {
         assert_eq!(
             Message::decode(&bytes),
             Some(Message::Register {
+                hints: NatHints::unknown(),
                 id: oid,
                 token: [4; TOKEN_LEN],
                 flags: REGISTER_PRIVATE,
@@ -681,6 +795,7 @@ mod tests {
     fn every_message_survives_the_wire() {
         let id = Identity::generate().id();
         roundtrip(Message::Register {
+            hints: NatHints::unknown(),
             id,
             token: [0; TOKEN_LEN],
             flags: 0,
@@ -688,6 +803,7 @@ mod tests {
             proof: [0; PROOF_LEN],
         });
         roundtrip(Message::Register {
+            hints: NatHints::unknown(),
             id,
             token: [7; TOKEN_LEN],
             flags: REGISTER_PRIVATE,
@@ -706,21 +822,25 @@ mod tests {
             observed: "[2001:db8::1]:5555".parse().unwrap(),
         });
         roundtrip(Message::Connect {
+            hints: NatHints::unknown(),
             target: id,
             token: [3; TOKEN_LEN],
         });
         roundtrip(Message::ConnectAs {
+            hints: NatHints::unknown(),
             target: id,
             token: [3; TOKEN_LEN],
             id: Identity::generate().id(),
             proof: [9; PROOF_LEN],
         });
         roundtrip(Message::Allocated {
+            hints: NatHints::unknown(),
             port: 50001,
             peer: "198.51.100.9:6000".parse().unwrap(),
             ticket: [5; TOKEN_LEN],
         });
         roundtrip(Message::Incoming {
+            hints: NatHints::unknown(),
             port: 50001,
             peer: "[2001:db8::2]:6000".parse().unwrap(),
             ticket: [6; TOKEN_LEN],
@@ -761,6 +881,7 @@ mod tests {
     fn malformed_messages_are_refused_not_guessed() {
         let id = Identity::generate().id();
         let good = Message::Register {
+            hints: NatHints::unknown(),
             id,
             token: [1; TOKEN_LEN],
             flags: 0,

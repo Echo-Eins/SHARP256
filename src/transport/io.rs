@@ -60,8 +60,12 @@ impl BatchSocket {
     /// Binds the socket and waits until it can send: until the runtime has
     /// seen it writable, every send would report `WouldBlock`.
     pub async fn bind(addr: SocketAddr, buffer_bytes: usize) -> io::Result<Self> {
-        let io = bind_udp(addr, buffer_bytes)?;
-        let state = UdpSocketState::new((&io).into())?;
+        Self::wrap(Arc::new(bind_udp(addr, buffer_bytes)?)).await
+    }
+
+    /// Batches the datagrams of a socket bound elsewhere (see [`bind_udp`]).
+    pub async fn wrap(io: Arc<UdpSocket>) -> io::Result<Self> {
+        let state = UdpSocketState::new((&*io).into())?;
         // The batch layer lets the kernel ignore the path MTUs it learns;
         // the transfer engines want to hear about them (EMSGSIZE) so that
         // they can shrink their packets.
@@ -82,7 +86,7 @@ impl BatchSocket {
         }
         io.writable().await?;
         Ok(Self {
-            io: Arc::new(io),
+            io,
             state,
             segments_failed: AtomicBool::new(false),
         })

@@ -431,10 +431,12 @@ fn seed_frames() -> Vec<Vec<u8>> {
 
 #[cfg(feature = "nat-traversal")]
 fn seed_relay() -> Vec<Vec<u8>> {
+    use crate::nat::card::NatHints;
     use crate::relay::{Message, Refusal, PROOF_LEN, TOKEN_LEN};
     let id = fixture().receiver;
     [
         Message::Register {
+            hints: NatHints::unknown(),
             id,
             token: [1; TOKEN_LEN],
             flags: 1,
@@ -442,14 +444,33 @@ fn seed_relay() -> Vec<Vec<u8>> {
             proof: [2; PROOF_LEN],
         },
         Message::Connect {
+            hints: NatHints::unknown(),
             target: id,
             token: [3; TOKEN_LEN],
         },
         Message::ConnectAs {
+            hints: NatHints::unknown(),
             target: id,
             token: [3; TOKEN_LEN],
             id,
             proof: [4; PROOF_LEN],
+        },
+        Message::Allocated {
+            hints: NatHints {
+                mapping: 3,
+                allocation: crate::nat::behaviour::Allocation::Sequential,
+                delta: 2,
+                ..NatHints::unknown()
+            },
+            port: 40000,
+            peer: "203.0.113.5:4000".parse().expect("literal"),
+            ticket: [5; TOKEN_LEN],
+        },
+        Message::Incoming {
+            hints: NatHints::unknown(),
+            port: 40001,
+            peer: "[2001:db8::7]:4000".parse().expect("literal"),
+            ticket: [6; TOKEN_LEN],
         },
         Message::Registered {
             lease: 120,

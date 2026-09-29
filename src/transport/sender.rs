@@ -218,7 +218,12 @@ impl Sender {
     /// filled in as the relays' names resolve, so a slow name server holds
     /// up nothing. The addresses the introductions turn up go to `found`.
     #[cfg(feature = "nat-traversal")]
-    fn spawn_relay_introductions(&self, found_tx: mpsc::UnboundedSender<Found>) -> RelayInboxes {
+    fn spawn_relay_introductions(
+        &self,
+        found_tx: mpsc::UnboundedSender<Found>,
+        puncher: Arc<crate::nat::punch::Puncher>,
+        discovery_done: CancellationToken,
+    ) -> RelayInboxes {
         let inboxes: RelayInboxes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let reach = crate::address::Reach::of(&self.socket.udp());
         for name in &self.cfg.relays {
@@ -238,10 +243,24 @@ impl Sender {
             let found = found_tx.clone();
             let inboxes = inboxes.clone();
             let identity = self.identity.clone();
+            let puncher = puncher.clone();
+            let discovery_done = discovery_done.clone();
             tokio::spawn(async move {
                 // Only for a relay that asks, and only if we know its
                 // identity to prove ours against.
                 let auth = relay_id.map(|r| (&identity, r));
+                // What our own NAT does is worth telling the relay — and
+                // through it the receiver, who aims its punches by it — but
+                // not worth holding the introduction up for long: the tests
+                // take a round trip or two, and without them the receiver
+                // simply treats our NAT as an easy one.
+                let mut hints = puncher.subscribe();
+                tokio::select! {
+                    _ = hints.wait_for(|h| h.is_known()) => {}
+                    _ = discovery_done.cancelled() => {}
+                    _ = tokio::time::sleep(HINTS_WAIT) => {}
+                }
+                let ours = puncher.mine().primary();
                 // A name is resolved like the receiver's own: as a hint.
                 let resolved = tokio::select! {
                     r = tokio::time::timeout(
@@ -281,6 +300,7 @@ impl Sender {
                         &mut rx,
                         &cancel,
                         auth,
+                        ours,
                     )
                     .await
                     {
@@ -306,6 +326,15 @@ impl Sender {
                                 let _ = found.send(Found::Relay(peer));
                             }
                             let _ = found.send(Found::Relay(i.relayed));
+                            // Push outwards at where the receiver appears
+                            // to be, aimed by what it says its NAT does,
+                            // while its own punches come the other way.
+                            if let Some(peer) = i.peer {
+                                let (puncher, cancel) = (puncher.clone(), cancel.clone());
+                                tokio::spawn(async move {
+                                    puncher.run(peer, i.peer_hints, &cancel).await;
+                                });
+                            }
                             // And bind our side of the relay's port, which
                             // takes a round trip to it: until then it carries
                             // nothing of ours.
@@ -525,8 +554,58 @@ impl Sender {
         // IPv6-only network all add more as they turn up, while the
         // addresses above are already being tried.
         let (found_tx, found_rx) = mpsc::unbounded_channel();
+        // What our NAT does, for the relays to pass on and our punches to be
+        // aimed by; found out only where there is a relay to tell.
         #[cfg(feature = "nat-traversal")]
-        let relay_inboxes = self.spawn_relay_introductions(found_tx.clone());
+        let (hints_tx, hints_rx) =
+            tokio::sync::watch::channel(crate::nat::card::FamilyHints::unknown());
+        #[cfg(feature = "nat-traversal")]
+        let (hits_tx, hits_rx) = mpsc::unbounded_channel();
+        #[cfg(feature = "nat-traversal")]
+        let puncher = Arc::new(
+            crate::nat::punch::Puncher::new(self.socket.udp(), hints_rx).with_hit_handler(
+                Arc::new(move |hit| {
+                    let _ = hits_tx.send(hit);
+                }),
+            ),
+        );
+        #[cfg(feature = "nat-traversal")]
+        let discovery_done = CancellationToken::new();
+        #[cfg(feature = "nat-traversal")]
+        let stun_inbox = if self.cfg.nat_traversal && !self.cfg.relays.is_empty() {
+            let mut c = crate::nat::NatConfig {
+                enable_port_mapping: false,
+                maintain: false,
+                ..crate::nat::NatConfig::default()
+            };
+            if !self.cfg.stun_servers.is_empty() {
+                c.stun_servers = self.cfg.stun_servers.clone();
+            }
+            crate::nat::spawn_discovery(
+                self.socket.udp(),
+                c,
+                Default::default(),
+                hints_tx,
+                self.cancel.clone(),
+                |_| {},
+            )
+            .map(|t| {
+                // Told when the tests are over, so that an introduction
+                // does not wait for hints that are not coming.
+                let (done, stun) = (discovery_done.clone(), t.stun_responses);
+                tokio::spawn(async move {
+                    let _ = t.task.await;
+                    done.cancel();
+                });
+                stun
+            })
+        } else {
+            discovery_done.cancel();
+            None
+        };
+        #[cfg(feature = "nat-traversal")]
+        let relay_inboxes =
+            self.spawn_relay_introductions(found_tx.clone(), puncher, discovery_done);
         #[cfg(not(feature = "nat-traversal"))]
         let relay_inboxes = RelayInboxes::default();
         let unresolved = self.spawn_name_resolution(reach, found_tx.clone());
@@ -552,6 +631,11 @@ impl Sender {
             self.cancel.clone(),
         );
 
+        #[cfg(feature = "nat-traversal")]
+        {
+            engine.stun_inbox = stun_inbox;
+            engine.hits = Some(hits_rx);
+        }
         let result = engine.run(hash_task).await;
 
         // Tell the receiver why the transfer ends, so that it releases the
@@ -817,6 +901,13 @@ enum Found {
     Named(SocketAddr),
 }
 
+/// A socket a birthday meeting was made at; there is no such thing without
+/// NAT traversal.
+#[cfg(feature = "nat-traversal")]
+type Hit = crate::nat::birthday::Hit;
+#[cfg(not(feature = "nat-traversal"))]
+type Hit = std::convert::Infallible;
+
 /// A relay we are talking to, and the inbox its datagrams go into.
 type RelayInbox = (SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>);
 /// Every relay's inbox, added to as each relay's name resolves.
@@ -824,6 +915,9 @@ type RelayInboxes = Arc<parking_lot::RwLock<Vec<RelayInbox>>>;
 /// How long a relay's name may take to resolve before it is given up.
 #[cfg(feature = "nat-traversal")]
 const RELAY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an introduction waits for our own NAT tests, at most.
+#[cfg(feature = "nat-traversal")]
+const HINTS_WAIT: Duration = Duration::from_millis(1500);
 
 /// Who we are, whom we talk to, and the shared secret.
 struct Peer {
@@ -903,6 +997,13 @@ struct Engine {
     /// `nat-traversal` feature, which is the only thing that fills it.
     #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
     relay_inboxes: RelayInboxes,
+    /// Where NAT discovery's STUN answers go, while it runs.
+    #[cfg(feature = "nat-traversal")]
+    stun_inbox: Option<mpsc::Sender<crate::nat::stun::Incoming>>,
+    /// Sockets a birthday meeting was made at (see `nat::birthday`): the
+    /// receiver's packets can only be received at one of those, so the
+    /// handshake moves there.
+    hits: Option<mpsc::UnboundedReceiver<Hit>>,
     /// Addresses the introductions, the names and NAT64 turn up, as they
     /// turn up.
     found_rx: mpsc::UnboundedReceiver<Found>,
@@ -920,6 +1021,7 @@ struct Engine {
     peer_ips: std::collections::HashSet<std::net::IpAddr>,
     /// Ports learned that way: how many initiations each has had, and when
     /// the last went.
+    #[cfg(feature = "nat-traversal")]
     reflexive: std::collections::HashMap<SocketAddr, (u32, Instant)>,
     /// Initiations sent so far; while this is below the number of
     /// candidates, there are still untried addresses and probing stays
@@ -1078,10 +1180,14 @@ impl Engine {
             candidates,
             next_candidate: 0,
             relay_inboxes,
+            #[cfg(feature = "nat-traversal")]
+            stun_inbox: None,
+            hits: None,
             found_rx,
             unresolved,
             answered_at: None,
             peer_ips: std::collections::HashSet::new(),
+            #[cfg(feature = "nat-traversal")]
             reflexive: std::collections::HashMap::new(),
             probes_sent: 0,
             answer: None,
@@ -1298,6 +1404,33 @@ impl Engine {
         while let Ok(found) = self.found_rx.try_recv() {
             self.add_candidate(found);
         }
+    }
+
+    /// Moves the handshake to the socket a birthday meeting was made at:
+    /// the receiver's NAT lets packets through to that one and to no other.
+    /// The packet that made the meeting is handled as if it had come in
+    /// here, which answers it — a punch from the receiver is exactly what
+    /// draws our first initiation.
+    #[cfg(feature = "nat-traversal")]
+    async fn adopt_socket(&mut self, hit: Hit) -> Result<(), SendError> {
+        let Hit {
+            socket,
+            from,
+            mut datagram,
+        } = hit;
+        let batch = BatchSocket::wrap(socket).await?;
+        tracing::info!(
+            "the receiver's NAT let {} through to {}; carrying on from there",
+            from,
+            batch.local_addr()?
+        );
+        self.socket = Arc::new(batch);
+        self.on_datagram(&mut datagram, from)
+    }
+
+    #[cfg(not(feature = "nat-traversal"))]
+    async fn adopt_socket(&mut self, hit: Hit) -> Result<(), SendError> {
+        match hit {}
     }
 
     /// Adds an address that turned up, if it is one we are willing to send
@@ -1621,7 +1754,7 @@ impl Engine {
         let mut delay = Duration::from_millis(250);
         let mut next_attempt = Instant::now();
         let mut next_poll: Option<Instant> = None;
-        let socket = self.socket.clone();
+        let mut socket = self.socket.clone();
         let cancel = self.cancel.clone();
         loop {
             if cancel.is_cancelled() {
@@ -1740,11 +1873,18 @@ impl Engine {
                     }));
                 }
             }
+            let mut hit = None;
+            let hits_pending = self.hits.is_some() && self.secure.is_none();
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
                 a = self.found_rx.recv(), if finders_pending => { found = a; }
+                h = async { self.hits.as_mut().unwrap().recv().await }, if hits_pending => { hit = h; }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
                 _ = cancel.cancelled() => return Err(SendError::Cancelled),
+            }
+            if let Some(hit) = hit {
+                self.adopt_socket(hit).await?;
+                socket = self.socket.clone();
             }
             if let Some(found) = found {
                 let before = self.candidates.len();
@@ -2513,6 +2653,18 @@ impl Engine {
         // set aside for us — handed over to whichever introduction is
         // waiting for them. They can never be confused with traffic: the
         // connection id they would parse as is one no endpoint ever picks.
+        // STUN answers to our own NAT tests, while they run: told apart
+        // by the magic cookie, which a transport packet has one chance in
+        // four billion of carrying.
+        #[cfg(feature = "nat-traversal")]
+        if let Some(tx) = &self.stun_inbox {
+            if tx.is_closed() {
+                self.stun_inbox = None;
+            } else if crate::nat::stun::is_stun_message(pkt) {
+                let _ = tx.try_send((pkt.to_vec(), from));
+                return Ok(());
+            }
+        }
         #[cfg(feature = "nat-traversal")]
         if crate::relay::is_control(pkt) {
             if let Some((_, tx)) = self

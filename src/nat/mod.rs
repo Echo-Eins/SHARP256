@@ -27,9 +27,11 @@
 //! Authentication settles that, so a lie costs a wasted attempt.
 
 pub mod behaviour;
+pub mod birthday;
 pub mod card;
 pub mod keepalive;
 pub mod portmap;
+pub mod punch;
 pub mod stun;
 pub mod stunserver;
 pub mod upnp;
@@ -67,6 +69,10 @@ pub struct NatConfig {
     pub mapping_check: Duration,
     /// How often this host's own addresses are looked at again.
     pub host_refresh: Duration,
+    /// Keep the mapping and the addresses up to date after the first
+    /// results. A receiver does, for as long as it runs; a sender wants
+    /// its NAT's behaviour once, for the length of one transfer.
+    pub maintain: bool,
 }
 
 impl Default for NatConfig {
@@ -83,6 +89,7 @@ impl Default for NatConfig {
             publish_lan_addresses: true,
             mapping_check: MAPPING_CHECK,
             host_refresh: HOST_REFRESH,
+            maintain: true,
         }
     }
 }
@@ -498,8 +505,12 @@ pub const MAX_CANDIDATES: usize = 6;
 pub struct Reachability {
     pub local_addr: SocketAddr,
     pub public_addr: Option<SocketAddr>,
-    /// What the NAT in front of this socket actually does (RFC 5780).
+    /// What the NAT in front of this socket actually does (RFC 5780): over
+    /// IPv4 where the socket speaks it, since that is where the NATs are.
     pub behaviour: Behaviour,
+    /// The same measured over IPv6, on a dual-stack socket whose host has a
+    /// global IPv6 address: usually no NAT, and what shows is the firewall.
+    pub behaviour6: Option<Behaviour>,
     pub upnp_addr: Option<SocketAddr>,
     /// The router forwarded a port, but reports an inside address as its
     /// own: it is behind another NAT, and the forward does not reach it
@@ -511,6 +522,37 @@ pub struct Reachability {
 }
 
 impl Reachability {
+    /// What is known of the NAT or firewall in front of each family, in the
+    /// form a peer is told: over a relay, or in a contact card.
+    pub fn hints(&self) -> card::FamilyHints {
+        let primary_v6 = self
+            .behaviour
+            .tested_with
+            .is_some_and(|a| crate::address::canonical(a).is_ipv6());
+        let mut first = card::NatHints::from(&self.behaviour);
+        if !primary_v6 {
+            // Behind a carrier's NAT as well as the router's: the shared
+            // address space, or a router that itself has an inside address.
+            first.cgn = self.double_nat
+                || matches!(
+                    self.behaviour.mapped.map(|m| crate::address::canonical(m).ip()),
+                    Some(IpAddr::V4(v4)) if is_shared_address_space(v4)
+                );
+        }
+        let second = self.behaviour6.as_ref().map(card::NatHints::from);
+        if primary_v6 {
+            card::FamilyHints {
+                v4: card::NatHints::unknown(),
+                v6: first,
+            }
+        } else {
+            card::FamilyHints {
+                v4: first,
+                v6: second.unwrap_or_else(card::NatHints::unknown),
+            }
+        }
+    }
+
     /// Address senders outside the local network should use, if known.
     pub fn advertised(&self) -> Option<SocketAddr> {
         if let Some(a) = self.upnp_addr {
@@ -645,10 +687,18 @@ impl Reachability {
     }
 }
 
+/// Whether `ip` is in 100.64.0.0/10, the address space carriers give their
+/// customers behind a carrier-grade NAT (RFC 6598).
+fn is_shared_address_space(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (64..128).contains(&o[1])
+}
+
 /// What discovery has found so far.
 fn reachability(
     local_addr: SocketAddr,
     behaviour: &Behaviour,
+    behaviour6: Option<&Behaviour>,
     forward: Option<&PortForward>,
     publish_lan: bool,
 ) -> Reachability {
@@ -661,6 +711,7 @@ fn reachability(
         local_addr,
         public_addr,
         behaviour: *behaviour,
+        behaviour6: behaviour6.copied(),
         upnp_addr,
         double_nat,
         host: host_addresses(local_addr, publish_lan),
@@ -692,10 +743,11 @@ pub struct NatTask {
 /// through `on_result` again. A port forward is given back when `cancel`
 /// fires, so the router does not keep forwarding a port nothing listens on.
 /// Returns `None` for loopback sockets, where there is nothing to discover.
-pub fn spawn_receiver_discovery(
+pub fn spawn_discovery(
     socket: Arc<UdpSocket>,
     config: NatConfig,
     keepalive: keepalive::SharedKeepalive,
+    hints: tokio::sync::watch::Sender<card::FamilyHints>,
     cancel: CancellationToken,
     on_result: impl Fn(&Reachability) + Send + 'static,
 ) -> Option<NatTask> {
@@ -704,6 +756,16 @@ pub fn spawn_receiver_discovery(
         return None;
     }
     let (tx, rx) = mpsc::channel::<stun::Incoming>(64);
+    // What is found is passed to whoever follows `hints` as it is found,
+    // and every result that is reported says it again.
+    let hints = Arc::new(hints);
+    let on_result = {
+        let hints = hints.clone();
+        move |r: &Reachability| {
+            publish_hints(&hints, r.hints());
+            on_result(r)
+        }
+    };
     let task = tokio::spawn(async move {
         // Owns the channel the STUN messages come in on, and lets go of it
         // when done: the dispatcher then stops handing us any.
@@ -712,16 +774,55 @@ pub fn spawn_receiver_discovery(
             config.stun_servers.clone(),
             config.enable_stun,
         );
+        let early = hints.clone();
         let tests = async move {
             let mut rx = rx;
+            let mut b6 = None;
             let b = if enable_stun {
-                let b = behaviour::discover(&tests_socket, &servers, &mut rx).await;
+                let b = behaviour::discover_reporting(
+                    &tests_socket,
+                    &servers,
+                    &mut rx,
+                    behaviour::Timing::default(),
+                    &mut |b| {
+                        let found = card::NatHints::from(b);
+                        let six = b
+                            .tested_with
+                            .is_some_and(|a| crate::address::canonical(a).is_ipv6());
+                        early.send_if_modified(|h| {
+                            let slot = if six { &mut h.v6 } else { &mut h.v4 };
+                            let changed = *slot != found;
+                            *slot = found;
+                            changed
+                        });
+                    },
+                )
+                .await;
                 tracing::debug!("NAT: {}", b.describe());
+                // The other family, where the host has a global address in
+                // it: what is measured there is the firewall.
+                let reach = crate::address::Reach::of(&tests_socket);
+                let has_global_v6 = host_addresses(local, false).iter().any(IpAddr::is_ipv6);
+                if reach.v4() && reach.v6() && has_global_v6 {
+                    let six = behaviour::discover_family(
+                        &tests_socket,
+                        &servers,
+                        &mut rx,
+                        behaviour::Timing::default(),
+                        Some(true),
+                        &mut |_| {},
+                    )
+                    .await;
+                    if six.mapped.is_some() {
+                        tracing::debug!("NAT (IPv6): {}", six.describe());
+                        b6 = Some(six);
+                    }
+                }
                 b
             } else {
                 Behaviour::default()
             };
-            (b, rx)
+            (b, b6, rx)
         };
         let (enable_mapping, lease) = (config.enable_port_mapping, config.mapping_lease);
         let mapping = async move {
@@ -733,20 +834,26 @@ pub fn spawn_receiver_discovery(
         };
         tokio::pin!(tests, mapping);
         let mut behaviour: Option<Behaviour> = None;
+        let mut behaviour6: Option<Behaviour> = None;
         let mut responses: Option<mpsc::Receiver<stun::Incoming>> = None;
         let mut forward: Option<Option<PortForward>> = None;
         while behaviour.is_none() || forward.is_none() {
             tokio::select! {
-                (b, rx) = &mut tests, if behaviour.is_none() => {
+                (b, b6, rx) = &mut tests, if behaviour.is_none() => {
                     let r = reachability(
                         local,
                         &b,
+                        b6.as_ref(),
                         forward.as_ref().and_then(|f| f.as_ref()),
                         config.publish_lan_addresses,
                     );
                     tracing::info!("NAT: {}", r.describe());
+                    if let Some(b6) = &b6 {
+                        tracing::info!("NAT over IPv6: {}", b6.describe());
+                    }
                     on_result(&r);
                     behaviour = Some(b);
+                    behaviour6 = b6;
                     responses = Some(rx);
                 }
                 f = &mut mapping, if forward.is_none() => {
@@ -755,7 +862,13 @@ pub fn spawn_receiver_discovery(
                         // Worth saying again only once there is something
                         // to say it with.
                         if let Some(b) = &behaviour {
-                            let r = reachability(local, b, Some(f), config.publish_lan_addresses);
+                            let r = reachability(
+                                local,
+                                b,
+                                behaviour6.as_ref(),
+                                Some(f),
+                                config.publish_lan_addresses,
+                            );
                             tracing::info!("NAT: {}", r.describe());
                             on_result(&r);
                         }
@@ -774,11 +887,18 @@ pub fn spawn_receiver_discovery(
         else {
             return;
         };
+        if !config.maintain {
+            // Once is what was asked for. Letting go of the channel tells
+            // whoever routes STUN messages here to stop.
+            drop(responses);
+            return;
+        }
         maintain(Maintained {
             socket,
             config,
             local,
             behaviour,
+            behaviour6,
             forward,
             responses,
             keepalive,
@@ -791,6 +911,16 @@ pub fn spawn_receiver_discovery(
         stun_responses: tx,
         task,
     })
+}
+
+/// Tells whoever follows `hints` what the NAT tests have found, when that
+/// is news.
+fn publish_hints(hints: &tokio::sync::watch::Sender<card::FamilyHints>, found: card::FamilyHints) {
+    hints.send_if_modified(|current| {
+        let changed = *current != found;
+        *current = found;
+        changed
+    });
 }
 
 /// How often the mapping behind a published address is checked with a
@@ -807,6 +937,7 @@ struct Maintained<F> {
     config: NatConfig,
     local: SocketAddr,
     behaviour: Behaviour,
+    behaviour6: Option<Behaviour>,
     forward: Option<PortForward>,
     responses: mpsc::Receiver<stun::Incoming>,
     keepalive: keepalive::SharedKeepalive,
@@ -833,6 +964,7 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
         config,
         local,
         mut behaviour,
+        behaviour6,
         forward,
         mut responses,
         keepalive,
@@ -840,7 +972,13 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
         on_result,
     } = m;
     let lan = config.publish_lan_addresses;
-    let mut current = reachability(local, &behaviour, forward.as_ref(), lan);
+    let mut current = reachability(
+        local,
+        &behaviour,
+        behaviour6.as_ref(),
+        forward.as_ref(),
+        lan,
+    );
     let server = behaviour.tested_with;
     // Worth keeping only when an address resting on the mapping is
     // published: a NAT that changes the port per destination gets nothing
@@ -925,14 +1063,14 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
                             }
                         );
                         behaviour.mapped = Some(seen);
-                        current = reachability(local, &behaviour, forward.as_ref(), lan);
+                        current = reachability(local, &behaviour, behaviour6.as_ref(), forward.as_ref(), lan);
                         on_result(&current);
                     }
                 }
                 next_check = Instant::now() + config.mapping_check;
             }
             _ = at(next_host) => {
-                let fresh = reachability(local, &behaviour, forward.as_ref(), lan);
+                let fresh = reachability(local, &behaviour, behaviour6.as_ref(), forward.as_ref(), lan);
                 if fresh.candidates() != current.candidates() {
                     tracing::info!("NAT: this host's addresses changed");
                     current = fresh;
@@ -1001,6 +1139,7 @@ mod tests {
             local_addr: "0.0.0.0:5555".parse().unwrap(),
             public_addr: public.map(|p| p.parse().unwrap()),
             behaviour,
+            behaviour6: None,
             upnp_addr: upnp.map(|u| u.parse().unwrap()),
             double_nat: false,
             host: Vec::new(),
@@ -1147,6 +1286,7 @@ mod tests {
                 mapped: public,
                 ..behaviour
             },
+            None,
             Some(&inner("100.64.3.4")),
             true,
         );
@@ -1325,6 +1465,7 @@ garbage line
             config,
             local: socket.local_addr().unwrap(),
             behaviour,
+            behaviour6: None,
             forward: None,
             responses: rx,
             keepalive: keepalive.clone(),
@@ -1362,6 +1503,7 @@ garbage line
             local_addr: "127.0.0.1:5555".parse().unwrap(),
             public_addr: None,
             behaviour: Behaviour::default(),
+            behaviour6: None,
             upnp_addr: None,
             double_nat: false,
             host: host_addresses("127.0.0.1:5555".parse().unwrap(), true),

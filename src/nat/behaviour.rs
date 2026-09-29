@@ -293,15 +293,49 @@ pub async fn discover_with(
     responses: &mut mpsc::Receiver<Incoming>,
     timing: Timing,
 ) -> Behaviour {
+    discover_reporting(socket, servers, responses, timing, &mut |_| {}).await
+}
+
+/// [`discover_with`], telling `progress` what is known as soon as it is.
+///
+/// How the NAT numbers its ports is known after a few quick exchanges; the
+/// filtering tests that follow wait out timeouts for every packet the NAT
+/// is right to drop. Whoever aims a punch by the first does not have to
+/// wait for the second.
+pub async fn discover_reporting(
+    socket: &UdpSocket,
+    servers: &[String],
+    responses: &mut mpsc::Receiver<Incoming>,
+    timing: Timing,
+    progress: &mut (dyn FnMut(&Behaviour) + Send),
+) -> Behaviour {
+    // A dual-stack socket is tested over IPv4 first, which is where the
+    // NATs are; [`discover_family`] does the other family.
+    let reach = crate::address::Reach::of(socket);
+    let family = (reach.v4() && reach.v6()).then_some(false);
+    discover_family(socket, servers, responses, timing, family, progress).await
+}
+
+/// [`discover_reporting`] for one address family of a dual-stack socket:
+/// `Some(true)` is IPv6, `Some(false)` IPv4, `None` whichever the socket
+/// has. Over IPv6 there is usually no NAT to find, and what the tests
+/// measure is the firewall in front of the host: whether what arrives
+/// unasked is let in (RFC 6092 recommends not, and most home routers do
+/// not).
+pub async fn discover_family(
+    socket: &UdpSocket,
+    servers: &[String],
+    responses: &mut mpsc::Receiver<Incoming>,
+    timing: Timing,
+    family: Option<bool>,
+    progress: &mut (dyn FnMut(&Behaviour) + Send),
+) -> Behaviour {
     let mut out = Behaviour::default();
     let Ok(local) = socket.local_addr() else {
         return out;
     };
     let client = StunClient::new(servers.to_vec()).with_timing(timing.per_try, timing.tries);
     let reach = crate::address::Reach::of(socket);
-    // A dual-stack socket is tested over IPv4, which is where the NATs are;
-    // its IPv6 addresses are published as they are, being the host's own.
-    let family = (reach.v4() && reach.v6()).then_some(false);
 
     // Test I against each server in turn. One server that offers a usable
     // second address is all the real tests need; otherwise a second server's
@@ -376,6 +410,7 @@ pub async fn discover_with(
                 out.alloc_step = step;
             }
         }
+        progress(&out);
         out.filtering = filtering_behaviour(socket, &client, responses, server).await;
     } else if !out.open_internet {
         // Weaker, but the same question: does a different destination get a
@@ -387,6 +422,7 @@ pub async fn discover_with(
             Some(_) => Mapping::AddressAndPortDependent,
             None => Mapping::Unknown,
         };
+        progress(&out);
     }
 
     if !out.open_internet && out.mapping == Mapping::EndpointIndependent {

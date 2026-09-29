@@ -159,6 +159,13 @@ pub struct SenderConfig {
     /// do not answer. Each adds two more candidates: where the receiver
     /// appears to be, and the relay's own port for the pair.
     pub relays: Vec<String>,
+    /// Find out what this host's NAT does (RFC 5780), so that a relay can
+    /// tell the receiver how to aim its punches and ours can be aimed in
+    /// return. Only done when there are relays to tell.
+    pub nat_traversal: bool,
+    /// Servers for those tests; empty = the built-in list. A
+    /// `sharp-relay --stun` is one.
+    pub stun_servers: Vec<String>,
     pub events: Option<EventCallback>,
 }
 
@@ -176,6 +183,8 @@ impl std::fmt::Debug for SenderConfig {
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
             .field("relays", &self.relays)
+            .field("nat_traversal", &self.nat_traversal)
+            .field("stun_servers", &self.stun_servers)
             .field("events", &self.events.is_some())
             .finish()
     }
@@ -216,6 +225,8 @@ impl SenderConfig {
             identity: None,
             psk: None,
             relays: Vec::new(),
+            nat_traversal: false,
+            stun_servers: Vec::new(),
             events: None,
         }
     }

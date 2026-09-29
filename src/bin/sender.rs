@@ -24,9 +24,17 @@ struct Args {
     #[arg(short, long, default_value = "[::]:0")]
     bind: SocketAddr,
 
-    /// Accepted for compatibility; the sender needs no NAT handling
-    #[arg(long, hide = true)]
+    /// Do not find out what this host's NAT does. With a relay the sender
+    /// asks STUN servers (see --stun) how its NAT numbers ports, so that
+    /// the receiver can aim its punches; this switches that off
+    #[arg(long)]
     no_nat: bool,
+
+    /// A STUN server (host:port) for that; repeat it for several. A
+    /// `sharp-relay --stun` is one, and only a server with two addresses
+    /// can measure everything a NAT does. Default: well-known public ones.
+    #[arg(long = "stun", value_name = "HOST:PORT")]
+    stun: Vec<String>,
 
     /// Ask a relay at [<relay ID>@]<host>:<port> to put this transfer
     /// through when the receiver's own addresses do not answer. May be
@@ -134,7 +142,8 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     // decides which one is the receiver.
     let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file.clone());
     cfg.bind = args.bind;
-    let _ = args.no_nat;
+    cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
+    cfg.stun_servers = args.stun.clone();
     cfg.relays = args.relays.clone();
     cfg.state_dir = args.state_dir.clone();
     cfg.identity = Some(identity);

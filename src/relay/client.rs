@@ -14,7 +14,8 @@
 
 use super::{Message, Refusal, PROOF_LEN, TOKEN_LEN};
 use crate::crypto::{Identity, SharpId};
-use crate::nat::stun::is_usable_server_address;
+use crate::nat::card::NatHints;
+use crate::nat::punch::Puncher;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +58,10 @@ pub struct Introduction {
     pub relayed: SocketAddr,
     /// Which side of that port we are; see [`hold`].
     pub ticket: [u8; TOKEN_LEN],
+    /// What the receiver says its NAT does; all "not measured" when it has
+    /// not said. Advice from a party that need not be honest, used only to
+    /// decide how much to send (see `nat::punch`).
+    pub peer_hints: NatHints,
 }
 
 /// Why a relay did not put us through.
@@ -84,7 +89,8 @@ impl std::fmt::Display for ConnectError {
 /// identity, and the relay's, against which ownership of ours is proven.
 pub type SenderAuth<'a> = Option<(&'a Identity, SharpId)>;
 
-/// Asks a relay to put us through to `target`.
+/// Asks a relay to put us through to `target`, telling it (and through it,
+/// the receiver) what `hints` says our NAT does.
 ///
 /// Runs alongside the connectivity checks rather than before them, as ICE
 /// gathers candidates while it is already checking others (RFC 8445 section
@@ -106,6 +112,7 @@ pub async fn connect(
     incoming: &mut mpsc::Receiver<Incoming>,
     cancel: &CancellationToken,
     auth: SenderAuth<'_>,
+    hints: NatHints,
 ) -> Result<Introduction, ConnectError> {
     let mut token = [0u8; TOKEN_LEN];
     // Set once the relay has refused us as a stranger.
@@ -122,11 +129,17 @@ pub async fn connect(
                 Message::ConnectAs {
                     target,
                     token,
+                    hints,
                     id,
                     proof: [0; PROOF_LEN],
                 },
             ),
-            None => Message::Connect { target, token }.encode(),
+            None => Message::Connect {
+                target,
+                token,
+                hints,
+            }
+            .encode(),
         };
         if let Err(e) = socket.send_to(&ask, relay).await {
             return Err(ConnectError::NoAnswer(format!(
@@ -137,7 +150,12 @@ pub async fn connect(
         match wait_for(incoming, relay, REPLY_WAIT).await {
             // The relay wants us to prove we receive where we say we do.
             Some(Message::Challenge { token: t }) => token = t,
-            Some(Message::Allocated { port, peer, ticket }) => {
+            Some(Message::Allocated {
+                port,
+                peer,
+                ticket,
+                hints: peer_hints,
+            }) => {
                 // The relay may decline to say where the receiver is,
                 // because the receiver asked it not to. There is then no
                 // direct path to offer, only the relayed one.
@@ -155,6 +173,7 @@ pub async fn connect(
                     peer,
                     relayed,
                     ticket,
+                    peer_hints,
                 });
             }
             // A relay that serves only senders on its list: say who we
@@ -255,6 +274,11 @@ pub async fn hold(
 /// from the ports it allocates — handed over by whoever owns the socket's
 /// receive loop. `on_registered` hears the address registered with and
 /// where the relay sees us, the first time and whenever that changes.
+///
+/// What `puncher` knows of our NAT goes into every registration, and a
+/// registration is sent again the moment that changes, so that a sender
+/// asking after the NAT tests finished is told what they found. When the
+/// relay introduces a sender, `puncher` pushes back at it.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     socket: Arc<UdpSocket>,
@@ -265,6 +289,7 @@ pub async fn serve(
     mut incoming: mpsc::Receiver<Incoming>,
     cancel: CancellationToken,
     keepalive: crate::nat::keepalive::SharedKeepalive,
+    puncher: Arc<Puncher>,
     on_registered: impl Fn(SocketAddr, SocketAddr) + Send + 'static,
 ) {
     let Some(&first) = relays.first() else {
@@ -282,6 +307,8 @@ pub async fn serve(
         return;
     };
     let reach = crate::address::Reach::of(&socket);
+    let mut hints_changed = puncher.subscribe();
+    let mut watching_hints = true;
     let flags = if private { super::REGISTER_PRIVATE } else { 0 };
     let mut stamps = Stamps::default();
     let mut token = [0u8; TOKEN_LEN];
@@ -337,6 +364,7 @@ pub async fn serve(
                     token,
                     flags,
                     stamp: stamps.next(),
+                    hints: puncher.mine().primary(),
                     proof: [0; PROOF_LEN],
                 },
             );
@@ -371,6 +399,17 @@ pub async fn serve(
         let msg = tokio::select! {
             m = incoming.recv() => m,
             _ = tokio::time::sleep(wait) => continue,
+            // What we know of our NAT has changed (its tests finished): say
+            // so now, not at the next refresh.
+            changed = hints_changed.changed(), if watching_hints => {
+                match changed {
+                    Ok(()) if registered => next_send = Instant::now(),
+                    Ok(()) => {}
+                    // Nothing will ever change it now.
+                    Err(_) => watching_hints = false,
+                }
+                continue;
+            }
             _ = cancel.cancelled() => {
                 if registered {
                     goodbye(&socket, relay, &key, id, token, &mut stamps, &mut incoming).await;
@@ -449,7 +488,12 @@ pub async fn serve(
                 retry = Duration::from_millis(500);
                 next_send = Instant::now() + keepalive.lock().next().min(lease / 2);
             }
-            Message::Incoming { port, peer, ticket } => {
+            Message::Incoming {
+                port,
+                peer,
+                ticket,
+                hints: peer_hints,
+            } => {
                 let relayed = SocketAddr::new(relay.ip(), port);
                 // The relay repeats an introduction until our side of the
                 // port is bound, because a lost one would otherwise fail the
@@ -495,6 +539,8 @@ pub async fn serve(
                 };
                 tracing::info!("relay {} is introducing {}", relay, peer);
                 let socket = socket.clone();
+                let puncher = puncher.clone();
+                let cancel = cancel.clone();
                 // Both jobs at once, and that is not a figure of speech.
                 // Binding our side of the relay's port and pushing outwards
                 // towards the sender are each spread over most of a second,
@@ -505,7 +551,10 @@ pub async fn serve(
                 tokio::spawn(async move {
                     match target.and_then(|p| reach.native(p)) {
                         Some(peer) => {
-                            tokio::join!(announce(&socket, relayed, ticket), punch(&socket, peer));
+                            tokio::join!(
+                                announce(&socket, relayed, ticket),
+                                puncher.run(peer, peer_hints, &cancel)
+                            );
                         }
                         None => announce(&socket, relayed, ticket).await,
                     }
@@ -620,35 +669,6 @@ async fn announce(socket: &UdpSocket, allocated: SocketAddr, ticket: [u8; TOKEN_
     .encode();
     for i in 0..REPEATS {
         if socket.send_to(&msg, allocated).await.is_err() {
-            return;
-        }
-        if i + 1 < REPEATS {
-            tokio::time::sleep(REPEAT_GAP).await;
-        }
-    }
-}
-
-/// Pushes a few datagrams at the address the relay named, so that our NAT
-/// has a way back open when the other side's first packet arrives.
-///
-/// The address comes from the relay, which is not trusted, so it is screened
-/// the same way a STUN server's suggestions are: never this host, a
-/// multicast or broadcast group, or an address the socket cannot reach.
-/// What the screen cannot do is tell a sender from anyone else the relay
-/// might name, here or on the internet; what bounds that is the allowance
-/// in [`serve`] and how little is sent — four datagrams of a dozen bytes
-/// that draw no reply from anyone.
-async fn punch(socket: &UdpSocket, peer: SocketAddr) {
-    let Ok(local) = socket.local_addr() else {
-        return;
-    };
-    if !is_usable_server_address(peer, local) {
-        tracing::debug!("relay named {}, which is not worth sending to", peer);
-        return;
-    }
-    let msg = Message::Punch.encode();
-    for i in 0..REPEATS {
-        if socket.send_to(&msg, peer).await.is_err() {
             return;
         }
         if i + 1 < REPEATS {
