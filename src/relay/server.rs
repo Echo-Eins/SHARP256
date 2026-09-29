@@ -20,9 +20,8 @@
 //! * an allocated port carries traffic only between the two addresses that
 //!   presented its tickets, and forgets it when it goes quiet.
 
-use super::{is_control, Message, Refusal, TOKEN_LEN};
+use super::{is_control, Hints, Message, Refusal, TOKEN_LEN};
 use crate::crypto::{Identity, SharpId};
-use crate::nat::card::NatHints;
 use crate::transport::io::PktSocket;
 use rand::RngCore;
 use std::collections::HashMap;
@@ -483,9 +482,10 @@ struct Registration {
     /// The newest stamp taken from the owner. Anything not newer is a
     /// replay, or an owner whose clock went backwards.
     stamp: u64,
-    /// What the owner says its NAT does, for the senders it is introduced
-    /// to. Kept only as advice to pass on.
-    hints: NatHints,
+    /// What the owner says of its NAT and of where else it can be reached,
+    /// for the senders it is introduced to. Kept only as advice to pass on,
+    /// and only what [`Hints::screened`] let through.
+    hints: Hints,
     /// The relay address the registration was sent to, which is where what
     /// is sent to the owner later — an introduction — has to come from.
     via: Option<std::net::IpAddr>,
@@ -801,7 +801,7 @@ impl Relay {
                         expires: now + self.cfg.lease,
                         private: flags & super::REGISTER_PRIVATE != 0,
                         stamp,
-                        hints,
+                        hints: hints.screened(from),
                         via: self.via,
                     },
                 );
@@ -838,7 +838,8 @@ impl Relay {
                     .await;
                     return;
                 }
-                self.put_through(target, from, hints, now).await;
+                self.put_through(target, from, hints.screened(from), now)
+                    .await;
             }
             Message::ConnectAs {
                 target,
@@ -879,7 +880,8 @@ impl Relay {
                     .await;
                     return;
                 }
-                self.put_through(target, from, hints, now).await;
+                self.put_through(target, from, hints.screened(from), now)
+                    .await;
             }
             Message::Bye {
                 id, token, stamp, ..
@@ -932,7 +934,7 @@ impl Relay {
         &mut self,
         target: SharpId,
         from: SocketAddr,
-        sender_hints: NatHints,
+        sender_hints: Hints,
         now: Instant,
     ) {
         let Some(reg) = self.registrations.get(&target).filter(|r| r.fresh(now)) else {
@@ -956,7 +958,7 @@ impl Relay {
         let (receiver_hints, sender_hints) = if disclose {
             (reg.hints, sender_hints)
         } else {
-            (NatHints::unknown(), NatHints::unknown())
+            (Hints::none(), Hints::none())
         };
         // The same pair asking again means our answer went missing,
         // not that they want a second port. That has to be settled
@@ -1067,7 +1069,7 @@ impl Relay {
         receiver: SocketAddr,
         receiver_via: Option<std::net::IpAddr>,
         disclose: bool,
-        sender_hints: NatHints,
+        sender_hints: Hints,
     ) -> Option<(u16, [u8; TOKEN_LEN], [u8; TOKEN_LEN])> {
         // On the address the control port actually has: `[::]` may have
         // fallen back to IPv4 there, and a pair must be reachable the way
@@ -1189,7 +1191,7 @@ struct Carried {
     /// repeated: exactly what the first one said, so a private registration
     /// learns no more the second time than the first.
     sender_shown: SocketAddr,
-    sender_hints: NatHints,
+    sender_hints: Hints,
     /// Where the control exchange reached the receiver. Used to repeat the
     /// introduction, and never as a peer address: what counts here is
     /// whichever address presents the ticket.
@@ -1533,6 +1535,7 @@ mod tests {
 mod wire_tests {
     use super::*;
     use crate::crypto::Identity;
+    use crate::nat::card::NatHints;
     use crate::relay::Message;
     use tokio::net::UdpSocket;
 
@@ -1632,7 +1635,7 @@ mod wire_tests {
     /// and would otherwise be mistaken for the answer.
     async fn token_for(sock: &UdpSocket, relay: SocketAddr, id: SharpId) -> [u8; TOKEN_LEN] {
         let ask = Message::Register {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             id,
             token: [0; TOKEN_LEN],
             flags: 0,
@@ -1672,7 +1675,7 @@ mod wire_tests {
         identity: &Identity,
         flags: u8,
     ) -> Option<(Message, Vec<u8>)> {
-        register_hinted(sock, relay, relay_id, identity, flags, NatHints::unknown()).await
+        register_hinted(sock, relay, relay_id, identity, flags, Hints::none()).await
     }
 
     /// [`register_raw`], saying what the receiver's NAT does.
@@ -1682,7 +1685,7 @@ mod wire_tests {
         relay_id: &SharpId,
         identity: &Identity,
         flags: u8,
-        hints: NatHints,
+        hints: Hints,
     ) -> Option<(Message, Vec<u8>)> {
         let id = identity.id();
         let key = crate::relay::auth_key(identity, relay_id, &id, relay_id).unwrap();
@@ -1730,7 +1733,7 @@ mod wire_tests {
             &rc,
             relay,
             Message::Register {
-                hints: NatHints::unknown(),
+                hints: Hints::none(),
                 id,
                 token: [0; TOKEN_LEN],
                 flags: 0,
@@ -1750,7 +1753,7 @@ mod wire_tests {
         let allocated = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         let Some(Message::Allocated {
@@ -1849,7 +1852,7 @@ mod wire_tests {
         let answer = with_token(&sc, relay, |token| Message::Connect {
             target,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         assert!(
@@ -1919,7 +1922,7 @@ mod wire_tests {
         let still_there = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         assert!(
@@ -1946,7 +1949,7 @@ mod wire_tests {
         let gone = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         assert!(
@@ -1981,7 +1984,7 @@ mod wire_tests {
             let msg = signed(
                 &wrong,
                 Message::Register {
-                    hints: NatHints::unknown(),
+                    hints: Hints::none(),
                     id,
                     token,
                     flags: 0,
@@ -2012,7 +2015,7 @@ mod wire_tests {
         let answer = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         assert!(
@@ -2055,7 +2058,7 @@ mod wire_tests {
             let msg = signed(
                 &key,
                 Message::Register {
-                    hints: NatHints::unknown(),
+                    hints: Hints::none(),
                     id,
                     token,
                     flags: 0,
@@ -2106,7 +2109,7 @@ mod wire_tests {
         for asked in ["127.0.0.2", "127.0.0.1"] {
             let to = SocketAddr::new(asked.parse().unwrap(), relay.port());
             let ask = Message::Register {
-                hints: NatHints::unknown(),
+                hints: Hints::none(),
                 id: owner.id(),
                 token: [0; TOKEN_LEN],
                 flags: 0,
@@ -2130,22 +2133,43 @@ mod wire_tests {
 
     /// What each side says of its NAT is what the other is told — the
     /// receiver's when it registered, the sender's when it asked — so that
-    /// each can aim its punches. Unless the receiver asked not to be
-    /// described: then nothing about it, or about who asks, is passed on.
+    /// each can aim its punches; and so is where each can be reached in the
+    /// other address family, which the relay cannot see for itself. Unless
+    /// the receiver asked not to be described: then nothing about it, or
+    /// about who asks, is passed on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_side_is_told_what_the_others_nat_does() {
         use crate::nat::behaviour::Allocation;
-        let receiver_hints = NatHints {
+        use crate::relay::Alt;
+        let receiver_nat = NatHints {
             mapping: 3,
             filtering: 3,
             allocation: Allocation::Sequential,
             delta: 2,
             ..NatHints::unknown()
         };
-        let sender_hints = NatHints {
+        let sender_nat = NatHints {
             mapping: 3,
             allocation: Allocation::Random,
             ..NatHints::unknown()
+        };
+        let receiver_hints = Hints {
+            nat: receiver_nat,
+            alt: Some(Alt {
+                addr: "[2a0e:aa00:1:1::1]:5555".parse().unwrap(),
+                nat: NatHints {
+                    mapping: 4,
+                    filtering: 3,
+                    ..NatHints::unknown()
+                },
+            }),
+        };
+        let sender_hints = Hints {
+            nat: sender_nat,
+            alt: Some(Alt {
+                addr: "[2a0e:aa00:2:1::2]:6666".parse().unwrap(),
+                nat: NatHints::unknown(),
+            }),
         };
         for private in [false, true] {
             let (relay, relay_id, cancel) = start_relay().await;
@@ -2179,12 +2203,70 @@ mod wire_tests {
                 panic!("the receiver was not introduced");
             };
             if private {
-                assert_eq!(hints, NatHints::unknown());
-                assert_eq!(told, NatHints::unknown());
+                assert_eq!(hints, Hints::none());
+                assert_eq!(told, Hints::none());
             } else {
                 assert_eq!(hints, receiver_hints);
                 assert_eq!(told, sender_hints);
             }
+            cancel.cancel();
+        }
+    }
+
+    /// Where somebody says it can also be reached is passed on only if it
+    /// can mean what it says: another family from the one the relay sees it
+    /// in, an address the internet routes, and a port. Anything else would
+    /// have a stranger's datagrams sent wherever a peer liked — including
+    /// the inside of the network of whoever it is introduced to. (Every
+    /// case is in `relay::tests`; this is the relay applying it, to both
+    /// what a receiver registers with and what a sender asks with.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_alternative_address_is_passed_on_only_if_it_can_be_true() {
+        use crate::relay::Alt;
+        let alt = |addr: &str| {
+            Some(Alt {
+                addr: addr.parse().unwrap(),
+                nat: NatHints::unknown(),
+            })
+        };
+        // The same family as the one the relay sees (IPv4 here), and a
+        // private address in the other.
+        for bad in ["8.8.8.8:5", "[fd00::1]:5"] {
+            let (relay, relay_id, cancel) = start_relay().await;
+            let owner = Identity::generate();
+            let id = owner.id();
+            let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let hints = Hints {
+                nat: NatHints::unknown(),
+                alt: alt(bad),
+            };
+            assert!(
+                matches!(
+                    register_hinted(&rc, relay, &relay_id, &owner, 0, hints)
+                        .await
+                        .map(|(m, _)| m),
+                    Some(Message::Registered { .. })
+                ),
+                "{} was refused outright; it should merely not be passed on",
+                bad
+            );
+            let answer = with_token(&sc, relay, |token| Message::Connect {
+                target: id,
+                token,
+                hints,
+            })
+            .await;
+            let Some(Message::Allocated { hints: told, .. }) = answer else {
+                panic!("expected an allocation, got {:?}", answer);
+            };
+            assert_eq!(told.alt, None, "{} was passed on to the sender", bad);
+            let Some(Message::Incoming { hints: told, .. }) =
+                recv_message(&rc, Duration::from_secs(2)).await
+            else {
+                panic!("the receiver was not introduced");
+            };
+            assert_eq!(told.alt, None, "{} was passed on to the receiver", bad);
             cancel.cancel();
         }
     }
@@ -2211,7 +2293,7 @@ mod wire_tests {
         let answer = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         let Some(Message::Allocated { peer, port, .. }) = answer else {
@@ -2281,7 +2363,7 @@ mod wire_tests {
             with_token(&first, relay, |token| Message::Connect {
                 target: id,
                 token,
-                hints: NatHints::unknown(),
+                hints: Hints::none(),
             })
             .await
         else {
@@ -2289,7 +2371,7 @@ mod wire_tests {
         };
         assert!(matches!(
             with_token(&second, relay, |token| Message::Connect {
-                hints: NatHints::unknown(),
+                hints: Hints::none(),
                 target: id,
                 token
             })
@@ -2300,7 +2382,7 @@ mod wire_tests {
         let third = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(matches!(
             with_token(&third, relay, |token| Message::Connect {
-                hints: NatHints::unknown(),
+                hints: Hints::none(),
                 target: id,
                 token
             })
@@ -2312,7 +2394,7 @@ mod wire_tests {
 
         // The first asks again and is handed back what it already has.
         let again = with_token(&first, relay, |token| Message::Connect {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             target: id,
             token,
         })
@@ -2376,7 +2458,7 @@ mod wire_tests {
             with_token(&sc, relay, |token| Message::Connect {
                 target: id,
                 token,
-                hints: NatHints::unknown(),
+                hints: Hints::none(),
             })
             .await
         else {
@@ -2418,7 +2500,7 @@ mod wire_tests {
         let still = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         assert!(
@@ -2502,7 +2584,7 @@ mod wire_tests {
         let gone = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await;
         assert!(matches!(
@@ -2537,7 +2619,7 @@ mod wire_tests {
         }) = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await
         else {
@@ -2643,7 +2725,7 @@ mod wire_tests {
         }) = with_token(&sc, relay, |token| Message::Connect {
             target: id,
             token,
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
         })
         .await
         else {
@@ -2701,7 +2783,7 @@ mod wire_tests {
         );
         // Without the proof, not even that much is said.
         let unproven = with_token(&b, relay, |token| Message::Register {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             id: ours.id(),
             token,
             flags: 0,
@@ -2739,7 +2821,7 @@ mod wire_tests {
         ));
         let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let plain = with_token(&sc, relay, |token| Message::Connect {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             target: receiver.id(),
             token,
         })
@@ -2756,7 +2838,7 @@ mod wire_tests {
             signed(
                 &key,
                 Message::ConnectAs {
-                    hints: NatHints::unknown(),
+                    hints: Hints::none(),
                     target: receiver.id(),
                     token,
                     id: who.id(),

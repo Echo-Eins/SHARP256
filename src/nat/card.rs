@@ -168,6 +168,13 @@ impl NatHints {
 pub struct FamilyHints {
     pub v4: NatHints,
     pub v6: NatHints,
+    /// Where a peer should aim in each family, as far as this end knows:
+    /// the address the internet sees this socket at, when it is one worth
+    /// naming. A relay sees a registration over one family only, and these
+    /// are how it can be told where the *other* one is (see
+    /// `relay::Hints`).
+    pub aim4: Option<SocketAddr>,
+    pub aim6: Option<SocketAddr>,
 }
 
 impl FamilyHints {
@@ -175,6 +182,8 @@ impl FamilyHints {
         Self {
             v4: NatHints::unknown(),
             v6: NatHints::unknown(),
+            aim4: None,
+            aim6: None,
         }
     }
 

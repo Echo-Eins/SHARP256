@@ -493,42 +493,84 @@ fn seed_cards() -> Vec<Vec<u8>> {
 #[cfg(feature = "nat-traversal")]
 fn seed_relay() -> Vec<Vec<u8>> {
     use crate::nat::card::NatHints;
-    use crate::relay::{Message, Refusal, PROOF_LEN, TOKEN_LEN};
+    use crate::relay::{Alt, Hints, Message, Refusal, PROOF_LEN, TOKEN_LEN};
     let id = fixture().receiver;
+    let sequential = Hints {
+        nat: NatHints {
+            mapping: 3,
+            allocation: crate::nat::behaviour::Allocation::Sequential,
+            delta: 2,
+            ..NatHints::unknown()
+        },
+        alt: None,
+    };
+    // The other family's address, in each spelling.
+    let with_v6 = Hints {
+        nat: sequential.nat,
+        alt: Some(Alt {
+            addr: "[2a0e:aa00:1:1::1]:40000".parse().expect("literal"),
+            nat: NatHints {
+                mapping: 4,
+                filtering: 3,
+                ..NatHints::unknown()
+            },
+        }),
+    };
+    let with_v4 = Hints {
+        nat: NatHints::unknown(),
+        alt: Some(Alt {
+            addr: "198.18.0.1:7".parse().expect("literal"),
+            nat: sequential.nat,
+        }),
+    };
     [
         Message::Register {
-            hints: NatHints::unknown(),
+            hints: with_v6,
             id,
             token: [1; TOKEN_LEN],
             flags: 1,
             stamp: 42,
             proof: [2; PROOF_LEN],
         },
+        Message::Register {
+            hints: Hints::none(),
+            id,
+            token: [1; TOKEN_LEN],
+            flags: 0,
+            stamp: 43,
+            proof: [2; PROOF_LEN],
+        },
         Message::Connect {
-            hints: NatHints::unknown(),
+            hints: with_v4,
+            target: id,
+            token: [3; TOKEN_LEN],
+        },
+        Message::Connect {
+            hints: Hints::none(),
             target: id,
             token: [3; TOKEN_LEN],
         },
         Message::ConnectAs {
-            hints: NatHints::unknown(),
+            hints: with_v6,
             target: id,
             token: [3; TOKEN_LEN],
             id,
             proof: [4; PROOF_LEN],
         },
         Message::Allocated {
-            hints: NatHints {
-                mapping: 3,
-                allocation: crate::nat::behaviour::Allocation::Sequential,
-                delta: 2,
-                ..NatHints::unknown()
-            },
+            hints: sequential,
+            port: 40000,
+            peer: "203.0.113.5:4000".parse().expect("literal"),
+            ticket: [5; TOKEN_LEN],
+        },
+        Message::Allocated {
+            hints: with_v6,
             port: 40000,
             peer: "203.0.113.5:4000".parse().expect("literal"),
             ticket: [5; TOKEN_LEN],
         },
         Message::Incoming {
-            hints: NatHints::unknown(),
+            hints: with_v4,
             port: 40001,
             peer: "[2001:db8::7]:4000".parse().expect("literal"),
             ticket: [6; TOKEN_LEN],

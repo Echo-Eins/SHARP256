@@ -1025,22 +1025,33 @@ these, with nothing left over, is ignored.
 
 | kind | message | direction | body |
 |---|---|---|---|
-| 1 | Register | receiver → relay | `id[32] token[16] flags:u8 stamp:u64 hints[6] proof[16]` (flag 0x01: private) |
+| 1 | Register | receiver → relay | `id[32] token[16] flags:u8 stamp:u64 hints proof[16]` (flag 0x01: private) |
 | 2 | Challenge | relay → peer | `token[16]` |
 | 3 | Registered | relay → receiver | `lease:u32 observed:addr` |
-| 4 | Connect | sender → relay | `target[32] token[16] hints[6]` |
-| 5 | Allocated | relay → sender | `port:u16 peer:addr ticket[16] hints[6]` (peer unspecified: private) |
-| 6 | Incoming | relay → receiver | `port:u16 peer:addr ticket[16] hints[6]` |
+| 4 | Connect | sender → relay | `target[32] token[16] hints` |
+| 5 | Allocated | relay → sender | `port:u16 peer:addr ticket[16] hints` (peer unspecified: private) |
+| 6 | Incoming | relay → receiver | `port:u16 peer:addr ticket[16] hints` |
 | 7 | Error | relay → peer | `code:u8` (1 unknown, 2 bad token or proof, 3 busy, 4 stale) |
 | 8 | Open | peer → allocated port | `ticket[16] proof[16]` (proof zero: asking) |
 | 9 | Punch | peer → peer | — |
 | 10 | Bye | receiver → relay | `id[32] token[16] stamp:u64 proof[16]` |
 | 11 | Confirm | allocated port → peer | `proof[16]` |
-| 12 | ConnectAs | sender → relay | `target[32] token[16] hints[6] id[32] proof[16]` |
+| 12 | ConnectAs | sender → relay | `target[32] token[16] hints id[32] proof[16]` |
 
 Refusal 5 is *forbidden*: the relay serves only identities on its list.
 
-**NAT hints** (`hints[6]`) say what the NAT or firewall in front of the sender
+**Hints** are `nat[6] alt`, where `alt` is either the single byte `0` (nothing
+to say) or `addr nat[6]`: the peer's address in the *other* address family
+and what the NAT in front of that one does. A relay sees a peer over one
+family only, whichever the message came in on, and can say nothing of the
+other; on a host with both, the other family is often the path that works —
+IPv6 has no NAT to get through, and two IPv4 NATs that give a new port for
+every destination cannot be punched at all — but a firewall that lets in
+only what its own side sent out first has to be told the other end's address
+*before* they talk, or its side never opens. So each peer says, in the family
+it is reached over, how its NAT behaves, and in the other, where to aim.
+
+**NAT hints** (`nat[6]`) say what the NAT or firewall in front of the sender
 of the message does, as its own RFC 5780 tests measured it, so that the
 other end can aim its punches (see `docs/NAT.md`). Byte 0 is the mapping
 (0 not measured, 1 endpoint-independent, 2 address-dependent, 3
@@ -1049,12 +1060,21 @@ the same order), byte 2 how a NAT that varies the port numbers them (0
 unknown, 1 keeps the host's own port, 2 counts up, 3 random), bytes 3–4 the
 step of a counting NAT as a signed big-endian integer, and byte 5 flags:
 bits 0–1 hairpinning (0 unknown, 1 no, 2 yes), bit 2 a carrier-grade NAT in
-front. Any other value is a malformed message. A relay keeps the receiver's
-hints with its registration and passes them to each sender it introduces,
-and hands the receiver the sender's; for a receiver that registered as
-private both are sent as all zero. The hints are advice from a peer that
+front. Any other value is a malformed message, and so is a family byte in
+`alt` that is neither 0, 4 nor 6. A relay keeps the receiver's hints with
+its registration and passes them to each sender it introduces, and hands the
+receiver the sender's; for a receiver that registered as private both are
+sent as all zero (and `alt` as `0`). The hints are advice from a peer that
 need not be honest: they change how many datagrams of nine bytes are sent
 and to which ports, never who is trusted. In Register the proof covers them.
+
+The relay passes an `alt` on only if it can be what it says: in the family
+the message did *not* come in on (an IPv4-mapped IPv6 address is IPv4), with
+a nonzero port, and an address the internet routes (RFC 6890). Anything
+else is dropped, not refused, and what is passed on is written in its plain
+spelling. The peer that receives it screens it again, since the relay is not
+trusted either: it is one more address to send nine-byte punches to and to
+try in the handshake, subject to the same limits as any other candidate.
 
 `proof` in Register, Bye and ConnectAs is
 `BLAKE3-keyed(K, message up to it)[0..16]` with

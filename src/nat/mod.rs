@@ -485,6 +485,16 @@ pub(crate) fn host_addresses(local: SocketAddr, lan: bool) -> Vec<IpAddr> {
     choose_host_addresses(&found, &states, preferred)
 }
 
+/// Where to aim over IPv6 when nothing has been measured: the host's own
+/// global address — the one the system prefers for a global destination
+/// comes first — at the socket's port. With no NAT in the way there is
+/// nothing to measure, and a peer can be told at once.
+fn aim6_from_host(host: &[IpAddr], port: u16) -> Option<SocketAddr> {
+    host.iter()
+        .find(|ip| ip.is_ipv6() && crate::address::class::is_global(**ip))
+        .map(|ip| SocketAddr::new(*ip, port))
+}
+
 /// The choice [`host_addresses`] makes, from what it gathered: every
 /// usable address with its interface, the system's flags, and the source
 /// address the system prefers for a global destination.
@@ -721,17 +731,40 @@ impl Reachability {
             h.filtering = 1;
             second = Some(h);
         }
-        if primary_v6 {
-            card::FamilyHints {
-                v4: card::NatHints::unknown(),
-                v6: first,
-            }
+        let (v4, v6) = if primary_v6 {
+            (card::NatHints::unknown(), first)
         } else {
-            card::FamilyHints {
-                v4: first,
-                v6: second.unwrap_or_else(card::NatHints::unknown),
-            }
+            (first, second.unwrap_or_else(card::NatHints::unknown))
+        };
+        card::FamilyHints {
+            v4,
+            v6,
+            aim4: self.aim4(),
+            aim6: self.aim6(),
         }
+    }
+
+    /// Where a peer should aim over IPv4: the address a router forwards to
+    /// us, or else the one the internet sees the socket at. Only an address
+    /// the internet routes counts — a private one is what a peer on our own
+    /// network already knows, and a stranger has no use for it.
+    fn aim4(&self) -> Option<SocketAddr> {
+        self.upnp_addr
+            .or(self.public_addr)
+            .filter(|a| a.port() != 0 && crate::address::class::is_global(a.ip()))
+            .filter(|a| crate::address::canonical(*a).is_ipv4())
+    }
+
+    /// Where a peer should aim over IPv6: an opening the router made for us
+    /// if there is one, else the address the internet sees the socket at (the
+    /// STUN answer, which is right even where a prefix is translated), else
+    /// one of the host's own global addresses at the socket's port.
+    fn aim6(&self) -> Option<SocketAddr> {
+        self.pinhole6
+            .or_else(|| self.behaviour6.as_ref().and_then(|b| b.mapped))
+            .or_else(|| aim6_from_host(&self.host, self.local_addr.port()))
+            .filter(|a| a.port() != 0 && crate::address::class::is_global(a.ip()))
+            .filter(|a| crate::address::canonical(*a).is_ipv6())
     }
 
     /// Address senders outside the local network should use, if known.
@@ -1040,6 +1073,16 @@ pub fn spawn_discovery(
             config.enable_stun,
         );
         let early = hints.clone();
+        // Over IPv6 there is usually no NAT to measure, and a peer can be
+        // told where to aim before any test is done — which is when a
+        // sender asking a relay for an introduction wants it.
+        if let Some(aim) = aim6_from_host(&host_addresses(local, false), local.port()) {
+            hints.send_if_modified(|h| {
+                let changed = h.aim6.is_none();
+                h.aim6.get_or_insert(aim);
+                changed
+            });
+        }
         let tests = async move {
             let mut rx = rx;
             let mut b6 = None;
@@ -1054,10 +1097,22 @@ pub fn spawn_discovery(
                         let six = b
                             .tested_with
                             .is_some_and(|a| crate::address::canonical(a).is_ipv6());
+                        // The address the server saw is where a peer is to
+                        // aim, as far as anything is yet known of it.
+                        let seen = b
+                            .mapped
+                            .filter(|a| crate::address::class::is_global(a.ip()));
                         early.send_if_modified(|h| {
-                            let slot = if six { &mut h.v6 } else { &mut h.v4 };
-                            let changed = *slot != found;
+                            let (slot, aim) = if six {
+                                (&mut h.v6, &mut h.aim6)
+                            } else {
+                                (&mut h.v4, &mut h.aim4)
+                            };
+                            let changed = *slot != found || (seen.is_some() && *aim != seen);
                             *slot = found;
+                            if seen.is_some() {
+                                *aim = seen;
+                            }
                             changed
                         });
                     },
@@ -1822,6 +1877,70 @@ garbage line
         assert_eq!(c.v6.expect("IPv6 hints").mapping, 4, "no translation");
         // And it survives being written down and read back.
         assert_eq!(card::Card::from_text(&c.to_text()).unwrap(), c);
+    }
+
+    /// A peer is told where to aim in each family: what a router forwards
+    /// or opens for us first, then what the internet sees the socket at,
+    /// then — over IPv6, where nothing has to be measured — the host's own
+    /// address. Never an address the internet does not route.
+    #[test]
+    fn a_peer_is_told_where_to_aim_in_each_family() {
+        let mut r = reach(
+            Behaviour {
+                mapped: Some("11.1.0.1:40000".parse().unwrap()),
+                ..nat(Mapping::EndpointIndependent, Filtering::AddressDependent)
+            },
+            None,
+            Some("11.1.0.1:40000"),
+        );
+        r.host = vec![
+            "192.168.1.5".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "2a0e:aa00:1:1::5".parse().unwrap(),
+        ];
+        let aim = |r: &Reachability| (r.hints().aim4, r.hints().aim6);
+        let a = |s: &str| Some(s.parse::<SocketAddr>().unwrap());
+        // The socket is at port 5555; the host has no NAT over IPv6.
+        assert_eq!(aim(&r), (a("11.1.0.1:40000"), a("[2a0e:aa00:1:1::5]:5555")));
+        // A forward the router made outranks the mapped address.
+        r.upnp_addr = a("11.1.0.1:5555");
+        assert_eq!(aim(&r).0, a("11.1.0.1:5555"));
+        // What the internet saw over IPv6 outranks the host's own address —
+        // it is right where a prefix is translated — and a pinhole the
+        // router opened outranks both.
+        r.behaviour6 = Some(Behaviour {
+            mapped: a("[2a0e:aa00:1:1::99]:5555"),
+            ..nat(Mapping::EndpointIndependent, Filtering::AddressDependent)
+        });
+        assert_eq!(aim(&r).1, a("[2a0e:aa00:1:1::99]:5555"));
+        r.pinhole6 = a("[2a0e:aa00:1:1::5]:6000");
+        assert_eq!(aim(&r).1, a("[2a0e:aa00:1:1::5]:6000"));
+        // Nothing the internet routes, nothing to say.
+        let mut r = reach(
+            Behaviour {
+                mapped: Some("10.9.9.9:40000".parse().unwrap()),
+                ..nat(Mapping::EndpointIndependent, Filtering::AddressDependent)
+            },
+            None,
+            Some("10.9.9.9:40000"),
+        );
+        r.host = vec!["fd00::5".parse().unwrap(), "2001:db8::5".parse().unwrap()];
+        assert_eq!(aim(&r), (None, None));
+    }
+
+    #[test]
+    fn the_hosts_own_global_ipv6_address_is_where_to_aim_before_any_test() {
+        let host: Vec<IpAddr> = vec![
+            "192.168.1.2".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "fd00::2".parse().unwrap(),
+            "2a0e:aa00:1:1::2".parse().unwrap(),
+        ];
+        assert_eq!(
+            aim6_from_host(&host, 40000),
+            Some("[2a0e:aa00:1:1::2]:40000".parse().unwrap())
+        );
+        assert_eq!(aim6_from_host(&host[..3], 40000), None);
     }
 
     #[test]

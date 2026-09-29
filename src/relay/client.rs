@@ -12,7 +12,7 @@
 //! registration made from any other socket would describe a way in that
 //! does not exist.
 
-use super::{Message, Refusal, PROOF_LEN, TOKEN_LEN};
+use super::{Alt, Hints, Message, Refusal, PROOF_LEN, TOKEN_LEN};
 use crate::crypto::{Identity, SharpId};
 use crate::nat::card::NatHints;
 use crate::nat::punch::Puncher;
@@ -62,6 +62,12 @@ pub struct Introduction {
     /// not said. Advice from a party that need not be honest, used only to
     /// decide how much to send (see `nat::punch`).
     pub peer_hints: NatHints,
+    /// Where the receiver says it can also be reached, in the other address
+    /// family — already screened: another family from `peer`'s, one the
+    /// internet routes. Worth pushing at too, and often the only direct
+    /// path there is: two IPv4 NATs that cannot meet leave IPv6 with none
+    /// to get through.
+    pub peer_alt: Option<Alt>,
 }
 
 /// Why a relay did not put us through.
@@ -90,7 +96,8 @@ impl std::fmt::Display for ConnectError {
 pub type SenderAuth<'a> = Option<(&'a Identity, SharpId)>;
 
 /// Asks a relay to put us through to `target`, telling it (and through it,
-/// the receiver) what `hints` says our NAT does.
+/// the receiver) what `hints` says of our NAT and of where else we can be
+/// reached.
 ///
 /// Runs alongside the connectivity checks rather than before them, as ICE
 /// gathers candidates while it is already checking others (RFC 8445 section
@@ -112,7 +119,7 @@ pub async fn connect(
     incoming: &mut mpsc::Receiver<Incoming>,
     cancel: &CancellationToken,
     auth: SenderAuth<'_>,
-    hints: NatHints,
+    hints: Hints,
 ) -> Result<Introduction, ConnectError> {
     let mut token = [0u8; TOKEN_LEN];
     // Set once the relay has refused us as a stranger.
@@ -164,6 +171,14 @@ pub async fn connect(
                 } else {
                     Some(peer)
                 };
+                // What the relay passes on of the receiver is no more
+                // trusted than the rest of what it says, and the other
+                // family's address is only meaningful next to one in this
+                // family.
+                let peer_hints = match peer {
+                    Some(seen) => peer_hints.screened(seen),
+                    None => Hints::none(),
+                };
                 let relayed = SocketAddr::new(relay.ip(), port);
                 // Binding our side of that port is the caller's to run,
                 // with [`hold`]: it takes a round trip to the port and
@@ -173,7 +188,8 @@ pub async fn connect(
                     peer,
                     relayed,
                     ticket,
-                    peer_hints,
+                    peer_hints: peer_hints.nat,
+                    peer_alt: peer_hints.alt,
                 });
             }
             // A relay that serves only senders on its list: say who we
@@ -364,7 +380,7 @@ pub async fn serve(
                     token,
                     flags,
                     stamp: stamps.next(),
-                    hints: puncher.mine().primary(),
+                    hints: Hints::told_to(&puncher.mine(), relay),
                     proof: [0; PROOF_LEN],
                 },
             );
@@ -528,7 +544,8 @@ pub async fn serve(
                 // where the other side is — either it asked to stay hidden,
                 // or we did — so there is nothing to punch towards and the
                 // pair meets at the relay's port.
-                let target = if peer.ip().is_unspecified() {
+                let hidden = peer.ip().is_unspecified();
+                let target = if hidden {
                     None
                 } else if allowance >= 1.0 {
                     allowance -= 1.0;
@@ -537,7 +554,27 @@ pub async fn serve(
                     tracing::debug!("relay {} is introducing too fast; not punching", relay);
                     None
                 };
-                tracing::info!("relay {} is introducing {}", relay, peer);
+                // The sender's address in the other family, when it named
+                // one. It belongs to the same introduction, so it costs no
+                // allowance of its own; what bounds the datagrams sent
+                // there is the puncher's own budget per address.
+                let peer_hints = if hidden {
+                    Hints::none()
+                } else {
+                    peer_hints.screened(peer)
+                };
+                let alt = target
+                    .and(peer_hints.alt)
+                    .and_then(|a| reach.native(a.addr).map(|addr| (addr, a.nat)));
+                match &peer_hints.alt {
+                    Some(a) if alt.is_some() => tracing::info!(
+                        "relay {} is introducing {} (and {} in the other family)",
+                        relay,
+                        peer,
+                        a.addr
+                    ),
+                    _ => tracing::info!("relay {} is introducing {}", relay, peer),
+                }
                 let socket = socket.clone();
                 let puncher = puncher.clone();
                 let cancel = cancel.clone();
@@ -549,15 +586,21 @@ pub async fn serve(
                 // have our first datagram leave after the sender's had
                 // already been dropped by our NAT.
                 tokio::spawn(async move {
-                    match target.and_then(|p| reach.native(p)) {
-                        Some(peer) => {
-                            tokio::join!(
-                                announce(&socket, relayed, ticket),
-                                puncher.run(peer, peer_hints, &cancel)
-                            );
+                    let towards = async {
+                        if let Some(peer) = target.and_then(|p| reach.native(p)) {
+                            puncher.run(peer, peer_hints.nat, &cancel).await;
                         }
-                        None => announce(&socket, relayed, ticket).await,
-                    }
+                    };
+                    let towards_other_family = async {
+                        if let Some((addr, nat)) = alt {
+                            puncher.run(addr, nat, &cancel).await;
+                        }
+                    };
+                    tokio::join!(
+                        announce(&socket, relayed, ticket),
+                        towards,
+                        towards_other_family
+                    );
                 });
             }
             Message::Error { code } => {

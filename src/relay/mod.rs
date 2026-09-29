@@ -44,7 +44,7 @@ pub mod client;
 pub mod server;
 
 use crate::crypto::{Identity, SharpId};
-use crate::nat::card::NatHints;
+use crate::nat::card::{FamilyHints, NatHints};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use subtle::ConstantTimeEq;
 
@@ -120,7 +120,81 @@ pub fn proof_is_good(key: &[u8; 32], pkt: &[u8]) -> bool {
 /// actually hides where you are.
 pub const REGISTER_PRIVATE: u8 = 0x01;
 /// Longest control message. Everything here is far smaller.
-pub const MAX_MESSAGE: usize = 128;
+pub const MAX_MESSAGE: usize = 192;
+
+/// Where a peer can be reached in the address family the relay did not see
+/// it in, and how the NAT (or firewall) in front of that path behaves.
+///
+/// A relay sees a peer over one family — whichever its registration or its
+/// request came in on — and can say nothing of the other. On a host with
+/// both, that is exactly the path worth trying: IPv6 has no NAT to punch
+/// through, and two IPv4 NATs that give out a new port for every
+/// destination cannot be punched at all. Without this, the two peers would
+/// learn of each other's IPv6 addresses only once they were already
+/// talking — too late for a firewall that lets in nothing but what its own
+/// side sent out first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Alt {
+    pub addr: SocketAddr,
+    pub nat: NatHints,
+}
+
+/// What a peer tells a relay about itself, for the relay to hand on to
+/// whoever it is put through to. Advice, not authority: the proof on a
+/// registration covers it only so that nobody on the way can change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hints {
+    /// How the NAT in front of the address the relay sees behaves.
+    pub nat: NatHints,
+    /// The other family's address, when there is one worth naming.
+    pub alt: Option<Alt>,
+}
+
+impl Hints {
+    /// Nothing to say.
+    pub const fn none() -> Self {
+        Self {
+            nat: NatHints::unknown(),
+            alt: None,
+        }
+    }
+
+    /// What to tell a relay reached at `via`: how the NAT in front of that
+    /// family behaves, and where the other family can be aimed at.
+    pub fn told_to(mine: &FamilyHints, via: SocketAddr) -> Self {
+        let (nat, alt) = if crate::address::canonical(via).is_ipv6() {
+            (mine.v6, mine.aim4.map(|addr| Alt { addr, nat: mine.v4 }))
+        } else {
+            (mine.v4, mine.aim6.map(|addr| Alt { addr, nat: mine.v6 }))
+        };
+        Self { nat, alt }
+    }
+
+    /// What is worth passing on from a peer seen at `seen`: the other
+    /// family's address only if it really is the other family and one the
+    /// internet routes. A peer may name anything, and what is named ends up
+    /// as a place somebody else sends datagrams to.
+    pub fn screened(self, seen: SocketAddr) -> Self {
+        let seen = crate::address::canonical(seen);
+        Self {
+            nat: self.nat,
+            // Passed on in its plain spelling, so that "IPv4 written the
+            // IPv6 way" is neither taken for the other family nor handed
+            // to somebody whose socket would not know what to do with it.
+            alt: self
+                .alt
+                .map(|a| Alt {
+                    addr: crate::address::canonical(a.addr),
+                    nat: a.nat,
+                })
+                .filter(|a| {
+                    a.addr.port() != 0
+                        && a.addr.is_ipv6() != seen.is_ipv6()
+                        && crate::address::class::is_global(a.addr.ip())
+                }),
+        }
+    }
+}
 
 /// The connection id a SHARP packet must never use, because a relay would
 /// read it as one of these messages instead.
@@ -229,7 +303,7 @@ pub enum Message {
         /// hand to whoever asks for it (see [`NatHints`]). Advice, not
         /// authority: the proof covers it, but only so that nobody on the
         /// way can change it.
-        hints: NatHints,
+        hints: Hints,
         /// Proof that this is the identity's owner asking.
         proof: [u8; PROOF_LEN],
     },
@@ -249,7 +323,7 @@ pub enum Message {
         target: SharpId,
         token: [u8; TOKEN_LEN],
         /// The sender's own, for the receiver to be told.
-        hints: NatHints,
+        hints: Hints,
     },
     /// Sender → relay: the same, saying who is asking and proving it, for a
     /// relay that serves only identities on its list. The proof is made as
@@ -258,7 +332,7 @@ pub enum Message {
     ConnectAs {
         target: SharpId,
         token: [u8; TOKEN_LEN],
-        hints: NatHints,
+        hints: Hints,
         id: SharpId,
         proof: [u8; PROOF_LEN],
     },
@@ -272,7 +346,7 @@ pub enum Message {
         ticket: [u8; TOKEN_LEN],
         /// What the receiver said of its NAT when it registered: how to aim
         /// at it when its address alone is not enough.
-        hints: NatHints,
+        hints: Hints,
     },
     /// Relay → receiver: somebody is coming through on this port, and they
     /// appear to be at this address. Send an [`Message::Open`] to the port
@@ -282,7 +356,7 @@ pub enum Message {
         peer: SocketAddr,
         ticket: [u8; TOKEN_LEN],
         /// What the sender said of its NAT.
-        hints: NatHints,
+        hints: Hints,
     },
     Error {
         code: Refusal,
@@ -395,16 +469,47 @@ fn take_addr(buf: &[u8], pos: &mut usize) -> Option<SocketAddr> {
 /// this version would not have written is not guessed at, and the message
 /// carrying it is refused (there is one encoding of each message, which the
 /// fuzzing target insists on).
-fn take_hints(buf: &[u8], pos: &mut usize) -> Option<NatHints> {
+fn take_hints(buf: &[u8], pos: &mut usize) -> Option<Hints> {
+    let nat = take_nat(buf, pos)?;
+    // No other family's address is a single zero byte; one is written as an
+    // address, which starts with its family (4 or 6).
+    let alt = match *buf.get(*pos)? {
+        0 => {
+            *pos += 1;
+            None
+        }
+        _ => {
+            let addr = take_addr(buf, pos)?;
+            Some(Alt {
+                addr,
+                nat: take_nat(buf, pos)?,
+            })
+        }
+    };
+    Some(Hints { nat, alt })
+}
+
+fn take_nat(buf: &[u8], pos: &mut usize) -> Option<NatHints> {
     let raw: [u8; NatHints::WIRE_LEN] =
         buf.get(*pos..*pos + NatHints::WIRE_LEN)?.try_into().ok()?;
     *pos += NatHints::WIRE_LEN;
     NatHints::from_bytes(&raw)
 }
 
+fn put_hints(out: &mut Vec<u8>, hints: &Hints) {
+    out.extend_from_slice(&hints.nat.to_bytes());
+    match &hints.alt {
+        None => out.push(0),
+        Some(alt) => {
+            put_addr(out, alt.addr);
+            out.extend_from_slice(&alt.nat.to_bytes());
+        }
+    }
+}
+
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 56);
+        let mut out = Vec::with_capacity(HEADER_LEN + 96);
         out.extend_from_slice(&MAGIC);
         match self {
             Message::Register {
@@ -420,7 +525,7 @@ impl Message {
                 out.extend_from_slice(token);
                 out.push(*flags);
                 out.extend_from_slice(&stamp.to_be_bytes());
-                out.extend_from_slice(&hints.to_bytes());
+                put_hints(&mut out, hints);
                 out.extend_from_slice(proof);
             }
             Message::Challenge { token } => {
@@ -440,7 +545,7 @@ impl Message {
                 out.push(Kind::Connect as u8);
                 out.extend_from_slice(target.as_bytes());
                 out.extend_from_slice(token);
-                out.extend_from_slice(&hints.to_bytes());
+                put_hints(&mut out, hints);
             }
             Message::ConnectAs {
                 target,
@@ -452,7 +557,7 @@ impl Message {
                 out.push(Kind::ConnectAs as u8);
                 out.extend_from_slice(target.as_bytes());
                 out.extend_from_slice(token);
-                out.extend_from_slice(&hints.to_bytes());
+                put_hints(&mut out, hints);
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(proof);
             }
@@ -466,7 +571,7 @@ impl Message {
                 out.extend_from_slice(&port.to_be_bytes());
                 put_addr(&mut out, *peer);
                 out.extend_from_slice(ticket);
-                out.extend_from_slice(&hints.to_bytes());
+                put_hints(&mut out, hints);
             }
             Message::Incoming {
                 port,
@@ -478,7 +583,7 @@ impl Message {
                 out.extend_from_slice(&port.to_be_bytes());
                 put_addr(&mut out, *peer);
                 out.extend_from_slice(ticket);
-                out.extend_from_slice(&hints.to_bytes());
+                put_hints(&mut out, hints);
             }
             Message::Error { code } => {
                 out.push(Kind::Error as u8);
@@ -674,7 +779,7 @@ mod tests {
     #[test]
     fn hints_ride_along_and_invalid_ones_are_refused() {
         use crate::nat::behaviour::Allocation;
-        let hints = NatHints {
+        let nat = NatHints {
             mapping: 3,
             filtering: 2,
             allocation: Allocation::Sequential,
@@ -682,35 +787,188 @@ mod tests {
             hairpin: Some(true),
             cgn: true,
         };
+        let plain = Hints { nat, alt: None };
+        let with_v6 = Hints {
+            nat,
+            alt: Some(Alt {
+                addr: "[2a0e:aa00:1:1::1]:40000".parse().unwrap(),
+                nat: NatHints {
+                    mapping: 4,
+                    filtering: 3,
+                    ..NatHints::unknown()
+                },
+            }),
+        };
+        let with_v4 = Hints {
+            nat,
+            alt: Some(Alt {
+                addr: "198.18.0.1:7".parse().unwrap(),
+                nat: NatHints::unknown(),
+            }),
+        };
         let id = Identity::generate().id();
-        roundtrip(Message::Connect {
-            target: id,
-            token: [1; TOKEN_LEN],
-            hints,
-        });
-        roundtrip(Message::Allocated {
-            port: 40000,
-            peer: "203.0.113.1:5".parse().unwrap(),
-            ticket: [2; TOKEN_LEN],
-            hints,
-        });
-        roundtrip(Message::Incoming {
-            port: 40001,
-            peer: "[2001:db8::1]:5".parse().unwrap(),
-            ticket: [3; TOKEN_LEN],
-            hints,
-        });
+        for hints in [plain, with_v6, with_v4] {
+            roundtrip(Message::Connect {
+                target: id,
+                token: [1; TOKEN_LEN],
+                hints,
+            });
+            roundtrip(Message::ConnectAs {
+                target: id,
+                token: [1; TOKEN_LEN],
+                hints,
+                id,
+                proof: [9; PROOF_LEN],
+            });
+            roundtrip(Message::Register {
+                id,
+                token: [1; TOKEN_LEN],
+                flags: 0,
+                stamp: 5,
+                hints,
+                proof: [9; PROOF_LEN],
+            });
+            roundtrip(Message::Allocated {
+                port: 40000,
+                peer: "203.0.113.1:5".parse().unwrap(),
+                ticket: [2; TOKEN_LEN],
+                hints,
+            });
+            roundtrip(Message::Incoming {
+                port: 40001,
+                peer: "[2001:db8::1]:5".parse().unwrap(),
+                ticket: [3; TOKEN_LEN],
+                hints,
+            });
+        }
         // A value this version would not write is refused, not guessed at.
         let mut bytes = Message::Incoming {
             port: 1,
             peer: "203.0.113.1:5".parse().unwrap(),
             ticket: [3; TOKEN_LEN],
-            hints,
+            hints: plain,
         }
         .encode();
-        let at = bytes.len() - NatHints::WIRE_LEN;
+        let at = bytes.len() - 1 - NatHints::WIRE_LEN;
         bytes[at] = 99;
         assert_eq!(Message::decode(&bytes), None);
+        // So is a family byte that is neither "none" nor an address, and an
+        // alternative address cut short.
+        let good = Message::Incoming {
+            port: 1,
+            peer: "203.0.113.1:5".parse().unwrap(),
+            ticket: [3; TOKEN_LEN],
+            hints: with_v6,
+        }
+        .encode();
+        let mut bytes = good.clone();
+        let family = good.len() - (19 + NatHints::WIRE_LEN);
+        assert_eq!(bytes[family], 6);
+        bytes[family] = 5;
+        assert_eq!(Message::decode(&bytes), None);
+        assert_eq!(Message::decode(&good[..good.len() - 1]), None);
+        // And the longest thing that can be said fits.
+        let longest = Message::ConnectAs {
+            target: id,
+            token: [1; TOKEN_LEN],
+            hints: with_v6,
+            id,
+            proof: [9; PROOF_LEN],
+        }
+        .encode();
+        assert!(longest.len() <= MAX_MESSAGE, "{} bytes", longest.len());
+    }
+
+    /// What is passed on of a peer's other address is what could be true of
+    /// it, and the choice of which family is "other" follows the way the
+    /// relay is reached.
+    #[test]
+    fn the_other_family_is_named_from_the_way_the_relay_is_reached() {
+        let mut mine = FamilyHints::unknown();
+        mine.v4.mapping = 3;
+        mine.v6.mapping = 4;
+        mine.aim4 = Some("11.1.0.1:4000".parse().unwrap());
+        mine.aim6 = Some("[2a0e:aa00:1:1::1]:5000".parse().unwrap());
+
+        let over_v4 = Hints::told_to(&mine, "11.9.0.10:5560".parse().unwrap());
+        assert_eq!(over_v4.nat.mapping, 3);
+        assert_eq!(over_v4.alt.unwrap().addr, mine.aim6.unwrap());
+        assert_eq!(over_v4.alt.unwrap().nat.mapping, 4);
+
+        let over_v6 = Hints::told_to(&mine, "[2a0e:aa00:f::10]:5560".parse().unwrap());
+        assert_eq!(over_v6.nat.mapping, 4);
+        assert_eq!(over_v6.alt.unwrap().addr, mine.aim4.unwrap());
+        assert_eq!(over_v6.alt.unwrap().nat.mapping, 3);
+
+        // A relay reached through the mapped spelling is an IPv4 one.
+        let mapped = Hints::told_to(&mine, "[::ffff:11.9.0.10]:5560".parse().unwrap());
+        assert_eq!(mapped, over_v4);
+
+        // Nothing to say of the other family: nothing said.
+        mine.aim6 = None;
+        assert_eq!(
+            Hints::told_to(&mine, "11.9.0.10:5560".parse().unwrap()).alt,
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_believable_other_address_is_passed_on() {
+        let alt = |addr: &str| Alt {
+            addr: addr.parse().unwrap(),
+            nat: NatHints::unknown(),
+        };
+        let seen_v4: SocketAddr = "11.1.0.1:4000".parse().unwrap();
+        let seen_v6: SocketAddr = "[2a0e:aa00:1:1::1]:5000".parse().unwrap();
+        let said = |a: Alt| Hints {
+            nat: NatHints::unknown(),
+            alt: Some(a),
+        };
+        // The other family, routable, with a port: kept.
+        assert!(said(alt("[2a0e:aa00:2:1::2]:6"))
+            .screened(seen_v4)
+            .alt
+            .is_some());
+        assert!(said(alt("11.2.0.1:6")).screened(seen_v6).alt.is_some());
+        // The same family as the one seen, or a mapped spelling of it.
+        assert!(said(alt("11.2.0.1:6")).screened(seen_v4).alt.is_none());
+        assert!(said(alt("[2a0e:aa00:2:1::2]:6"))
+            .screened(seen_v6)
+            .alt
+            .is_none());
+        assert!(said(alt("[::ffff:11.2.0.1]:6"))
+            .screened(seen_v4)
+            .alt
+            .is_none());
+        // IPv4 written the IPv6 way is IPv4: the other family to an IPv6
+        // peer, and passed on plainly.
+        let plain = said(alt("[::ffff:11.2.0.1]:6"))
+            .screened(seen_v6)
+            .alt
+            .unwrap();
+        assert_eq!(plain.addr, "11.2.0.1:6".parse::<SocketAddr>().unwrap());
+        // Not something the internet routes, and no port at all.
+        for bad in [
+            "10.0.0.1:6",
+            "100.64.0.1:6",
+            "127.0.0.1:6",
+            "[::1]:6",
+            "[fd00::1]:6",
+            "[fe80::1]:6",
+            "[ff02::1]:6",
+            "[2001:db8::1]:6",
+        ] {
+            let seen = if bad.starts_with('[') {
+                seen_v4
+            } else {
+                seen_v6
+            };
+            assert!(said(alt(bad)).screened(seen).alt.is_none(), "{}", bad);
+        }
+        assert!(said(alt("[2a0e:aa00:2:1::2]:0"))
+            .screened(seen_v4)
+            .alt
+            .is_none());
     }
 
     #[test]
@@ -745,7 +1003,7 @@ mod tests {
         assert_eq!(by_owner, by_relay);
 
         let mut bytes = Message::Register {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             id: oid,
             token: [4; TOKEN_LEN],
             flags: REGISTER_PRIVATE,
@@ -760,7 +1018,7 @@ mod tests {
         assert_eq!(
             Message::decode(&bytes),
             Some(Message::Register {
-                hints: NatHints::unknown(),
+                hints: Hints::none(),
                 id: oid,
                 token: [4; TOKEN_LEN],
                 flags: REGISTER_PRIVATE,
@@ -795,7 +1053,7 @@ mod tests {
     fn every_message_survives_the_wire() {
         let id = Identity::generate().id();
         roundtrip(Message::Register {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             id,
             token: [0; TOKEN_LEN],
             flags: 0,
@@ -803,7 +1061,7 @@ mod tests {
             proof: [0; PROOF_LEN],
         });
         roundtrip(Message::Register {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             id,
             token: [7; TOKEN_LEN],
             flags: REGISTER_PRIVATE,
@@ -822,25 +1080,25 @@ mod tests {
             observed: "[2001:db8::1]:5555".parse().unwrap(),
         });
         roundtrip(Message::Connect {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             target: id,
             token: [3; TOKEN_LEN],
         });
         roundtrip(Message::ConnectAs {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             target: id,
             token: [3; TOKEN_LEN],
             id: Identity::generate().id(),
             proof: [9; PROOF_LEN],
         });
         roundtrip(Message::Allocated {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             port: 50001,
             peer: "198.51.100.9:6000".parse().unwrap(),
             ticket: [5; TOKEN_LEN],
         });
         roundtrip(Message::Incoming {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             port: 50001,
             peer: "[2001:db8::2]:6000".parse().unwrap(),
             ticket: [6; TOKEN_LEN],
@@ -881,7 +1139,7 @@ mod tests {
     fn malformed_messages_are_refused_not_guessed() {
         let id = Identity::generate().id();
         let good = Message::Register {
-            hints: NatHints::unknown(),
+            hints: Hints::none(),
             id,
             token: [1; TOKEN_LEN],
             flags: 0,

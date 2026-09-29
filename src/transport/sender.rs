@@ -252,7 +252,7 @@ impl Sender {
                 // not worth holding the introduction up for long: the tests
                 // take a round trip or two, and without them the receiver
                 // simply treats our NAT as an easy one.
-                let ours = puncher.hints_when_known().await.primary();
+                let ours = puncher.hints_when_known().await;
                 // A name is resolved like the receiver's own: as a hint.
                 let resolved = tokio::select! {
                     r = tokio::time::timeout(
@@ -292,7 +292,9 @@ impl Sender {
                         &mut rx,
                         &cancel,
                         auth,
-                        ours,
+                        // Told in the family this relay is reached over,
+                        // with where we can be aimed at in the other.
+                        crate::relay::Hints::told_to(&ours, addr),
                     )
                     .await
                     {
@@ -317,14 +319,34 @@ impl Sender {
                             if let Some(peer) = i.peer {
                                 let _ = found.send(Found::Relay(peer));
                             }
+                            // Then where it says it is in the other family:
+                            // the path with no NAT in it, when both ends
+                            // have IPv6 — and the only direct one when the
+                            // IPv4 NATs cannot be got through.
+                            if let Some(alt) = i.peer_alt.filter(|_| i.peer.is_some()) {
+                                tracing::info!(
+                                    "relay {} also says the receiver is at {}",
+                                    addr,
+                                    alt.addr
+                                );
+                                let _ = found.send(Found::Relay(alt.addr));
+                            }
                             let _ = found.send(Found::Relay(i.relayed));
                             // Push outwards at where the receiver appears
                             // to be, aimed by what it says its NAT does,
                             // while its own punches come the other way.
-                            if let Some(peer) = i.peer {
+                            let aimed = i.peer.map(|peer| (peer, i.peer_hints)).into_iter().chain(
+                                i.peer_alt
+                                    .map(|a| (a.addr, a.nat))
+                                    .filter(|_| i.peer.is_some()),
+                            );
+                            for (peer, nat) in aimed {
+                                let Some(peer) = reach.native(peer) else {
+                                    continue;
+                                };
                                 let (puncher, cancel) = (puncher.clone(), cancel.clone());
                                 tokio::spawn(async move {
-                                    puncher.run(peer, i.peer_hints, &cancel).await;
+                                    puncher.run(peer, nat, &cancel).await;
                                 });
                             }
                             // And bind our side of the relay's port, which
