@@ -30,6 +30,15 @@ pub type Incoming = (Vec<u8>, SocketAddr);
 const REPLY_WAIT: Duration = Duration::from_millis(600);
 /// Tries per relay exchange.
 const TRIES: u32 = 3;
+/// How long a sender goes on asking a relay for a receiver the relay says it
+/// does not know, and the pauses between asks (doubling, up to the last).
+/// The receiver may be registering this very moment — two people starting at
+/// about the same time — or its registration may have lapsed and be renewed
+/// within seconds; giving up on the relay at the first "unknown" loses the
+/// introduction for good, and with it every direct path that needs one.
+const UNKNOWN_PATIENCE: Duration = Duration::from_secs(120);
+const UNKNOWN_PAUSE: Duration = Duration::from_millis(600);
+const UNKNOWN_PAUSE_MAX: Duration = Duration::from_secs(4);
 /// How many times a side announces itself on an allocated port, and how
 /// many punches a receiver sends. More than one because the first may be
 /// the one that opens the NAT rather than the one that gets through.
@@ -124,9 +133,14 @@ pub async fn connect(
     let mut token = [0u8; TOKEN_LEN];
     // Set once the relay has refused us as a stranger.
     let mut identify: Option<(SharpId, [u8; 32])> = None;
+    // Since when the relay has been saying it does not know the receiver,
+    // and how long to pause before asking again.
+    let mut unknown: Option<(Instant, Duration)> = None;
     // Two more than the plain exchange needs, for the round that tells us
     // to identify ourselves and the one that fetches a token for it.
-    for _ in 0..TRIES + 2 {
+    let mut tries = 0;
+    while tries < TRIES + 2 {
+        tries += 1;
         if cancel.is_cancelled() {
             return Err(ConnectError::Cancelled);
         }
@@ -211,6 +225,30 @@ pub async fn connect(
                         )))
                     }
                 }
+            }
+            Some(Message::Error {
+                code: Refusal::Unknown,
+            }) => {
+                let (since, pause) = unknown.get_or_insert((Instant::now(), UNKNOWN_PAUSE));
+                if since.elapsed() >= UNKNOWN_PATIENCE {
+                    return Err(ConnectError::Refused(
+                        Refusal::Unknown.describe().to_string(),
+                    ));
+                }
+                if *pause == UNKNOWN_PAUSE {
+                    tracing::info!(
+                        "relay {}: the receiver is not registered there (yet); asking again",
+                        relay
+                    );
+                }
+                let wait = *pause;
+                *pause = (*pause * 2).min(UNKNOWN_PAUSE_MAX);
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = cancel.cancelled() => return Err(ConnectError::Cancelled),
+                }
+                // Waiting for the receiver is not a try that failed.
+                tries -= 1;
             }
             Some(Message::Error { code }) => {
                 return Err(ConnectError::Refused(code.describe().to_string()))

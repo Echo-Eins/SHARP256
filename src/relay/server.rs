@@ -2944,6 +2944,114 @@ mod wire_tests {
         assert!(!m.allow(a, 1, t0));
     }
 
+    /// A sender that asks for a receiver before the receiver has registered
+    /// (two people starting together, or a registration being renewed) keeps
+    /// asking, and is put through once the receiver is there: giving up on
+    /// the relay at the first "unknown" would lose the introduction for good.
+    #[tokio::test]
+    async fn a_sender_that_comes_first_is_put_through_when_its_receiver_registers() {
+        let (relay, relay_id, cancel) = start_relay().await;
+        let owner = Identity::generate();
+        let sender_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // What the socket's owner does in a real sender: hand the relay's
+        // datagrams to the exchange.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let reader = {
+            let socket = sender_socket.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    if tx.send((buf[..n].to_vec(), from)).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let asking = {
+            let (socket, id, cancel) =
+                (sender_socket.clone(), owner.id(), CancellationToken::new());
+            tokio::spawn(async move {
+                crate::relay::client::connect(
+                    socket,
+                    relay,
+                    id,
+                    &mut rx,
+                    &cancel,
+                    None,
+                    Hints::none(),
+                )
+                .await
+            })
+        };
+        // Long enough for the sender to have been told "unknown" more than
+        // once.
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        assert!(
+            !asking.is_finished(),
+            "it is still waiting for the receiver"
+        );
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered = register(&receiver_socket, relay, &relay_id, &owner, 0).await;
+        assert!(matches!(registered, Some(Message::Registered { .. })));
+        let introduced = tokio::time::timeout(Duration::from_secs(10), asking)
+            .await
+            .expect("put through soon after the receiver registered")
+            .unwrap()
+            .expect("introduced");
+        assert_eq!(
+            introduced.peer,
+            Some(receiver_socket.local_addr().unwrap()),
+            "told where the receiver is"
+        );
+        reader.abort();
+        cancel.cancel();
+    }
+
+    /// A receiver that never registers is asked for a while and then given
+    /// up on, with the relay's own answer.
+    #[tokio::test]
+    async fn a_receiver_that_never_registers_ends_the_asking_when_cancelled() {
+        let (relay, _relay_id, relay_cancel) = start_relay().await;
+        let sender_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let reader = {
+            let socket = sender_socket.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    if tx.send((buf[..n].to_vec(), from)).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let cancel = CancellationToken::new();
+        let asking = {
+            let (socket, cancel) = (sender_socket.clone(), cancel.clone());
+            tokio::spawn(async move {
+                crate::relay::client::connect(
+                    socket,
+                    relay,
+                    Identity::generate().id(),
+                    &mut rx,
+                    &cancel,
+                    None,
+                    Hints::none(),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        cancel.cancel();
+        let ended = tokio::time::timeout(Duration::from_secs(3), asking)
+            .await
+            .expect("stops when told to")
+            .unwrap();
+        assert_eq!(ended, Err(crate::relay::client::ConnectError::Cancelled));
+        reader.abort();
+        relay_cancel.cancel();
+    }
+
     /// No limits configured: nothing is tracked, and everything passes.
     #[test]
     fn without_limits_nothing_is_tracked() {
