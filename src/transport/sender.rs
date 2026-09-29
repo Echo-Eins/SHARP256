@@ -1173,6 +1173,24 @@ type Hit = crate::nat::birthday::Hit;
 #[cfg(not(feature = "nat-traversal"))]
 type Hit = std::convert::Infallible;
 
+/// A socket a birthday meeting was made at *after* the session was up — a
+/// session carried by a relay or a TURN server — and the address the
+/// receiver got through to it from. The receiver's NAT lets packets in at
+/// that socket and at no other, so the frames that ask it whether the way
+/// is open go out from here, what arrives here is read with everything
+/// else, and once the receiver has proven the address (as for any move to a
+/// new one) this becomes the socket the session runs on.
+#[cfg(feature = "nat-traversal")]
+struct Aux {
+    socket: Arc<BatchSocket>,
+    peer: SocketAddr,
+    since: Instant,
+}
+
+/// How long the receiver is given to prove an address at such a socket.
+#[cfg(feature = "nat-traversal")]
+const AUX_PATIENCE: Duration = Duration::from_secs(20);
+
 /// A relay we are talking to, and the inbox its datagrams go into.
 type RelayInbox = (SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>);
 /// Every relay's inbox, added to as each relay's name resolves.
@@ -1266,6 +1284,10 @@ struct Engine {
     /// receiver's packets can only be received at one of those, so the
     /// handshake moves there.
     hits: Option<mpsc::UnboundedReceiver<Hit>>,
+    /// The socket of a meeting made after the handshake, while its address
+    /// is being proven (see [`Aux`]).
+    #[cfg(feature = "nat-traversal")]
+    aux: Option<Aux>,
     /// Addresses the introductions, the names and NAT64 turn up, as they
     /// turn up.
     found_rx: mpsc::UnboundedReceiver<Found>,
@@ -1462,6 +1484,8 @@ impl Engine {
             #[cfg(feature = "nat-traversal")]
             stun_inbox: None,
             hits: None,
+            #[cfg(feature = "nat-traversal")]
+            aux: None,
             found_rx,
             unresolved,
             answered_at: None,
@@ -1554,8 +1578,19 @@ impl Engine {
 
     /// Handles everything queued on the socket.
     fn drain_socket(&mut self) -> Result<(), SendError> {
+        let socket = self.socket.clone();
+        self.drain(&socket)?;
+        #[cfg(feature = "nat-traversal")]
+        if let Some(aux) = self.aux.as_ref().map(|a| a.socket.clone()) {
+            self.drain(&aux)?;
+        }
+        Ok(())
+    }
+
+    /// Everything that is queued on `socket`.
+    fn drain(&mut self, socket: &BatchSocket) -> Result<(), SendError> {
         for _ in 0..MAX_RECV_CALLS {
-            let n = match self.socket.try_recv(&mut self.rx_bufs, &mut self.rx_meta) {
+            let n = match socket.try_recv(&mut self.rx_bufs, &mut self.rx_meta) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => {
@@ -1608,7 +1643,16 @@ impl Engine {
             .send
             .seal(&mut self.ctl_buf)
             .map_err(io::Error::other)?;
-        match self.socket.try_send(to, &self.ctl_buf) {
+        // Towards the address a late meeting was made at, from the socket it
+        // was made at: no other socket has a way in there.
+        #[cfg(feature = "nat-traversal")]
+        let out: &BatchSocket = match &self.aux {
+            Some(aux) if aux.peer == to => &aux.socket,
+            _ => &self.socket,
+        };
+        #[cfg(not(feature = "nat-traversal"))]
+        let out: &BatchSocket = &self.socket;
+        match out.try_send(to, &self.ctl_buf) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => Ok(()),
             Err(e) => Err(e),
@@ -1716,6 +1760,86 @@ impl Engine {
     #[cfg(not(feature = "nat-traversal"))]
     async fn adopt_socket(&mut self, hit: Hit) -> Result<(), SendError> {
         match hit {}
+    }
+
+    /// Whether a meeting made now is worth taking up: while the session is
+    /// carried by a relay or a TURN server, and none is being proven.
+    fn can_take_meeting(&self) -> bool {
+        #[cfg(feature = "nat-traversal")]
+        {
+            self.secure.is_some() && self.aux.is_none() && self.is_relayed(self.peer)
+        }
+        #[cfg(not(feature = "nat-traversal"))]
+        {
+            false
+        }
+    }
+
+    /// The socket being proven, for the loop to wait on.
+    fn aux_socket(&self) -> Option<Arc<BatchSocket>> {
+        #[cfg(feature = "nat-traversal")]
+        {
+            self.aux.as_ref().map(|a| a.socket.clone())
+        }
+        #[cfg(not(feature = "nat-traversal"))]
+        {
+            None
+        }
+    }
+
+    /// A birthday meeting made after the handshake, while the session is
+    /// carried. Before it was, the handshake moved to the socket and the
+    /// session was never anywhere else; now the session is up, elsewhere,
+    /// and moving it is the same business as moving to any new address —
+    /// each end proving the other's — with the difference that the frames
+    /// asking go out from the socket the receiver's NAT lets in.
+    #[cfg(feature = "nat-traversal")]
+    async fn meet_late(&mut self, hit: Hit) {
+        let Hit { socket, from, .. } = hit;
+        let Ok(batch) = BatchSocket::wrap(socket).await else {
+            return;
+        };
+        let Some(from) = self.reach.native(from) else {
+            return;
+        };
+        tracing::info!(
+            "the receiver's NAT let {} through to {} while the session is carried by {}: asking it there",
+            from,
+            batch.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+            self.peer
+        );
+        self.aux = Some(Aux {
+            socket: Arc::new(batch),
+            peer: from,
+            since: Instant::now(),
+        });
+        // An address to ask like any other, and at once.
+        if self.candidates.len() < MAX_CANDIDATES && !self.candidates.contains(&from) {
+            self.candidates.push(from);
+        }
+        self.peer_ips.insert(crate::address::canonical(from).ip());
+        self.next_direct_probe = Instant::now();
+    }
+
+    #[cfg(not(feature = "nat-traversal"))]
+    async fn meet_late(&mut self, hit: Hit) {
+        match hit {}
+    }
+
+    /// The receiver has proven `addr`: if that is the address a late meeting
+    /// was made at, the socket it was made at is the session's from now on.
+    #[cfg(feature = "nat-traversal")]
+    fn adopt_aux(&mut self, addr: SocketAddr) {
+        if let Some(aux) = self.aux.take_if(|a| a.peer == addr) {
+            tracing::info!(
+                "the session now runs from {}, where the meeting was made",
+                aux.socket
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
+            );
+            self.socket = aux.socket;
+        }
     }
 
     /// Adds an address that turned up, if it is one we are willing to send
@@ -2433,7 +2557,7 @@ impl Engine {
         );
 
         let mut hash_task = Some(hash_task);
-        let socket = self.socket.clone();
+        let mut socket = self.socket.clone();
         let cancel = self.cancel.clone();
         let mut next_tick = Instant::now() + TICK;
         let mut next_progress = Instant::now() + self.cfg.progress_interval;
@@ -2443,7 +2567,12 @@ impl Engine {
                 return Err(SendError::Cancelled);
             }
 
-            // 1. Input: everything that is already queued on the socket.
+            // 1. Input: everything that is already queued on the socket. The
+            // socket may have changed since: a late birthday meeting whose
+            // address the receiver has proven is where the session runs now.
+            if !Arc::ptr_eq(&socket, &self.socket) {
+                socket = self.socket.clone();
+            }
             self.drain_socket()?;
             // An answer to a re-handshake or state query: adopt the
             // receiver's view of what it holds.
@@ -2518,9 +2647,17 @@ impl Engine {
                 SendBlock::Idle | SendBlock::Window | SendBlock::Pipeline => {}
             }
             let sealing = self.pipe.in_pool > 0;
+            // While the session is carried, a meeting made at a socket of
+            // ours is a way to a direct path; and the socket of one being
+            // proven is read alongside this one.
+            let aux_socket = self.aux_socket();
+            let hits_open = self.hits.is_some() && self.can_take_meeting();
+            let mut late_hit = None;
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
                 r = socket.writable(), if want_write => { let _ = r; }
+                r = async { aux_socket.as_ref().unwrap().readable().await }, if aux_socket.is_some() => { let _ = r; }
+                h = async { self.hits.as_mut().unwrap().recv().await }, if hits_open => { late_hit = h; }
                 r = self.pipe.results.recv(), if sealing => {
                     if let Some(batch) = r {
                         self.pipe.in_pool -= 1;
@@ -2529,6 +2666,9 @@ impl Engine {
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
                 _ = cancel.cancelled() => {}
+            }
+            if let Some(hit) = late_hit {
+                self.meet_late(hit).await;
             }
         }
     }
@@ -3130,6 +3270,8 @@ impl Engine {
                 if let Some(addr) = self.path.on_response(from, p.data) {
                     tracing::info!("receiver address {} proven; sending there now", addr);
                     self.peer = addr;
+                    #[cfg(feature = "nat-traversal")]
+                    self.adopt_aux(addr);
                     // A move from IPv4 to IPv6 makes every header 20 bytes
                     // longer.
                     let fitted = self.family_chunk(self.chunk);
@@ -3558,13 +3700,22 @@ impl Engine {
             } else {
                 SLOW
             };
-        let asked: Vec<SocketAddr> = self
+        #[cfg_attr(not(feature = "nat-traversal"), allow(unused_mut))]
+        let mut asked: Vec<SocketAddr> = self
             .candidates
             .iter()
             .copied()
             .filter(|a| *a != self.peer && !self.is_relayed(*a))
             .take(ADDRESSES)
             .collect();
+        // The address of a meeting being proven is asked whatever else is
+        // being: it is the one that has been shown to lead somewhere.
+        #[cfg(feature = "nat-traversal")]
+        if let Some(aux) = &self.aux {
+            asked.retain(|a| *a != aux.peer);
+            asked.insert(0, aux.peer);
+            asked.truncate(ADDRESSES);
+        }
         if asked.is_empty() {
             return;
         }
@@ -3677,6 +3828,17 @@ impl Engine {
                 0,
                 &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
             );
+        }
+        #[cfg(feature = "nat-traversal")]
+        if self
+            .aux
+            .as_ref()
+            .is_some_and(|a| now.saturating_duration_since(a.since) >= AUX_PATIENCE)
+        {
+            tracing::info!(
+                "the receiver did not prove the address of the late meeting; leaving it"
+            );
+            self.aux = None;
         }
         self.probe_direct(now);
         self.maybe_send_tail_probe(now)?;
