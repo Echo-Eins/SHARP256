@@ -211,7 +211,8 @@ pub struct Puncher {
     /// Cancelled when what this end's NAT does will not become known any
     /// better than it is: the tests are over, or were never going to run.
     settled: CancellationToken,
-    last_spray: parking_lot::Mutex<Option<Instant>>,
+    /// When each address was last sprayed at.
+    last_spray: parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, Instant>>,
     /// What to do with the socket a birthday meeting was made at. Without
     /// one, an end whose NAT draws ports at random can only punch from the
     /// one socket, which is a hope and not a method.
@@ -238,7 +239,7 @@ impl Puncher {
             socket,
             mine,
             settled: CancellationToken::new(),
-            last_spray: parking_lot::Mutex::new(None),
+            last_spray: parking_lot::Mutex::new(std::collections::HashMap::new()),
             on_hit: None,
         }
     }
@@ -330,17 +331,30 @@ impl Puncher {
             return;
         }
         let mine = self.hints_when_known().await.for_addr(&base);
-        let plan = plan(&mine, &theirs, base);
+        // Working out where a peer's NAT will put a port only means
+        // something for an address the internet routes: a private one on a
+        // card is the peer's own network, which is no place for a spray.
+        let plan = if crate::address::class::is_global(base.ip()) {
+            plan(&mine, &theirs, base)
+        } else {
+            Plan {
+                verdict: Verdict::Direct,
+                ports: vec![base.port()],
+                spray: 0,
+                sockets: 0,
+            }
+        };
         tracing::info!("punching towards {}: {}", base, plan.verdict.describe());
         let mut spray = plan.spray;
         if spray > 0 {
             let now = Instant::now();
             let mut last = self.last_spray.lock();
-            if last.is_some_and(|t| now.saturating_duration_since(t) < SPRAY_SPACING) {
-                tracing::debug!("punch: not spraying again so soon");
+            last.retain(|_, t| now.saturating_duration_since(*t) < SPRAY_SPACING);
+            if last.contains_key(&base.ip()) || last.len() >= 8 {
+                tracing::debug!("punch: not spraying at {} again so soon", base.ip());
                 spray = 0;
             } else {
-                *last = Some(now);
+                last.insert(base.ip(), now);
             }
         }
         let aux = async {

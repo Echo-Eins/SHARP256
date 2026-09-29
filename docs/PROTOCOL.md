@@ -1025,20 +1025,36 @@ these, with nothing left over, is ignored.
 
 | kind | message | direction | body |
 |---|---|---|---|
-| 1 | Register | receiver → relay | `id[32] token[16] flags:u8 stamp:u64 proof[16]` (flag 0x01: private) |
+| 1 | Register | receiver → relay | `id[32] token[16] flags:u8 stamp:u64 hints[6] proof[16]` (flag 0x01: private) |
 | 2 | Challenge | relay → peer | `token[16]` |
 | 3 | Registered | relay → receiver | `lease:u32 observed:addr` |
-| 4 | Connect | sender → relay | `target[32] token[16]` |
-| 5 | Allocated | relay → sender | `port:u16 peer:addr ticket[16]` (peer unspecified: private) |
-| 6 | Incoming | relay → receiver | `port:u16 peer:addr ticket[16]` |
+| 4 | Connect | sender → relay | `target[32] token[16] hints[6]` |
+| 5 | Allocated | relay → sender | `port:u16 peer:addr ticket[16] hints[6]` (peer unspecified: private) |
+| 6 | Incoming | relay → receiver | `port:u16 peer:addr ticket[16] hints[6]` |
 | 7 | Error | relay → peer | `code:u8` (1 unknown, 2 bad token or proof, 3 busy, 4 stale) |
 | 8 | Open | peer → allocated port | `ticket[16] proof[16]` (proof zero: asking) |
 | 9 | Punch | peer → peer | — |
 | 10 | Bye | receiver → relay | `id[32] token[16] stamp:u64 proof[16]` |
 | 11 | Confirm | allocated port → peer | `proof[16]` |
-| 12 | ConnectAs | sender → relay | `target[32] token[16] id[32] proof[16]` |
+| 12 | ConnectAs | sender → relay | `target[32] token[16] hints[6] id[32] proof[16]` |
 
 Refusal 5 is *forbidden*: the relay serves only identities on its list.
+
+**NAT hints** (`hints[6]`) say what the NAT or firewall in front of the sender
+of the message does, as its own RFC 5780 tests measured it, so that the
+other end can aim its punches (see `docs/NAT.md`). Byte 0 is the mapping
+(0 not measured, 1 endpoint-independent, 2 address-dependent, 3
+address-and-port-dependent, 4 no translation), byte 1 the filtering (0 to 3,
+the same order), byte 2 how a NAT that varies the port numbers them (0
+unknown, 1 keeps the host's own port, 2 counts up, 3 random), bytes 3–4 the
+step of a counting NAT as a signed big-endian integer, and byte 5 flags:
+bits 0–1 hairpinning (0 unknown, 1 no, 2 yes), bit 2 a carrier-grade NAT in
+front. Any other value is a malformed message. A relay keeps the receiver's
+hints with its registration and passes them to each sender it introduces,
+and hands the receiver the sender's; for a receiver that registered as
+private both are sent as all zero. The hints are advice from a peer that
+need not be honest: they change how many datagrams of nine bytes are sent
+and to which ports, never who is trusted. In Register the proof covers them.
 
 `proof` in Register, Bye and ConnectAs is
 `BLAKE3-keyed(K, message up to it)[0..16]` with

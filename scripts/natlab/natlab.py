@@ -584,9 +584,15 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose):
     elif sender.poll() is None:
         sender.kill()
         return False, "none", 0, "the sender printed no card:\n" + lab.log("sender.log")
-    try:
-        sender.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    samples = []
+    end = time.time() + timeout
+    while sender.poll() is None and time.time() < end:
+        if os.environ.get("NATLAB_SAMPLE"):
+            ct = lab.x("RA", "cat", "/proc/net/nf_conntrack", check=False).stdout
+            n = sum(1 for l in ct.splitlines() if "dst=11.2.0.1" in l.split("src=")[1] if "udp" in l)
+            samples.append(f"{time.time() - start:.0f}s:{n}")
+        time.sleep(2)
+    if sender.poll() is None:
         sender.kill()
     took = time.time() - start
     log = lab.log("sender.log")
@@ -597,7 +603,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose):
         if not name.endswith(".sharp-part"):
             got = hashlib.sha256(open(f"{d}/out/{name}", "rb").read()).hexdigest()
     ok = got == want
-    detail = f"cards exchanged by hand after {human_delay:.0f}s"
+    detail = f"cards exchanged by hand after {human_delay:.0f}s" + (f"\nflows at the sender's NAT towards the receiver: {' '.join(samples)}" if samples else "")
     if verbose or not ok:
         for gw in ("RA", "RB"):
             ct = lab.x(gw, "cat", "/proc/net/nf_conntrack", check=False).stdout
