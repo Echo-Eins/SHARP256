@@ -1,0 +1,20 @@
+#!/bin/sh
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+mkdir -p /dev/pts /run
+ln -sf /proc/self/fd /dev/fd; ln -sf /proc/self/fd/0 /dev/stdin; ln -sf /proc/self/fd/1 /dev/stdout; ln -sf /proc/self/fd/2 /dev/stderr
+ip link set lo up
+for m in veth nf_tables nf_conntrack nf_nat nf_defrag_ipv4 nf_defrag_ipv6 nft_ct nft_nat nft_masq nft_chain_nat nft_numgen nft_limit nft_counter nft_log nft_compat nf_conntrack_netlink; do
+  modprobe $m 2>/dev/null
+done
+echo "=== kernel: $(uname -r)"
+echo "=== ipv6: $(head -c 300 /proc/net/if_inet6 | head -2)"
+echo "=== nft: $(nft --version 2>&1)"
+export SHARP_BIN_DIR=/lab HOME=/tmp
+cd /lab
+sh /lab/run.sh
+echo "=== EXIT $?"
+/bin/busybox poweroff -f || echo o > /proc/sysrq-trigger

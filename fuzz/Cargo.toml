@@ -103,3 +103,24 @@ path = "fuzz_targets/card.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mdns"
+path = "fuzz_targets/mdns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "turn"
+path = "fuzz_targets/turn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dht"
+path = "fuzz_targets/dht.rs"
+test = false
+doc = false
+bench = false
