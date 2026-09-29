@@ -161,10 +161,11 @@ jobs:
             run: python3 scripts/natlab/natlab.py matrix --isolate -v
           - name: networks that cannot reach each other, TURN
             run: NATLAB_SIZE_MB=20 python3 scripts/natlab/natlab.py matrix --via turn --isolate --timeout 60 -v
-          - name: port forwards (PCP, NAT-PMP, UPnP), and a carrier's PCP
+          - name: port forwards (PCP, NAT-PMP, UPnP), a carrier's PCP, a port already taken
             run: |
               python3 scripts/natlab/natlab.py portmap
               python3 scripts/natlab/natlab.py portmap --anycast
+              python3 scripts/natlab/natlab.py portmap --taken
           - name: IPv6 firewalls, and both families at once
             run: python3 scripts/natlab/natlab.py v6 --direct-only -v
           - name: IPv6 pinholes
@@ -193,7 +194,7 @@ jobs:
             run: python3 scripts/natlab/natlab.py fallback
           - name: a carrier-grade NAT in front of the router
             run: python3 scripts/natlab/natlab.py cgn -v
-          - name: local network (IPv4 and IPv6), one NAT, forgetful NAT
+          - name: local network (IPv4 and IPv6), one NAT with and without hairpinning, forgetful NAT
             run: |
               python3 scripts/natlab/natlab.py lan
               python3 scripts/natlab/natlab.py lan --v6

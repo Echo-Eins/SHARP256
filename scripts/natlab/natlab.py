@@ -40,14 +40,17 @@ client.
     scripts/natlab/natlab.py matrix --via addr      # ... and no cards, no server: two addresses read off two screens
     scripts/natlab/natlab.py pair port_restricted symmetric_random
     scripts/natlab/natlab.py portmap                # PCP, NAT-PMP, UPnP against miniupnpd
+    scripts/natlab/natlab.py portmap --taken        # ... with the port asked for already forwarded to another
     scripts/natlab/natlab.py portmap6               # IPv6 pinholes (PCP, UPnP IGD2), with a control
     scripts/natlab/natlab.py lan [--v6]             # multicast DNS on one network (with IPv6 only)
+    scripts/natlab/natlab.py samenat                # two hosts behind one NAT, with and without hairpinning
     scripts/natlab/natlab.py early                  # a sender that starts before its receiver has registered
     scripts/natlab/natlab.py fallback               # a direct path that dies: back to the relay or TURN server
     scripts/natlab/natlab.py cgn                    # a carrier-grade NAT in front of the home router: two NATs in a row
     scripts/natlab/natlab.py v6                     # IPv6 firewalls, and both families together
     scripts/natlab/natlab.py probe port_restricted symmetric_random   # sharp-probe on both hosts
-    scripts/natlab/natlab.py probe --all --wait 12  # ... for every pair: does its verdict match what a transfer does?
+    scripts/natlab/natlab.py probe --all --wait 12  # ... for every pair: does its verdict match what a transfer does,
+                                                    #     and is what each host says of its own NAT true?
     scripts/natlab/natlab.py probe --v6 --wait 12   # ... over IPv6, for every pair of firewalls
     scripts/natlab/natlab.py probe --all --addr --wait 45   # ... with addresses swapped instead of cards
 """
@@ -1067,6 +1070,67 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
     return ok, path, took, detail
 
 
+# What `sharp-probe` has to say of each kind of NAT, in its own words
+# (`describe_family`, src/nat/probe.rs): how the NAT maps, whom it lets in,
+# how it numbers the ports of new mappings. No NAT here sends back in what
+# an inside host addresses to the outside address (whatever lets packets in
+# is on the outside interface alone): the ones that keep one mapping for
+# every destination have to report no hairpinning, and a symmetric one is
+# not asked (its mapping for the test would be a new one, `behaviour.rs`)
+# — none may claim that hairpinning works (`PROBE_NEVER`).
+PROBE_SAYS = {
+    "open": ["no NAT", "lets in packets from anyone"],
+    "full_cone": ["one port for every destination", "lets in packets from anyone", "no hairpinning"],
+    "restricted": ["one port for every destination", "lets in packets from hosts it was sent to", "no hairpinning"],
+    "port_restricted": ["one port for every destination",
+                        "lets in only packets from the exact address and port it was sent to", "no hairpinning"],
+    "symmetric_seq": ["the port depends on destination host and port (symmetric)",
+                      "lets in only packets from the exact address and port it was sent to",
+                      "new ports count up"],
+    "symmetric_random": ["the port depends on destination host and port (symmetric)",
+                         "lets in only packets from the exact address and port it was sent to",
+                         "new ports are random"],
+}
+# Nothing in these laboratories loops back, and nothing has a carrier's NAT
+# in front of the router.
+PROBE_NEVER = ["hairpinning works", "another NAT in front"]
+# And of each IPv6 firewall: nothing translated, and whom it lets in.
+PROBE_SAYS6 = {
+    "open6": ["no address translation", "lets in packets from anyone"],
+    "stateful6": ["no address translation", "lets in only packets from the exact address and port it was sent to"],
+    "restricted6": ["no address translation", "lets in packets from hosts it was sent to"],
+}
+
+
+def probe_report_wrong(report, topo, host, kind, fw6, v4):
+    """What is wrong in what `sharp-probe` on `host` reported of its own
+    network, measured against the laboratory as it was built: the address
+    the internet sees the host at, and what `PROBE_SAYS` (IPv4, behind
+    `kind`) and `PROBE_SAYS6` (IPv6, behind the firewall `fw6`) say it must
+    report. Nothing, if it is right."""
+    checks = []
+    if v4:
+        checks.append(("IPv4", topo.inside_ip[host] if kind == "open" else topo.wan_ip[host], PROBE_SAYS[kind]))
+    if fw6:
+        checks.append(("IPv6", topo.v6_ip[host], PROBE_SAYS6[fw6]))
+    wrong = []
+    for family, ip, says in checks:
+        m = re.search(rf"^{family}:\s+(.*)$", report, re.M)
+        if not m:
+            wrong.append(f"no {family} line")
+            continue
+        parts = [p.strip() for p in m.group(1).split("; ")]
+        seen = re.match(r"your address as the internet sees it: (\S+)$", parts[0])
+        seen_ip = plain(seen.group(1)).rsplit(":", 1)[0].strip("[]") if seen else None
+        missing = [w for w in says if not any(p.startswith(w) for p in parts)]
+        said = [n for n in PROBE_NEVER if any(p.startswith(n) for p in parts)]
+        if seen_ip != ip or missing or said:
+            wrong.append(f"{family}" + (f", not at {ip}" if seen_ip != ip else "")
+                         + (f", no word of {missing}" if missing else "") + (f", said {said}" if said else "")
+                         + f": \"{m.group(1)[:400]}\"")
+    return wrong
+
+
 def cmd_probe(args):
     """`sharp-probe` on both hosts of a pair: each prints what it sees and
     its card, the cards are swapped by hand (through standard input), and
@@ -1077,39 +1141,53 @@ def cmd_probe(args):
     (give `--wait` 45 s or so)."""
     by = "addr" if args.addr else "card"
     if args.v6:
-        print(f"{'scenario':46} {'A firewall':12} {'B firewall':12} punch test")
-        bad = total = 0
+        print(f"{'scenario':46} {'A firewall':12} {'B firewall':12} {'punch test':44} what each host said of its network")
+        bad = total = wrong = 0
         for name, an, bn, has_v4 in V6_SCENARIOS:
             for fa in FW6_KINDS:
                 for fb in FW6_KINDS:
-                    ok, want_ok = probe_pair(an, bn, args.wait, quiet=True, v6=(fa, fb), v4=has_v4, by=by)
+                    ok, want_ok, said = probe_pair(an, bn, args.wait, quiet=True, v6=(fa, fb), v4=has_v4, by=by)
                     total += 1
                     bad += ok != want_ok
+                    wrong += sum(1 for w in said.values() if w)
                     print(f"{name:46} {fa:12} {fb:12} {'a packet got through both ways' if ok else 'nothing got through':32} "
-                          f"{'as expected' if ok == want_ok else 'UNEXPECTED'}", flush=True)
+                          f"{'as expected' if ok == want_ok else 'UNEXPECTED':11} {reports_line(said)}", flush=True)
         print(f"\n{total - bad} of {total} as they must be")
-        return 1 if bad else 0
+        print(f"{2 * total - wrong} of {2 * total} reports of a host's own network true to the laboratory")
+        return 1 if bad or wrong else 0
     if not args.all:
         if not (args.a and args.b):
             raise SystemExit("name two NAT kinds, or --all")
-        ok, want_ok = probe_pair(args.a, args.b, args.wait, by=by)
-        return 0 if ok == want_ok else 1
-    print(f"{'host A behind':18} {'host B behind':18} punch test")
-    bad = 0
+        ok, want_ok, said = probe_pair(args.a, args.b, args.wait, by=by)
+        print(f"what each host said of its network: {reports_line(said)}")
+        return 0 if ok == want_ok and not any(said.values()) else 1
+    print(f"{'host A behind':18} {'host B behind':18} {'punch test':44} what each host said of its network")
+    bad = wrong = 0
     for a in NAT_KINDS:
         for b in NAT_KINDS:
-            ok, want_ok = probe_pair(a, b, args.wait, quiet=True, by=by)
+            ok, want_ok, said = probe_pair(a, b, args.wait, quiet=True, by=by)
             bad += ok != want_ok
+            wrong += sum(1 for w in said.values() if w)
             print(f"{a:18} {b:18} {'a packet got through both ways' if ok else 'nothing got through':32} "
-                  f"{'as expected' if ok == want_ok else 'UNEXPECTED'}", flush=True)
+                  f"{'as expected' if ok == want_ok else 'UNEXPECTED':11} {reports_line(said)}", flush=True)
     print(f"\n{len(NAT_KINDS) ** 2 - bad} of {len(NAT_KINDS) ** 2} as the theory says they must")
-    return 1 if bad else 0
+    print(f"{2 * len(NAT_KINDS) ** 2 - wrong} of {2 * len(NAT_KINDS) ** 2} reports of a host's own network true to the laboratory")
+    return 1 if bad or wrong else 0
+
+
+def reports_line(said):
+    """`probe_pair`'s verdict on what the two hosts reported, in a line."""
+    if not any(said.values()):
+        return "both true"
+    return "; ".join(f"host {h} WRONG: {' / '.join(w)}" for h, w in said.items() if w)
 
 
 def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True, by="card"):
-    """One pair; (did a packet get through both ways, did it have to). With
-    `v6`, a pair of IPv6 firewall kinds: every such pair has to get through.
-    `by` is what the two swap: "card", or "addr" — the `Addresses:` line."""
+    """One pair; (did a packet get through both ways, did it have to, what
+    was wrong in each host's report of its own network — see
+    `probe_report_wrong`). With `v6`, a pair of IPv6 firewall kinds: every
+    such pair has to get through. `by` is what the two swap: "card", or
+    "addr" — the `Addresses:` line."""
     args = argparse.Namespace(a=a_nat, b=b_nat, wait=wait)
     lab = Lab(keep=False)
     try:
@@ -1124,8 +1202,8 @@ def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True, by="card"):
         )
         if not wait_for(lab, "relay.log", r"Receivers: --relay", 10):
             print("the relay (and its STUN server) did not start")
-            return False, True
-        procs, cards = {}, {}
+            return False, True, {"A": ["not run"], "B": ["not run"]}
+        procs, cards, said = {}, {}, {}
         for ns, name, extra in (("A", "a", []), ("B", "b", ["--receiver"])):
             procs[name] = lab.spawn(
                 ns,
@@ -1144,9 +1222,12 @@ def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True, by="card"):
             if not m:
                 print(f"host {name.upper()} printed no {'card' if by == 'card' else 'addresses'}:\n"
                       + lab.log(f"probe_{name}.log")[-1500:])
-                return False, True
+                return False, True, {"A": ["not run"], "B": ["not run"]}
             cards[name] = m.group(1).strip()
             report = lab.log(f"probe_{name}.log").split("Your card")[0]
+            host = name.upper()
+            said[host] = probe_report_wrong(report, topo, host, args.a if name == "a" else args.b,
+                                            (v6[0] if name == "a" else v6[1]) if v6 else None, v4)
             if not quiet:
                 print(f"--- host {name.upper()} behind {args.a if name == 'a' else args.b}\n{report.split('Measuring')[-1]}")
         # Each is handed the other's card, one after the other, as two people would.
@@ -1167,7 +1248,7 @@ def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True, by="card"):
                 print(f"--- punch test, host {name.upper()}\nSending at{tail[-700:]}")
             print(f"punch test: {'a packet got through both ways' if ok else 'nothing got through'} "
                   f"({'as expected' if ok == want_ok else 'UNEXPECTED'})")
-        return ok, want_ok
+        return ok, want_ok, said
     finally:
         lab.close()
 
@@ -1434,14 +1515,17 @@ MINIUPNPD_TABLE = """table inet miniupnpd {
 def start_miniupnpd(lab, gw, ext_if, lan_ip, protocols, ext_ip, prefix=24):
     """miniupnpd — an independent implementation of UPnP-IGD, NAT-PMP and
     PCP — as the router's daemon, with the nftables backend and only the
-    protocols in `protocols` switched on. It answers at `lan_ip`, and hosts
-    whose addresses share its first `prefix` bits (its "LAN") alone."""
+    protocols in `protocols` switched on ("upnp-v1": UPnP, describing itself
+    as an IGDv1 router, which has no AddAnyPortMapping). It answers at
+    `lan_ip`, and hosts whose addresses share its first `prefix` bits (its
+    "LAN") alone."""
     lab.nft(gw, MINIUPNPD_TABLE)
     conf = f"""ext_ifname={ext_if}
 listening_ip={lan_ip}/{prefix}
 ipv6_disable=yes
 enable_pcp_pmp={'yes' if ('pcp' in protocols or 'natpmp' in protocols) else 'no'}
-enable_upnp={'yes' if 'upnp' in protocols else 'no'}
+enable_upnp={'yes' if ('upnp' in protocols or 'upnp-v1' in protocols) else 'no'}
+{'force_igd_desc_v1=yes' if 'upnp-v1' in protocols else ''}
 secure_mode=no
 system_uptime=yes
 uuid=6d5c1a3e-1f3a-4c7e-9a52-3c1f7f0e2b11
@@ -1465,13 +1549,92 @@ allow 1024-65535 0.0.0.0/0 1024-65535
 
 PCP_ANYCAST = "192.0.0.9"
 PCP_ANYCAST_V6 = "2001:1::1"
-# What miniupnpd logs when a request of each kind has made the forward to
-# the receiver (10.2.0.2, port 5555).
+# What miniupnpd logs when a request of each kind has asked it for a
+# forward to the receiver (10.2.0.2, port 5555).
 DAEMON_GRANTED = {
     "pcp": r"PCP MAP: added mapping UDP \d+->10\.2\.0\.2:5555",
     "natpmp": r"NAT-PMP port mapping request : \d+->10\.2\.0\.2:5555 udp",
     "upnp": r"Add(?:Any)?PortMapping: ext port \d+ to 10\.2\.0\.2:5555 protocol UDP",
+    "upnp-v1": r"AddPortMapping: ext port \d+ to 10\.2\.0\.2:5555 protocol UDP",
 }
+# With the port taken (`--taken`), what it logs of the way round: the port
+# it found in use, and for UPnP which action of which version of the
+# service asked for another.
+TAKEN_SAID = {
+    "pcp": [r"PCP MAP: added mapping UDP (?!5555\b)\d+->10\.2\.0\.2:5555"],
+    "natpmp": [r"port 5555 protocol udp already in use"],
+    "upnp": [r"port 5555 UDP \(rhost ''\) already redirected to 10\.2\.0\.99:5555",
+             r"WANIPConnection:2#AddAnyPortMapping"],
+    "upnp-v1": [r"port 5555 UDP \(rhost ''\) already redirected to 10\.2\.0\.99:5555",
+                r"WANIPConnection:1#AddPortMapping"],
+}
+# And what settles it, whatever was said: the router's own rule, the
+# forwarded port translated to the receiver.
+ROUTER_RULE = r"th dport {port} dnat ip to 10\.2\.0\.2:5555"
+TAKEN_PORT = 5555
+# Takes the router's port 5555 for somebody else, in the protocol of the
+# row, before the receiver asks for it (`portmap --taken`). PCP and NAT-PMP
+# map only for the host that asks, so it is the receiver's own host at
+# another inside port (6000); UPnP would take that for an update of one
+# mapping, so there it is another host of the network (10.2.0.99). Run in
+# the receiver's namespace: proto, router, the daemon's log.
+TAKE_PORT = r"""
+import os, re, socket, struct, sys, time, urllib.request
+proto, router, log = sys.argv[1:4]
+if proto in ("pcp", "natpmp"):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("10.2.0.2", 0))
+    s.settimeout(1.0)
+    if proto == "pcp":
+        # MAP, RFC 6887 section 11.1: UDP, inside port 6000, 5555 suggested.
+        me = bytes(10) + b"\xff\xff" + socket.inet_aton("10.2.0.2")
+        req = (struct.pack("!BBHI", 2, 1, 0, 3600) + me + os.urandom(12)
+               + struct.pack("!B3xHH", 17, 6000, 5555) + bytes(10) + b"\xff\xff" + bytes(4))
+    else:
+        # RFC 6886 section 3.3: UDP, inside port 6000, 5555 suggested.
+        req = struct.pack("!BBHHHI", 0, 1, 0, 6000, 5555, 3600)
+    for _ in range(4):
+        s.sendto(req, (router, 5351))
+        try:
+            data = s.recv(1100)
+            break
+        except socket.timeout:
+            pass
+    else:
+        sys.exit(f"{proto}: no answer")
+    if proto == "pcp":
+        result, port = data[3], struct.unpack("!H", data[42:44])[0]
+    else:
+        result, port = struct.unpack("!H", data[2:4])[0], struct.unpack("!H", data[10:12])[0]
+    print(f"{proto}: 5555 -> 10.2.0.2:6000, result {result}, port {port}")
+    sys.exit(0 if result == 0 and port == 5555 else 1)
+http = None
+for _ in range(50):
+    m = re.search(r"HTTP listening on port (\d+)", open(log).read())
+    if m:
+        http = m.group(1)
+        break
+    time.sleep(0.1)
+if not http:
+    sys.exit("upnp: the daemon says of no HTTP port")
+base = f"http://{router}:{http}"
+fetch = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+desc = fetch(base + "/rootDesc.xml", timeout=5).read().decode()
+m = re.search(r"<serviceType>(urn:schemas-upnp-org:service:WANIPConnection:\d)</serviceType>.*?"
+              r"<controlURL>([^<]+)</controlURL>", desc, re.S)
+stype, ctl = m.groups()
+body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+        f'<u:AddPortMapping xmlns:u="{stype}"><NewRemoteHost></NewRemoteHost>'
+        '<NewExternalPort>5555</NewExternalPort><NewProtocol>UDP</NewProtocol>'
+        '<NewInternalPort>5555</NewInternalPort><NewInternalClient>10.2.0.99</NewInternalClient>'
+        '<NewEnabled>1</NewEnabled><NewPortMappingDescription>somebody else</NewPortMappingDescription>'
+        '<NewLeaseDuration>3600</NewLeaseDuration></u:AddPortMapping></s:Body></s:Envelope>')
+req = urllib.request.Request(base + ctl, data=body.encode(), headers={
+    "Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": f'"{stype}#AddPortMapping"'})
+fetch(req, timeout=5).read()
+print(f"upnp ({stype.rsplit(':', 1)[1] == '2' and 'IGDv2' or 'IGDv1'}): 5555 -> 10.2.0.99:5555")
+"""
 
 
 def cmd_portmap(args):
@@ -1485,12 +1648,21 @@ def cmd_portmap(args):
     nothing; the NAT is the carrier's, in front of it, and its PCP server
     is reached at the PCP anycast address (RFC 7723) alone — miniupnpd
     listens there and nowhere else, so a forward granted can only have come
-    from there."""
+    from there.
+
+    With `--taken` the router's port 5555 is already forwarded to somebody
+    else when the receiver asks for it (`TAKE_PORT`): what the receiver is
+    granted, and publishes, is a port the router picked — a PCP or NAT-PMP
+    server's own choice, AddAnyPortMapping on an IGDv2 router, and on an
+    IGDv1 router ("upnp-v1") one of the ports the receiver tries itself."""
     ok_all = True
-    protos = args.protocols or (["pcp"] if args.anycast else ["pcp", "natpmp", "upnp"])
+    if args.taken and args.anycast:
+        raise SystemExit("--taken is a router's port; --anycast has no router doing it")
+    protos = args.protocols or (["pcp"] if args.anycast else
+                                ["pcp", "natpmp", "upnp", "upnp-v1"] if args.taken else ["pcp", "natpmp", "upnp"])
     if args.anycast and protos != ["pcp"]:
         raise SystemExit("the anycast address is PCP's alone (RFC 7723)")
-    kinds = args.senders or list(NAT_KINDS)
+    kinds = args.senders or (["port_restricted", "symmetric_random"] if args.taken else list(NAT_KINDS))
     print(f"{'receiver asks by':18} {'receiver NAT':18} {'sender behind':18} result")
     for proto in protos:
         for b_nat in args.receivers:
@@ -1528,6 +1700,16 @@ def cmd_portmap(args):
 }
 """)
                     time.sleep(1.0)
+                    label = f"{proto} at {PCP_ANYCAST}" if args.anycast else proto
+                    if args.taken:
+                        took_first = lab.x("B", sys.executable, "-c", TAKE_PORT, proto.split("-")[0], "10.2.0.1",
+                                           os.path.join(d, "miniupnpd.log"), check=False)
+                        if took_first.returncode != 0:
+                            print(f"{label:18} {b_nat:18} {a_nat:18} FAIL port {TAKEN_PORT} could not be taken first: "
+                                  f"{(took_first.stdout + took_first.stderr).strip()[-300:]}\n"
+                                  + "--- miniupnpd\n" + lab.log("miniupnpd.log")[-1000:])
+                            ok_all = False
+                            continue
                     data = os.path.join(d, "payload.bin")
                     with open(data, "wb") as f:
                         f.write(os.urandom(1 << 20))
@@ -1540,7 +1722,6 @@ def cmd_portmap(args):
                          "--log-level", "info"],
                         "receiver.log",
                     )
-                    label = f"{proto} at {PCP_ANYCAST}" if args.anycast else proto
                     m = wait_for(lab, "receiver.log", r"reachable from outside at (\S+) \(port forward\)", 25)
                     log = lab.log("receiver.log")
                     if not m:
@@ -1569,13 +1750,27 @@ def cmd_portmap(args):
                             got = hashlib.sha256(open(f"{d}/out/{name}", "rb").read()).hexdigest()
                     conn = re.search(r"Connected to (\S+)", lab.log("sender.log"))
                     # And the forward is the one asked for: the daemon's own
-                    # log names the request that made it.
-                    granted = re.search(DAEMON_GRANTED[proto], lab.log("miniupnpd.log"))
-                    ok = got == want and conn is not None and plain(conn.group(1)) == plain(forwarded) and bool(granted)
+                    # log names the request, and the router's rules hold the
+                    # forward — the port published, to the receiver.
+                    daemon = lab.log("miniupnpd.log")
+                    granted = re.search(DAEMON_GRANTED[proto], daemon)
+                    port = int(forwarded.rsplit(":", 1)[1])
+                    rules = lab.x("CB" if args.anycast else "RB", "nft", "list", "table", "inet", "miniupnpd",
+                                  check=False).stdout
+                    rule = re.search(ROUTER_RULE.format(port=port), rules)
+                    said = [re.search(r, daemon) for r in TAKEN_SAID[proto]] if args.taken else []
+                    ok = (got == want and conn is not None and plain(conn.group(1)) == plain(forwarded) and bool(granted)
+                          and bool(rule) and all(said) and not (args.taken and port == TAKEN_PORT))
                     ok_all &= ok
                     print(f"{label:18} {b_nat:18} {a_nat:18} {'ok  ' if ok else 'FAIL'} via {forwarded} in {took:.1f}s; "
+                          + (f"{TAKEN_PORT} taken first ({took_first.stdout.strip()}); " if args.taken else "")
                           + (f"the daemon: \"{granted.group(0)}\"" if granted
-                             else f"the daemon's log shows no {proto} request that made the forward"), flush=True)
+                             else f"the daemon's log shows no {proto} request that made the forward")
+                          + "".join(f", \"{m.group(0)}\"" if m else f", nothing like /{r}/"
+                                    for m, r in zip(said, TAKEN_SAID[proto] if args.taken else [])
+                                    if not (m and granted and m.group(0) == granted.group(0)))
+                          + (f"; the router: \"{rule.group(0)}\"" if rule else f"; the router has no rule for port {port}"),
+                          flush=True)
                     if not ok:
                         print(lab.log("miniupnpd.log")[-800:])
                         print(lab.log("sender.log")[-800:])
@@ -1784,19 +1979,42 @@ def cmd_portmap6(args):
     return 0 if ok_all else 1
 
 
+# What makes a NAT loop back (RFC 4787 REQ-9) what a host inside sends to
+# the outside address, for `samenat`: to whichever host has that port
+# outside — the NAT keeps the port a host sends from, and the receiver sends
+# from 5555, the sender from the kernel's ephemeral range — and from the
+# outside address, as the RFC wants, so that each sees the other where the
+# relay said it would be. A host sending to its own outside address gets
+# its own packet back, from there: what the hairpinning test looks for.
+HAIRPIN = """table ip hairpin {
+  chain pre {
+    type nat hook prerouting priority dstnat - 1; policy accept;
+    iifname "lan" ip daddr 11.1.0.1 udp dport 5555 dnat to 10.1.0.3
+    iifname "lan" ip daddr 11.1.0.1 udp dport 32768-60999 dnat to 10.1.0.2
+  }
+  chain post {
+    type nat hook postrouting priority srcnat - 1; policy accept;
+    ip saddr 10.1.0.0/24 ip daddr 10.1.0.0/24 ct status dnat snat to 11.1.0.1
+  }
+}
+"""
+
+
 def cmd_samenat(args):
-    """Two hosts behind one NAT — which is not a NAT that loops packets back
-    (RFC 4787 REQ-9): a Linux one does not for the ports it hands out
-    dynamically. The public address a relay tells the sender is then the
-    router itself. What is expected: the receiver's own address on the
-    network is worth having, and where it is kept back only a relay gets
-    the transfer across."""
+    """Two hosts behind one NAT. A Linux NAT does not loop packets back
+    (RFC 4787 REQ-9) for the ports it hands out dynamically, so the public
+    address a relay tells the sender is the router itself: the receiver's
+    own address on the network is worth having, and where it is kept back
+    only a relay gets the transfer across. Unless the NAT does loop back
+    (`HAIRPIN`): then the two meet at their outside addresses. Each case
+    also checks what the receiver measured of the NAT."""
     ok_all = True
     print(f"{'case':56} result")
-    for name, extra, carry, want in (
-        ("the receiver publishes its address on the network", [], True, "lan"),
-        ("...keeps it back, and the relay carries", ["--no-lan-addresses"], True, "relay"),
-        ("...keeps it back, and the relay only introduces", ["--no-lan-addresses"], False, "none"),
+    for name, extra, carry, loops, want in (
+        ("the receiver publishes its address on the network", [], True, False, "lan"),
+        ("...keeps it back, and the relay carries", ["--no-lan-addresses"], True, False, "relay"),
+        ("...keeps it back, and the relay only introduces", ["--no-lan-addresses"], False, False, "none"),
+        ("...and the NAT loops back (hairpinning)", ["--no-lan-addresses"], False, True, "direct-via-nat"),
     ):
         lab = Lab()
         try:
@@ -1822,6 +2040,13 @@ def cmd_samenat(args):
             for ifn in ("pA", "pA2"):
                 lab.x("RA", "ip", "link", "set", ifn, "master", "lan")
                 lab.x("RA", "ip", "link", "set", ifn, "up")
+            # The bridge is the router's switch: what one host sends another
+            # is switched, and only what is sent to the router is routed —
+            # and translated. With br_netfilter loaded, Linux would put the
+            # switched frames through the router's rules too, and a packet
+            # looped back to the host it came from would be switched back
+            # untranslated (the host drops it: its own address as source).
+            lab.x("RA", "sysctl", "-qw", "net.bridge.bridge-nf-call-iptables=0", check=False)
             lab.addr("RA", "lan", "10.1.0.1/24")
             lab.addr("A", "eth0", "10.1.0.2/24", "10.1.0.1")
             lab.addr("A2", "eth0", "10.1.0.3/24", "10.1.0.1")
@@ -1834,6 +2059,8 @@ def cmd_samenat(args):
             lab.x("RA", "sysctl", "-qw", "net.ipv4.ip_forward=1")
             lab.nft("RA", nat_rules("port_restricted", "10.1.0.0/24").replace("$WANIP", "11.1.0.1"))
             lab.nft("RA", gateway_input())
+            if loops:
+                lab.nft("RA", HAIRPIN)
             d = lab.dir
             if not carry:
                 lab.nft("S", """table ip filter {
@@ -1887,7 +2114,7 @@ def cmd_samenat(args):
             conn = re.search(r"Connected to (\S+)", lab.log("sender.log"))
             topo = type("Topo", (), {"wan_ip": {"A": "11.1.0.1"}})()
             path = classify(conn.group(1) if conn else None, topo, 5560) if got == want_hash else "none"
-            ok = path == want
+            ok = path == want and hairpin == ("hairpinning works" if loops else "no hairpinning")
             ok_all &= ok
             print(f"{name:56} {'ok  ' if ok else 'FAIL'} {path} in {took:.1f}s (the NAT says: {hairpin})", flush=True)
             if not ok:
@@ -2288,12 +2515,14 @@ def main():
     pm6.add_argument("--protocols", nargs="*", choices=["pcp", "pcp-anycast", "upnp"])
     pm6.add_argument("--timeout", type=int, default=25)
     pm = sub.add_parser("portmap")
-    pm.add_argument("--protocols", nargs="*", choices=["pcp", "natpmp", "upnp"])
+    pm.add_argument("--protocols", nargs="*", choices=["pcp", "natpmp", "upnp", "upnp-v1"])
     pm.add_argument("--receivers", nargs="*", default=["port_restricted", "symmetric_random"], choices=list(NAT_KINDS))
     pm.add_argument("--senders", nargs="*", choices=list(NAT_KINDS))
     pm.add_argument("--timeout", type=int, default=25)
     pm.add_argument("--anycast", action="store_true",
                     help="the NAT and its PCP server are the carrier's, at the PCP anycast address")
+    pm.add_argument("--taken", action="store_true",
+                    help="the router's port 5555 is forwarded to somebody else before the receiver asks")
     matrix = sub.add_parser("matrix")
     matrix.add_argument("kinds", nargs="*", help="a subset of: " + " ".join(NAT_KINDS))
     matrix.add_argument("--markdown", help="write the results as a table to this file")
