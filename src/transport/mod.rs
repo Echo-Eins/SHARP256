@@ -2,6 +2,8 @@
 
 pub mod congestion;
 pub mod io;
+#[cfg(test)]
+mod log_hygiene;
 pub mod parallel;
 pub mod path;
 pub mod receiver;

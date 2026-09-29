@@ -224,6 +224,11 @@ impl SymmetricState {
         let (ck, k) = hkdf2(&self.ck, ikm);
         self.ck = *ck;
         self.cipher.set(&k);
+        #[cfg(test)]
+        {
+            crate::crypto::secret::keylog::note(&self.ck);
+            crate::crypto::secret::keylog::note(&self.cipher.k);
+        }
     }
 
     fn mix_hash(&mut self, data: &[u8]) {
@@ -235,6 +240,11 @@ impl SymmetricState {
         self.ck = *ck;
         self.mix_hash(&temp_h[..]);
         self.cipher.set(&k);
+        #[cfg(test)]
+        {
+            crate::crypto::secret::keylog::note(&self.ck);
+            crate::crypto::secret::keylog::note(&self.cipher.k);
+        }
     }
 
     fn encrypt_and_hash(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<(), CryptoError> {
@@ -260,6 +270,11 @@ impl SymmetricState {
     /// with the second.
     fn split(&self) -> Split {
         let (first, second) = hkdf2(&self.ck, &[]);
+        #[cfg(test)]
+        {
+            crate::crypto::secret::keylog::note(&first[..]);
+            crate::crypto::secret::keylog::note(&second[..]);
+        }
         Split {
             initiator_to_responder: first,
             responder_to_initiator: second,

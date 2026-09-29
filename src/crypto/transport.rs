@@ -307,14 +307,16 @@ pub struct DirectionKeys {
 
 impl DirectionKeys {
     pub fn new(suite: Suite, secret: &[u8; 32]) -> Self {
+        #[cfg(test)]
+        crate::crypto::secret::keylog::note(secret);
         let keys = Locked::with(|k: &mut Secrets| {
             k.secret = *secret;
             let iv = derive_secret("sharp256 v3 aead iv", &[secret]);
             k.iv.copy_from_slice(&iv[..12]);
-            k.hp.set(
-                suite,
-                &derive_secret("sharp256 v3 header protection", &[secret]),
-            );
+            let hp = derive_secret("sharp256 v3 header protection", &[secret]);
+            #[cfg(test)]
+            crate::crypto::secret::keylog::note(&hp[..]);
+            k.hp.set(suite, &hp);
             let slots = k.slots.get_mut();
             for (slot, epoch) in slots.iter_mut().zip(0..) {
                 Self::fill(slot, suite, secret, epoch);
@@ -333,6 +335,8 @@ impl DirectionKeys {
 
     fn fill(slot: &mut Slot, suite: Suite, secret: &[u8; 32], epoch: u64) {
         let key = derive_secret("sharp256 v3 aead key", &[secret, &epoch.to_be_bytes()]);
+        #[cfg(test)]
+        crate::crypto::secret::keylog::note(&key[..]);
         slot.epoch = epoch;
         slot.aead = Aead::new(suite, &key);
     }

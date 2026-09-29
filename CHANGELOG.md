@@ -165,6 +165,16 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   unmasked epoch with branches, and a forged packet naming a kept epoch was
   rejected about a cycle sooner than one naming another; the choice is now
   made with constant-time selection, and the difference is gone.
+- A test that no key and no byte of a transfer reaches the log: two
+  transfers, one direct with a shared secret and one only a relay can
+  carry, logged at the most detailed level as the program's own subscriber
+  prints it; every key made meanwhile (identities, the pre-shared key and
+  its passphrase, ephemeral keys, every chaining and cipher key of the
+  handshakes, split and traffic secrets, header and epoch keys, cookie,
+  token and relay keys: 135 of them) is looked for in hex of either case,
+  `{:?}`, `{:x?}`, base64 and base32, and in every eight-byte stretch; so
+  are a line of text planted in the file and stretches of its bytes. A key
+  logged on purpose as a control is found; nothing else is.
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the

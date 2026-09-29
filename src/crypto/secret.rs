@@ -113,7 +113,10 @@ pub struct SecretKey(Arc<Locked<[u8; 32]>>);
 impl SecretKey {
     /// A key made where it will stay by `fill`.
     pub fn with(fill: impl FnOnce(&mut [u8; 32])) -> Self {
-        Self(Arc::new(Locked::with(fill)))
+        let key = Self(Arc::new(Locked::with(fill)));
+        #[cfg(test)]
+        keylog::note(key.expose());
+        key
     }
 
     /// A copy of `bytes`. The caller's own copy is the caller's to wipe.
@@ -161,6 +164,33 @@ impl fmt::Debug for SecretKey {
 /// environment variable only to the same user.
 pub fn passphrase(s: &str) -> Result<zeroize::Zeroizing<String>, std::convert::Infallible> {
     Ok(zeroize::Zeroizing::new(s.to_string()))
+}
+
+/// For the tests only: every key made while recording is on, so that a
+/// test can look for each of them where none may be (the log;
+/// `transport::log_hygiene`). Keys made outside [`SecretKey`] note
+/// themselves here too.
+#[cfg(test)]
+pub(crate) mod keylog {
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static KEYS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+    pub(crate) fn note(key: &[u8]) {
+        if ON.load(Ordering::Relaxed) {
+            KEYS.lock().push(key.to_vec());
+        }
+    }
+
+    pub(crate) fn record(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take() -> Vec<Vec<u8>> {
+        std::mem::take(&mut *KEYS.lock())
+    }
 }
 
 /// Whether keys could be locked in memory so far.
