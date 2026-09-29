@@ -80,9 +80,10 @@ struct Args {
         value_name = "USER:PASSWORD@HOST[:PORT]",
         env = "SHARP256_TURN",
         hide_env_values = true,
-        value_delimiter = ' '
+        value_delimiter = ' ',
+        value_parser = sharp256::crypto::secret::secret_text
     )]
-    turn: Vec<String>,
+    turn: Vec<sharp256::crypto::secret::SecretText>,
 
     /// Announce this receiver in the Mainline DHT (the one BitTorrent uses)
     /// and look there for the sender, so that the two find each other's
@@ -162,8 +163,8 @@ struct Args {
     authorized_senders: Option<PathBuf>,
 
     /// Shared secret every sender must also use (or set SHARP256_SECRET)
-    #[arg(long, env = "SHARP256_SECRET", hide_env_values = true, value_parser = sharp256::crypto::secret::passphrase)]
-    secret: Option<zeroize::Zeroizing<String>>,
+    #[arg(long, env = "SHARP256_SECRET", hide_env_values = true, value_parser = sharp256::crypto::secret::secret_text)]
+    secret: Option<sharp256::crypto::secret::SecretText>,
 
     /// Identity key file (default: per-user data directory)
     #[arg(long)]
@@ -214,14 +215,15 @@ async fn main() -> Result<()> {
     cfg.stun_servers = args.stun.clone();
     #[cfg(feature = "nat-traversal")]
     for t in &args.turn {
-        t.parse::<sharp256::nat::turn::Server>()
+        t.as_str()
+            .parse::<sharp256::nat::turn::Server>()
             .map_err(|e| anyhow::anyhow!("--turn: {}", e))?;
     }
     #[cfg(not(feature = "nat-traversal"))]
     if !args.turn.is_empty() {
         anyhow::bail!("--turn needs a build with the nat-traversal feature");
     }
-    cfg.turn_servers = args.turn.clone();
+    cfg.turn_servers = args.turn.iter().map(|t| t.to_string()).collect();
     cfg.dht = args.dht && cfg!(feature = "nat-traversal");
     cfg.dht_bootstrap = args.dht_bootstrap.clone();
     cfg.state_dir = args.state_dir.clone();
@@ -493,5 +495,27 @@ fn read_pasted_peers(
                 Err(e) => println!("That address cannot be used: {}", e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The arguments derive Debug; the passphrase and a TURN server's
+    /// password are in them, and are not what it prints.
+    #[test]
+    fn secrets_given_as_arguments_are_not_printed() {
+        let args = Args::parse_from([
+            "sharp-receiver",
+            "--secret",
+            "correct horse battery staple",
+            "--turn",
+            "alice:hunter2hunter2@turn.example.org",
+        ]);
+        let shown = format!("{:?}", args);
+        assert!(!shown.contains("horse"), "{}", shown);
+        assert!(!shown.contains("hunter2"), "{}", shown);
+        assert_eq!(args.secret.as_deref(), Some("correct horse battery staple"));
     }
 }

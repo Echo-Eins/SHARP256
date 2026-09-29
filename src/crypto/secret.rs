@@ -157,13 +157,43 @@ impl fmt::Debug for SecretKey {
     }
 }
 
-/// Reads a passphrase from the command line into a string that is wiped
-/// when dropped (a `clap` value parser). What the system keeps of the
-/// command line and the environment is beyond reach: a passphrase given
-/// with `--secret` is visible in the list of processes, one in an
-/// environment variable only to the same user.
-pub fn passphrase(s: &str) -> Result<zeroize::Zeroizing<String>, std::convert::Infallible> {
-    Ok(zeroize::Zeroizing::new(s.to_string()))
+/// Text with a secret in it — a passphrase, a TURN server's
+/// `USER:PASSWORD@HOST` — in a string that is wiped when dropped and never
+/// printed: `{:?}` shows `SecretText(..)`, so a structure holding one (the
+/// programs' command-line arguments) can derive `Debug` without giving it
+/// away.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretText(zeroize::Zeroizing<String>);
+
+impl SecretText {
+    pub fn new(text: String) -> Self {
+        Self(zeroize::Zeroizing::new(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for SecretText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretText(..)")
+    }
+}
+
+/// Reads text with a secret in it from the command line (a `clap` value
+/// parser). What the system keeps of the command line and the environment
+/// is beyond reach: what is given as an argument is visible in the list of
+/// processes, what is in an environment variable only to the same user.
+pub fn secret_text(s: &str) -> Result<SecretText, std::convert::Infallible> {
+    Ok(SecretText::new(s.to_string()))
 }
 
 /// For the tests only: every key made while recording is on, so that a
@@ -532,6 +562,13 @@ mod tests {
             derived.expose(),
             &blake3::derive_key("sharp256 test", b"xy")
         );
+    }
+
+    #[test]
+    fn secret_text_is_never_shown() {
+        let t = secret_text("alice:hunter2@turn.example.org").unwrap();
+        assert_eq!(format!("{:?}", t), "SecretText(..)");
+        assert_eq!(&*t, "alice:hunter2@turn.example.org");
     }
 
     /// On this machine keys are locked: the test environment has room for

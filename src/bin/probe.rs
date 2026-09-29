@@ -51,9 +51,10 @@ struct Args {
         value_name = "USER:PASSWORD@HOST[:PORT]",
         env = "SHARP256_TURN",
         hide_env_values = true,
-        value_delimiter = ' '
+        value_delimiter = ' ',
+        value_parser = sharp256::crypto::secret::secret_text
     )]
-    turn: Vec<String>,
+    turn: Vec<sharp256::crypto::secret::SecretText>,
 
     /// The other side's contact card (shc1-…), or @FILE with one in it.
     /// Sends at its addresses for --wait seconds, listens for the other
@@ -131,7 +132,7 @@ async fn main() -> Result<()> {
             Role::Sender
         },
         relays: Vec::new(),
-        turn: args.turn.clone(),
+        turn: args.turn.iter().map(|t| t.to_string()).collect(),
     })
     .await
     .context("the tests could not be run")?;

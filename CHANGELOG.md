@@ -175,6 +175,9 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   `{:?}`, `{:x?}`, base64 and base32, and in every eight-byte stretch; so
   are a line of text planted in the file and stretches of its bytes. A key
   logged on purpose as a control is found; nothing else is.
+- A passphrase or TURN credentials given on the command line are held as
+  `SecretText`, which prints as `SecretText(..)`: the programs' arguments
+  derive `Debug`, and would have printed them.
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the

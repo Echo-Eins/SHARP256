@@ -49,9 +49,10 @@ struct Args {
         value_name = "USER:PASSWORD@HOST[:PORT]",
         env = "SHARP256_TURN",
         hide_env_values = true,
-        value_delimiter = ' '
+        value_delimiter = ' ',
+        value_parser = sharp256::crypto::secret::secret_text
     )]
-    turn: Vec<String>,
+    turn: Vec<sharp256::crypto::secret::SecretText>,
 
     /// Look for the receiver in the Mainline DHT (the one BitTorrent uses),
     /// which it has to be announced in too (sharp-receiver --dht), so that
@@ -107,8 +108,8 @@ struct Args {
     max_rate: Option<String>,
 
     /// Shared secret the receiver also uses (or set SHARP256_SECRET)
-    #[arg(long, env = "SHARP256_SECRET", hide_env_values = true, value_parser = sharp256::crypto::secret::passphrase)]
-    secret: Option<zeroize::Zeroizing<String>>,
+    #[arg(long, env = "SHARP256_SECRET", hide_env_values = true, value_parser = sharp256::crypto::secret::secret_text)]
+    secret: Option<sharp256::crypto::secret::SecretText>,
 
     /// Identity key file (default: per-user data directory)
     #[arg(long)]
@@ -236,14 +237,15 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     cfg.give_card = args.card;
     #[cfg(feature = "nat-traversal")]
     for t in &args.turn {
-        t.parse::<sharp256::nat::turn::Server>()
+        t.as_str()
+            .parse::<sharp256::nat::turn::Server>()
             .map_err(|e| anyhow::anyhow!("--turn: {}", e))?;
     }
     #[cfg(not(feature = "nat-traversal"))]
     if !args.turn.is_empty() {
         anyhow::bail!("--turn needs a build with the nat-traversal feature");
     }
-    cfg.turn_servers = args.turn.clone();
+    cfg.turn_servers = args.turn.iter().map(|t| t.to_string()).collect();
     cfg.dht = args.dht && cfg!(feature = "nat-traversal");
     cfg.dht_bootstrap = args.dht_bootstrap.clone();
     #[cfg(feature = "nat-traversal")]
@@ -408,5 +410,27 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
             eprintln!("\nTransfer failed: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The arguments derive Debug; the passphrase and a TURN server's
+    /// password are in them, and are not what it prints.
+    #[test]
+    fn secrets_given_as_arguments_are_not_printed() {
+        let args = Args::parse_from([
+            "sharp-sender",
+            "--secret",
+            "correct horse battery staple",
+            "--turn",
+            "alice:hunter2hunter2@turn.example.org",
+        ]);
+        let shown = format!("{:?}", args);
+        assert!(!shown.contains("horse"), "{}", shown);
+        assert!(!shown.contains("hunter2"), "{}", shown);
+        assert_eq!(args.secret.as_deref(), Some("correct horse battery staple"));
     }
 }
