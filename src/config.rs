@@ -154,7 +154,7 @@ pub struct SenderConfig {
     pub identity: Option<Identity>,
     /// Pre-shared key (see `crypto::psk_from_passphrase`), if the receiver
     /// requires one.
-    pub psk: Option<[u8; 32]>,
+    pub psk: Option<crate::crypto::SecretKey>,
     /// Relays to ask for an introduction when the receiver's own addresses
     /// do not answer. Each adds two more candidates: where the receiver
     /// appears to be, and the relay's own port for the pair.
@@ -380,7 +380,7 @@ pub struct ReceiverConfig {
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
     /// Pre-shared key every sender must also use, if any.
-    pub psk: Option<[u8; 32]>,
+    pub psk: Option<crate::crypto::SecretKey>,
     /// Senders allowed to start transfers; `None` admits any sender that
     /// knows this receiver's ID.
     pub allowed_senders: Option<HashSet<SharpId>>,

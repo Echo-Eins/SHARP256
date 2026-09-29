@@ -11,9 +11,11 @@ pub mod handshake;
 pub mod identity;
 pub mod noise;
 pub mod replay;
+pub mod secret;
 pub mod transport;
 
 pub use identity::{Identity, SharpId};
+pub use secret::SecretKey;
 pub use transport::{SessionKeys, Suite};
 
 use zeroize::{Zeroize, Zeroizing};
@@ -80,7 +82,7 @@ pub const PSK_PASSES: u32 = 3;
 /// Derives the pre-shared key from a passphrase shared by sender and
 /// receiver. The receiver's ID salts the derivation, so the same passphrase
 /// yields unrelated keys for different receivers.
-pub fn psk_from_passphrase(passphrase: &str, receiver: &SharpId) -> [u8; 32] {
+pub fn psk_from_passphrase(passphrase: &str, receiver: &SharpId) -> SecretKey {
     psk_from_passphrase_with_cost(passphrase, receiver, PSK_MEMORY_KIB, PSK_PASSES)
 }
 
@@ -90,17 +92,24 @@ pub fn psk_from_passphrase_with_cost(
     receiver: &SharpId,
     memory_kib: u32,
     passes: u32,
-) -> [u8; 32] {
+) -> SecretKey {
     let params = argon2::Params::new(memory_kib.max(8), passes.max(1), 1, Some(32))
         .expect("valid Argon2 parameters");
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut salt = b"sharp256 v3 psk ".to_vec();
     salt.extend_from_slice(receiver.as_bytes());
-    let mut out = [0u8; 32];
-    argon
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut out)
-        .expect("Argon2 output length is valid");
-    out
+    // Written by Argon2 straight into its locked place; Argon2 wipes its
+    // own memory blocks (its `zeroize` feature).
+    SecretKey::with(|out| {
+        argon
+            .hash_password_into(passphrase.as_bytes(), &salt, out)
+            .expect("Argon2 output length is valid")
+    })
+}
+
+/// The pre-shared key when no secret is set: [`NO_PSK`].
+pub fn no_psk() -> SecretKey {
+    SecretKey::from_bytes(&NO_PSK)
 }
 
 #[cfg(test)]
@@ -159,6 +168,6 @@ mod tests {
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);
-        assert_ne!(k1, NO_PSK);
+        assert_ne!(k1, no_psk());
     }
 }

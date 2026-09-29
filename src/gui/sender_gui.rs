@@ -93,7 +93,8 @@ impl SenderApp {
                 }
             }
         };
-        let secret = (!self.secret.is_empty()).then(|| self.secret.clone());
+        let secret =
+            (!self.secret.is_empty()).then(|| zeroize::Zeroizing::new(self.secret.clone()));
         let state = self.state.clone();
         let repaint = ctx.clone();
         let events: crate::progress::EventCallback = Arc::new(move |ev: TransferEvent| {

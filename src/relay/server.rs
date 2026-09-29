@@ -21,7 +21,7 @@
 //!   presented its tickets, and forgets it when it goes quiet.
 
 use super::{is_control, tagged, Hints, Message, Refusal, NONCE_LEN, TAG_LEN, TOKEN_LEN};
-use crate::crypto::{Identity, SharpId};
+use crate::crypto::{Identity, SecretKey, SharpId};
 use crate::transport::io::PktSocket;
 use rand::RngCore;
 use std::collections::HashMap;
@@ -30,7 +30,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
 
 /// How long a registration lives without a keepalive.
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
@@ -141,7 +140,7 @@ impl Default for Config {
 /// A keyed hash of the address rather than a stored value, so a flood of
 /// forged registrations has nothing to fill up.
 struct TokenJar {
-    secrets: [Zeroizing<[u8; 32]>; 2],
+    secrets: [SecretKey; 2],
     born: Instant,
 }
 
@@ -175,12 +174,12 @@ impl TokenJar {
         self.born += TOKEN_LIFETIME * periods.min(u32::MAX as u128) as u32;
     }
 
-    fn make(secret: &[u8; 32], addr: SocketAddr) -> [u8; TOKEN_LEN] {
+    fn make(secret: &SecretKey, addr: SocketAddr) -> [u8; TOKEN_LEN] {
         let ip = match crate::address::canonical(addr).ip() {
             std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
             std::net::IpAddr::V6(v6) => v6.octets(),
         };
-        crate::crypto::keyed_mac(secret, &[&ip, &addr.port().to_be_bytes()])
+        crate::crypto::keyed_mac(secret.expose(), &[&ip, &addr.port().to_be_bytes()])
     }
 
     fn issue(&mut self, addr: SocketAddr, now: Instant) -> [u8; TOKEN_LEN] {
@@ -201,22 +200,20 @@ fn constant_time_eq(a: &[u8; TOKEN_LEN], b: &[u8; TOKEN_LEN]) -> bool {
     bool::from(a.ct_eq(b))
 }
 
-fn random_key() -> Zeroizing<[u8; 32]> {
-    let mut k = Zeroizing::new([0u8; 32]);
-    rand::rngs::OsRng.fill_bytes(&mut *k);
-    k
+fn random_key() -> SecretKey {
+    SecretKey::random()
 }
 
 /// What an allocated port sends a side to prove it receives at `from`: a
 /// keyed hash of the side's ticket and that address, under a key only this
 /// pair knows.
-fn confirmation(key: &[u8; 32], ticket: &[u8; TOKEN_LEN], from: SocketAddr) -> [u8; TOKEN_LEN] {
+fn confirmation(key: &SecretKey, ticket: &[u8; TOKEN_LEN], from: SocketAddr) -> [u8; TOKEN_LEN] {
     let from = crate::address::canonical(from);
     let ip = match from.ip() {
         std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
         std::net::IpAddr::V6(v6) => v6.octets(),
     };
-    crate::crypto::keyed_mac(key, &[ticket, &ip, &from.port().to_be_bytes()])
+    crate::crypto::keyed_mac(key.expose(), &[ticket, &ip, &from.port().to_be_bytes()])
 }
 
 fn random_token() -> [u8; TOKEN_LEN] {
@@ -484,7 +481,7 @@ struct Registration {
     /// What everything sent to the owner is tagged with (see
     /// [`super::relay_tag`]): the key its registration was proven with, and
     /// the nonce it registered with.
-    key: Zeroizing<[u8; 32]>,
+    key: SecretKey,
     nonce: [u8; NONCE_LEN],
 }
 
@@ -667,7 +664,7 @@ impl Relay {
     async fn reply_tagged(
         &self,
         to: SocketAddr,
-        key: &[u8; 32],
+        key: &crate::crypto::SecretKey,
         nonce: &[u8; NONCE_LEN],
         msg: Message,
     ) {
@@ -681,7 +678,7 @@ impl Relay {
     /// only the identity's owner could have made. Both sides work the key
     /// out from their long-term keys alone, so there is nothing to exchange
     /// and nothing to store.
-    fn owner_key(&self, id: &SharpId, raw: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
+    fn owner_key(&self, id: &SharpId, raw: &[u8]) -> Option<SecretKey> {
         let key = super::auth_key(&self.identity, id, id, &self.identity.id())?;
         super::proof_is_good(&key, raw).then_some(key)
     }
@@ -1121,7 +1118,7 @@ impl Relay {
         sender: SocketAddr,
         receiver: SocketAddr,
         receiver_via: Option<std::net::IpAddr>,
-        receiver_tag: (Zeroizing<[u8; 32]>, [u8; NONCE_LEN]),
+        receiver_tag: (SecretKey, [u8; NONCE_LEN]),
         disclose: bool,
         sender_hints: Hints,
     ) -> Option<(u16, [u8; TOKEN_LEN], [u8; TOKEN_LEN])> {
@@ -1255,7 +1252,7 @@ struct Carried {
     receiver_via: Option<std::net::IpAddr>,
     /// What the receiver checks an introduction by: the key and nonce of
     /// its registration (see [`super::relay_tag`]).
-    receiver_tag: (Zeroizing<[u8; 32]>, [u8; NONCE_LEN]),
+    receiver_tag: (SecretKey, [u8; NONCE_LEN]),
     idle: Duration,
     /// The relay's account of what it carries, and what this pair may carry
     /// in all (0: no limit).
@@ -1683,7 +1680,7 @@ mod wire_tests {
     }
 
     /// Encodes a message and fills in its proof.
-    fn signed(key: &[u8; 32], msg: Message) -> Vec<u8> {
+    fn signed(key: &crate::crypto::SecretKey, msg: Message) -> Vec<u8> {
         let mut bytes = msg.encode();
         let split = bytes.len() - crate::relay::PROOF_LEN;
         let proof = crate::relay::proof_for(key, &bytes[..split]);
@@ -2235,7 +2232,10 @@ mod wire_tests {
             let mut material = [0u8; 96];
             material[32..64].copy_from_slice(id.as_bytes());
             material[64..].copy_from_slice(relay_id.as_bytes());
-            let key = blake3::derive_key("sharp256 relay v1 registration", &material);
+            let key = SecretKey::from_bytes(&blake3::derive_key(
+                "sharp256 relay v1 registration",
+                &material,
+            ));
             let msg = signed(
                 &key,
                 Message::Register {

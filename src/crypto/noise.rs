@@ -26,11 +26,12 @@
 
 use crate::crypto::blake2s::{hash, hmac, HASH_LEN};
 use crate::crypto::identity::{Identity, KEY_LEN};
+use crate::crypto::secret::{Locked, SecretKey};
 use crate::crypto::CryptoError;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const PROTOCOL_NAME: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const TAG_LEN: usize = 16;
@@ -55,13 +56,18 @@ fn failed(what: &str) -> CryptoError {
 
 /// Diffie-Hellman (section 12.1), refusing a public key whose exchange
 /// comes out the same for every secret — a small-order point, which has
-/// no private half and so authenticates nothing.
-fn dh(secret: &StaticSecret, public: &[u8; KEY_LEN]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-    let shared = secret.diffie_hellman(&PublicKey::from(*public));
+/// no private half and so authenticates nothing. The private key goes into
+/// x25519-dalek's type only for the computation, which wipes it after.
+fn dh(secret: &[u8; KEY_LEN], public: &[u8; KEY_LEN]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    let shared = StaticSecret::from(*secret).diffie_hellman(&PublicKey::from(*public));
     if !shared.was_contributory() {
         return Err(failed("a key with no private half"));
     }
     Ok(Zeroizing::new(shared.to_bytes()))
+}
+
+fn public_of(secret: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
 }
 
 /// `HKDF(chaining_key, input_key_material, 2)` (section 4.3).
@@ -90,13 +96,20 @@ fn hkdf3(
 }
 
 /// A CipherState (section 5.1): a key, once there is one, and the nonce.
-#[derive(Clone)]
+#[derive(Default)]
 struct CipherState {
-    k: Option<Zeroizing<[u8; 32]>>,
+    k: [u8; 32],
+    has_key: bool,
     n: u64,
 }
 
 impl CipherState {
+    fn set(&mut self, k: &[u8; 32]) {
+        self.k = *k;
+        self.has_key = true;
+        self.n = 0;
+    }
+
     /// ChaChaPoly's nonce: 32 zero bits and the counter little-endian
     /// (section 12.3).
     fn nonce(&self) -> [u8; 12] {
@@ -114,10 +127,10 @@ impl CipherState {
     ) -> Result<(), CryptoError> {
         let start = out.len();
         out.extend_from_slice(plaintext);
-        let Some(k) = &self.k else {
+        if !self.has_key {
             return Ok(());
-        };
-        let tag = ChaCha20Poly1305::new((&**k).into())
+        }
+        let tag = ChaCha20Poly1305::new((&self.k).into())
             .encrypt_in_place_detached((&self.nonce()).into(), ad, &mut out[start..])
             .map_err(|_| failed("encryption failed"))?;
         out.extend_from_slice(&tag);
@@ -133,16 +146,16 @@ impl CipherState {
         ciphertext: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), CryptoError> {
-        let Some(k) = &self.k else {
+        if !self.has_key {
             out.extend_from_slice(ciphertext);
             return Ok(());
-        };
+        }
         let Some(body_len) = ciphertext.len().checked_sub(TAG_LEN) else {
             return Err(failed("message too short"));
         };
         let start = out.len();
         out.extend_from_slice(&ciphertext[..body_len]);
-        let opened = ChaCha20Poly1305::new((&**k).into()).decrypt_in_place_detached(
+        let opened = ChaCha20Poly1305::new((&self.k).into()).decrypt_in_place_detached(
             (&self.nonce()).into(),
             ad,
             &mut out[start..],
@@ -157,35 +170,60 @@ impl CipherState {
     }
 }
 
-/// A SymmetricState (section 5.2).
-#[derive(Clone)]
+impl Zeroize for CipherState {
+    fn zeroize(&mut self) {
+        self.k.zeroize();
+        self.has_key.zeroize();
+        self.n.zeroize();
+    }
+}
+
+/// A SymmetricState (section 5.2). It holds the chaining key, from which
+/// every key of the session follows, so it lives in locked memory.
+#[derive(Default)]
 struct SymmetricState {
-    ck: Zeroizing<[u8; 32]>,
+    ck: [u8; 32],
     h: [u8; 32],
     cipher: CipherState,
+}
+
+impl Zeroize for SymmetricState {
+    fn zeroize(&mut self) {
+        self.ck.zeroize();
+        self.h.zeroize();
+        self.cipher.zeroize();
+    }
 }
 
 impl SymmetricState {
     /// `InitializeSymmetric(protocol_name)`, then the prologue and the
     /// responder's static key, which IK's pre-message makes known to both.
-    fn new(prologue: &[u8], responder_static: &[u8; KEY_LEN]) -> Self {
-        // A name longer than a hash is hashed; this one is (37 bytes).
-        const { assert!(PROTOCOL_NAME.len() > HASH_LEN) };
-        let h = *hash(&[PROTOCOL_NAME.as_bytes()]);
-        let mut state = Self {
-            ck: Zeroizing::new(h),
-            h,
-            cipher: CipherState { k: None, n: 0 },
-        };
-        state.mix_hash(prologue);
-        state.mix_hash(responder_static);
-        state
+    fn new(prologue: &[u8], responder_static: &[u8; KEY_LEN]) -> Locked<Self> {
+        Locked::with(|state: &mut Self| {
+            // A name longer than a hash is hashed; this one is (37 bytes).
+            const { assert!(PROTOCOL_NAME.len() > HASH_LEN) };
+            state.h = *hash(&[PROTOCOL_NAME.as_bytes()]);
+            state.ck = state.h;
+            state.mix_hash(prologue);
+            state.mix_hash(responder_static);
+        })
+    }
+
+    /// A copy in locked memory of its own, to work on.
+    fn copy(&self) -> Locked<Self> {
+        Locked::with(|copy: &mut Self| {
+            copy.ck = self.ck;
+            copy.h = self.h;
+            copy.cipher.k = self.cipher.k;
+            copy.cipher.has_key = self.cipher.has_key;
+            copy.cipher.n = self.cipher.n;
+        })
     }
 
     fn mix_key(&mut self, ikm: &[u8]) {
         let (ck, k) = hkdf2(&self.ck, ikm);
-        self.ck = ck;
-        self.cipher = CipherState { k: Some(k), n: 0 };
+        self.ck = *ck;
+        self.cipher.set(&k);
     }
 
     fn mix_hash(&mut self, data: &[u8]) {
@@ -194,9 +232,9 @@ impl SymmetricState {
 
     fn mix_key_and_hash(&mut self, ikm: &[u8]) {
         let (ck, temp_h, k) = hkdf3(&self.ck, ikm);
-        self.ck = ck;
+        self.ck = *ck;
         self.mix_hash(&temp_h[..]);
-        self.cipher = CipherState { k: Some(k), n: 0 };
+        self.cipher.set(&k);
     }
 
     fn encrypt_and_hash(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<(), CryptoError> {
@@ -237,26 +275,15 @@ fn mix_ephemeral(state: &mut SymmetricState, public: &[u8; KEY_LEN]) {
     state.mix_key(public);
 }
 
-fn new_ephemeral() -> StaticSecret {
-    StaticSecret::random_from_rng(rand::rngs::OsRng)
-}
-
-fn public_of(secret: &StaticSecret) -> [u8; KEY_LEN] {
-    PublicKey::from(secret).to_bytes()
-}
-
-fn static_secret(identity: &Identity) -> StaticSecret {
-    StaticSecret::from(*identity.secret())
-}
-
 /// The initiator of a handshake: made, then writes message 1, then reads
-/// message 2.
+/// message 2. Its keys are in locked memory (`secret`): the identity's is
+/// shared with the identity, not copied.
 pub struct Initiator {
-    state: SymmetricState,
-    s: StaticSecret,
+    state: Locked<SymmetricState>,
+    identity: Identity,
     rs: [u8; KEY_LEN],
-    psk: Zeroizing<[u8; 32]>,
-    e: Option<StaticSecret>,
+    psk: SecretKey,
+    e: Option<SecretKey>,
     finished: bool,
 }
 
@@ -264,14 +291,14 @@ impl Initiator {
     pub fn new(
         identity: &Identity,
         responder: &[u8; KEY_LEN],
-        psk: &[u8; 32],
+        psk: &SecretKey,
         prologue: &[u8],
     ) -> Self {
         Self {
             state: SymmetricState::new(prologue, responder),
-            s: static_secret(identity),
+            identity: identity.clone(),
             rs: *responder,
-            psk: Zeroizing::new(*psk),
+            psk: psk.clone(),
             e: None,
             finished: false,
         }
@@ -279,25 +306,26 @@ impl Initiator {
 
     /// Message 1, `-> e, es, s, ss`, carrying `payload`.
     pub fn write_initiation(&mut self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.write_initiation_with(new_ephemeral(), payload)
+        self.write_initiation_with(SecretKey::random(), payload)
     }
 
     fn write_initiation_with(
         &mut self,
-        e: StaticSecret,
+        e: SecretKey,
         payload: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
         if self.e.is_some() {
             return Err(failed("message 1 was already written"));
         }
         let mut out = Vec::with_capacity(INITIATION_LEN + payload.len());
-        let e_pub = public_of(&e);
+        let e_pub = public_of(e.expose());
         out.extend_from_slice(&e_pub);
         mix_ephemeral(&mut self.state, &e_pub);
-        self.state.mix_key(&dh(&e, &self.rs)?[..]); // es
-        let s_pub = public_of(&self.s);
-        self.state.encrypt_and_hash(&s_pub, &mut out)?; // s
-        self.state.mix_key(&dh(&self.s, &self.rs)?[..]); // ss
+        self.state.mix_key(&dh(e.expose(), &self.rs)?[..]); // es
+        self.state
+            .encrypt_and_hash(self.identity.public(), &mut out)?; // s
+        self.state
+            .mix_key(&dh(self.identity.secret(), &self.rs)?[..]); // ss
         self.state.encrypt_and_hash(payload, &mut out)?;
         self.e = Some(e);
         Ok(out)
@@ -312,18 +340,15 @@ impl Initiator {
         let Some(e) = &self.e else {
             return Err(CryptoError::Malformed);
         };
-        if self.finished {
-            return Err(CryptoError::Malformed);
-        }
-        if msg.len() < RESPONSE_LEN {
+        if self.finished || msg.len() < RESPONSE_LEN {
             return Err(CryptoError::Malformed);
         }
         let re: [u8; KEY_LEN] = msg[..KEY_LEN].try_into().expect("a key's length");
-        let mut state = self.state.clone();
+        let mut state = self.state.copy();
         mix_ephemeral(&mut state, &re);
-        state.mix_key(&dh(e, &re)?[..]); // ee
-        state.mix_key(&dh(&self.s, &re)?[..]); // se
-        state.mix_key_and_hash(&self.psk[..]); // psk
+        state.mix_key(&dh(e.expose(), &re)?[..]); // ee
+        state.mix_key(&dh(self.identity.secret(), &re)?[..]); // se
+        state.mix_key_and_hash(self.psk.expose()); // psk
         let mut payload = Zeroizing::new(Vec::with_capacity(msg.len() - RESPONSE_LEN));
         state.decrypt_and_hash(&msg[KEY_LEN..], &mut payload)?;
         self.state = state;
@@ -344,10 +369,10 @@ impl Initiator {
 
 /// The responder, after message 1 has been read: writes message 2.
 pub struct Responder {
-    state: SymmetricState,
+    state: Locked<SymmetricState>,
     re: [u8; KEY_LEN],
     rs: [u8; KEY_LEN],
-    psk: Zeroizing<[u8; 32]>,
+    psk: SecretKey,
 }
 
 /// What message 1 said: who sent it, and its payload.
@@ -361,22 +386,21 @@ impl Responder {
     /// Reads message 1, `-> e, es, s, ss`, made for `identity`.
     pub fn read_initiation(
         identity: &Identity,
-        psk: &[u8; 32],
+        psk: &SecretKey,
         prologue: &[u8],
         msg: &[u8],
     ) -> Result<Initiation, CryptoError> {
         if msg.len() < INITIATION_LEN {
             return Err(CryptoError::Malformed);
         }
-        let s = static_secret(identity);
         let mut state = SymmetricState::new(prologue, identity.public());
         let re: [u8; KEY_LEN] = msg[..KEY_LEN].try_into().expect("a key's length");
         mix_ephemeral(&mut state, &re);
-        state.mix_key(&dh(&s, &re)?[..]); // es
+        state.mix_key(&dh(identity.secret(), &re)?[..]); // es
         let mut rs = Vec::with_capacity(KEY_LEN);
         state.decrypt_and_hash(&msg[KEY_LEN..2 * KEY_LEN + TAG_LEN], &mut rs)?; // s
         let rs: [u8; KEY_LEN] = rs.try_into().expect("a key's length");
-        state.mix_key(&dh(&s, &rs)?[..]); // ss
+        state.mix_key(&dh(identity.secret(), &rs)?[..]); // ss
         let mut payload = Zeroizing::new(Vec::with_capacity(msg.len() - INITIATION_LEN));
         state.decrypt_and_hash(&msg[2 * KEY_LEN + TAG_LEN..], &mut payload)?;
         Ok(Initiation {
@@ -384,7 +408,7 @@ impl Responder {
                 state,
                 re,
                 rs,
-                psk: Zeroizing::new(*psk),
+                psk: psk.clone(),
             },
             initiator_static: rs,
             payload,
@@ -393,21 +417,21 @@ impl Responder {
 
     /// Message 2, `<- e, ee, se, psk`, carrying `payload`, and the keys.
     pub fn write_response(self, payload: &[u8]) -> Result<(Vec<u8>, Split), CryptoError> {
-        self.write_response_with(new_ephemeral(), payload)
+        self.write_response_with(SecretKey::random(), payload)
     }
 
     fn write_response_with(
         mut self,
-        e: StaticSecret,
+        e: SecretKey,
         payload: &[u8],
     ) -> Result<(Vec<u8>, Split), CryptoError> {
         let mut out = Vec::with_capacity(RESPONSE_LEN + payload.len());
-        let e_pub = public_of(&e);
+        let e_pub = public_of(e.expose());
         out.extend_from_slice(&e_pub);
         mix_ephemeral(&mut self.state, &e_pub);
-        self.state.mix_key(&dh(&e, &self.re)?[..]); // ee
-        self.state.mix_key(&dh(&e, &self.rs)?[..]); // se
-        self.state.mix_key_and_hash(&self.psk[..]); // psk
+        self.state.mix_key(&dh(e.expose(), &self.re)?[..]); // ee
+        self.state.mix_key(&dh(e.expose(), &self.rs)?[..]); // se
+        self.state.mix_key_and_hash(self.psk.expose()); // psk
         self.state.encrypt_and_hash(payload, &mut out)?;
         Ok((out, self.state.split()))
     }
@@ -433,10 +457,9 @@ mod tests {
     /// (this protocol derives its own traffic keys from the split, but the
     /// vector checks the split through them).
     fn transport(k: &[u8; 32], n: u64, plaintext: &[u8]) -> Vec<u8> {
-        let mut cipher = CipherState {
-            k: Some(Zeroizing::new(*k)),
-            n,
-        };
+        let mut cipher = CipherState::default();
+        cipher.set(k);
+        cipher.n = n;
         let mut out = Vec::new();
         cipher.encrypt_with_ad(&[], plaintext, &mut out).unwrap();
         out
@@ -455,8 +478,8 @@ mod tests {
         assert_eq!(s("protocol_name"), PROTOCOL_NAME);
         let prologue = hex(s("init_prologue"));
         assert_eq!(prologue, hex(s("resp_prologue")));
-        let psk = key(v["init_psks"][0].as_str().unwrap());
-        assert_eq!(psk, key(v["resp_psks"][0].as_str().unwrap()));
+        let psk = SecretKey::from_bytes(&key(v["init_psks"][0].as_str().unwrap()));
+        assert_eq!(psk.expose(), &key(v["resp_psks"][0].as_str().unwrap()));
         let init = Identity::from_secret(key(s("init_static")));
         let resp = Identity::from_secret(key(s("resp_static")));
         assert_eq!(resp.public(), &key(s("init_remote_static")));
@@ -466,7 +489,7 @@ mod tests {
         let mut initiator = Initiator::new(&init, resp.public(), &psk, &prologue);
         let m1 = initiator
             .write_initiation_with(
-                StaticSecret::from(key(s("init_ephemeral"))),
+                SecretKey::from_bytes(&key(s("init_ephemeral"))),
                 &msg(0, "payload"),
             )
             .unwrap();
@@ -477,7 +500,7 @@ mod tests {
         let (m2, rsplit) = read
             .responder
             .write_response_with(
-                StaticSecret::from(key(s("resp_ephemeral"))),
+                SecretKey::from_bytes(&key(s("resp_ephemeral"))),
                 &msg(1, "payload"),
             )
             .unwrap();
@@ -539,9 +562,10 @@ mod tests {
             let p1: Vec<u8> = (0..round * 3 % 1100).map(|i| i as u8).collect();
             let p2: Vec<u8> = (0..round * 7 % 1000).map(|i| (i * 7) as u8).collect();
 
-            let mut ours = Initiator::new(&init, resp.public(), &psk, prologue);
+            let mut ours =
+                Initiator::new(&init, resp.public(), &SecretKey::from_bytes(&psk), prologue);
             let m1 = ours
-                .write_initiation_with(StaticSecret::from(ie), &p1)
+                .write_initiation_with(SecretKey::from_bytes(&ie), &p1)
                 .unwrap();
             let mut snow_i = snow_builder(prologue)
                 .local_private_key(init.secret())
@@ -554,10 +578,12 @@ mod tests {
             let n = snow_i.write_message(&p1, &mut buf).unwrap();
             assert_eq!(m1, &buf[..n], "message 1, round {}", round);
 
-            let read = Responder::read_initiation(&resp, &psk, prologue, &m1).unwrap();
+            let read =
+                Responder::read_initiation(&resp, &SecretKey::from_bytes(&psk), prologue, &m1)
+                    .unwrap();
             let (m2, rsplit) = read
                 .responder
-                .write_response_with(StaticSecret::from(re), &p2)
+                .write_response_with(SecretKey::from_bytes(&re), &p2)
                 .unwrap();
             let mut snow_r = snow_builder(prologue)
                 .local_private_key(resp.secret())
@@ -590,7 +616,8 @@ mod tests {
             let (init, resp, psk) = (Identity::generate(), Identity::generate(), random::<32>());
 
             // Ours starts, snow answers.
-            let mut ours = Initiator::new(&init, resp.public(), &psk, prologue);
+            let mut ours =
+                Initiator::new(&init, resp.public(), &SecretKey::from_bytes(&psk), prologue);
             let m1 = ours.write_initiation(b"hello").unwrap();
             let mut snow_r = snow_builder(prologue)
                 .local_private_key(resp.secret())
@@ -617,7 +644,13 @@ mod tests {
                 .build_initiator()
                 .unwrap();
             let n = snow_i.write_message(b"hello", &mut buf).unwrap();
-            let read = Responder::read_initiation(&resp, &psk, prologue, &buf[..n]).unwrap();
+            let read = Responder::read_initiation(
+                &resp,
+                &SecretKey::from_bytes(&psk),
+                prologue,
+                &buf[..n],
+            )
+            .unwrap();
             assert_eq!(&read.initiator_static, init.public());
             assert_eq!(*read.payload, b"hello");
             let (m2, split) = read.responder.write_response(b"ack").unwrap();
@@ -637,11 +670,12 @@ mod tests {
     #[test]
     fn a_failed_read_uses_nothing_up() {
         let (init, resp, psk) = (Identity::generate(), Identity::generate(), [5u8; 32]);
-        let mut ours = Initiator::new(&init, resp.public(), &psk, b"p");
+        let mut ours = Initiator::new(&init, resp.public(), &SecretKey::from_bytes(&psk), b"p");
         assert!(ours.read_response(&[0u8; 80]).is_err());
         let m1 = ours.write_initiation(b"x").unwrap();
         assert!(ours.write_initiation(b"x").is_err(), "message 1 twice");
-        let read = Responder::read_initiation(&resp, &psk, b"p", &m1).unwrap();
+        let read =
+            Responder::read_initiation(&resp, &SecretKey::from_bytes(&psk), b"p", &m1).unwrap();
         let (m2, _) = read.responder.write_response(b"y").unwrap();
         for i in 0..m2.len() {
             let mut bad = m2.clone();
@@ -663,12 +697,18 @@ mod tests {
         let (init, resp) = (Identity::generate(), Identity::generate());
         let other = Identity::generate();
         let psk = [1u8; 32];
-        let mut ours = Initiator::new(&init, resp.public(), &psk, b"v3");
+        let mut ours = Initiator::new(&init, resp.public(), &SecretKey::from_bytes(&psk), b"v3");
         let m1 = ours.write_initiation(b"x").unwrap();
-        assert!(Responder::read_initiation(&other, &psk, b"v3", &m1).is_err());
-        assert!(Responder::read_initiation(&resp, &psk, b"v4", &m1).is_err());
+        assert!(
+            Responder::read_initiation(&other, &SecretKey::from_bytes(&psk), b"v3", &m1).is_err()
+        );
+        assert!(
+            Responder::read_initiation(&resp, &SecretKey::from_bytes(&psk), b"v4", &m1).is_err()
+        );
         // The PSK comes in only with message 2.
-        let read = Responder::read_initiation(&resp, &[2u8; 32], b"v3", &m1).unwrap();
+        let read =
+            Responder::read_initiation(&resp, &SecretKey::from_bytes(&[2u8; 32]), b"v3", &m1)
+                .unwrap();
         let (m2, _) = read.responder.write_response(b"y").unwrap();
         assert!(ours.read_response(&m2).is_err());
     }
@@ -678,15 +718,16 @@ mod tests {
     #[test]
     fn an_ephemeral_with_no_private_half_is_refused() {
         let (init, resp, psk) = (Identity::generate(), Identity::generate(), [0u8; 32]);
-        let mut ours = Initiator::new(&init, resp.public(), &psk, b"");
+        let mut ours = Initiator::new(&init, resp.public(), &SecretKey::from_bytes(&psk), b"");
         let mut m1 = ours.write_initiation(b"x").unwrap();
         m1[..32].copy_from_slice(&[0u8; 32]);
-        assert!(Responder::read_initiation(&resp, &psk, b"", &m1).is_err());
+        assert!(Responder::read_initiation(&resp, &SecretKey::from_bytes(&psk), b"", &m1).is_err());
         let good = ours.write_initiation(b"x");
         assert!(good.is_err(), "one message 1 per initiator");
-        let mut ours = Initiator::new(&init, resp.public(), &psk, b"");
+        let mut ours = Initiator::new(&init, resp.public(), &SecretKey::from_bytes(&psk), b"");
         let m1 = ours.write_initiation(b"x").unwrap();
-        let read = Responder::read_initiation(&resp, &psk, b"", &m1).unwrap();
+        let read =
+            Responder::read_initiation(&resp, &SecretKey::from_bytes(&psk), b"", &m1).unwrap();
         let (mut m2, _) = read.responder.write_response(b"y").unwrap();
         m2[..32].copy_from_slice(&[0u8; 32]);
         assert!(ours.read_response(&m2).is_err());

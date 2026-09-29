@@ -1026,9 +1026,9 @@ fn fake_initiation_with(
     hello: sharp256::protocol::wire::Hello,
 ) -> (sharp256::crypto::handshake::Initiator, Vec<u8>) {
     use sharp256::crypto::handshake::{initiation_timestamp, Initiator};
-    use sharp256::crypto::{Suite, NO_PSK};
+    use sharp256::crypto::{no_psk, Suite};
     use sharp256::protocol::wire;
-    let mut init = Initiator::new(&Identity::generate(), &receiver, &NO_PSK).unwrap();
+    let mut init = Initiator::new(&Identity::generate(), &receiver, &no_psk()).unwrap();
     let payload = wire::encode_initiation(&wire::Initiation {
         timestamp: initiation_timestamp(),
         suites: Suite::ALL_BITS,
@@ -1455,7 +1455,7 @@ async fn mismatched_secret_fails_cleanly() {
     let receiver_psk = psk("correct horse battery staple");
     let mut r = start_receiver(&out, &state, |cfg| {
         cfg.identity = Some(identity.clone());
-        cfg.psk = Some(receiver_psk);
+        cfg.psk = Some(receiver_psk.clone());
     })
     .await;
     let path = make_file(&src, "secret.bin", 100_000, 64);
@@ -2184,10 +2184,10 @@ async fn handshake_as(
     name: &str,
 ) -> (UdpSocket, sharp256::protocol::wire::Response) {
     use sharp256::crypto::handshake::{initiation_timestamp, Initiator};
-    use sharp256::crypto::{Suite, NO_PSK};
+    use sharp256::crypto::{no_psk, Suite};
     use sharp256::protocol::wire;
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut init = Initiator::new(identity, &r.id, &NO_PSK).unwrap();
+    let mut init = Initiator::new(identity, &r.id, &no_psk()).unwrap();
     let payload = wire::encode_initiation(&wire::Initiation {
         timestamp: initiation_timestamp(),
         suites: Suite::ALL_BITS,

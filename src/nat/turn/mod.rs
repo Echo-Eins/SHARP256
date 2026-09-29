@@ -105,7 +105,8 @@ pub struct Server {
     /// `host:port`, resolved when it is used.
     pub address: String,
     pub username: String,
-    pub password: String,
+    /// Wiped when the last copy goes; never printed (see `Display`).
+    pub password: zeroize::Zeroizing<String>,
 }
 
 impl std::fmt::Debug for Server {
@@ -154,7 +155,7 @@ impl std::str::FromStr for Server {
         // A time-limited credential (the "TURN REST API" kind) has a colon
         // in its user name, and a URL writes that as %3A.
         let username = percent_decode(username)?;
-        let password = percent_decode(password)?;
+        let password = zeroize::Zeroizing::new(percent_decode(password)?);
         // Without a port the well-known one is meant. An IPv6 literal has
         // colons of its own, so only `]:` or a single colon says there is one.
         let has_port = if host.starts_with('[') {

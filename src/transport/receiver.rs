@@ -37,7 +37,7 @@ use crate::crypto::replay::ReplayWindow;
 use crate::crypto::transport::{
     begin_packet, peek_cid, DirectionKeys, SessionKeys, Suite, HEADER_LEN, OVERHEAD, TAG_LEN,
 };
-use crate::crypto::{Identity, SharpId, NO_PSK};
+use crate::crypto::{Identity, SharpId};
 use crate::file::tree::{self, Manifest};
 use crate::file::{
     available_space, hash_file, hash_to_hex, part_path_for, rename_with_retry, sanitize_file_name,
@@ -896,7 +896,10 @@ struct Dispatcher {
 impl Dispatcher {
     fn new(shared: Arc<Shared>, done_tx: mpsc::Sender<TransferKey>) -> Self {
         let cfg = &shared.cfg;
-        let responder = Responder::new(shared.identity.clone(), cfg.psk.unwrap_or(NO_PSK));
+        let responder = Responder::new(
+            shared.identity.clone(),
+            cfg.psk.clone().unwrap_or_else(crate::crypto::no_psk),
+        );
         let cookies = CookieJar::new(&shared.identity.id());
         let limiter = HandshakeLimiter::new(
             cfg.handshake_rate,

@@ -73,7 +73,7 @@ impl Fake {
         Server {
             address: self.control.to_string(),
             username: USER.to_string(),
-            password: password.to_string(),
+            password: password.to_string().into(),
         }
     }
 }
@@ -618,7 +618,7 @@ async fn a_server_that_is_not_there_costs_nothing_but_patience() {
         Server {
             address,
             username: USER.into(),
-            password: PASSWORD.into(),
+            password: PASSWORD.to_string().into(),
         },
         engine.local_addr().unwrap(),
         &[Family::V4],

@@ -93,22 +93,22 @@ pub fn auth_key(
     theirs: &SharpId,
     peer: &SharpId,
     relay: &SharpId,
-) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+) -> Option<crate::crypto::SecretKey> {
     let dh = ours.shared_secret(theirs)?;
-    Some(crate::crypto::derive_secret(
+    Some(crate::crypto::SecretKey::derive(
         "sharp256 relay v1 registration",
         &[&dh[..], peer.as_bytes(), relay.as_bytes()],
     ))
 }
 
 /// The proof carried by a message, over everything in it that precedes it.
-pub fn proof_for(key: &[u8; 32], signed: &[u8]) -> [u8; PROOF_LEN] {
-    crate::crypto::keyed_mac(key, &[signed])
+pub fn proof_for(key: &crate::crypto::SecretKey, signed: &[u8]) -> [u8; PROOF_LEN] {
+    crate::crypto::keyed_mac(key.expose(), &[signed])
 }
 
 /// Whether `pkt` carries a proof that matches `key`. The proof covers the
 /// whole message before it, so nothing in it can be altered in flight.
-pub fn proof_is_good(key: &[u8; 32], pkt: &[u8]) -> bool {
+pub fn proof_is_good(key: &crate::crypto::SecretKey, pkt: &[u8]) -> bool {
     let Some(split) = pkt.len().checked_sub(PROOF_LEN) else {
         return false;
     };
@@ -123,16 +123,20 @@ pub fn proof_is_good(key: &[u8; 32], pkt: &[u8]) -> bool {
 /// to write, and before this an introduction or a refusal "from the relay"
 /// was believed on its address alone — and it holds for this run of the
 /// receiver only: another run registers with another nonce.
-pub fn relay_tag(key: &[u8; 32], nonce: &[u8; NONCE_LEN], unsigned: &[u8]) -> [u8; TAG_LEN] {
+pub fn relay_tag(
+    key: &crate::crypto::SecretKey,
+    nonce: &[u8; NONCE_LEN],
+    unsigned: &[u8],
+) -> [u8; TAG_LEN] {
     // A key of its own, so that nothing the relay tags could ever pass for
     // a peer's proof, or the other way round.
-    let own = crate::crypto::derive_secret("sharp256 relay v1 relay to peer", &[key]);
+    let own = crate::crypto::derive_secret("sharp256 relay v1 relay to peer", &[key.expose()]);
     crate::crypto::keyed_mac(&own, &[nonce, unsigned])
 }
 
 /// Encodes a message a relay sends a registered receiver, closed with its
 /// [`relay_tag`] (whatever tag the message was built with is replaced).
-pub fn tagged(key: &[u8; 32], nonce: &[u8; NONCE_LEN], msg: &Message) -> Vec<u8> {
+pub fn tagged(key: &crate::crypto::SecretKey, nonce: &[u8; NONCE_LEN], msg: &Message) -> Vec<u8> {
     let mut bytes = msg.encode();
     let split = bytes.len() - TAG_LEN;
     let tag = relay_tag(key, nonce, &bytes[..split]);
@@ -142,7 +146,11 @@ pub fn tagged(key: &[u8; 32], nonce: &[u8; NONCE_LEN], msg: &Message) -> Vec<u8>
 
 /// Whether `pkt`, a message from a relay, ends in the tag only that relay
 /// could have made for this receiver ([`relay_tag`]).
-pub fn relay_tag_is_good(key: &[u8; 32], nonce: &[u8; NONCE_LEN], pkt: &[u8]) -> bool {
+pub fn relay_tag_is_good(
+    key: &crate::crypto::SecretKey,
+    nonce: &[u8; NONCE_LEN],
+    pkt: &[u8],
+) -> bool {
     let Some(split) = pkt.len().checked_sub(TAG_LEN) else {
         return false;
     };

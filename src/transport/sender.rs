@@ -29,7 +29,7 @@ use crate::crypto::replay::ReplayWindow;
 use crate::crypto::transport::{
     begin_packet, peek_cid, push_header, DirectionKeys, SessionKeys, Suite, TAG_LEN,
 };
-use crate::crypto::{CryptoError, Identity, SharpId, NO_PSK};
+use crate::crypto::{CryptoError, Identity, SharpId};
 use crate::file::{hash_to_hex, sanitize_file_name, Source};
 use crate::progress::{emit, DirectoryInfo, EventCallback, TransferEvent, TransferStats};
 use crate::protocol::constants::*;
@@ -857,7 +857,7 @@ impl Sender {
             Peer {
                 identity: self.identity.clone(),
                 receiver: self.cfg.receiver_id,
-                psk: self.cfg.psk.unwrap_or(NO_PSK),
+                psk: self.cfg.psk.clone().unwrap_or_else(crate::crypto::no_psk),
             },
             self.source.clone(),
             file_name,
@@ -1297,7 +1297,7 @@ const RELAY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 struct Peer {
     identity: Identity,
     receiver: SharpId,
-    psk: [u8; 32],
+    psk: crate::crypto::SecretKey,
 }
 
 /// An established encrypted session with the receiver.

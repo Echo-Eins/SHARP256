@@ -515,10 +515,10 @@ impl Role {
 /// function of the ID alone, and anybody who knows the ID can compute it.
 pub fn rendezvous_key(
     receiver: &crate::crypto::SharpId,
-    secret: Option<&[u8; 32]>,
-) -> zeroize::Zeroizing<[u8; 32]> {
-    let secret: &[u8] = secret.map_or(&[], |s| &s[..]);
-    crate::crypto::derive_secret("sharp256 dht rendezvous v1", &[receiver.as_bytes(), secret])
+    secret: Option<&crate::crypto::SecretKey>,
+) -> crate::crypto::SecretKey {
+    let secret: &[u8] = secret.map_or(&[], |s| &s.expose()[..]);
+    crate::crypto::SecretKey::derive("sharp256 dht rendezvous v1", &[receiver.as_bytes(), secret])
 }
 
 /// The infohash a role announces under.
@@ -550,14 +550,17 @@ const LOOKUP_WITHIN: Duration = Duration::from_secs(12);
 /// again when it changes.
 pub fn spawn_rendezvous(
     dht: Dht,
-    key: zeroize::Zeroizing<[u8; 32]>,
+    key: crate::crypto::SecretKey,
     role: Role,
     aims: tokio::sync::watch::Receiver<crate::nat::card::FamilyHints>,
     cancel: CancellationToken,
     on_peer: impl Fn(SocketAddr) + Send + Sync + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let (mine, theirs) = (info_hash(&key, role), info_hash(&key, role.other()));
+        let (mine, theirs) = (
+            info_hash(key.expose(), role),
+            info_hash(key.expose(), role.other()),
+        );
         let mut seen: HashSet<SocketAddr> = HashSet::new();
         let mut announced: Option<(Option<u16>, Option<u16>, Instant)> = None;
         let mut aims = aims;

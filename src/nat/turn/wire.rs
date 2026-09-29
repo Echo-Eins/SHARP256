@@ -108,8 +108,10 @@ pub struct Credentials {
     pub username: String,
     pub realm: String,
     pub nonce: Vec<u8>,
-    /// `MD5(username ":" realm ":" password)`.
-    key: [u8; 16],
+    /// `MD5(username ":" realm ":" password)`, in locked memory. (What the
+    /// md-5 crate keeps of the password while it hashes cannot be wiped: it
+    /// has no way to. The password is one the TURN server knows anyway.)
+    key: crate::crypto::secret::Locked<[u8; 16]>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -130,11 +132,15 @@ impl Credentials {
         md5.update(realm.as_bytes());
         md5.update(b":");
         md5.update(password.as_bytes());
+        let mut digest = md5.finalize();
+        let key =
+            crate::crypto::secret::Locked::with(|k: &mut [u8; 16]| k.copy_from_slice(&digest));
+        zeroize::Zeroize::zeroize(digest.as_mut_slice());
         Self {
             username: username.to_string(),
             realm: realm.to_string(),
             nonce: nonce.to_vec(),
-            key: md5.finalize().into(),
+            key,
         }
     }
 

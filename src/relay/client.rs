@@ -136,7 +136,7 @@ pub async fn connect(
     // refuse us, or point our punches at whoever they liked.
     let nonce: [u8; NONCE_LEN] = rand::random();
     // Set once the relay has refused us as a stranger.
-    let mut identify: Option<(SharpId, zeroize::Zeroizing<[u8; 32]>)> = None;
+    let mut identify: Option<(SharpId, crate::crypto::SecretKey)> = None;
     // Since when the relay has been saying it does not know the receiver,
     // and how long to pause before asking again.
     let mut unknown: Option<(Instant, Duration)> = None;
@@ -764,7 +764,7 @@ const GOODBYE_WAIT: Duration = Duration::from_millis(700);
 async fn goodbye(
     socket: &UdpSocket,
     relay: SocketAddr,
-    key: &[u8; 32],
+    key: &crate::crypto::SecretKey,
     id: SharpId,
     mut token: [u8; TOKEN_LEN],
     nonce: [u8; NONCE_LEN],
@@ -798,7 +798,7 @@ async fn goodbye(
 
 /// Encodes a message and fills in its proof, which covers everything in
 /// front of it.
-fn signed(key: &[u8; 32], msg: Message) -> Vec<u8> {
+fn signed(key: &crate::crypto::SecretKey, msg: Message) -> Vec<u8> {
     let mut bytes = msg.encode();
     let split = bytes.len() - PROOF_LEN;
     let proof = super::proof_for(key, &bytes[..split]);

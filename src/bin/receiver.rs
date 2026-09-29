@@ -162,8 +162,8 @@ struct Args {
     authorized_senders: Option<PathBuf>,
 
     /// Shared secret every sender must also use (or set SHARP256_SECRET)
-    #[arg(long, env = "SHARP256_SECRET", hide_env_values = true)]
-    secret: Option<String>,
+    #[arg(long, env = "SHARP256_SECRET", hide_env_values = true, value_parser = sharp256::crypto::secret::passphrase)]
+    secret: Option<zeroize::Zeroizing<String>>,
 
     /// Identity key file (default: per-user data directory)
     #[arg(long)]

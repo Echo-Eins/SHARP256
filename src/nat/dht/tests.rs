@@ -527,7 +527,7 @@ async fn two_ends_meet_through_the_dht() {
 fn the_key_is_what_both_ends_know_and_the_roles_differ() {
     let id = crate::crypto::Identity::generate().id();
     let other = crate::crypto::Identity::generate().id();
-    let secret = [7u8; 32];
+    let secret = crate::crypto::SecretKey::from_bytes(&[7u8; 32]);
     // The same for both ends, whichever computes it.
     assert_eq!(
         rendezvous_key(&id, Some(&secret)),
@@ -541,15 +541,15 @@ fn the_key_is_what_both_ends_know_and_the_roles_differ() {
     );
     assert_ne!(
         rendezvous_key(&id, Some(&secret)),
-        rendezvous_key(&id, Some(&[8u8; 32]))
+        rendezvous_key(&id, Some(&crate::crypto::SecretKey::from_bytes(&[8u8; 32])))
     );
     // The two roles announce under different infohashes, which are not the
     // key itself.
     let key = rendezvous_key(&id, Some(&secret));
     let (r, s) = (
-        info_hash(&key, Role::Receiver),
-        info_hash(&key, Role::Sender),
+        info_hash(key.expose(), Role::Receiver),
+        info_hash(key.expose(), Role::Sender),
     );
     assert_ne!(r, s);
-    assert_ne!(&r[..], &key[..20]);
+    assert_ne!(&r[..], &key.expose()[..20]);
 }

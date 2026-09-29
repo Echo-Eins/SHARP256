@@ -75,7 +75,7 @@ fn fixture() -> &'static Fixture {
         let receiver = crate::crypto::Identity::generate();
         let id = receiver.id();
         Fixture {
-            responder: crate::crypto::handshake::Responder::new(receiver, crate::crypto::NO_PSK),
+            responder: crate::crypto::handshake::Responder::new(receiver, crate::crypto::no_psk()),
             receiver: id,
             sender: crate::crypto::Identity::generate(),
             keys: crate::crypto::transport::DirectionKeys::new(
@@ -94,7 +94,7 @@ pub fn datagram(data: &[u8]) {
     let _ = crate::crypto::transport::peek_cid(data);
     let _ = f.responder.read_initiation(data);
     if let Ok(mut attempt) =
-        crate::crypto::handshake::Initiator::new(&f.sender, &f.receiver, &crate::crypto::NO_PSK)
+        crate::crypto::handshake::Initiator::new(&f.sender, &f.receiver, &crate::crypto::no_psk())
     {
         let _ = attempt.read_cookie_reply(data);
         let _ = attempt.read_response(data);
@@ -424,7 +424,7 @@ pub fn seeds(target: &str) -> Vec<Vec<u8>> {
             let mut attempt = crate::crypto::handshake::Initiator::new(
                 &f.sender,
                 &f.receiver,
-                &crate::crypto::NO_PSK,
+                &crate::crypto::no_psk(),
             )
             .expect("initiator");
             let payload = wire::encode_initiation(&wire::Initiation {

@@ -125,6 +125,20 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   Noise test vector for the protocol from cacophony, so peers built before
   talk to it unchanged; snow stays for the tests only. An ephemeral key
   that is a small-order point is now refused, as a static one always was.
+- Keys are kept in locked memory (`crypto::secret`): the identity's private
+  key, the pre-shared key, the state of every handshake in progress (its
+  chaining key and ephemeral key), the secrets of cookies and relay tokens,
+  the relay's registration keys, the DHT rendezvous key and a TURN
+  server's key lie on pages locked in RAM (`mlock`, `VirtualLock`) and, on
+  Linux and FreeBSD, left out of core dumps; they are wiped when the last
+  copy goes, and copies of a key are handles to one place rather than
+  copies of it. Pages are counted, since locking is per page and keys share
+  them. A system that refuses (`RLIMIT_MEMLOCK`) is reported once, with
+  how to raise the limit; keys then work as before. None of these types
+  prints its contents.
+- The passphrase of `--secret` (and `SHARP256_SECRET`), the one typed into
+  the sender's window, and a TURN server's password are held in strings
+  that are wiped.
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the

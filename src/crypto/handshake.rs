@@ -25,7 +25,7 @@
 use crate::crypto::identity::{Identity, SharpId, KEY_LEN};
 use crate::crypto::noise;
 use crate::crypto::transport::CID_LEN;
-use crate::crypto::{derive_secret, keyed_mac, CryptoError};
+use crate::crypto::{derive_secret, keyed_mac, CryptoError, SecretKey};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
@@ -143,7 +143,7 @@ impl Initiator {
     pub fn new(
         identity: &Identity,
         receiver: &SharpId,
-        psk: &[u8; 32],
+        psk: &SecretKey,
     ) -> Result<Self, CryptoError> {
         // Every exchange with such a key comes out the same whatever the
         // secrets, so the handshake would authenticate nobody. Parsing an ID
@@ -266,7 +266,7 @@ impl Initiator {
 /// Receiver side of handshakes: checks MACs, reads initiations.
 pub struct Responder {
     identity: Identity,
-    psk: Zeroizing<[u8; 32]>,
+    psk: SecretKey,
     mac1_key: [u8; 32],
 }
 
@@ -279,11 +279,11 @@ pub struct Incoming {
 }
 
 impl Responder {
-    pub fn new(identity: Identity, psk: [u8; 32]) -> Self {
+    pub fn new(identity: Identity, psk: SecretKey) -> Self {
         let mac1_key = mac1_key(identity.public());
         Self {
             identity,
-            psk: Zeroizing::new(psk),
+            psk,
             mac1_key,
         }
     }
@@ -380,7 +380,7 @@ impl Incoming {
 /// Receiver-side cookie state: verifies mac2 and issues cookie replies.
 pub struct CookieJar {
     reply_key: [u8; 32],
-    secrets: [Zeroizing<[u8; 32]>; 2],
+    secrets: [SecretKey; 2],
     born: Instant,
 }
 
@@ -388,7 +388,7 @@ impl CookieJar {
     pub fn new(own: &SharpId) -> Self {
         Self {
             reply_key: cookie_key(own.as_bytes()),
-            secrets: [random_key(), random_key()],
+            secrets: [SecretKey::random(), SecretKey::random()],
             born: Instant::now(),
         }
     }
@@ -396,7 +396,7 @@ impl CookieJar {
     fn rotate(&mut self, now: Instant) {
         if now.saturating_duration_since(self.born) >= COOKIE_LIFETIME {
             self.secrets.swap(0, 1);
-            self.secrets[0] = random_key();
+            self.secrets[0] = SecretKey::random();
             self.born = now;
         }
     }
@@ -419,7 +419,7 @@ impl CookieJar {
         }
         let (msg, mac2) = pkt.split_at(n - MAC_LEN);
         self.secrets.iter().any(|s| {
-            let cookie = Self::cookie(s, from);
+            let cookie = Self::cookie(s.expose(), from);
             ct_eq(&keyed_mac::<MAC_LEN>(&mac2_key(&cookie), &[msg]), mac2)
         })
     }
@@ -432,7 +432,7 @@ impl CookieJar {
             return None;
         }
         let mac1 = &initiation[n - 2 * MAC_LEN..n - MAC_LEN];
-        let mut cookie = Self::cookie(&self.secrets[0], from);
+        let mut cookie = Self::cookie(self.secrets[0].expose(), from);
         let mut nonce = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let tag = XChaCha20Poly1305::new((&self.reply_key).into())
@@ -445,12 +445,6 @@ impl CookieJar {
         out.extend_from_slice(&tag);
         Some(out)
     }
-}
-
-fn random_key() -> Zeroizing<[u8; 32]> {
-    let mut k = Zeroizing::new([0u8; 32]);
-    rand::rngs::OsRng.fill_bytes(&mut *k);
-    k
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +611,9 @@ impl HandshakeLimiter {
 mod tests {
     use super::*;
 
-    const PSK: [u8; 32] = [7; 32];
+    fn psk() -> SecretKey {
+        SecretKey::from_bytes(&[7; 32])
+    }
 
     fn pair() -> (Identity, Identity) {
         (Identity::generate(), Identity::generate())
@@ -626,8 +622,8 @@ mod tests {
     #[test]
     fn handshake_agrees_on_keys_and_authenticates_both() {
         let (s, r) = pair();
-        let responder = Responder::new(r.clone(), PSK);
-        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let responder = Responder::new(r.clone(), psk());
+        let mut init = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt = init.initiation(b"hello payload", None).unwrap();
         assert_eq!(pkt.len(), INITIATION_OVERHEAD + 13);
         assert!(responder.is_initiation(&pkt));
@@ -648,14 +644,14 @@ mod tests {
     #[test]
     fn strangers_and_tampering_are_rejected() {
         let (s, r) = pair();
-        let responder = Responder::new(r.clone(), PSK);
+        let responder = Responder::new(r.clone(), psk());
         // Sender that does not know the receiver's ID: mac1 fails, silence.
         let wrong = Identity::generate();
-        let mut init = Initiator::new(&s, &wrong.id(), &PSK).unwrap();
+        let mut init = Initiator::new(&s, &wrong.id(), &psk()).unwrap();
         let pkt = init.initiation(b"x", None).unwrap();
         assert!(!responder.is_initiation(&pkt));
         // Right ID, but any modified byte breaks mac1 or the handshake.
-        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let mut init = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt = init.initiation(b"payload", None).unwrap();
         for i in 0..pkt.len() - MAC_LEN {
             let mut bad = pkt.clone();
@@ -681,15 +677,15 @@ mod tests {
         let s = Identity::generate();
         for point in crate::crypto::identity::tests::low_order_points() {
             let id = SharpId::from_public(point);
-            assert!(Initiator::new(&s, &id, &PSK).is_err());
+            assert!(Initiator::new(&s, &id, &psk()).is_err());
         }
     }
 
     #[test]
     fn different_psk_fails_at_the_response() {
         let (s, r) = pair();
-        let responder = Responder::new(r.clone(), [9; 32]);
-        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let responder = Responder::new(r.clone(), SecretKey::from_bytes(&[9; 32]));
+        let mut init = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt = init.initiation(b"p", None).unwrap();
         let incoming = responder.read_initiation(&pkt).unwrap();
         let (resp, _) = incoming.respond(5, b"r").unwrap();
@@ -704,8 +700,8 @@ mod tests {
     #[test]
     fn junk_addressed_to_an_attempt_does_not_use_it_up() {
         let (s, r) = pair();
-        let responder = Responder::new(r.clone(), PSK);
-        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let responder = Responder::new(r.clone(), psk());
+        let mut init = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt = init.initiation(b"p", None).unwrap();
         let (resp, _) = responder
             .read_initiation(&pkt)
@@ -739,8 +735,8 @@ mod tests {
     #[test]
     fn connection_ids_changed_on_the_way_are_not_believed() {
         let (s, r) = pair();
-        let responder = Responder::new(r.clone(), PSK);
-        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let responder = Responder::new(r.clone(), psk());
+        let mut init = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt = init.initiation(b"p", None).unwrap();
         let end = pkt.len() - 2 * MAC_LEN;
         let mut altered = pkt.clone();
@@ -767,10 +763,10 @@ mod tests {
     #[test]
     fn responses_are_bound_to_their_attempt() {
         let (s, r) = pair();
-        let responder = Responder::new(r.clone(), PSK);
-        let mut first = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let responder = Responder::new(r.clone(), psk());
+        let mut first = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt1 = first.initiation(b"1", None).unwrap();
-        let mut second = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let mut second = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let _pkt2 = second.initiation(b"2", None).unwrap();
         let (resp1, _) = responder
             .read_initiation(&pkt1)
@@ -787,14 +783,14 @@ mod tests {
         let mut jar = CookieJar::new(&r.id());
         let now = Instant::now();
         let from: SocketAddr = "192.0.2.7:4000".parse().unwrap();
-        let mut init = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let mut init = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt = init.initiation(b"p", None).unwrap();
         assert!(!jar.mac2_ok(&pkt, from, now));
         let reply = jar.reply(&pkt, from, now).unwrap();
         assert_eq!(reply.len(), COOKIE_REPLY_LEN);
         let cookie = init.read_cookie_reply(&reply).unwrap();
         // The retried attempt carries mac2 with the cookie.
-        let mut retry = Initiator::new(&s, &r.id(), &PSK).unwrap();
+        let mut retry = Initiator::new(&s, &r.id(), &psk()).unwrap();
         let pkt2 = retry.initiation(b"p", Some(&cookie)).unwrap();
         assert!(jar.mac2_ok(&pkt2, from, now));
         // From another address the same mac2 is worthless.

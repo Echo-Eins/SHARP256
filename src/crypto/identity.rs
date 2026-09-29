@@ -7,7 +7,7 @@
 //! to reach it at all (see `handshake`), and the ID authenticates the
 //! receiver to the sender.
 
-use rand::RngCore;
+use crate::crypto::SecretKey;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -114,27 +114,31 @@ impl FromStr for SharpId {
     }
 }
 
-/// A local identity: X25519 static key pair.
+/// A local identity: X25519 static key pair. The private key is in locked
+/// memory ([`SecretKey`]); clones share it.
 #[derive(Clone)]
 pub struct Identity {
-    secret: Zeroizing<[u8; KEY_LEN]>,
+    secret: SecretKey,
     public: [u8; KEY_LEN],
 }
 
 impl Identity {
     pub fn generate() -> Self {
-        let mut secret = [0u8; KEY_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
-        let id = Self::from_secret(secret);
-        secret.zeroize();
-        id
+        Self::from_key(SecretKey::random())
     }
 
-    pub fn from_secret(secret: [u8; KEY_LEN]) -> Self {
-        let secret = Zeroizing::new(secret);
+    /// The identity with this private key. The array passed in is wiped.
+    pub fn from_secret(mut secret: [u8; KEY_LEN]) -> Self {
+        let key = SecretKey::from_bytes(&secret);
+        secret.zeroize();
+        Self::from_key(key)
+    }
+
+    fn from_key(secret: SecretKey) -> Self {
         // StaticSecret wipes its copy when dropped.
         let public =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret)).to_bytes();
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret.expose()))
+                .to_bytes();
         Self { secret, public }
     }
 
@@ -148,7 +152,7 @@ impl Identity {
 
     /// Private key bytes (for the Noise handshake).
     pub(crate) fn secret(&self) -> &[u8; KEY_LEN] {
-        &self.secret
+        self.secret.expose()
     }
 
     /// The X25519 shared secret between this identity and `other`.
@@ -221,7 +225,7 @@ impl Identity {
         let mut text = Zeroizing::new(Vec::with_capacity(head.len() + 2 * KEY_LEN + 1));
         text.extend_from_slice(head.as_bytes());
         let mut hex = Zeroizing::new([0u8; 2 * KEY_LEN]);
-        hex_encode(&self.secret[..], &mut hex[..]);
+        hex_encode(self.secret.expose(), &mut hex[..]);
         text.extend_from_slice(&*hex);
         text.push(b'\n');
         text
@@ -232,11 +236,10 @@ impl Identity {
             .split(|&b| b == b'\n')
             .map(<[u8]>::trim_ascii)
             .find(|l| !l.is_empty() && !l.starts_with(b"#"))?;
-        let mut secret = Zeroizing::new([0u8; KEY_LEN]);
-        if !hex_decode(line, &mut secret[..]) {
-            return None;
-        }
-        Some(Self::from_secret(*secret))
+        // Decoded straight into its locked place.
+        let mut valid = false;
+        let key = SecretKey::with(|k| valid = hex_decode(line, k));
+        valid.then(|| Self::from_key(key))
     }
 }
 
