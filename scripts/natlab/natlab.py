@@ -89,6 +89,21 @@ def sh(*cmd, check=True, **kw):
     return r
 
 
+# No duplicate address detection anywhere in a laboratory: nothing in it can
+# have a duplicate, and while an interface's link-local address is still
+# being checked — a second or two after the interface comes up — Linux will
+# not solicit a neighbour for a packet it forwards. Every router of the
+# laboratory would hold every IPv6 packet it routes for that long, and a
+# program that measures its network the moment it starts (a host with IPv6
+# alone has nothing else to measure first) finds no answer on a fast machine
+# and a full one on a slow one. Real routers have been up for longer than
+# that. Set in a namespace before any link comes into it: an interface takes
+# the "default" of the namespace it is moved to, and DAD is skipped only if
+# "all" says so too. (Where the kernel has no IPv6 the settings do not
+# exist, and nothing needs them.)
+NO_DAD = ("net.ipv6.conf.all.accept_dad=0", "net.ipv6.conf.default.accept_dad=0")
+
+
 class Lab:
     def __init__(self, keep=False):
         self.dir = tempfile.mkdtemp(prefix="natlab.")
@@ -99,6 +114,8 @@ class Lab:
         # Link ends made in this process's own namespace (the core, "I"):
         # see `close`.
         self.core_links = []
+        for setting in NO_DAD:
+            sh("sysctl", "-qw", setting, check=False)
 
     # ----- namespaces -----------------------------------------------------
 
@@ -118,7 +135,20 @@ class Lab:
             except OSError:
                 pass
             time.sleep(0.01)
+        for setting in NO_DAD:
+            self.x(name, "sysctl", "-qw", setting, check=False)
         self.x(name, "ip", "link", "set", "lo", "up")
+
+    def settle(self, names, within=5.0):
+        """Waits, `within` seconds at most, until no IPv6 address in the
+        namespaces `names` is still being checked for duplicates (`NO_DAD`
+        should have seen to that: this is for a kernel that ignored it)."""
+        end = time.time() + within
+        while time.time() < end:
+            if not any(self.x(n, "ip", "-6", "addr", "show", "tentative", check=False).stdout.strip() for n in names):
+                return True
+            time.sleep(0.1)
+        return False
 
     def prefix(self, ns):
         return [] if ns == "I" else ["nsenter", "-t", str(self.pid[ns]), "-n"]
@@ -445,6 +475,7 @@ class Topo:
         lab.x("I", "sysctl", "-qw", "net.ipv4.ip_forward=1")
         if v6:
             self.wire_v6(v6, sides)
+            lab.settle(["I", *lab.pid])
         if isolate:
             # The two networks cannot reach each other at all — as behind a
             # firewall that lets nothing peer-to-peer through — while both can
