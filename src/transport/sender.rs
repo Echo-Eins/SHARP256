@@ -525,9 +525,16 @@ impl Sender {
         let first = match candidates.first() {
             Some(&first) => first,
             // Nothing to try until a relay or a name turns something up.
-            None if !self.cfg.relays.is_empty() || names_pending => {
+            None if !self.cfg.relays.is_empty() || names_pending || self.cfg.find_lan => {
                 if !names_pending {
-                    tracing::info!("no direct address for the receiver; asking the relays");
+                    tracing::info!(
+                        "no direct address for the receiver; asking {}",
+                        if self.cfg.find_lan {
+                            "the local network and the relays"
+                        } else {
+                            "the relays"
+                        }
+                    );
                 }
                 self.cfg.peer
             }
@@ -640,6 +647,25 @@ impl Sender {
         #[cfg(not(feature = "nat-traversal"))]
         let relay_inboxes = RelayInboxes::default();
         let unresolved = self.spawn_name_resolution(reach, found_tx.clone());
+        // The local network, if asked: one multicast question, and whatever
+        // the receiver there says of itself joins the candidates.
+        #[cfg(feature = "nat-traversal")]
+        if self.cfg.find_lan {
+            let (found, id, cancel) = (found_tx.clone(), self.cfg.receiver_id, self.cancel.clone());
+            tokio::spawn(async move {
+                let addrs = tokio::select! {
+                    a = crate::nat::mdns::find(&id, Duration::from_secs(3)) => a,
+                    _ = cancel.cancelled() => return,
+                };
+                if addrs.is_empty() {
+                    tracing::info!("nobody on the local network answered for the receiver");
+                }
+                for a in addrs {
+                    tracing::info!("the receiver says it is at {} on the local network", a);
+                    let _ = found.send(Found::Named(a));
+                }
+            });
+        }
         self.spawn_nat64(&given, reach, found_tx);
 
         let mut engine = Engine::new(

@@ -36,6 +36,13 @@ struct Args {
     #[arg(long = "stun", value_name = "HOST:PORT")]
     stun: Vec<String>,
 
+    /// Look for the receiver on the local network with multicast DNS: it
+    /// has to be started with --announce-lan, and <RECEIVER> may then be its
+    /// ID alone. The question tells everybody on the network whom you are
+    /// looking for, which is why it is only asked when you ask it
+    #[arg(long)]
+    lan: bool,
+
     /// Ask a relay at [<relay ID>@]<host>:<port> to put this transfer
     /// through when the receiver's own addresses do not answer. May be
     /// repeated. Only a relay that puts through just the senders it lists
@@ -152,7 +159,7 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
         None => sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?,
     };
     // A receiver reached only through a relay publishes no address.
-    if card_id.is_none() && hosts.is_empty() && args.relays.is_empty() {
+    if card_id.is_none() && hosts.is_empty() && args.relays.is_empty() && !args.lan {
         anyhow::bail!(
             "{} has no address: write it as <ID>@<host>:<port>, or name the relay it \
              registered with using --relay",
@@ -176,6 +183,7 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file.clone());
     cfg.bind = args.bind;
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
+    cfg.find_lan = args.lan && cfg!(feature = "nat-traversal");
     cfg.stun_servers = args.stun.clone();
     cfg.relays.extend(args.relays.iter().cloned());
     cfg.state_dir = args.state_dir.clone();

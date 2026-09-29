@@ -173,6 +173,11 @@ pub struct SenderConfig {
     /// the sender's own.
     #[cfg(feature = "nat-traversal")]
     pub peer_card: Option<crate::nat::card::Card>,
+    /// Ask the local network for the receiver with multicast DNS, once, at
+    /// the start (it has to announce itself: `ReceiverConfig::announce_lan`).
+    /// A question tells everybody on the network whom this sender is
+    /// looking for, so it is not asked unless asked for.
+    pub find_lan: bool,
     pub events: Option<EventCallback>,
 }
 
@@ -192,6 +197,7 @@ impl std::fmt::Debug for SenderConfig {
             .field("relays", &self.relays)
             .field("nat_traversal", &self.nat_traversal)
             .field("stun_servers", &self.stun_servers)
+            .field("find_lan", &self.find_lan)
             .field("events", &self.events.is_some())
             .finish()
     }
@@ -236,6 +242,7 @@ impl SenderConfig {
             stun_servers: Vec::new(),
             #[cfg(feature = "nat-traversal")]
             peer_card: None,
+            find_lan: false,
             events: None,
         }
     }
@@ -321,6 +328,11 @@ pub struct ReceiverConfig {
     /// A relay run with `--stun` is one, and the only kind that can carry
     /// out every behaviour test.
     pub stun_servers: Vec<String>,
+    /// Announce this receiver on the local network with multicast DNS, so
+    /// that a sender there that knows its ID can find it without being told
+    /// an address. Off unless asked for: the announcement tells everybody on
+    /// the network that this host receives SHARP-256 transfers.
+    pub announce_lan: bool,
     pub accept: AcceptPolicy,
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
@@ -355,6 +367,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("publish_lan_addresses", &self.publish_lan_addresses)
             .field("nat_keepalive", &self.nat_keepalive)
             .field("stun_servers", &self.stun_servers)
+            .field("announce_lan", &self.announce_lan)
             .field("accept", &self.accept)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
@@ -411,6 +424,7 @@ impl ReceiverConfig {
             publish_lan_addresses: true,
             nat_keepalive: Duration::from_secs(15),
             stun_servers: Vec::new(),
+            announce_lan: false,
             accept: AcceptPolicy::AcceptAll,
             identity: None,
             psk: None,

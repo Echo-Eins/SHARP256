@@ -515,6 +515,30 @@ impl Receiver {
             puncher.settle();
         }
 
+        // Announced on the local network, when asked to be: a sender there
+        // that knows this receiver's ID finds it without an address.
+        #[cfg(feature = "nat-traversal")]
+        if shared.cfg.announce_lan {
+            let (id, socket) = (shared.identity.id(), shared.socket.clone());
+            match crate::nat::mdns::announce(
+                move || crate::nat::mdns::Announcement {
+                    id,
+                    port: socket.local_addr().map(|a| a.port()).unwrap_or(0),
+                    addresses: socket
+                        .local_addr()
+                        .map(|l| crate::nat::host_addresses(l, true))
+                        .unwrap_or_default(),
+                },
+                shared.cancel.clone(),
+            ) {
+                Ok(_) => tracing::info!(
+                    "announced on the local network as {}",
+                    crate::nat::mdns::instance_name(&shared.identity.id())
+                ),
+                Err(e) => tracing::warn!("cannot announce on the local network: {}", e),
+            }
+        }
+
         // Relays run alongside: each registers this receiver so that a
         // sender who cannot reach any of its addresses can still be
         // introduced to it, and carried if the introduction is not enough.

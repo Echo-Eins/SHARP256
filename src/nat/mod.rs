@@ -30,6 +30,7 @@ pub mod behaviour;
 pub mod birthday;
 pub mod card;
 pub mod keepalive;
+pub mod mdns;
 pub mod portmap;
 pub mod probe;
 pub mod punch;
@@ -449,7 +450,7 @@ fn forward_address(
 ///
 /// With `lan` off, only addresses the internet routes are published: the
 /// rest say how the local network is laid out, to whoever is given them.
-fn host_addresses(local: SocketAddr, lan: bool) -> Vec<IpAddr> {
+pub(crate) fn host_addresses(local: SocketAddr, lan: bool) -> Vec<IpAddr> {
     use crate::address::class;
     let wanted = |ip: IpAddr| class::is_publishable_host(ip) && (lan || class::is_global(ip));
     let local_ip = crate::address::canonical(local).ip();

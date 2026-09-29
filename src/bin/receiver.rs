@@ -67,6 +67,14 @@ struct Args {
     #[arg(long = "stun", value_name = "HOST:PORT")]
     stun: Vec<String>,
 
+    /// Announce this receiver on the local network with multicast DNS, so
+    /// that a sender there (sharp-sender --lan) that knows the receiver ID
+    /// finds it without being told an address. The announcement tells
+    /// everybody on the network that this host receives SHARP-256
+    /// transfers, which is why it is off unless asked for
+    #[arg(long)]
+    announce_lan: bool,
+
     /// The contact card (shc1-…) of a sender on another network, or @FILE
     /// with one in it; repeat it for several. The receiver starts sending
     /// at every address on the card at once, which is what lets a sender
@@ -146,6 +154,7 @@ async fn main() -> Result<()> {
     cfg.relays = args.relays.clone();
     cfg.relay_private = args.relay_private;
     cfg.publish_lan_addresses = !args.no_lan_addresses;
+    cfg.announce_lan = args.announce_lan && cfg!(feature = "nat-traversal");
     cfg.nat_keepalive = std::time::Duration::from_secs(args.keepalive.clamp(1, 3600));
     cfg.stun_servers = args.stun.clone();
     cfg.state_dir = args.state_dir.clone();
