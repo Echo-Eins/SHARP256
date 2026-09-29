@@ -1381,6 +1381,19 @@ moves the session there; the sender does the same for what the receiver then
 sends. Both ends prove the other's address before they move (section 8,
 address validation), so nothing here can be turned on a third party.
 
+Neither end follows the other back to a server's address — a relay's port,
+an address on a TURN server, a TURN shim — while the direct address it runs
+on has been heard from within the last three seconds (`DIRECT_GRACE`). What
+arrives through the server meanwhile is the other end catching up: packets
+it sent before it moved, answers to challenges made then. Followed back,
+they made the two ends swap paths in turn, each moving because the other
+just had, and a session could end on a TURN server with a direct path open
+all along (seen in the laboratory where the server's path is the slower
+one). The sender knows which of the receiver's addresses are servers'; the
+receiver counts its own TURN shims, the hosts of its relays, and the TURN
+addresses on the cards it was given. A direct path that stays quiet longer
+is left in the usual way (below).
+
 A sender whose NAT draws its ports at random meets a receiver behind an
 ordinary one with many sockets (section 8, punching), and only the socket
 the receiver's packet reached has a way in. The sender keeps that socket

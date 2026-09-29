@@ -52,6 +52,28 @@ const AMPLIFICATION: usize = 3;
 /// Size of one PATH_CHALLENGE datagram on the wire.
 pub const CHALLENGE_BYTES: usize = crate::crypto::transport::OVERHEAD + PATH_TOKEN_LEN;
 
+/// How long a direct path may be quiet before the session follows its peer
+/// to a relay's or a TURN server's address again.
+///
+/// While the direct path is heard from, what comes through a server is the
+/// other end catching up: packets it sent before it moved, answers to
+/// challenges made then. Followed back, those made the two ends swap paths
+/// in turn, each moving because the other just had, and a session could end
+/// on a TURN server with a direct path open all along (the laboratory saw it
+/// where the server's path is the slower one). A direct path that has gone
+/// quiet this long is another matter: the session goes back to the server
+/// (see the sender's re-handshakes after a stall).
+pub const DIRECT_GRACE: Duration = Duration::from_secs(3);
+
+/// Whether a claim for an address is to be passed over: it is a server's
+/// (`to_relayed`) while the session runs on a direct address
+/// (`!peer_relayed`) heard from `quiet` ago, within [`DIRECT_GRACE`]. A
+/// direct address is always worth asking, and a server's is when the
+/// session is on one already.
+pub fn keeps_direct(to_relayed: bool, peer_relayed: bool, quiet: Duration) -> bool {
+    to_relayed && !peer_relayed && quiet < DIRECT_GRACE
+}
+
 /// A challenge the caller should send: `nonce` to `to`, as an authenticated
 /// PATH_CHALLENGE frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,5 +417,31 @@ mod tests {
         assert!(p.probing().is_empty());
         // A late echo of the cancelled claim no longer migrates anything.
         assert!(p.on_response(other, c.nonce).is_none());
+    }
+
+    /// A session on a direct path does not follow its peer to a server's
+    /// address while the direct one is heard from; it does once that has
+    /// gone quiet, and a direct address is always worth asking.
+    #[test]
+    fn a_direct_path_is_not_given_up_for_a_server_while_it_is_heard() {
+        let recent = Duration::from_millis(200);
+        let quiet = DIRECT_GRACE + Duration::from_millis(1);
+        assert!(keeps_direct(true, false, recent));
+        assert!(
+            !keeps_direct(true, false, quiet),
+            "gone quiet: back to the server"
+        );
+        assert!(
+            !keeps_direct(false, false, recent),
+            "another direct address"
+        );
+        assert!(
+            !keeps_direct(false, true, recent),
+            "from a server to a direct one"
+        );
+        assert!(
+            !keeps_direct(true, true, recent),
+            "from one server to another"
+        );
     }
 }

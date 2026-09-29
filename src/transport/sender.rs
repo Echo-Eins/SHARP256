@@ -1493,6 +1493,9 @@ struct Engine {
 
     start: Instant,
     last_rx: Instant,
+    /// When the receiver was last heard from at `peer` itself (see
+    /// [`Engine::keeps_direct`]).
+    heard_peer_at: Instant,
     last_ping: Instant,
     probe_ts: Vec<u32>,
     stalled: bool,
@@ -1643,6 +1646,7 @@ impl Engine {
             last_idle_probe: None,
             start: now,
             last_rx: now,
+            heard_peer_at: now,
             last_ping: now,
             probe_ts: Vec::new(),
             stalled: false,
@@ -2311,6 +2315,7 @@ impl Engine {
             tracing::info!("receiver answered at {}", target);
             self.peer = target;
         }
+        self.heard_peer_at = Instant::now();
         self.follow_peer();
         // The new keys are in place, so liveness and — when the answer came
         // from an address we have not proven — its validation can both run
@@ -3418,9 +3423,15 @@ impl Engine {
                 );
             }
             Message::PathResponse(p) => {
-                if let Some(addr) = self.path.on_response(from, p.data) {
+                let now = Instant::now();
+                if let Some(addr) = self
+                    .path
+                    .on_response(from, p.data)
+                    .filter(|a| !self.keeps_direct(*a, now))
+                {
                     tracing::info!("receiver address {} proven; sending there now", addr);
                     self.peer = addr;
+                    self.heard_peer_at = now;
                     self.follow_peer();
                     // A move from IPv4 to IPv6 makes every header 20 bytes
                     // longer.
@@ -3480,7 +3491,16 @@ impl Engine {
     fn note_alive(&mut self, now: Instant, from: SocketAddr, len: usize) {
         self.last_rx = now;
         self.ping_backoff = 0;
-        if let Some(c) = self.path.on_authentic(from, self.peer, now, len) {
+        if from == self.peer {
+            self.heard_peer_at = now;
+        }
+        // Through a server while the direct path is heard from: the receiver
+        // catching up, not moving (see `path::DIRECT_GRACE`).
+        let held = from != self.peer && self.keeps_direct(from, now);
+        if let Some(c) = (!held)
+            .then(|| self.path.on_authentic(from, self.peer, now, len))
+            .flatten()
+        {
             tracing::info!(
                 "receiver claims address {} (was {}); validating it",
                 c.to,
@@ -3808,6 +3828,17 @@ impl Engine {
     /// Whether `addr` carries the transfer without being the receiver: a
     /// port a relay set aside, or an address on a TURN server, or a
     /// loopback address that stands for the receiver through one.
+    /// Whether `to` is passed over for now: a relay's or a TURN server's
+    /// address while the session runs directly and the receiver was heard
+    /// from there lately (see [`crate::transport::path::DIRECT_GRACE`]).
+    fn keeps_direct(&self, to: SocketAddr, now: Instant) -> bool {
+        crate::transport::path::keeps_direct(
+            self.is_relayed(to),
+            self.is_relayed(self.peer),
+            now.saturating_duration_since(self.heard_peer_at),
+        )
+    }
+
     fn is_relayed(&self, addr: SocketAddr) -> bool {
         let addr = crate::address::canonical(addr);
         #[cfg(feature = "nat-traversal")]

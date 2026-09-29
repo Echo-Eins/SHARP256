@@ -267,6 +267,16 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   the cut (the stall timeout, then a round of re-handshakes), and delivered.
   A relay keeps an idle pair's port for a minute (`--idle`), so later than
   that only a TURN server is a way back.
+- **A direct path is kept while it is heard from.** With a direct path and a
+  server's both alive, what came through the server after a move — packets
+  sent before it, answers to challenges made then — made an end check the
+  server's address, find it alive and move back; the other end followed,
+  and the two swapped paths in turn. In the laboratory's virtual machine,
+  where the path through coturn is much the slower, 10 of the 18 IPv6 cells
+  with a TURN server ended on it with a direct path open both ways. Neither
+  end now follows the other to a relay's port, an address on a TURN server
+  or a TURN shim while its direct address was heard from in the last three
+  seconds; a direct path that stays quiet longer is left as before.
 - **What an adversarial review of this round found, fixed.** An address on a
   TURN server was on the lines people copy (`Senders use:`, `Addresses:`),
   and a peer given it punched at it as at a host whose NAT is unknown —

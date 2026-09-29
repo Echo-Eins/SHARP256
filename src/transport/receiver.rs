@@ -187,6 +187,52 @@ struct Shared {
     /// work (see [`Shared::meet`]).
     #[cfg(feature = "nat-traversal")]
     meetings: Meetings,
+    /// Addresses that carry a sender without being it (see [`Relayed`]).
+    #[cfg(feature = "nat-traversal")]
+    relayed: Relayed,
+}
+
+/// Addresses a sender reaches this receiver through without being there:
+/// this receiver's own TURN shims, the hosts of the relays it is registered
+/// with (a relay carries a pair on ports of its own), and the addresses on
+/// senders' cards that are on a TURN server. A session on a direct path does
+/// not follow its sender to one of them while the direct path is heard from
+/// (see `path::DIRECT_GRACE`).
+#[cfg(feature = "nat-traversal")]
+#[derive(Default)]
+struct Relayed {
+    turns: parking_lot::RwLock<Vec<crate::nat::turn::Turn>>,
+    hosts: parking_lot::RwLock<std::collections::HashSet<std::net::IpAddr>>,
+    addrs: parking_lot::RwLock<std::collections::HashSet<SocketAddr>>,
+}
+
+/// Servers' addresses remembered from cards: a card names a few, and people
+/// paste only so many.
+#[cfg(feature = "nat-traversal")]
+const MAX_RELAYED: usize = 256;
+
+#[cfg(feature = "nat-traversal")]
+impl Relayed {
+    fn contains(&self, addr: SocketAddr) -> bool {
+        let addr = crate::address::canonical(addr);
+        self.turns.read().iter().any(|t| t.is_shim(addr))
+            || self.hosts.read().contains(&addr.ip())
+            || self.addrs.read().contains(&addr)
+    }
+
+    fn add_hosts(&self, addrs: &[SocketAddr]) {
+        let mut hosts = self.hosts.write();
+        for a in addrs {
+            hosts.insert(crate::address::canonical(*a).ip());
+        }
+    }
+
+    fn add(&self, addr: SocketAddr) {
+        let mut addrs = self.addrs.write();
+        if addrs.len() < MAX_RELAYED {
+            addrs.insert(crate::address::canonical(addr));
+        }
+    }
 }
 
 /// Punching at peers' addresses for meetings — an address on a card, one
@@ -507,6 +553,8 @@ impl Receiver {
                 routes,
                 #[cfg(feature = "nat-traversal")]
                 meetings: Meetings::default(),
+                #[cfg(feature = "nat-traversal")]
+                relayed: Relayed::default(),
             }),
         })
     }
@@ -581,6 +629,10 @@ impl Receiver {
             &shared.socket.udp(),
             &shared.cancel,
         );
+        #[cfg(feature = "nat-traversal")]
+        {
+            *shared.relayed.turns.write() = turns.clone();
+        }
         #[cfg(feature = "nat-traversal")]
         let puncher = Arc::new(
             crate::nat::punch::Puncher::new(shared.socket.udp(), hints_rx)
@@ -1237,6 +1289,11 @@ fn meet_card(
     if let Some(why) = card.staleness() {
         tracing::warn!("contact card of {}: {}", card.id.short(), why);
     }
+    for c in &card.candidates {
+        if c.kind == crate::nat::card::Kind::Relayed {
+            shared.relayed.add(c.addr);
+        }
+    }
     let targets = card.punch_targets();
     tracing::info!(
         "contact card of {}: punching towards {} address(es)",
@@ -1308,6 +1365,7 @@ fn spawn_relay_clients(
         let identity = shared.identity.clone();
         let private = shared.cfg.relay_private;
         let cancel = shared.cancel.clone();
+        let relayed = shared.clone();
         let events = shared.cfg.events.clone();
         let list = list.clone();
         let keepalive = keepalive.clone();
@@ -1316,6 +1374,7 @@ fn spawn_relay_clients(
             let Some(addrs) = resolve_relay(&host, reach, &cancel).await else {
                 return;
             };
+            relayed.relayed.add_hosts(&addrs);
             let (tx, rx) = mpsc::channel(32);
             list.write().push(RelayClient {
                 addrs: addrs.clone(),
@@ -1784,6 +1843,9 @@ struct Session {
 
     start: Instant,
     last_rx: Instant,
+    /// When the sender was last heard from at `peer` itself (see
+    /// [`Session::keeps_direct`]).
+    heard_peer_at: Instant,
     stalled: bool,
     last_progress_at: Instant,
     last_progress_bytes: u64,
@@ -1847,6 +1909,7 @@ impl Session {
             flush_snapshot: None,
             start: now,
             last_rx: now,
+            heard_peer_at: now,
             stalled: false,
             last_progress_at: now,
             last_progress_bytes: 0,
@@ -2026,6 +2089,7 @@ impl Session {
     fn start(&mut self, h: Handshake) -> Option<Option<oneshot::Receiver<bool>>> {
         self.peer = h.from;
         self.last_rx = h.at;
+        self.heard_peer_at = h.at;
         let hello = h.init.hello.clone();
         if let Err((reason, message)) = self.prepare(&hello) {
             self.reject_handshake(h, reason, &message);
@@ -2757,6 +2821,27 @@ impl Session {
 
     /// Something authentic arrived from the sender.
     ///
+    /// Whether `to` is passed over for now: a relay's port, a TURN shim of
+    /// ours or a TURN address on the sender's card, while the session runs
+    /// on a direct address the sender was heard from lately (see
+    /// [`crate::transport::path::DIRECT_GRACE`]).
+    fn keeps_direct(&self, to: SocketAddr, now: Instant) -> bool {
+        #[cfg(feature = "nat-traversal")]
+        {
+            let relayed = &self.shared.relayed;
+            crate::transport::path::keeps_direct(
+                relayed.contains(to),
+                relayed.contains(self.peer),
+                now.saturating_duration_since(self.heard_peer_at),
+            )
+        }
+        #[cfg(not(feature = "nat-traversal"))]
+        {
+            let _ = (to, now);
+            false
+        }
+    }
+
     /// An authentic packet from an address we have not proven does *not*
     /// move the transfer there: it only makes us ask. See
     /// [`crate::transport::path`] — an attacker that repeats a captured
@@ -2764,6 +2849,9 @@ impl Session {
     /// ACKs (and, on the sending side, the data stream) at a third party.
     fn note_alive(&mut self, from: SocketAddr, at: Instant, len: usize) {
         self.last_rx = at;
+        if from == self.peer {
+            self.heard_peer_at = at;
+        }
         // A transport packet from the address the handshake came from proves
         // that address: it takes the keys our answer to the handshake made,
         // and the answer went there. (The handshake alone proves nothing
@@ -2781,7 +2869,13 @@ impl Session {
                 },
             );
         }
-        if let Some(c) = self.path.on_authentic(from, self.peer, at, len) {
+        // Through a server while the direct path is heard from: the sender
+        // catching up, not moving (see `path::DIRECT_GRACE`).
+        let held = from != self.peer && self.keeps_direct(from, at);
+        if let Some(c) = (!held)
+            .then(|| self.path.on_authentic(from, self.peer, at, len))
+            .flatten()
+        {
             tracing::info!(
                 "sender claims address {} (was {}); validating it",
                 c.to,
@@ -2876,9 +2970,15 @@ impl Session {
                 );
             }
             Message::PathResponse(p) => {
-                if let Some(addr) = self.path.on_response(c.from, p.data) {
+                let now = Instant::now();
+                if let Some(addr) = self
+                    .path
+                    .on_response(c.from, p.data)
+                    .filter(|a| !self.keeps_direct(*a, now))
+                {
                     tracing::info!("sender address {} proven; moving the session there", addr);
                     self.peer = addr;
+                    self.heard_peer_at = now;
                     #[cfg(feature = "nat-traversal")]
                     self.met_directly();
                 }
