@@ -139,6 +139,21 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - The passphrase of `--secret` (and `SHARP256_SECRET`), the one typed into
   the sender's window, and a TURN server's password are held in strings
   that are wiped.
+- Session keys are in locked memory too: each direction's traffic secret,
+  IV, header protection key and the AEADs of its epochs, kept inline in
+  one locked allocation instead of boxes on ordinary pages.
+- A forged packet no longer makes a key. The epoch of a packet comes from
+  its packet number, which an unauthenticated packet only claims, and every
+  forged packet used to cost a key derivation for whatever epoch it named
+  and push the real epoch's key out of a cache of three. Keys are now kept
+  for the newest epoch that has carried an authentic packet and the ones
+  on either side of it, and move on only when an authentic packet reaches
+  the next; a packet naming any other epoch is opened with the newest key
+  and fails like any forgery, in the same time. One up to 16 epochs ahead
+  (far beyond anything a sender's window allows) is tried with a key made
+  for it alone and kept only if it authenticates. Throughput is unchanged
+  (2 GiB over loopback, six runs of each build alternated: 1.88 s against
+  1.86 s on average).
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the

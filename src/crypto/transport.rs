@@ -21,11 +21,12 @@
 //! than AES-GCM's confidentiality bound allows, without any key-update
 //! signalling: both sides compute the key from the packet number.
 
+use crate::crypto::secret::Locked;
 use crate::crypto::{derive_secret, CryptoError};
 use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
-use std::sync::{Arc, RwLock};
-use zeroize::Zeroizing;
+use std::sync::atomic::{AtomicU64, Ordering};
+use zeroize::Zeroize;
 
 /// Connection id length.
 pub const CID_LEN: usize = 8;
@@ -101,18 +102,26 @@ impl Suite {
     }
 }
 
+/// The AEAD of one epoch, or none. It wipes itself when dropped (its
+/// crates' `zeroize` features), so wiping it is dropping it where it lies.
+/// Kept inline, not boxed: it is inside a locked page, and a box would put
+/// the key schedule on an ordinary one.
+#[derive(Default)]
+#[allow(clippy::large_enum_variant)]
 enum Aead {
-    Aes(Box<aes_gcm::Aes256Gcm>),
-    ChaCha(Box<chacha20poly1305::ChaCha20Poly1305>),
+    #[default]
+    None,
+    Aes(aes_gcm::Aes256Gcm),
+    ChaCha(chacha20poly1305::ChaCha20Poly1305),
 }
 
 impl Aead {
     fn new(suite: Suite, key: &[u8; 32]) -> Self {
         match suite {
-            Suite::Aes256Gcm => Aead::Aes(Box::new(aes_gcm::Aes256Gcm::new(key.into()))),
-            Suite::ChaCha20Poly1305 => Aead::ChaCha(Box::new(
-                chacha20poly1305::ChaCha20Poly1305::new(key.into()),
-            )),
+            Suite::Aes256Gcm => Aead::Aes(aes_gcm::Aes256Gcm::new(key.into())),
+            Suite::ChaCha20Poly1305 => {
+                Aead::ChaCha(chacha20poly1305::ChaCha20Poly1305::new(key.into()))
+            }
         }
     }
 
@@ -125,6 +134,7 @@ impl Aead {
         let tag = match self {
             Aead::Aes(c) => c.encrypt_in_place_detached(nonce.into(), aad, body),
             Aead::ChaCha(c) => c.encrypt_in_place_detached(nonce.into(), aad, body),
+            Aead::None => return Err(CryptoError::Seal),
         }
         .map_err(|_| CryptoError::Seal)?;
         let mut out = [0u8; TAG_LEN];
@@ -142,22 +152,41 @@ impl Aead {
         match self {
             Aead::Aes(c) => c.decrypt_in_place_detached(nonce.into(), aad, body, tag.into()),
             Aead::ChaCha(c) => c.decrypt_in_place_detached(nonce.into(), aad, body, tag.into()),
+            Aead::None => return Err(CryptoError::Open),
         }
         .map_err(|_| CryptoError::Open)
     }
 }
 
+impl Zeroize for Aead {
+    fn zeroize(&mut self) {
+        *self = Aead::None;
+    }
+}
+
+/// The header protection key; inline for the same reason as [`Aead`].
+#[derive(Default)]
+#[allow(clippy::large_enum_variant)]
 enum HeaderKey {
-    Aes(Box<aes::Aes256>),
-    ChaCha(Zeroizing<[u8; 32]>),
+    #[default]
+    None,
+    Aes(aes::Aes256),
+    ChaCha([u8; 32]),
 }
 
 impl HeaderKey {
+    #[cfg(test)]
     fn new(suite: Suite, key: &[u8; 32]) -> Self {
-        match suite {
-            Suite::Aes256Gcm => HeaderKey::Aes(Box::new(aes::Aes256::new(key.into()))),
-            Suite::ChaCha20Poly1305 => HeaderKey::ChaCha(Zeroizing::new(*key)),
-        }
+        let mut hp = HeaderKey::None;
+        hp.set(suite, key);
+        hp
+    }
+
+    fn set(&mut self, suite: Suite, key: &[u8; 32]) {
+        *self = match suite {
+            Suite::Aes256Gcm => HeaderKey::Aes(aes::Aes256::new(key.into())),
+            Suite::ChaCha20Poly1305 => HeaderKey::ChaCha(*key),
+        };
     }
 
     /// Mask for the 9 protected header bytes, computed from a 16-byte sample
@@ -183,41 +212,117 @@ impl HeaderKey {
                 // position) and refusing panics, so a packet whose tag began
                 // with ff ff ff ff took the endpoint down before its tag was
                 // even checked; and one of our own came out that way once
-                // in 2^32 packets. Found by fuzzing.
-                let mut core = chacha20::ChaChaCore::<U10>::new((&**key).into(), (&nonce).into());
+                // in 2^32 packets. Found by fuzzing. (The core wipes its
+                // state when dropped.)
+                let mut core = chacha20::ChaChaCore::<U10>::new(key.into(), (&nonce).into());
                 core.set_block_pos(counter);
                 let mut block = Default::default();
                 core.write_keystream_block(&mut block);
                 let mut mask = [0u8; 16];
                 mask.copy_from_slice(&block[..16]);
+                block.zeroize();
                 mask
             }
+            HeaderKey::None => [0; 16],
+        }
+    }
+}
+
+impl Zeroize for HeaderKey {
+    fn zeroize(&mut self) {
+        if let HeaderKey::ChaCha(key) = self {
+            key.zeroize();
+        }
+        *self = HeaderKey::None;
+    }
+}
+
+/// The key of one epoch: which epoch, and its AEAD.
+#[derive(Default)]
+struct Slot {
+    epoch: u64,
+    aead: Aead,
+}
+
+/// Epochs whose keys are kept at a time: the newest one that has carried an
+/// authentic packet, the one after it (so that the first packet of a new
+/// epoch finds its key ready), and the one before it (for packets reordered
+/// across the boundary).
+const SLOTS: usize = 3;
+
+/// How many epochs beyond the kept ones a packet may be from and still be
+/// tried, with a key made for it alone (and kept only if it authenticates).
+/// A sender never has more packets unacknowledged than its window holds —
+/// at most 256 MiB, 2^19 packets of the smallest size — while an epoch is
+/// 2^22 packets, so an authentic packet is always within an epoch or two;
+/// this is a margin, not a limit anything reaches. A forged packet cannot
+/// choose its epoch (the packet number is masked with a function of the
+/// tag it does not know), so almost none land here; one made from a real
+/// packet by flipping bits of its masked header can, and costs one key
+/// derivation, about what checking its tag costs anyway.
+const AHEAD: u64 = 16;
+
+/// What one direction keeps, all of it in locked memory: the traffic
+/// secret, the IV, the header protection key and the AEADs of the epochs
+/// in use.
+#[derive(Default)]
+struct Secrets {
+    secret: [u8; 32],
+    iv: [u8; 12],
+    hp: HeaderKey,
+    slots: parking_lot::RwLock<[Slot; SLOTS]>,
+}
+
+impl Zeroize for Secrets {
+    fn zeroize(&mut self) {
+        self.secret.zeroize();
+        self.iv.zeroize();
+        self.hp.zeroize();
+        for slot in self.slots.get_mut().iter_mut() {
+            slot.epoch = 0;
+            slot.aead.zeroize();
         }
     }
 }
 
 /// Keys of one direction of a session.
+///
+/// Keys are derived for an epoch only once a packet of the epoch before it
+/// has authenticated (or, when sealing, once our own packet numbers reach
+/// it). The epoch of a packet comes from its packet number, which a packet
+/// that has not yet authenticated only claims; deriving a key for whatever
+/// epoch a forgery named made every forged packet cost a key derivation and
+/// push the real epoch's key out of a small cache, and made its handling
+/// take a time that depended on the header. A packet naming an epoch that
+/// is not kept is opened with the newest epoch's key instead — it fails the
+/// same way, in the same time, as any other forgery.
 pub struct DirectionKeys {
     suite: Suite,
-    secret: Zeroizing<[u8; 32]>,
-    iv: [u8; 12],
-    hp: HeaderKey,
-    /// AEAD instances of recently used epochs.
-    epochs: RwLock<Vec<(u64, Arc<Aead>)>>,
+    keys: Locked<Secrets>,
+    /// The newest epoch that has carried an authentic packet (opening), or
+    /// that our own packets have reached (sealing).
+    top: AtomicU64,
 }
 
 impl DirectionKeys {
     pub fn new(suite: Suite, secret: &[u8; 32]) -> Self {
-        let iv_full = derive_secret("sharp256 v3 aead iv", &[secret]);
-        let mut iv = [0u8; 12];
-        iv.copy_from_slice(&iv_full[..12]);
-        let hp_key = derive_secret("sharp256 v3 header protection", &[secret]);
+        let keys = Locked::with(|k: &mut Secrets| {
+            k.secret = *secret;
+            let iv = derive_secret("sharp256 v3 aead iv", &[secret]);
+            k.iv.copy_from_slice(&iv[..12]);
+            k.hp.set(
+                suite,
+                &derive_secret("sharp256 v3 header protection", &[secret]),
+            );
+            let slots = k.slots.get_mut();
+            for (slot, epoch) in slots.iter_mut().zip(0..) {
+                Self::fill(slot, suite, secret, epoch);
+            }
+        });
         Self {
             suite,
-            secret: Zeroizing::new(*secret),
-            iv,
-            hp: HeaderKey::new(suite, &hp_key),
-            epochs: RwLock::new(Vec::new()),
+            keys,
+            top: AtomicU64::new(0),
         }
     }
 
@@ -225,28 +330,47 @@ impl DirectionKeys {
         self.suite
     }
 
-    fn aead(&self, epoch: u64) -> Arc<Aead> {
-        if let Ok(cache) = self.epochs.read() {
-            if let Some((_, a)) = cache.iter().find(|(e, _)| *e == epoch) {
-                return a.clone();
+    fn fill(slot: &mut Slot, suite: Suite, secret: &[u8; 32], epoch: u64) {
+        let key = derive_secret("sharp256 v3 aead key", &[secret, &epoch.to_be_bytes()]);
+        slot.epoch = epoch;
+        slot.aead = Aead::new(suite, &key);
+    }
+
+    /// Moves the kept epochs on to `epoch - 1 ..= epoch + 1`, deriving the
+    /// keys not yet there. Called only for an epoch an authentic packet (or
+    /// our own packet number) has reached.
+    fn advance(&self, epoch: u64) {
+        let mut slots = self.keys.slots.write();
+        if epoch <= self.top.load(Ordering::Acquire) {
+            return;
+        }
+        let wanted = [epoch.saturating_sub(1), epoch, epoch + 1];
+        // Keys still wanted stay where they are; the others' places are
+        // refilled with the ones missing.
+        let missing: Vec<u64> = wanted
+            .iter()
+            .copied()
+            .filter(|e| {
+                !slots
+                    .iter()
+                    .any(|s| s.epoch == *e && !matches!(s.aead, Aead::None))
+            })
+            .collect();
+        let mut missing = missing.into_iter();
+        for slot in slots.iter_mut() {
+            if wanted.contains(&slot.epoch) && !matches!(slot.aead, Aead::None) {
+                continue;
+            }
+            match missing.next() {
+                Some(e) => Self::fill(slot, self.suite, &self.keys.secret, e),
+                None => slot.aead.zeroize(),
             }
         }
-        let key = derive_secret(
-            "sharp256 v3 aead key",
-            &[&*self.secret, &epoch.to_be_bytes()],
-        );
-        let aead = Arc::new(Aead::new(self.suite, &key));
-        if let Ok(mut cache) = self.epochs.write() {
-            if cache.len() >= 3 {
-                cache.remove(0);
-            }
-            cache.push((epoch, aead.clone()));
-        }
-        aead
+        self.top.store(epoch, Ordering::Release);
     }
 
     fn nonce(&self, pn: u64) -> [u8; 12] {
-        let mut n = self.iv;
+        let mut n = self.keys.iv;
         for (b, p) in n[4..].iter_mut().zip(pn.to_be_bytes()) {
             *b ^= p;
         }
@@ -272,13 +396,24 @@ impl DirectionKeys {
             return Err(CryptoError::Malformed);
         }
         let pn = u64::from_be_bytes(pkt[CID_LEN + 1..HEADER_LEN].try_into().unwrap());
+        let epoch = pn >> EPOCH_BITS;
+        // Our own packet numbers only ever grow within a session.
+        if epoch > self.top.load(Ordering::Acquire) {
+            self.advance(epoch);
+        }
         let nonce = self.nonce(pn);
-        let aead = self.aead(pn >> EPOCH_BITS);
         let (head, rest) = pkt.split_at_mut(HEADER_LEN);
         let (body, tag_room) = rest.split_at_mut(rest.len() - TAG_LEN);
-        let tag = aead.seal(&nonce, head, body)?;
+        let tag = {
+            let slots = self.keys.slots.read();
+            let slot = slots
+                .iter()
+                .find(|s| s.epoch == epoch)
+                .ok_or(CryptoError::Seal)?;
+            slot.aead.seal(&nonce, head, body)?
+        };
         tag_room.copy_from_slice(&tag);
-        let mask = self.hp.mask(&tag);
+        let mask = self.keys.hp.mask(&tag);
         for (b, m) in pkt[CID_LEN..HEADER_LEN].iter_mut().zip(mask) {
             *b ^= m;
         }
@@ -294,17 +429,44 @@ impl DirectionKeys {
         }
         let mut sample = [0u8; TAG_LEN];
         sample.copy_from_slice(&pkt[n - TAG_LEN..]);
-        let mask = self.hp.mask(&sample);
+        let mask = self.keys.hp.mask(&sample);
         for (b, m) in pkt[CID_LEN..HEADER_LEN].iter_mut().zip(mask) {
             *b ^= m;
         }
         let type_byte = pkt[CID_LEN];
         let pn = u64::from_be_bytes(pkt[CID_LEN + 1..HEADER_LEN].try_into().unwrap());
+        let epoch = pn >> EPOCH_BITS;
         let nonce = self.nonce(pn);
-        let aead = self.aead(pn >> EPOCH_BITS);
         let (head, rest) = pkt.split_at_mut(HEADER_LEN);
         let (body, tag) = rest.split_at_mut(rest.len() - TAG_LEN);
-        aead.open(&nonce, head, body, tag)?;
+        {
+            let slots = self.keys.slots.read();
+            let top = self.top.load(Ordering::Acquire);
+            match slots.iter().find(|s| s.epoch == epoch) {
+                Some(slot) => slot.aead.open(&nonce, head, body, tag)?,
+                None if epoch > top && epoch <= top + AHEAD => {
+                    #[cfg(test)]
+                    tests::LOOKAHEAD_KEYS.with(|n| n.set(n.get() + 1));
+                    let key = derive_secret(
+                        "sharp256 v3 aead key",
+                        &[&self.keys.secret, &epoch.to_be_bytes()],
+                    );
+                    Locked::new(Aead::new(self.suite, &key)).open(&nonce, head, body, tag)?
+                }
+                // Any other epoch is a forgery, or older than the replay
+                // window: it is opened with the newest key, and fails like
+                // any forgery, in the same time.
+                None => slots
+                    .iter()
+                    .find(|s| s.epoch == top)
+                    .ok_or(CryptoError::Open)?
+                    .aead
+                    .open(&nonce, head, body, tag)?,
+            }
+        }
+        if epoch > self.top.load(Ordering::Acquire) {
+            self.advance(epoch);
+        }
         Ok((type_byte, pn, body))
     }
 }
@@ -400,6 +562,12 @@ mod tests {
     use super::*;
     use crate::crypto::handshake::Split;
 
+    thread_local! {
+        /// Keys made for a single packet ahead of the kept epochs, on this
+        /// thread (each test runs on its own).
+        pub(super) static LOOKAHEAD_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// Throughput of sealing and opening full-size packets:
     /// `cargo test --release --lib aead_throughput -- --ignored --nocapture`
     #[test]
@@ -436,8 +604,8 @@ mod tests {
 
     fn split() -> Split {
         Split {
-            initiator_to_responder: Zeroizing::new([1; 32]),
-            responder_to_initiator: Zeroizing::new([2; 32]),
+            initiator_to_responder: zeroize::Zeroizing::new([1; 32]),
+            responder_to_initiator: zeroize::Zeroizing::new([2; 32]),
             hash: [3; 32],
         }
     }
@@ -453,6 +621,13 @@ mod tests {
             (u64::MAX >> 1, 33),
         ] {
             let body: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            // A receiver follows the epochs authentic packets reach; one
+            // that has never seen the epochs in between would refuse a
+            // packet this far ahead (see the test after this one).
+            let epoch = pn >> EPOCH_BITS;
+            if epoch > b.recv.top.load(Ordering::Relaxed) + AHEAD {
+                b.recv.advance(epoch);
+            }
             let mut buf = Vec::new();
             begin_packet(&mut buf, 0xABCD_EF01_2345_6789, 0x43, pn);
             buf.extend_from_slice(&body);
@@ -473,6 +648,118 @@ mod tests {
     fn seal_open_both_suites() {
         roundtrip(Suite::Aes256Gcm);
         roundtrip(Suite::ChaCha20Poly1305);
+    }
+
+    /// The epochs a direction keeps keys for, in order.
+    fn kept(k: &DirectionKeys) -> Vec<u64> {
+        let mut epochs: Vec<u64> = k
+            .keys
+            .slots
+            .read()
+            .iter()
+            .filter(|s| !matches!(s.aead, Aead::None))
+            .map(|s| s.epoch)
+            .collect();
+        epochs.sort();
+        epochs
+    }
+
+    fn sealed(k: &DirectionKeys, pn: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        begin_packet(&mut buf, 5, 3, pn);
+        buf.extend_from_slice(&pn.to_be_bytes());
+        k.seal(&mut buf).unwrap();
+        buf
+    }
+
+    /// Forged packets make no keys, whatever their headers say: the epochs
+    /// kept stay where authentic packets put them, and those still open.
+    /// (Each used to cost a key derivation for whatever epoch it named, and
+    /// to push the real epoch's key out of a cache of three.)
+    #[test]
+    fn forged_packets_make_no_keys() {
+        use rand::{Rng, RngCore};
+        for suite in [Suite::Aes256Gcm, Suite::ChaCha20Poly1305] {
+            let a = SessionKeys::derive(&split(), true, suite);
+            let b = SessionKeys::derive(&split(), false, suite);
+            let real = sealed(&a.send, 1000);
+            let mut rng = rand::thread_rng();
+            // Random ones cannot choose their epoch, so none gets a key of
+            // its own either.
+            LOOKAHEAD_KEYS.with(|n| n.set(0));
+            for _ in 0..20_000 {
+                let mut forged = vec![0u8; rng.gen_range(OVERHEAD..200)];
+                rng.fill_bytes(&mut forged);
+                assert!(b.recv.open(&mut forged).is_err());
+            }
+            assert_eq!(LOOKAHEAD_KEYS.with(|n| n.get()), 0);
+            // A real packet with bits of its masked packet number flipped
+            // is the one way to aim at an epoch.
+            for byte in CID_LEN + 1..HEADER_LEN {
+                for bit in 0..8 {
+                    let mut forged = real.clone();
+                    forged[byte] ^= 1 << bit;
+                    assert!(b.recv.open(&mut forged).is_err());
+                }
+            }
+            // Of those, the ones that turn epoch 0 into 4, 8 or 16 — ahead
+            // of the kept epochs 0 to 2, within the look-ahead — got a key
+            // for themselves alone; none was kept.
+            assert_eq!(LOOKAHEAD_KEYS.with(|n| n.get()), 3);
+            assert_eq!(kept(&b.recv), vec![0, 1, 2]);
+            assert_eq!(b.recv.top.load(Ordering::Relaxed), 0);
+            let mut pkt = real.clone();
+            assert_eq!(b.recv.open(&mut pkt).unwrap().1, 1000);
+        }
+    }
+
+    /// Packets on both sides of epoch boundaries open, reordered too; the
+    /// kept epochs follow the newest epoch that has carried an authentic
+    /// packet; one well ahead of the kept ones opens with a key made for it
+    /// alone, and moves them on; one from before the kept ones, or too far
+    /// ahead, is refused.
+    #[test]
+    fn epochs_move_on_with_authentic_packets_only() {
+        let e = 1u64 << EPOCH_BITS;
+        let a = SessionKeys::derive(&split(), true, Suite::Aes256Gcm);
+        let b = SessionKeys::derive(&split(), false, Suite::Aes256Gcm);
+        let pns = [
+            e - 2,
+            e - 1,
+            e,
+            e + 1,
+            2 * e,
+            e + 3,
+            2 * e + 5,
+            3 * e + 1,
+            5 * e,
+        ];
+        let mut sorted = pns;
+        sorted.sort();
+        let packets: std::collections::HashMap<u64, Vec<u8>> =
+            sorted.iter().map(|&pn| (pn, sealed(&a.send, pn))).collect();
+        let open = |pn: u64| {
+            let mut pkt = packets[&pn].clone();
+            b.recv.open(&mut pkt).map(|(_, p, _)| p)
+        };
+        for pn in [e - 2, e, e - 1, e + 1, 2 * e] {
+            assert_eq!(open(pn), Ok(pn));
+        }
+        assert_eq!(kept(&b.recv), vec![1, 2, 3]);
+        // Reordered from the epoch before: still kept.
+        assert_eq!(open(e + 3), Ok(e + 3));
+        assert_eq!(open(3 * e + 1), Ok(3 * e + 1));
+        assert_eq!(kept(&b.recv), vec![2, 3, 4]);
+        // Two epochs ahead of the newest kept one: a key of its own.
+        assert_eq!(open(5 * e), Ok(5 * e));
+        assert_eq!(kept(&b.recv), vec![4, 5, 6]);
+        // Epoch 2 is behind the kept ones now, and older than any replay
+        // window: refused.
+        assert_eq!(open(2 * e + 5), Err(CryptoError::Open));
+        // Beyond the look-ahead: refused, and nothing moves.
+        let far = sealed(&a.send, (5 + AHEAD + 2) * e);
+        assert!(b.recv.open(&mut far.clone()).is_err());
+        assert_eq!(kept(&b.recv), vec![4, 5, 6]);
     }
 
     #[test]
