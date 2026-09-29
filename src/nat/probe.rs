@@ -15,6 +15,7 @@
 //! it shows are only what one socket was given.
 
 use super::behaviour::{Allocation, Behaviour, Filtering, Mapping};
+use super::birthday::Hit;
 use super::card::{Card, FamilyHints, RelayRef, Role};
 use super::punch::Puncher;
 use super::{spawn_discovery, NatConfig, Reachability};
@@ -291,8 +292,17 @@ impl Probe {
     /// listens for the peer doing the same: the two of you both running
     /// this within `duration` of each other is the test.
     pub async fn punch_test(&mut self, peer: &Card, duration: Duration) -> Outcome {
+        // A peer that got through to a socket of ours other than the main one
+        // (the birthday method, for a NAT that draws ports at random) is a way
+        // in as much as one that got through to the main one: the transfer
+        // would go there.
+        let (hit_tx, mut hit_rx) = mpsc::unbounded_channel::<Hit>();
         let puncher = Arc::new(
-            Puncher::new(self.socket.clone(), self.hints.clone()).with_turns(self.turns.clone()),
+            Puncher::new(self.socket.clone(), self.hints.clone())
+                .with_hit_handler(Arc::new(move |hit| {
+                    let _ = hit_tx.send(hit);
+                }))
+                .with_turns(self.turns.clone()),
         );
         let cancel = self.cancel.child_token();
         let targets = peer.punch_targets();
@@ -309,22 +319,30 @@ impl Probe {
             .collect();
         let deadline = tokio::time::Instant::now() + duration;
         let mut heard = None;
+        let mut answered = false;
         while heard.is_none() {
-            let Ok(Some((d, from))) =
-                tokio::time::timeout_at(deadline, self.datagrams.recv()).await
-            else {
-                break;
-            };
-            if !peer_ips.contains(&crate::address::canonical(from).ip()) {
-                continue;
-            }
-            if matches!(Message::decode(&d), Some(Message::Punch)) {
-                heard = Some(from);
+            tokio::select! {
+                got = tokio::time::timeout_at(deadline, self.datagrams.recv()) => {
+                    let Ok(Some((d, from))) = got else {
+                        break;
+                    };
+                    if !peer_ips.contains(&crate::address::canonical(from).ip()) {
+                        continue;
+                    }
+                    if matches!(Message::decode(&d), Some(Message::Punch)) {
+                        heard = Some(from);
+                    }
+                }
+                // The meeting has already answered from that socket.
+                Some(hit) = hit_rx.recv() => {
+                    heard = Some(hit.from);
+                    answered = true;
+                }
             }
         }
         // Answer from where it was heard, a few times, so that the peer
         // hears us too if it has not.
-        if let Some(from) = heard {
+        if let (Some(from), false) = (heard, answered) {
             for _ in 0..4 {
                 let _ = self.socket.send_to(&Message::Punch.encode(), from).await;
                 tokio::time::sleep(Duration::from_millis(120)).await;
