@@ -1,0 +1,28 @@
+# The code of 8a76c1b with the epoch compared as before its fix, in
+# DirectionKeys::open:
+#   let ahead = (epoch > top) & (epoch <= top + AHEAD);
+#   if ahead & !bool::from(kept) {
+# (the compiler makes the two comparisons two jumps). Everything else as
+# in dudect.log.
+
+# dudect run
+# commit:  8a76c1b (with local changes)
+# rustc:   rustc 1.95.0 (59807616e 2026-04-14)
+# cpu:     AMD Ryzen 9 5900HX with Radeon Graphics (pinned to core 5)
+# kernel:  Linux 6.19.2-gentoo-dist
+# command: taskset -c 5 <lib tests> dudect --ignored --nocapture --test-threads=1
+# |t| > 4.5 = the two classes' times differ (dudect's threshold)
+
+AES-256-GCM tag, wrong at the first byte / anywhere              250000 runs  medians     620 /     620 ns  max |t|     1.91 (below the 90th percentile)  no difference found
+ChaCha20-Poly1305 tag, wrong at the first byte / anywhere        250000 runs  medians    1563 /    1563 ns  max |t|     1.31 (whole)  no difference found
+control: comparison stopping at the first difference            1000000 runs  medians       2 /      18 ns  max |t|  1118.03 (below the 95th percentile)  DIFFERS
+forged packet (AES-GCM), header of a kept epoch / random         125000 runs  medians     661 /     661 ns  max |t|     8.71 (below the 95th percentile)  DIFFERS
+identity file hex, one key / random keys                        1000000 runs  medians      30 /      30 ns  max |t|     1.53 (below the 99th percentile)  no difference found
+  (reported only) from_str_radix, one key / random keys         1000000 runs  medians     371 /     371 ns  max |t|     1.92 (below the 99.9th percentile)  no difference found
+mac1 check, wrong at the first byte / anywhere                   250000 runs  medians     250 /     250 ns  max |t|     0.96 (whole)  no difference found
+  (reported only) mac1 check, valid / invalid                    250000 runs  medians     241 /     241 ns  max |t|     1.20 (below the 99.9th percentile)  no difference found
+mac2 (cookie) check, wrong at the first byte / anywhere          250000 runs  medians    1332 /    1332 ns  max |t|     0.54 (whole)  no difference found
+  (reported only) mac2 check, valid / invalid                    250000 runs  medians     681 /    1342 ns  max |t| 10580.49 (below the 70th percentile)  DIFFERS
+subtle::ConstantTimeEq on 16 bytes                              1000000 runs  medians      20 /      20 ns  max |t|     1.16 (whole)  no difference found
+relay proof, wrong at the first byte / anywhere                  250000 runs  medians     220 /     220 ns  max |t|     1.52 (below the 60th percentile)  no difference found
+relay tag, wrong at the first byte / anywhere                    250000 runs  medians     491 /     491 ns  max |t|     1.71 (below the 90th percentile)  no difference found

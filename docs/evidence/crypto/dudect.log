@@ -1,0 +1,23 @@
+# dudect run
+# commit:  8a76c1b
+# rustc:   rustc 1.95.0 (59807616e 2026-04-14)
+# cpu:     AMD Ryzen 9 5900HX with Radeon Graphics (pinned to core 5)
+# kernel:  Linux 6.19.2-gentoo-dist
+# command: taskset -c 5 <lib tests> dudect --ignored --nocapture --test-threads=1
+# |t| > 4.5 = the two classes' times differ (dudect's threshold)
+
+AES-256-GCM tag, wrong at the first byte / anywhere              250000 runs  medians     621 /     621 ns  max |t|     0.77 (below the 99th percentile)  no difference found
+ChaCha20-Poly1305 tag, wrong at the first byte / anywhere        250000 runs  medians    1563 /    1563 ns  max |t|     1.37 (below the 99th percentile)  no difference found
+control: comparison stopping at the first difference            1000000 runs  medians       2 /      18 ns  max |t|  1089.78 (below the 99th percentile)  DIFFERS
+forged packet (AES-GCM), header of a kept epoch / random         125000 runs  medians     672 /     672 ns  max |t|     1.16 (below the 99th percentile)  no difference found
+forged packet (ChaCha20), header of a kept epoch / random        125000 runs  medians    1684 /    1684 ns  max |t|     0.89 (below the 95th percentile)  no difference found
+identity file hex, one key / random keys                        1000000 runs  medians      30 /      30 ns  max |t|     2.41 (below the 99.9th percentile)  no difference found
+  (reported only) from_str_radix, one key / random keys         1000000 runs  medians     371 /     371 ns  max |t|     2.21 (below the 60th percentile)  no difference found
+mac1 check, wrong at the first byte / anywhere                   250000 runs  medians     241 /     241 ns  max |t|     1.05 (below the 80th percentile)  no difference found
+  (reported only) mac1 check, valid / invalid                    250000 runs  medians     241 /     241 ns  max |t|     1.36 (below the 90th percentile)  no difference found
+mac2 (cookie) check, wrong at the first byte / anywhere          250000 runs  medians    1333 /    1333 ns  max |t|     2.14 (below the 95th percentile)  no difference found
+  (reported only) mac2 check, valid / invalid                    250000 runs  medians     681 /    1333 ns  max |t| 16110.68 (below the 80th percentile)  DIFFERS
+subtle::ConstantTimeEq on 16 bytes                              1000000 runs  medians      20 /      20 ns  max |t|     1.93 (below the 80th percentile)  no difference found
+relay proof, wrong at the first byte / anywhere                  250000 runs  medians     220 /     220 ns  max |t|     1.34 (whole)  no difference found
+relay tag, wrong at the first byte / anywhere                    250000 runs  medians     491 /     491 ns  max |t|     1.13 (below the 99th percentile)  no difference found
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 315 filtered out; finished in 6.44s
