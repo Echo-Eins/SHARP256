@@ -98,6 +98,14 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - `docs/THREAT_MODEL.md`: adversary classes and what each can achieve, every
   guarantee with the mechanism responsible, explicit non-goals and residual
   risks.
+- `docs/ROADMAP.md`: what is left and in which order, each item with its
+  priority, a "done when" and the residual risk it closes: proofs, checks of
+  the implementation, storage and transport, denial of service, NAT in real
+  networks, carriers, traffic analysis, the specification, operations and
+  independent review. The threat model names the one exception to the
+  three-times amplification bound: the relay's optional STUN server answers
+  a 20-byte request with up to 92 bytes, at most 20 times a second per
+  client.
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the

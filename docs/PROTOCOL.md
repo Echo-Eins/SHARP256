@@ -1579,8 +1579,11 @@ Extensions planned on this basis:
 | Per-file resume of directories whose contents changed | capability bit; compare per-entry metadata instead of the whole manifest |
 | Encrypted relay control messages | new relay message kinds; the transfer protocol is unchanged |
 | New connection ids on migration (as RFC 9000 section 9.5) | capability bit |
-| IPv6 firewall pinholes (PCP, UPnP IGDv2) | receiver-local; no wire change |
 | Delivery-rate based slow-start exit | sender-local; no wire change |
+
+IPv6 firewall pinholes, once on this list, are done (section 8, "IPv6
+firewall pinholes"). The plan beyond the wire format is in
+[ROADMAP.md](ROADMAP.md).
 
 ## 12. Defaults
 
