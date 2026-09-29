@@ -77,6 +77,10 @@ pub struct NatConfig {
     /// results. A receiver does, for as long as it runs; a sender wants
     /// its NAT's behaviour once, for the length of one transfer.
     pub maintain: bool,
+    /// When the first tests found nothing at all (no STUN server answered),
+    /// how long until they are run again; the wait doubles each time they
+    /// find nothing, up to [`REDISCOVER_CEILING`]. Only while `maintain`.
+    pub rediscover: Duration,
 }
 
 impl Default for NatConfig {
@@ -94,6 +98,7 @@ impl Default for NatConfig {
             mapping_check: MAPPING_CHECK,
             host_refresh: HOST_REFRESH,
             maintain: true,
+            rediscover: REDISCOVER,
         }
     }
 }
@@ -1232,62 +1237,34 @@ pub fn spawn_discovery(
         }
         let tests = async move {
             let mut rx = rx;
-            let mut b6 = None;
-            let b = if enable_stun {
-                let b = behaviour::discover_reporting(
-                    &tests_socket,
-                    &servers,
-                    &mut rx,
-                    behaviour::Timing::default(),
-                    &mut |b| {
-                        let found = card::NatHints::from(b);
-                        let six = b
-                            .tested_with
-                            .is_some_and(|a| crate::address::canonical(a).is_ipv6());
-                        // The address the server saw is where a peer is to
-                        // aim, as far as anything is yet known of it.
-                        let seen = b
-                            .mapped
-                            .filter(|a| crate::address::class::is_global(a.ip()));
-                        early.send_if_modified(|h| {
-                            let (slot, aim) = if six {
-                                (&mut h.v6, &mut h.aim6)
-                            } else {
-                                (&mut h.v4, &mut h.aim4)
-                            };
-                            let changed = *slot != found || (seen.is_some() && *aim != seen);
-                            *slot = found;
-                            if seen.is_some() {
-                                *aim = seen;
-                            }
-                            changed
-                        });
-                    },
-                )
-                .await;
-                tracing::debug!("NAT: {}", b.describe());
-                // The other family, where the host has a global address in
-                // it: what is measured there is the firewall.
-                let reach = crate::address::Reach::of(&tests_socket);
-                let has_global_v6 = host_addresses(local, false).iter().any(IpAddr::is_ipv6);
-                if reach.v4() && reach.v6() && has_global_v6 {
-                    let six = behaviour::discover_family(
-                        &tests_socket,
-                        &servers,
-                        &mut rx,
-                        behaviour::Timing::default(),
-                        Some(true),
-                        &mut |_| {},
-                    )
-                    .await;
-                    if six.mapped.is_some() {
-                        tracing::debug!("NAT (IPv6): {}", six.describe());
-                        b6 = Some(six);
-                    }
-                }
-                b
+            let (b, b6) = if enable_stun {
+                discover_families(&tests_socket, &servers, &mut rx, local, &mut |b| {
+                    let found = card::NatHints::from(b);
+                    let six = b
+                        .tested_with
+                        .is_some_and(|a| crate::address::canonical(a).is_ipv6());
+                    // The address the server saw is where a peer is to
+                    // aim, as far as anything is yet known of it.
+                    let seen = b
+                        .mapped
+                        .filter(|a| crate::address::class::is_global(a.ip()));
+                    early.send_if_modified(|h| {
+                        let (slot, aim) = if six {
+                            (&mut h.v6, &mut h.aim6)
+                        } else {
+                            (&mut h.v4, &mut h.aim4)
+                        };
+                        let changed = *slot != found || (seen.is_some() && *aim != seen);
+                        *slot = found;
+                        if seen.is_some() {
+                            *aim = seen;
+                        }
+                        changed
+                    });
+                })
+                .await
             } else {
-                Behaviour::default()
+                (Behaviour::default(), None)
             };
             (b, b6, rx)
         };
@@ -1385,6 +1362,42 @@ pub fn spawn_discovery(
     })
 }
 
+/// The tests of both families on `socket`: the one it speaks first (IPv4,
+/// where it speaks both — that is where the NATs are), with `progress`
+/// told as it goes; then IPv6, where the host has a global address in it,
+/// and what is measured there is the firewall.
+async fn discover_families(
+    socket: &UdpSocket,
+    servers: &[String],
+    rx: &mut mpsc::Receiver<stun::Incoming>,
+    local: SocketAddr,
+    progress: &mut (dyn FnMut(&Behaviour) + Send),
+) -> (Behaviour, Option<Behaviour>) {
+    let b =
+        behaviour::discover_reporting(socket, servers, rx, behaviour::Timing::default(), progress)
+            .await;
+    tracing::debug!("NAT: {}", b.describe());
+    let reach = crate::address::Reach::of(socket);
+    let has_global_v6 = host_addresses(local, false).iter().any(IpAddr::is_ipv6);
+    let mut b6 = None;
+    if reach.v4() && reach.v6() && has_global_v6 {
+        let six = behaviour::discover_family(
+            socket,
+            servers,
+            rx,
+            behaviour::Timing::default(),
+            Some(true),
+            &mut |_| {},
+        )
+        .await;
+        if six.mapped.is_some() {
+            tracing::debug!("NAT (IPv6): {}", six.describe());
+            b6 = Some(six);
+        }
+    }
+    (b, b6)
+}
+
 /// Tells whoever follows `hints` what the NAT tests have found, when that
 /// is news.
 fn publish_hints(hints: &tokio::sync::watch::Sender<card::FamilyHints>, found: card::FamilyHints) {
@@ -1402,6 +1415,14 @@ const MAPPING_CHECK: Duration = Duration::from_secs(60);
 /// How often this host's own addresses are looked at again: interfaces
 /// come and go, and a temporary IPv6 address is replaced every day or so.
 const HOST_REFRESH: Duration = Duration::from_secs(300);
+
+/// A first round of tests that found nothing is run again this long after,
+/// and then twice as long each time, up to [`REDISCOVER_CEILING`]: no STUN
+/// server answering at start-up may only mean that the network was not
+/// there yet (a laptop just woken, a link still coming up), and a receiver
+/// that runs for hours should not stay without an outside address for it.
+const REDISCOVER: Duration = Duration::from_secs(5);
+pub const REDISCOVER_CEILING: Duration = Duration::from_secs(300);
 
 /// What [`maintain`] looks after.
 struct Maintained<F> {
@@ -1430,13 +1451,15 @@ struct Maintained<F> {
 ///   4.6) and sets the interval.
 /// * This host's own addresses are looked at again every [`HOST_REFRESH`].
 /// * A port forward is renewed at half its lease.
+/// * Tests that found nothing at all are run again, after
+///   [`NatConfig::rediscover`] and then less and less often.
 async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
     let Maintained {
         socket,
         config,
         local,
         mut behaviour,
-        behaviour6,
+        mut behaviour6,
         forward,
         mut responses,
         keepalive,
@@ -1445,7 +1468,7 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
     } = m;
     let lan = config.publish_lan_addresses;
     let mut current = reachability(local, &behaviour, behaviour6.as_ref(), &forward, lan);
-    let server = behaviour.tested_with;
+    let mut server = behaviour.tested_with;
     // Worth keeping only when an address resting on the mapping is
     // published: a NAT that changes the port per destination gets nothing
     // published, and no NAT at all needs nothing kept.
@@ -1474,8 +1497,10 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
         .min()
         .map(|l| Duration::from_secs((l as u64 / 2).max(5)));
     let mut next_renewal = renew_every.map(|e| now + e);
-    let lifetime = match server {
-        Some(server) if behaviour.rfc5780 && rests_on_mapping(&behaviour) => {
+    // How long an idle mapping lasts, measured in the background where the
+    // server can tell (RFC 5780).
+    let measure_lifetime = |server: Option<SocketAddr>, b: &Behaviour| match server {
+        Some(server) if b.rfc5780 && rests_on_mapping(b) => {
             let bind_ip: IpAddr = if crate::address::canonical(server).is_ipv6() {
                 std::net::Ipv6Addr::UNSPECIFIED.into()
             } else {
@@ -1490,7 +1515,17 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
         }
         _ => None,
     };
-    let mut lifetime = lifetime;
+    let mut lifetime = measure_lifetime(server, &behaviour);
+    // Nothing measured in either family: tried again, less and less often,
+    // until something is.
+    let unmeasured = |b: &Behaviour, b6: &Option<Behaviour>| {
+        b.mapped.is_none() && b6.as_ref().is_none_or(|b| b.mapped.is_none())
+    };
+    let mut rediscover_every = config.rediscover;
+    let mut next_rediscovery = (config.enable_stun
+        && !config.stun_servers.is_empty()
+        && unmeasured(&behaviour, &behaviour6))
+    .then(|| now + rediscover_every);
     let client = stun::StunClient::new(Vec::new()).with_timing(Duration::from_millis(500), 2);
     let at = |i: Instant| tokio::time::sleep_until(tokio::time::Instant::from_std(i));
     loop {
@@ -1541,6 +1576,41 @@ async fn maintain<F: Fn(&Reachability)>(m: Maintained<F>) {
                     }
                 }
                 next_check = Instant::now() + config.mapping_check;
+            }
+            _ = at(next_rediscovery.unwrap_or(next_host)), if next_rediscovery.is_some() => {
+                let mut quietly = |_: &Behaviour| {};
+                let (b, b6) = tokio::select! {
+                    found = discover_families(
+                        &socket,
+                        &config.stun_servers,
+                        &mut responses,
+                        local,
+                        &mut quietly,
+                    ) => found,
+                    _ = cancel.cancelled() => break,
+                };
+                if unmeasured(&b, &b6) {
+                    rediscover_every = (rediscover_every * 2).min(REDISCOVER_CEILING);
+                    next_rediscovery = Some(Instant::now() + rediscover_every);
+                    tracing::debug!(
+                        "NAT: still no STUN server answers; asking again in {:?}",
+                        rediscover_every
+                    );
+                } else {
+                    behaviour = b;
+                    behaviour6 = b6;
+                    server = behaviour.tested_with;
+                    next_rediscovery = None;
+                    lifetime = measure_lifetime(server, &behaviour);
+                    next_keepalive = Instant::now() + keepalive.lock().next();
+                    next_check = Instant::now() + config.mapping_check;
+                    current = reachability(local, &behaviour, behaviour6.as_ref(), &forward, lan);
+                    tracing::info!("NAT: a STUN server answers now: {}", current.describe());
+                    if let Some(b6) = &behaviour6 {
+                        tracing::info!("NAT over IPv6: {}", b6.describe());
+                    }
+                    on_result(&current);
+                }
             }
             _ = at(next_host) => {
                 let fresh = reachability(local, &behaviour, behaviour6.as_ref(), &forward, lan);
@@ -2043,6 +2113,98 @@ garbage line
             "the new address was not reported"
         );
         assert_eq!(keepalive.lock().interval(), Duration::from_millis(50));
+    }
+
+    /// Tests that found nothing — no STUN server answered, as when the
+    /// network was not there yet — are run again until something is found,
+    /// which is then reported; and not again after that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tests_that_found_nothing_are_run_again_until_they_find() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let requests = Arc::new(AtomicU32::new(0));
+        let fake = {
+            let (server, requests) = (server.clone(), requests.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((n, from)) = server.recv_from(&mut buf).await {
+                    let pkt = &buf[..n];
+                    if !stun::is_stun_request(pkt) {
+                        continue;
+                    }
+                    let Some(tid) = stun::message_transaction_id(pkt) else {
+                        continue;
+                    };
+                    // Silent for the first three: the whole first round of
+                    // tests, and the first try of the next.
+                    if requests.fetch_add(1, Ordering::Relaxed) < 3 {
+                        continue;
+                    }
+                    let mapped: SocketAddr = "203.0.113.9:50000".parse().unwrap();
+                    let reply = stun::binding_success(&tid, mapped, Some(server_addr), None);
+                    let _ = server.send_to(&reply, from).await;
+                }
+            })
+        };
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let pump = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    if stun::is_stun_message(&buf[..n]) {
+                        let _ = tx.send((buf[..n].to_vec(), from)).await;
+                    }
+                }
+            })
+        };
+        let cancel = CancellationToken::new();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let config = NatConfig {
+            enable_port_mapping: false,
+            stun_servers: vec![server_addr.to_string()],
+            rediscover: Duration::from_millis(100),
+            mapping_check: Duration::from_secs(3600),
+            host_refresh: Duration::from_secs(3600),
+            ..NatConfig::default()
+        };
+        let task = tokio::spawn(maintain(Maintained {
+            socket: socket.clone(),
+            config,
+            local: socket.local_addr().unwrap(),
+            // What the first tests found: nothing.
+            behaviour: Behaviour::default(),
+            behaviour6: None,
+            forward: Forwards::default(),
+            responses: rx,
+            keepalive: Arc::new(parking_lot::Mutex::new(keepalive::Keepalive::new(
+                Duration::from_secs(3600),
+            ))),
+            cancel: cancel.clone(),
+            on_result: move |r: &Reachability| {
+                let _ = seen_tx.send(r.public_addr);
+            },
+        }));
+        let seen = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv())
+            .await
+            .expect("the tests were not run again, or found nothing");
+        assert_eq!(seen, Some(Some("203.0.113.9:50000".parse().unwrap())));
+        let asked = requests.load(Ordering::Relaxed);
+        assert_eq!(asked, 4, "three unanswered, then the one that was");
+        // Found: no more asking (a mapping that changes nothing with the
+        // destination is not known to be stable, so there is nothing to keep
+        // alive either).
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(requests.load(Ordering::Relaxed), asked);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stops when cancelled")
+            .unwrap();
+        pump.abort();
+        fake.abort();
     }
 
     /// A loopback socket has nothing to offer anyone else.
