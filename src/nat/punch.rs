@@ -381,13 +381,13 @@ impl Puncher {
     /// be named, here or on the internet; what bounds that is how little is
     /// sent — datagrams of nine bytes that draw no reply from anyone, a
     /// few dozen at most unless the hints ask for a spray, and one spray
-    /// per [`SPRAY_SPACING`].
+    /// per `SPRAY_SPACING`.
     pub async fn run(&self, base: SocketAddr, theirs: NatHints, cancel: &CancellationToken) {
         self.run_for(base, theirs, PUNCH_DURATION, cancel).await
     }
 
     /// [`Puncher::run`] for as long as `duration`: the same schedule again
-    /// every [`SPRAY_SPACING`], with fresh ports where the plan sprays.
+    /// every `SPRAY_SPACING`, with fresh ports where the plan sprays.
     pub async fn run_for(
         &self,
         base: SocketAddr,

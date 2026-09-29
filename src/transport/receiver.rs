@@ -3103,8 +3103,10 @@ impl Session {
                 let waited = now.saturating_duration_since(*started_at);
                 // The file is complete and verified locally; stop waiting for
                 // the sender's verdict once it has gone quiet (or after the
-                // overall limit).
-                if since_rx >= self.cfg.stall_timeout || waited >= self.cfg.give_up_timeout {
+                // overall limit). Its silence is counted from the first FIN:
+                // it had nothing to say while the file was being verified.
+                let quiet = waited.min(since_rx);
+                if quiet >= self.cfg.stall_timeout || waited >= self.cfg.give_up_timeout {
                     tracing::warn!("no FIN_ACK from sender; file is complete and verified locally");
                     self.complete(hash, false);
                     return ControlFlow::Break(());

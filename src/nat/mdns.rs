@@ -336,7 +336,7 @@ pub fn instance_name(id: &SharpId) -> String {
 pub fn host_name(id: &SharpId) -> String {
     format!(
         "sharp-{}.local.",
-        &id.to_string()[3..3 + 12].to_ascii_lowercase()
+        id.to_string()[3..3 + 12].to_ascii_lowercase()
     )
 }
 

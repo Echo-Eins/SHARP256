@@ -729,7 +729,14 @@ async fn lost_verdicts_are_answered_again() {
     );
     std::fs::create_dir_all(&src).unwrap();
     let path = make_file(&src, "verdict.bin", 300_000, 43);
-    let mut r = start_receiver(&out, &state, |_| {}).await;
+    // The third FIN goes out 600 ms after the first, and the usual test stall
+    // timeout of 800 ms leaves a busy CI runner (a Windows one, with a slow
+    // file system) no room to hear the answer: it gives up on the sender and
+    // reports the transfer unconfirmed. Nothing here needs it that short.
+    let mut r = start_receiver(&out, &state, |c| {
+        c.transport.stall_timeout = Duration::from_secs(3)
+    })
+    .await;
     let proxy = start_proxy(
         r.addr,
         Impairment {

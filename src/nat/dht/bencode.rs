@@ -99,7 +99,7 @@ fn put(v: &Value, out: &mut Vec<u8>) {
 /// Reads one value, with nothing after it. Integers are written the
 /// canonical way (no leading zeros, no "-0"), a dictionary key is a byte
 /// string that appears once, and nothing is nested deeper than
-/// [`MAX_DEPTH`] or longer than [`MAX_ITEMS`]. The order of a dictionary's
+/// `MAX_DEPTH` levels or longer than `MAX_ITEMS`. The order of a dictionary's
 /// keys is not insisted on: some real implementations get it wrong, and
 /// nothing here depends on it.
 pub fn decode(data: &[u8]) -> Option<Value> {
