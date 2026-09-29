@@ -436,8 +436,8 @@ mod tests {
 
     fn split() -> Split {
         Split {
-            initiator_to_responder: [1; 32],
-            responder_to_initiator: [2; 32],
+            initiator_to_responder: Zeroizing::new([1; 32]),
+            responder_to_initiator: Zeroizing::new([2; 32]),
             hash: [3; 32],
         }
     }

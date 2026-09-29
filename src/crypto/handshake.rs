@@ -23,6 +23,7 @@
 //!   it. Spoofed floods therefore cost the receiver one MAC per packet.
 
 use crate::crypto::identity::{Identity, SharpId, KEY_LEN};
+use crate::crypto::noise;
 use crate::crypto::transport::CID_LEN;
 use crate::crypto::{derive_secret, keyed_mac, CryptoError};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
@@ -33,45 +34,25 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-pub const NOISE_PARAMS: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+pub use crate::crypto::noise::{Split, PROTOCOL_NAME as NOISE_PARAMS};
+
 /// Bound into the handshake transcript: a peer speaking another version of
 /// the protocol cannot complete a handshake by accident.
 pub const PROLOGUE: &[u8] = b"SHARP-256 v3";
 pub const MAC_LEN: usize = 16;
-const E_LEN: usize = 32;
-const S_LEN: usize = 32 + 16;
 const AEAD_TAG: usize = 16;
 /// Initiation size without payload. The sender's connection id is in it
 /// twice: in the clear, where the receiver's dispatcher can see it, and
 /// sealed at the start of the Noise payload, where nobody can change it.
-pub const INITIATION_OVERHEAD: usize = 2 * CID_LEN + E_LEN + S_LEN + AEAD_TAG + 2 * MAC_LEN;
+pub const INITIATION_OVERHEAD: usize = 2 * CID_LEN + noise::INITIATION_LEN + 2 * MAC_LEN;
 /// Response size without payload; both connection ids in the clear, and the
 /// receiver's sealed again inside, for the same reason.
-pub const RESPONSE_OVERHEAD: usize = 3 * CID_LEN + E_LEN + AEAD_TAG + 2 * MAC_LEN;
+pub const RESPONSE_OVERHEAD: usize = 3 * CID_LEN + noise::RESPONSE_LEN + 2 * MAC_LEN;
 pub const COOKIE_REPLY_LEN: usize = CID_LEN + 24 + 16 + AEAD_TAG;
 /// How long a cookie secret is used before it is replaced.
 pub const COOKIE_LIFETIME: Duration = Duration::from_secs(120);
-
-/// Transport secrets agreed by a handshake.
-pub struct Split {
-    pub initiator_to_responder: [u8; 32],
-    pub responder_to_initiator: [u8; 32],
-    /// Handshake transcript hash; binds the derived keys to the transcript.
-    pub hash: [u8; 32],
-}
-
-impl Drop for Split {
-    fn drop(&mut self) {
-        self.initiator_to_responder.zeroize();
-        self.responder_to_initiator.zeroize();
-    }
-}
-
-fn params() -> snow::params::NoiseParams {
-    NOISE_PARAMS.parse().expect("valid Noise parameters")
-}
 
 fn mac1_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v3 mac1", public)
@@ -102,17 +83,6 @@ fn random_cid() -> u64 {
         if crate::protocol::constants::is_usable_cid(c) {
             return c;
         }
-    }
-}
-
-fn split_of(state: &mut snow::HandshakeState) -> Split {
-    let (a, b) = state.dangerously_get_raw_split();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&state.get_handshake_hash()[..32]);
-    Split {
-        initiator_to_responder: a,
-        responder_to_initiator: b,
-        hash,
     }
 }
 
@@ -161,7 +131,7 @@ pub fn raise_initiation_timestamp_floor(floor: u64) {
 /// One handshake attempt of a sender. Every retry is a new attempt with a
 /// new ephemeral key and connection id.
 pub struct Initiator {
-    state: snow::HandshakeState,
+    noise: noise::Initiator,
     cid: u64,
     receiver_mac1_key: [u8; 32],
     receiver_cookie_key: [u8; 32],
@@ -181,14 +151,8 @@ impl Initiator {
         if receiver.is_low_order() {
             return Err(CryptoError::Handshake("receiver key is not usable".into()));
         }
-        let state = snow::Builder::new(params())
-            .local_private_key(identity.secret())
-            .remote_public_key(receiver.as_bytes())
-            .psk(2, psk)
-            .prologue(PROLOGUE)
-            .build_initiator()?;
         Ok(Self {
-            state,
+            noise: noise::Initiator::new(identity, receiver.as_bytes(), psk, PROLOGUE),
             cid: random_cid(),
             receiver_mac1_key: mac1_key(receiver.as_bytes()),
             receiver_cookie_key: cookie_key(receiver.as_bytes()),
@@ -206,7 +170,7 @@ impl Initiator {
     /// Whether an answer has been read into this attempt, so that it can
     /// take no other.
     pub fn is_spent(&self) -> bool {
-        self.state.is_handshake_finished()
+        self.noise.is_finished()
     }
 
     /// Builds the initiation datagram. `cookie` is the latest cookie received
@@ -216,12 +180,13 @@ impl Initiator {
         payload: &[u8],
         cookie: Option<&[u8; MAC_LEN]>,
     ) -> Result<Vec<u8>, CryptoError> {
-        let mut out = vec![0u8; INITIATION_OVERHEAD + payload.len()];
-        out[..CID_LEN].copy_from_slice(&self.cid.to_be_bytes());
         let sealed = [&self.cid.to_be_bytes()[..], payload].concat();
-        let n = self.state.write_message(&sealed, &mut out[CID_LEN..])?;
-        let end = CID_LEN + n;
-        out.truncate(end + 2 * MAC_LEN);
+        let msg = self.noise.write_initiation(&sealed)?;
+        let mut out = Vec::with_capacity(INITIATION_OVERHEAD + payload.len());
+        out.extend_from_slice(&self.cid.to_be_bytes());
+        out.extend_from_slice(&msg);
+        let end = out.len();
+        out.resize(end + 2 * MAC_LEN, 0);
         self.last_mac1 = mac(&self.receiver_mac1_key, &out[..end]);
         out[end..end + MAC_LEN].copy_from_slice(&self.last_mac1);
         if let Some(cookie) = cookie {
@@ -258,7 +223,7 @@ impl Initiator {
     /// Once an answer has been read (see [`Initiator::is_spent`]), the
     /// attempt is finished either way.
     pub fn read_response(&mut self, pkt: &[u8]) -> Result<(u64, Vec<u8>, Split), CryptoError> {
-        if self.state.is_handshake_finished() {
+        if self.noise.is_finished() {
             return Err(CryptoError::Malformed);
         }
         let n = pkt.len();
@@ -272,11 +237,7 @@ impl Initiator {
         ) {
             return Err(CryptoError::Mac);
         }
-        let mut payload = vec![0u8; n];
-        let len = self
-            .state
-            .read_message(&pkt[2 * CID_LEN..body_end], &mut payload)?;
-        payload.truncate(len);
+        let mut payload = self.noise.read_response(&pkt[2 * CID_LEN..body_end])?;
         // The receiver's connection id is taken from inside, where it is
         // sealed, never from the clear copy: that one is covered only by a
         // mac1 anyone who knows our public key can make, so a copy of the
@@ -285,7 +246,7 @@ impl Initiator {
         // receiver does not have. Refusing such a copy is not an option —
         // reading it has already finished the handshake — but it no
         // longer matters what the clear copy says.
-        if len < CID_LEN || !self.state.is_handshake_finished() {
+        if payload.len() < CID_LEN {
             return Err(CryptoError::Malformed);
         }
         let responder_cid = u64::from_be_bytes(payload[..CID_LEN].try_into().unwrap());
@@ -293,8 +254,8 @@ impl Initiator {
         if responder_cid == 0 {
             return Err(CryptoError::Malformed);
         }
-        let split = split_of(&mut self.state);
-        Ok((responder_cid, payload, split))
+        let split = self.noise.split().expect("the response was read");
+        Ok((responder_cid, payload.to_vec(), split))
     }
 }
 
@@ -311,7 +272,7 @@ pub struct Responder {
 
 /// An authenticated initiation waiting for the receiver's answer.
 pub struct Incoming {
-    state: snow::HandshakeState,
+    noise: noise::Responder,
     pub sender_cid: u64,
     pub sender: SharpId,
     pub payload: Vec<u8>,
@@ -354,33 +315,28 @@ impl Responder {
         if n < INITIATION_OVERHEAD {
             return Err(CryptoError::Malformed);
         }
-        let mut state = snow::Builder::new(params())
-            .local_private_key(self.identity.secret())
-            .psk(2, &self.psk[..])
-            .prologue(PROLOGUE)
-            .build_responder()?;
         let sender_cid = u64::from_be_bytes(pkt[..CID_LEN].try_into().unwrap());
         if sender_cid == 0 {
             return Err(CryptoError::Malformed);
         }
-        let mut payload = vec![0u8; n];
-        let len = state.read_message(&pkt[CID_LEN..n - 2 * MAC_LEN], &mut payload)?;
-        payload.truncate(len);
+        let read = noise::Responder::read_initiation(
+            &self.identity,
+            &self.psk,
+            PROLOGUE,
+            &pkt[CID_LEN..n - 2 * MAC_LEN],
+        )?;
+        let mut payload = read.payload;
         // The connection id in the clear is covered by nothing but mac1,
         // whose key anyone can work out from our public key, so a copy of
         // an initiation could arrive with it changed — and the answer would
         // then go to a connection the sender does not have. The sealed copy
         // is the sender's; a packet where the two differ was altered on the
         // way, and is refused before it counts for anything.
-        if len < CID_LEN || payload[..CID_LEN] != pkt[..CID_LEN] {
+        if payload.len() < CID_LEN || payload[..CID_LEN] != pkt[..CID_LEN] {
             return Err(CryptoError::Malformed);
         }
         payload.drain(..CID_LEN);
-        let sender = state
-            .get_remote_static()
-            .and_then(|s| <[u8; KEY_LEN]>::try_from(s).ok())
-            .map(SharpId::from_public)
-            .ok_or(CryptoError::Malformed)?;
+        let sender = SharpId::from_public(read.initiator_static);
         // A static key with no private half. Anyone could present it, so it
         // identifies nobody — and a sender limit keyed on identities would
         // count everyone presenting it as one stranger.
@@ -388,10 +344,10 @@ impl Responder {
             return Err(CryptoError::Malformed);
         }
         Ok(Incoming {
-            state,
+            noise: read.responder,
             sender_cid,
             sender,
-            payload,
+            payload: payload.to_vec(),
         })
     }
 }
@@ -399,23 +355,20 @@ impl Responder {
 impl Incoming {
     /// Writes the response and completes the handshake.
     pub fn respond(
-        mut self,
+        self,
         receiver_cid: u64,
         payload: &[u8],
     ) -> Result<(Vec<u8>, Split), CryptoError> {
-        let mut out = vec![0u8; RESPONSE_OVERHEAD + payload.len()];
-        out[..CID_LEN].copy_from_slice(&self.sender_cid.to_be_bytes());
-        out[CID_LEN..2 * CID_LEN].copy_from_slice(&receiver_cid.to_be_bytes());
         let sealed = [&receiver_cid.to_be_bytes()[..], payload].concat();
-        let n = self.state.write_message(&sealed, &mut out[2 * CID_LEN..])?;
-        let end = 2 * CID_LEN + n;
-        out.truncate(end + 2 * MAC_LEN);
+        let (msg, split) = self.noise.write_response(&sealed)?;
+        let mut out = Vec::with_capacity(RESPONSE_OVERHEAD + payload.len());
+        out.extend_from_slice(&self.sender_cid.to_be_bytes());
+        out.extend_from_slice(&receiver_cid.to_be_bytes());
+        out.extend_from_slice(&msg);
+        let end = out.len();
+        out.resize(end + 2 * MAC_LEN, 0);
         let m1 = mac(&mac1_key(self.sender.as_bytes()), &out[..end]);
         out[end..end + MAC_LEN].copy_from_slice(&m1);
-        if !self.state.is_handshake_finished() {
-            return Err(CryptoError::Malformed);
-        }
-        let split = split_of(&mut self.state);
         Ok((out, split))
     }
 }

@@ -6,8 +6,10 @@
 //! * [`transport`] — per-packet AEAD with header protection and per-epoch keys;
 //! * [`replay`] — replay window for transport packet numbers.
 
+mod blake2s;
 pub mod handshake;
 pub mod identity;
+pub mod noise;
 pub mod replay;
 pub mod transport;
 
@@ -65,12 +67,6 @@ pub enum CryptoError {
     Mac,
     #[error("handshake failed: {0}")]
     Handshake(String),
-}
-
-impl From<snow::Error> for CryptoError {
-    fn from(e: snow::Error) -> Self {
-        CryptoError::Handshake(e.to_string())
-    }
 }
 
 /// Pre-shared key used when no shared secret is configured.

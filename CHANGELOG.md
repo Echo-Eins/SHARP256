@@ -115,6 +115,16 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - The identity file is read into, and written from, memory that is wiped,
   and the private key's hex is written and read without a branch on its
   digits (`format!("{:02x}")` and `from_str_radix` branch on each one).
+- The Noise handshake is our own (`crypto::noise`, with BLAKE2s and its
+  HMAC in `crypto::blake2s`) instead of snow's. No version of snow wipes
+  anything, so every handshake left a copy of the long-term private key,
+  the ephemeral key, the pre-shared key and the chaining key in freed
+  memory; here each of them, and every intermediate of HKDF and HMAC, is
+  wiped. It writes exactly what snow wrote (the same bytes and keys for the
+  same ephemeral keys, over hundreds of random handshakes) and passes the
+  Noise test vector for the protocol from cacophony, so peers built before
+  talk to it unchanged; snow stays for the tests only. An ephemeral key
+  that is a small-order point is now refused, as a static one always was.
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the
