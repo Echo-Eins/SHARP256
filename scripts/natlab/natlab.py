@@ -610,6 +610,43 @@ def plain(addr):
     return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
 
 
+def make_payload(d):
+    """The file every transfer sends: NATLAB_SIZE_MB megabytes (default one) of
+    random data. Returns its path and SHA-256."""
+    data = os.path.join(d, "payload.bin")
+    with open(data, "wb") as f:
+        for _ in range(int(os.environ.get("NATLAB_SIZE_MB", "1"))):
+            f.write(os.urandom(1 << 20))
+    return data, hashlib.sha256(open(data, "rb").read()).hexdigest()
+
+
+def rate_args():
+    """How long a transfer lasts is its size over its rate (NATLAB_MAX_RATE,
+    as sharp-sender's --max-rate takes it), not how fast the machine is:
+    a session that began through a server moves to a direct path in seconds,
+    and a transfer that is over sooner has nothing to show of it."""
+    return ["--max-rate", os.environ["NATLAB_MAX_RATE"]] if os.environ.get("NATLAB_MAX_RATE") else []
+
+
+def long_transfers():
+    """Whether the transfers last long enough for a move off a server."""
+    return bool(os.environ.get("NATLAB_MAX_RATE"))
+
+
+def session_path(log, topo, turn=False):
+    """The path a sender's session ended on, from its log: a session carried by
+    a relay or a TURN server moves to a direct path once one opens, so it is
+    the last address proven, and where it began is said next to it."""
+    conn = re.search(r"Connected to (\S+)", log)
+    proven = re.findall(r"receiver address (\S+) proven", log)
+    path = classify(proven[-1] if proven else (conn.group(1) if conn else None), topo, 5560, turn=turn)
+    if proven and conn:
+        started = classify(conn.group(1), topo, 5560, turn=turn)
+        if started != path:
+            path += f" (from {started})"
+    return path
+
+
 def classify(connected, topo, relay_port, turn=False):
     """Which kind of path a session ended up on, from the address it uses."""
     if connected is None:
@@ -756,10 +793,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
             return transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=(via == "turn"))
         if via == "dht":
             return transfer_by_dht(lab, topo, d, timeout, verbose)
-        data = os.path.join(d, "payload.bin")
-        with open(data, "wb") as f:
-            f.write(os.urandom(1 << 20))
-        want = hashlib.sha256(open(data, "rb").read()).hexdigest()
+        data, want = make_payload(d)
         os.makedirs(f"{d}/out", exist_ok=True)
         recv_args = [
             f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
@@ -782,7 +816,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         start = time.time()
         send_args = [
             f"{BIN}/sharp-sender", data, address, "--relay", f"{srv}:5560", "--headless",
-            *stun_args(topo),
+            *stun_args(topo), *rate_args(),
             "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info",
         ]
         sender = lab.spawn("A", send_args, "sender.log")
@@ -792,8 +826,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
             sender.kill()
         took = time.time() - start
         log = lab.log("sender.log")
-        conn = re.search(r"Connected to (\S+)", log)
-        path = classify(conn.group(1) if conn else None, topo, 5560)
+        path = session_path(log, topo)
         got = None
         for name in os.listdir(f"{d}/out"):
             if not name.endswith(".sharp-part"):
@@ -831,15 +864,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False):
         start_coturn(lab, v4=topo.v4, v6=bool(topo.v6))
         turn_args = ["--turn", f"{TURN_USER}:{TURN_PASSWORD}@{server_arg(topo)}:{TURN_PORT}"]
     data = os.path.join(d, "payload.bin")
-    # Small unless asked otherwise: a session carried by a relay is only moved
-    # to a direct path if it lasts long enough for the path to open. How long
-    # it lasts is the size over the rate (NATLAB_MAX_RATE, as sharp-sender's
-    # --max-rate takes it), not how fast the machine is.
-    size_mb = int(os.environ.get("NATLAB_SIZE_MB", "1"))
-    with open(data, "wb") as f:
-        for _ in range(size_mb):
-            f.write(os.urandom(1 << 20))
-    want = hashlib.sha256(open(data, "rb").read()).hexdigest()
+    data, want = make_payload(d)
     os.makedirs(f"{d}/out", exist_ok=True)
     recv = lab.spawn(
         "B",
@@ -864,7 +889,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False):
     sender = lab.spawn(
         "A",
         [f"{BIN}/sharp-sender", data, rcard, "--headless", *stun_args(topo), *turn_args,
-         *(["--max-rate", os.environ["NATLAB_MAX_RATE"]] if os.environ.get("NATLAB_MAX_RATE") else []),
+         *rate_args(),
          "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
         "sender.log",
     )
@@ -902,15 +927,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False):
         sender.kill()
     took = time.time() - start
     log = lab.log("sender.log")
-    conn = re.search(r"Connected to (\S+)", log)
-    # A session carried by a relay moves to a direct path once one opens: the
-    # path it ended on is the last one it was moved to.
-    proven = re.findall(r"receiver address (\S+) proven", log)
-    path = classify(proven[-1] if proven else (conn.group(1) if conn else None), topo, 5560, turn=turn)
-    if proven and conn:
-        started = classify(conn.group(1), topo, 5560, turn=turn)
-        if started != path:
-            path += f" (from {started})"
+    path = session_path(log, topo, turn=turn)
     got = None
     for name in os.listdir(f"{d}/out"):
         if not name.endswith(".sharp-part"):
@@ -933,10 +950,7 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
                           "--bind", f"{node}:6881"], "dht.log")
     if not wait_for(lab, "dht.log", r"dht node", 10):
         return False, "none", 0, "the DHT node did not start:\n" + lab.log("dht.log")
-    data = os.path.join(d, "payload.bin")
-    with open(data, "wb") as f:
-        f.write(os.urandom(1 << 20))
-    want = hashlib.sha256(open(data, "rb").read()).hexdigest()
+    data, want = make_payload(d)
     os.makedirs(f"{d}/out", exist_ok=True)
     dht_args = ["--dht", "--dht-bootstrap", f"{node}:6881"]
     lab.spawn(
@@ -953,7 +967,7 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
     start = time.time()
     sender = lab.spawn(
         "A",
-        [f"{BIN}/sharp-sender", data, rid, "--headless", *stun_args(topo), *dht_args,
+        [f"{BIN}/sharp-sender", data, rid, "--headless", *stun_args(topo), *dht_args, *rate_args(),
          "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
         "sender.log",
     )
@@ -1100,6 +1114,12 @@ def expected(a, b, carry, via="relay", isolate=False):
             # A TURN server carries, whatever the relay is allowed to do.
             return True, "turn"
         return (True, "relay") if carry and via == "relay" else (False, "none")
+    if (carry and via == "relay") or via == "turn":
+        # Whoever answers first carries a short transfer, and a server's
+        # answer may beat a direct path that needs a meeting of many sockets
+        # (about half a second): only one that lasts is expected to have
+        # moved off it.
+        return True, "direct" if long_transfers() else "either"
     return True, "direct"
 
 
@@ -1124,7 +1144,9 @@ def cmd_matrix(args):
             ok, path, took, detail = transfer(a, b, carry=carry, timeout=args.timeout, via=args.via, isolate=args.isolate)
             want_ok, want_path = expected(a, b, carry, args.via, args.isolate)
             met = ok == want_ok and (
-                not ok or is_carried(path) == is_carried(want_path) and (is_carried(want_path) or is_direct(path))
+                not ok
+                or want_path == "either"
+                or is_carried(path.split(" ")[0]) == is_carried(want_path) and (is_carried(want_path) or is_direct(path))
             )
             rows.append((a, b, ok, path, took, met))
             result = f"{'ok  ' if ok else 'FAIL'} {path:16} {took:5.1f}s"
@@ -1173,8 +1195,14 @@ def cmd_v6(args):
                     )
                     # Both ends have a global IPv6 address and, at worst, a
                     # stateful firewall: a direct path has to open in all nine
-                    # combinations, and it has to be the IPv6 one.
-                    met = ok and path == "direct-v6"
+                    # combinations, and it has to be the IPv6 one (possibly
+                    # after starting through a TURN server). With the two
+                    # networks cut off from each other only a server that
+                    # carries gets anything across.
+                    if args.isolate:
+                        met = ok and path.split(" ")[0] in ("relay", "turn")
+                    else:
+                        met = ok and path.startswith("direct-v6")
                     rows.append((name, fa, fb, ok, path, took, met))
                     print(f"{name:46} {fa:12} {fb:12} {'ok  ' if ok else 'FAIL'} {path:12} {took:5.1f}s "
                           f"{'as expected' if met else 'UNEXPECTED'}", flush=True)

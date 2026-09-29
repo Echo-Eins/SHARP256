@@ -145,6 +145,8 @@ jobs:
             run: python3 scripts/natlab/natlab.py oracle
           - name: every pair through a relay that carries
             run: python3 scripts/natlab/natlab.py matrix -v
+          - name: ... and a long transfer moves off the relay
+            run: NATLAB_SIZE_MB=30 NATLAB_MAX_RATE=20M python3 scripts/natlab/natlab.py matrix --timeout 90 -v
           - name: every pair through a relay that only introduces
             run: python3 scripts/natlab/natlab.py matrix --direct-only -v
           - name: every pair by contact cards, no relay

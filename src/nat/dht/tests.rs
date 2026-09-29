@@ -267,13 +267,10 @@ async fn an_announcement_needs_the_token_the_node_gave() {
     assert!(!dht.announce_peer(node, &ih, 1234, b"").await);
     let l = dht.lookup(&ih, Duration::from_secs(5)).await;
     assert!(l.peers.is_empty(), "a refused announcement was kept");
-    // With the token the node gave it is taken.
-    let token = l
-        .closest
-        .iter()
-        .find(|(a, _)| *a == node)
-        .map(|(_, t)| t.clone())
-        .expect("a token from that node");
+    // With the token a node gave it, an announcement to that node is taken.
+    // Which nodes the walk reached depends on who knows whom (the tables
+    // are drawn at random), so it is one that it did reach.
+    let (node, token) = l.closest.first().cloned().expect("a token from some node");
     assert!(dht.announce_peer(node, &ih, 1234, &token).await);
     cancel.cancel();
 }

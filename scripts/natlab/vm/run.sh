@@ -6,6 +6,7 @@
 #
 #     scripts/natlab/vm/run.sh v6 --scenario "dual stack" --direct-only
 #     scripts/natlab/vm/run.sh portmap6
+#     VM_SCRIPT=commands.sh scripts/natlab/vm/run.sh     # many commands, one boot
 #
 # The arguments are natlab.py's. Needs qemu-system-x86_64 and the image built
 # as scripts/natlab/vm/README.md says; VM_DIR names where it is
@@ -25,11 +26,16 @@ cp "$BIN_DIR"/sharp-{relay,sender,receiver,probe} "$WORK/extra/lab/"
 cp "$HERE/../natlab.py" "$HERE/../dht_node.py" "$WORK/extra/lab/"
 cp "$HERE/init" "$WORK/extra/init"
 chmod +x "$WORK/extra/init"
-{
-  printf '#!/bin/sh\nexec env NATLAB_DIAG=%s python3 /lab/natlab.py ' "${NATLAB_DIAG:-}"
-  printf '%q ' "$@"
-  printf '\n'
-} > "$WORK/extra/lab/run.sh"
+if [ -n "${VM_SCRIPT:-}" ]; then
+  # Several commands in one boot: a file of shell lines, run in /lab.
+  { printf '#!/bin/sh\ncd /lab\n'; cat "$VM_SCRIPT"; } > "$WORK/extra/lab/run.sh"
+else
+  {
+    printf '#!/bin/sh\nexec env NATLAB_DIAG=%s python3 /lab/natlab.py ' "${NATLAB_DIAG:-}"
+    printf '%q ' "$@"
+    printf '\n'
+  } > "$WORK/extra/lab/run.sh"
+fi
 (cd "$WORK/extra" && find . | busybox cpio -o -H newc 2>/dev/null | gzip -1) > "$WORK/extra.gz"
 cat "$VM_DIR/base.gz" "$WORK/extra.gz" > "$WORK/initrd.gz"
 KVM=()
