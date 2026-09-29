@@ -26,6 +26,7 @@ use crate::crypto::{derive_secret, CryptoError};
 use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use std::sync::atomic::{AtomicU64, Ordering};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
 use zeroize::Zeroize;
 
 /// Connection id length.
@@ -442,26 +443,36 @@ impl DirectionKeys {
         {
             let slots = self.keys.slots.read();
             let top = self.top.load(Ordering::Acquire);
-            match slots.iter().find(|s| s.epoch == epoch) {
-                Some(slot) => slot.aead.open(&nonce, head, body, tag)?,
-                None if epoch > top && epoch <= top + AHEAD => {
-                    #[cfg(test)]
-                    tests::LOOKAHEAD_KEYS.with(|n| n.set(n.get() + 1));
-                    let key = derive_secret(
-                        "sharp256 v3 aead key",
-                        &[&self.keys.secret, &epoch.to_be_bytes()],
-                    );
-                    Locked::new(Aead::new(self.suite, &key)).open(&nonce, head, body, tag)?
-                }
-                // Any other epoch is a forgery, or older than the replay
-                // window: it is opened with the newest key, and fails like
-                // any forgery, in the same time.
-                None => slots
-                    .iter()
-                    .find(|s| s.epoch == top)
-                    .ok_or(CryptoError::Open)?
-                    .aead
-                    .open(&nonce, head, body, tag)?,
+            // The slot to open with: the packet's epoch's if it is kept,
+            // the newest one's if not (the packet is then a forgery, or
+            // older than any replay window, and fails like any forgery).
+            // Chosen without a branch on the epoch, which is the unmasked
+            // header of a packet nobody has authenticated yet: an epoch
+            // compared with branches took a cycle or so less when it was
+            // a kept one, and that showed (`crypto::dudect`).
+            let mut chosen = 0u64;
+            let mut newest = 0u64;
+            let mut kept = Choice::from(0);
+            for (k, slot) in (0u64..).zip(slots.iter()) {
+                let here = slot.epoch.ct_eq(&epoch);
+                chosen.conditional_assign(&k, here);
+                newest.conditional_assign(&k, slot.epoch.ct_eq(&top));
+                kept |= here;
+            }
+            let ahead = epoch.ct_gt(&top) & !epoch.ct_gt(&(top + AHEAD));
+            // Taken only for an epoch in the look-ahead, which no forgery
+            // chooses (see `AHEAD`).
+            if bool::from(ahead & !kept) {
+                #[cfg(test)]
+                tests::LOOKAHEAD_KEYS.with(|n| n.set(n.get() + 1));
+                let key = derive_secret(
+                    "sharp256 v3 aead key",
+                    &[&self.keys.secret, &epoch.to_be_bytes()],
+                );
+                Locked::new(Aead::new(self.suite, &key)).open(&nonce, head, body, tag)?;
+            } else {
+                let index = u64::conditional_select(&newest, &chosen, kept);
+                slots[index as usize].aead.open(&nonce, head, body, tag)?;
             }
         }
         if epoch > self.top.load(Ordering::Acquire) {

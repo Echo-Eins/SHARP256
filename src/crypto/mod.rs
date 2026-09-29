@@ -7,6 +7,8 @@
 //! * [`replay`] — replay window for transport packet numbers.
 
 mod blake2s;
+#[cfg(test)]
+mod dudect;
 pub mod handshake;
 pub mod identity;
 pub mod noise;

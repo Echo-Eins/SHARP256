@@ -288,7 +288,7 @@ fn write_private(path: &Path, text: &[u8]) -> io::Result<()> {
 /// a branch or a table lookup that depends on the bytes: this is how the
 /// private key is written, and the time it takes must not say what it is.
 /// (`format!("{:02x}")` picks the digit with a branch.)
-fn hex_encode(bytes: &[u8], out: &mut [u8]) {
+pub(crate) fn hex_encode(bytes: &[u8], out: &mut [u8]) {
     debug_assert_eq!(out.len(), 2 * bytes.len());
     fn digit(n: u8) -> u8 {
         // n < 10: '0' + n; otherwise 'a' + n - 10, which is 39 further on.
@@ -307,7 +307,7 @@ fn hex_encode(bytes: &[u8], out: &mut [u8]) {
 /// must fill exactly; false if it is not that. The digits are read without
 /// a branch on their value, for the reason given at [`hex_encode`]; only
 /// whether the whole text was valid is decided at the end.
-fn hex_decode(text: &[u8], out: &mut [u8]) -> bool {
+pub(crate) fn hex_decode(text: &[u8], out: &mut [u8]) -> bool {
     if text.len() != 2 * out.len() {
         return false;
     }

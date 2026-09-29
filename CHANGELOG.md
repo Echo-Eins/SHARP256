@@ -154,6 +154,17 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   for it alone and kept only if it authenticates. Throughput is unchanged
   (2 GiB over loopback, six runs of each build alternated: 1.88 s against
   1.86 s on average).
+- Timing measurements in the manner of dudect (`src/crypto/dudect.rs`,
+  `scripts/dudect.sh`, results in `docs/evidence/crypto/`): every MAC and
+  tag check, a wrong value differing at its first byte against at a random
+  one — `subtle`'s comparison, mac1, mac2, the relay's proofs and tags, the
+  AEADs' tags — the rejection of a forged transport packet whatever its
+  header unmasks to, and reading the identity file's key; with a control
+  (a comparison that stops at the first difference) that the harness must
+  and does find. It found one thing: choosing the epoch's key compared the
+  unmasked epoch with branches, and a forged packet naming a kept epoch was
+  rejected about a cycle sooner than one naming another; the choice is now
+  made with constant-time selection, and the difference is gone.
 
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the
