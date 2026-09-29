@@ -75,12 +75,12 @@ struct Args {
     )]
     peer_addr: Vec<SocketAddr>,
 
-    /// Seconds the test with a peer's card goes on for
+    /// Seconds the test with the other side's card or addresses goes on for
     #[arg(long, default_value_t = 120)]
     wait: u64,
 
-    /// Read the other side's card from standard input even when it is not a
-    /// terminal (a terminal is always asked)
+    /// Read the other side's card or addresses from standard input even when
+    /// it is not a terminal (a terminal is always asked)
     #[arg(long)]
     stdin: bool,
 

@@ -180,8 +180,15 @@ jobs:
               NATLAB_SIZE_MB=20 python3 scripts/natlab/natlab.py v6 --via turn --isolate --timeout 60 -v
           - name: sharp-probe says what a transfer does, for every pair
             run: python3 scripts/natlab/natlab.py probe --all --wait 12
+          - name: sharp-probe with addresses typed in, and over IPv6
+            run: |
+              python3 scripts/natlab/natlab.py probe --all --addr --wait 45
+              python3 scripts/natlab/natlab.py probe --v6 --wait 12
+              python3 scripts/natlab/natlab.py probe --v6 --addr --wait 45
           - name: a sender that starts before its receiver
             run: python3 scripts/natlab/natlab.py early
+          - name: a direct path that dies, and the way back to the server
+            run: python3 scripts/natlab/natlab.py fallback
           - name: local network (IPv4 and IPv6), one NAT, forgetful NAT
             run: |
               python3 scripts/natlab/natlab.py lan

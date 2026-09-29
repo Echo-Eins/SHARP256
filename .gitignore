@@ -13,3 +13,6 @@
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Python's compiled copies of the laboratory scripts
+__pycache__/

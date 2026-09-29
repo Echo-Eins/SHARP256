@@ -3007,8 +3007,9 @@ mod wire_tests {
         cancel.cancel();
     }
 
-    /// A receiver that never registers is asked for a while and then given
-    /// up on, with the relay's own answer.
+    /// A receiver the relay does not know is asked for again — "unknown" is
+    /// the relay's view of this moment, and the receiver may be about to
+    /// register — until whoever is asking gives up, which ends it at once.
     #[tokio::test]
     async fn a_receiver_that_never_registers_ends_the_asking_when_cancelled() {
         let (relay, _relay_id, relay_cancel) = start_relay().await;
@@ -3042,6 +3043,10 @@ mod wire_tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !asking.is_finished(),
+            "an unknown receiver is asked for again, not given up on"
+        );
         cancel.cancel();
         let ended = tokio::time::timeout(Duration::from_secs(3), asking)
             .await

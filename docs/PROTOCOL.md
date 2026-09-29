@@ -904,10 +904,28 @@ published, and the summary says so.
 UPnP has no authentication at all — anything on the local network may
 answer the search, and the answer names a URL to fetch and post to — so
 its client is deliberately narrow: a device is believed only if it is on
-one of our IPv4 subnets and only about itself (the description and control
+one of our networks and only about itself (the description and control
 URLs must be on the address that answered), every HTTP exchange has a 3 s
 deadline and the whole attempt 10 s, and a description over 64 KiB or a
 SOAP answer over 16 KiB is an error.
+
+**IPv6 firewall pinholes.** Over IPv6 nothing is translated, but the home
+router's firewall (RFC 6092) drops what nobody inside asked for; PCP `MAP`
+(RFC 6887) and the IGD v2 service `WANIPv6FirewallControl` (`AddPinhole`,
+`UpdatePinhole`, `DeletePinhole`) are how a host asks it for a hole. PCP goes
+to the default gateway; for UPnP the search goes to the IPv6 groups `ff02::c`
+and `ff05::c` (UPnP Device Architecture 1.1, 1.3.2) on every network the host
+has IPv6 on, alongside the IPv4 one. An answer is believed if it came in on
+the network it was asked on, from an address a router has there (link-local,
+or inside a prefix the host has on that network). The router is then asked at
+the address that answered, at the port and path of the answer's `LOCATION` (a
+router that answers from its link-local address and names its global one
+is asked at the first), and the request leaves *from the address the pinhole
+is for*: a router lets a host open a pinhole to itself only — miniupnpd checks
+the address the request comes from against `InternalClient` and, for a
+request that came over IPv4, has no IPv6 address to check and refuses it
+(error 606) — so a pinhole asked for over IPv4 is only tried after the IPv6
+one, for routers that turn out to answer nothing else.
 
 **Candidates.** Every address that might work is published together, as
 `ID@host:port,host:port,…`: the port forward, the address the world sees the
@@ -1015,7 +1033,16 @@ receiver moves on to the next address after two unanswered attempts, so a
 relay whose IPv6 path is broken is still reached over IPv4. A receiver
 keeps retrying a name that does not resolve yet, and keeps re-registering
 through send errors, since the relay may be the only way anyone can reach
-it. A dual-stack relay carries a pair across the families: a sender over
+it. A sender is as persistent about the relay: told that the relay has no
+registration for the receiver (`Error` code 1) — the receiver may be
+registering at this very moment, or renewing a registration that lapsed — it
+asks again, pausing 0.6 s and doubling up to 4 s, for up to two minutes; and
+a relay none of whose addresses answered is asked again for up to a minute,
+pausing 1 s and doubling up to 8 s. Giving up on a relay at the first
+refusal or silence would lose the introduction, which is the only way in
+wherever the receiver's NAT lets nothing in unasked. Other refusals (busy,
+bad proof, not on the list) end the asking, as they always did.
+A dual-stack relay carries a pair across the families: a sender over
 IPv6 and a receiver over IPv4 meet on one allocated port.
 
 Relay control messages begin with the eight bytes `SHRELAY1` (the one
@@ -1176,6 +1203,216 @@ This is also the honest answer to hiding one's own address from a peer: run
 the traffic through a relay you control. Forging a source address is not an
 alternative to it — a transfer needs a return path, and it is an attack
 technique rather than a defence.
+
+### Contact cards
+
+A card is what one end tells the other by any channel that carries a line of
+text, so that two people on different networks can start sending at each
+other at the same moment. It is a hint, like every address here: it selects
+what to try and never whom to trust (the identity in it is the one the
+handshake demands a private key for).
+
+    version:u8 (1)  role:u8 (1 sender, 2 receiver)  created:u32 (seconds)
+    id[32]
+    n:u8 (≤ 16)  n × ( kind:u8  addr )
+    flags:u8 (bit 0: IPv4 hints follow, bit 1: IPv6 hints follow)
+    hints[6] per family present
+    m:u8 (≤ 4)   m × ( id[32]  addr )          the relays it can be reached through
+
+`kind` is 0 for an address of an interface, 1 for what a STUN server saw,
+2 for one a router granted (port forward or IPv6 pinhole) and 3 for an
+address on a TURN server. The text form is `shc1-` and the base32 of the
+body followed by the first four bytes of its BLAKE3 hash; whitespace and
+dashes inside are ignored, so a line a chat client wrapped still reads. The
+checksum catches a mangled line, not a forged one. A receiver takes cards
+given on the command line or pasted into the running process, sends at every
+address on each (kind 3 included) and — for a card given at the start —
+accepts only the senders whose cards it has. A card carries the time it was
+made, and a program says so when one is more than an hour old (or, by its
+own clock, made in the future): an address written down a while ago may not
+be one now.
+
+Two people may swap bare addresses (`IP:PORT`) instead of cards. The
+receiver's `Senders use:` line lists its candidates and, behind a NAT that
+numbers ports per destination, ends with the address a STUN server saw it
+at: no candidate (it is where *that server* reaches the receiver), but what
+tells the sender which IP the receiver's punches will come from — a sender
+answers a punch only from an IP it has reason to try — and where predictions
+of the receiver's next port start. `sharp-sender --card` prints the sender's
+own outside addresses and punches at the receiver's as it does at a DHT's,
+nothing being known of the NAT in front of them; the receiver punches at an
+address pasted into it (or given with `--peer-addr`) the same way. A bare
+address says nothing of who is behind it, so, unlike a card given at the
+start, it restricts nobody. Neither line has an address on a TURN server on
+it: written bare, nothing would say that it is one, and a peer punching at it
+as at a host whose NAT is unknown would spray somebody else's server with
+guessed ports. Only a card carries one, marked as what it is (kind 3).
+
+### Punching
+
+What a punch is, and how much is sent, is decided from what each end's NAT
+does (the hints above) by `nat::punch::plan`, for the address being aimed
+at:
+
+| ours | theirs | plan |
+|---|---|---|
+| any | no translation, filters by address alone or not at all | one socket, one port |
+| random | keeps one port per source (stable) | *birthday, hard side*: 256 sockets of ours, each sending at the peer's one address |
+| any | counts up by `step` | *prediction*: the peer's port, then `PREDICT_WINDOW` (48) further on and `PREDICT_BEHIND` (12) back, `step` apart |
+| stable or counting | random | *birthday, easy side*: `BIRTHDAY_PROBES` (2048) random ports of the peer, once each |
+| random or counting | random | nothing works in reasonable time: a relay |
+| anything else | stable | the address as told |
+
+A pass lasts six seconds and repeats every ten. A spray is sent at most once
+in ten seconds to one address and to at most eight addresses at a time; a
+prediction or a spray is aimed only at an address the internet routes (the
+peer's private address on a card is its own network). Where the peer's NAT
+is not known — an address from a DHT, from a name, from a list typed by
+hand — the first pass is the easy case and the passes after it are the plans
+a peer of each harder kind would call for, in turn (a peer that is strict
+but stable, one that counts up, one that draws at random), the ones that
+could not work left out. A punch is a nine-byte datagram (`Punch`, above)
+that draws no reply from anyone; the whole cost of a hostile hint is that.
+
+The hard side's sockets come out of one allowance for the whole process:
+half the descriptors the system lets it have open, where it says (1024 by
+default on Linux, 256 on macOS), and never more than two meetings' worth
+(512). A meeting that finds less opens less and is only the less likely to
+meet; one that finds none opens none. A process that ran out of descriptors
+could not open the file it is receiving into.
+
+Punching for a meeting — at the addresses on a card, at an address typed in,
+at one the DHT turned up — goes on for as long as a person may take on the
+other side (five minutes) and stops as soon as a session with that peer runs
+directly to its host: at the sender, when its session is on neither a relay's
+port nor a TURN address (and when its transfer ends, whatever the state); at
+the receiver, when a session from that peer — the card's sender, or anyone
+for a bare address — runs at the host punched at, at an address the peer has
+shown it receives at: a transport packet from the address the handshake came
+from (it takes the keys that the answer to the handshake made, and the answer
+went there; the handshake alone proves nothing of its source, which a copy
+may have forged), or an address that answered a challenge. A session carried
+by a server stops none of it: that punching is how a direct path opens
+(below).
+
+The sender, once it has been told the receiver's addresses, answers a punch
+that comes from an address it did not know but whose IP it did — the peer's
+NAT telling it which port it gave the peer for the sender — at once, from
+its own socket, so that the hole is used while it is open (at most sixteen
+such ports, twelve initiations each, eighty milliseconds apart).
+
+### The local network
+
+A receiver started with `--announce-lan` answers, for its identity, questions
+in multicast DNS (RFC 6762) for the service instance
+`<id, lower case>._sharp256._udp.local.`: the SRV (port), TXT and the A and
+AAAA records of the host name `sharp-<first twelve characters of the ID>.local.`
+alongside. A sender started with `--lan` asks that one question once, from an
+ephemeral port with the unicast-response bit set (RFC 6762 section 5.4, 6.7)
+and takes the addresses in the answer as candidates. An answer is taken only
+from an address on the same link (section 11), everything read is bounded
+(at most 64 records a section, 255 bytes a name, 16 compression pointers),
+and neither end does anything unless asked to: an announcement tells the
+whole network that this host receives SHARP-256 transfers, and a question
+tells it whom the sender is looking for.
+
+### The DHT
+
+With `--dht` the two ends use the Mainline DHT (BEP 5) as a meeting place.
+Both derive `key = BLAKE3-derive_key("sharp256 dht rendezvous v1", receiver_id
+|| secret)` (the secret, if any, being the 32 bytes `--secret` stands for)
+and the infohashes `BLAKE3-keyed(key, "receiver")[..20]` and
+`BLAKE3-keyed(key, "sender")[..20]`. The receiver announces the first and
+asks for the second, the sender the reverse; `announce_peer` carries the port
+the NAT tests found for the transfer socket, and the address is the one the
+node saw the announcement come from. The client is read-only (BEP 43), uses a
+socket of its own, walks towards the nodes closest to the infohash (the eight
+closest, three queries at a time, sixty at most, 256 candidates at most) and
+reads answers strictly and bounded: a reply is taken only from the address
+the query went to and under its four-byte transaction id, at most 32 nodes and
+32 peers are read from one, and a token longer than 64 bytes is not one.
+What turns up is punched at as an address on a card is. Nothing is said of the
+NAT in front of an address, which is why unknown-NAT punching above exists.
+
+Every node asked learns this host's address and that it looks for, or
+announces, an infohash; anyone who knows the infohash can read what was
+announced under it. Without a shared secret the key is a function of the
+receiver's ID alone, so anybody who knows the ID can compute it: the receiver
+is then as easy to find as if its address were published. This is said in the
+log where it happens.
+
+### TURN
+
+An allocation on a TURN server (RFC 8656, with RFC 6156 for an IPv6 relayed
+address) gives an address that reaches its holder whatever its NAT does. The
+client speaks UDP to the server only: an Allocate without credentials to be
+told the realm and a nonce, again with a long-term credential
+(`MD5(user:realm:password)`, HMAC-SHA1 over each request, checked on each
+success answer); a stale nonce (438) is taken and the request repeated;
+CreatePermission for each address that may send (permissions last five
+minutes and are renewed at four), ChannelBind for a peer that is being talked
+to (ten minutes, renewed at nine), Refresh at half the granted lifetime and
+with lifetime zero on the way out, and a Binding request every 25 seconds to
+keep the NAT's mapping towards the server. Requests are repeated after
+0.5, 1, 2 and 4 seconds.
+
+The transfer engine does not speak TURN. Each allocation has a socket of its
+own, and for each peer a loopback socket, the *shim*, connected to the
+engine's: what the engine sends to the shim goes to that peer through the
+server, and what the peer sends to the relayed address comes to the engine
+from the shim's address. A peer costs one loopback address; at most sixteen at
+a time, the quietest let go to make room for a new one. A datagram of more
+than 1232 bytes (the engine's own floor, `UDP_PAYLOAD_SAFE`) is dropped, so
+that the engine's path-MTU probing settles on it. The server forwards only
+what comes from an address it has a permission for, so the holder needs the
+other end's address before it can be reached — from that end's card, or from a
+relay's introduction — and every address punched at is permitted.
+
+### Leaving a relay for a direct path
+
+A relay's port and an address on a TURN server carry a session; neither is
+where the receiver is. While a session runs over one, the sender sends an
+authenticated `Ping` to each of the receiver's other addresses (four at
+most) every second for thirty rounds and every four seconds after, and keeps
+learning the receiver's punches as addresses. A receiver that gets the ping
+from an address it did not know treats it as any packet from a new address:
+it challenges the address (`PATH_CHALLENGE`, section 4), and on the answer
+moves the session there; the sender does the same for what the receiver then
+sends. Both ends prove the other's address before they move (section 8,
+address validation), so nothing here can be turned on a third party.
+
+A sender whose NAT draws its ports at random meets a receiver behind an
+ordinary one with many sockets (section 8, punching), and only the socket
+the receiver's packet reached has a way in. The sender keeps that socket
+next to the one it started on and reads both. What goes to the address the
+meeting was made with leaves from the meeting's socket; everything else, and
+above all what goes to a relay or a TURN server, leaves from the first one,
+which is the socket they know the sender by (a relay by the address it sees
+it at; a TURN shim is connected to it). A meeting made before the handshake
+completed is where the handshake goes. One made while the session is
+carried — it takes a few seconds, so a relay's or a TURN server's answer
+usually comes first — is an address like any other: the pings and address
+challenges to it leave from its socket, and once the receiver has proven it
+(to the receiver this is a sender at a new address, nothing more) the
+session runs on that socket. If it is not proven in twenty seconds the
+socket is let go.
+
+### Going back to a server
+
+A direct path can die in the middle of a transfer: a gateway reboots and
+forgets its mappings, a firewall rule changes, a route goes. The sender
+notices the silence after `stall_timeout` (20 s by default); from then on
+its re-handshakes go round every address the receiver is known by, the
+servers' among them, each from the socket it is reached from, and whichever
+answers carries the session (the transfer resumes where it stopped, as after
+any silence). A server's way stays open only as long as the server keeps
+it: a relay releases a pair's port after a minute with nothing flowing
+(`sharp-relay --idle`), so a direct path that dies later than that has only
+a TURN server to go back to — its allocations are kept by both ends for as
+long as they run — or nothing, and the transfer then ends after
+`give_up_timeout` with its state kept for a resume. A session back on a
+server asks the receiver's other addresses again, as above, the meeting's
+first.
 
 ## 9. Security considerations
 

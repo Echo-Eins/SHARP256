@@ -177,8 +177,12 @@ pub struct SenderConfig {
     /// even though the receiver was given by address (which says nothing of
     /// this side): the NAT tests are run, the router is asked for a port, and
     /// the result is reported as [`crate::TransferEvent::ContactCard`].
-    /// Done anyway with the receiver's card, a TURN server or the DHT.
-    /// Needs `nat_traversal`.
+    /// Done anyway with the receiver's card, a TURN server or the DHT. The
+    /// receiver's addresses are then punched at as a card's are, and for as
+    /// long, since its user will be punching back at ours.
+    ///
+    /// The card is made of what the NAT tests find, so it needs
+    /// `nat_traversal`; the punching does not, as with the receiver's card.
     pub give_card: bool,
     /// Ask the local network for the receiver with multicast DNS, once, at
     /// the start (it has to announce itself: `ReceiverConfig::announce_lan`).

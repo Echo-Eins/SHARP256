@@ -414,16 +414,20 @@ impl Card {
 
     /// The addresses a peer can be given by hand, as `IP:PORT`, when a card
     /// is more than the moment calls for: where the outside sees this host
-    /// (mapped, forwarded, on a TURN server) and its own global addresses,
-    /// where nothing is translated. An address on the local network is worth
-    /// something only to a peer on it, and the card carries it anyway.
+    /// (mapped, forwarded) and its own global addresses, where nothing is
+    /// translated. An address on the local network is worth something only
+    /// to a peer on it, and the card carries it anyway. So does an address on
+    /// a TURN server, which only a card can say is one: a peer punching at
+    /// it as at an unknown host would spray somebody else's server with
+    /// guessed ports.
     pub fn outside_addrs(&self) -> Vec<SocketAddr> {
         use crate::address::class::{classify, Class};
         self.candidates
             .iter()
             .filter(|c| match c.kind {
                 Kind::Host => classify(c.addr.ip()) == Class::Global,
-                _ => true,
+                Kind::Relayed => false,
+                Kind::Mapped | Kind::PortMapped => true,
             })
             .map(|c| c.addr)
             .collect()
@@ -668,7 +672,7 @@ mod tests {
     use crate::crypto::Identity;
 
     /// What a person is given to type: where the outside sees the host, not
-    /// its addresses on a local network.
+    /// its addresses on a local network, nor one on a TURN server.
     #[test]
     fn the_addresses_to_hand_over_are_the_ones_the_outside_can_use() {
         let mut c = Card::new(Role::Sender, Identity::generate().id());
@@ -691,8 +695,7 @@ mod tests {
             [
                 "203.0.113.7:41235",
                 "[2606:4700::5555]:5555",
-                "203.0.113.7:5555",
-                "198.51.100.9:50000"
+                "203.0.113.7:5555"
             ]
         );
         for a in &given {

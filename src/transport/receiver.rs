@@ -183,6 +183,64 @@ struct Shared {
     /// Sockets particular peers are answered from.
     #[cfg(feature = "nat-traversal")]
     routes: Arc<crate::nat::birthday::Routes>,
+    /// Punching at peers' addresses for a meeting, until each has done its
+    /// work (see [`Shared::meet`]).
+    #[cfg(feature = "nat-traversal")]
+    meetings: Meetings,
+}
+
+/// Punching at peers' addresses for meetings — an address on a card, one
+/// given by hand, one the DHT turned up — and what ends each early: a session
+/// with that peer running directly to that address's host.
+#[cfg(feature = "nat-traversal")]
+#[derive(Default)]
+struct Meetings(parking_lot::Mutex<Vec<Meeting>>);
+
+#[cfg(feature = "nat-traversal")]
+struct Meeting {
+    /// Whose card the address was on, if it was on a card: only a session
+    /// with that sender ends it then. An address without a card is anyone's.
+    id: Option<SharpId>,
+    ip: std::net::IpAddr,
+    stop: CancellationToken,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl Meetings {
+    /// A meeting at `addr`, stopped by the token returned — by this, or by
+    /// whoever cancels `parent`.
+    fn add(
+        &self,
+        addr: SocketAddr,
+        id: Option<SharpId>,
+        parent: &CancellationToken,
+    ) -> CancellationToken {
+        let stop = parent.child_token();
+        let mut all = self.0.lock();
+        all.retain(|m| !m.stop.is_cancelled());
+        all.push(Meeting {
+            id,
+            ip: crate::address::canonical(addr).ip(),
+            stop: stop.clone(),
+        });
+        stop
+    }
+
+    /// A session with `sender` runs at `peer` now: the meetings at that host
+    /// stop — those without a card, and those on `sender`'s. Returns how many.
+    fn met(&self, sender: &SharpId, peer: SocketAddr) -> usize {
+        let ip = crate::address::canonical(peer).ip();
+        let mut stopped = 0;
+        self.0.lock().retain(|m| {
+            let done = m.ip == ip && m.id.is_none_or(|id| id == *sender);
+            if done {
+                m.stop.cancel();
+                stopped += 1;
+            }
+            !done && !m.stop.is_cancelled()
+        });
+        stopped
+    }
 }
 
 /// Replaces the value of `a` with `f` of it, unless `f` says `None`;
@@ -201,6 +259,40 @@ fn update_atomic(a: &AtomicU64, mut f: impl FnMut(u64) -> Option<u64>) -> bool {
 }
 
 impl Shared {
+    /// Punches at `addr` for a meeting: for as long as a person may take to
+    /// hand the peer this receiver's own addresses, and no longer than it is
+    /// needed — until a session with the peer runs directly to its host (see
+    /// [`Shared::met`]), or the receiver stops.
+    #[cfg(feature = "nat-traversal")]
+    fn meet(
+        &self,
+        puncher: &Arc<crate::nat::punch::Puncher>,
+        addr: SocketAddr,
+        hints: crate::nat::card::NatHints,
+        id: Option<SharpId>,
+    ) {
+        let stop = self.meetings.add(addr, id, &self.cancel);
+        let puncher = puncher.clone();
+        tokio::spawn(async move {
+            puncher
+                .run_for(addr, hints, crate::nat::punch::MEET_DURATION, &stop)
+                .await;
+            // Over: its entry goes with the next change.
+            stop.cancel();
+        });
+    }
+
+    /// A session with `sender` runs at `peer` now. Punching at that host has
+    /// done its work: the meetings it was for stop. (A session carried by a
+    /// relay or a TURN server runs at the server's address, which is no
+    /// peer's: the punching that may yet open a direct path goes on.)
+    #[cfg(feature = "nat-traversal")]
+    fn met(&self, sender: &SharpId, peer: SocketAddr) {
+        if self.meetings.met(sender, peer) > 0 {
+            tracing::debug!("{} reached directly: punching at it no more", peer);
+        }
+    }
+
     /// Sends one datagram to `to` from the socket that peer is reached
     /// through: the receiver's own, unless the peer had to be met at another
     /// (see `nat::birthday`).
@@ -413,6 +505,8 @@ impl Receiver {
                 unwritten_total: AtomicU64::new(0),
                 #[cfg(feature = "nat-traversal")]
                 routes,
+                #[cfg(feature = "nat-traversal")]
+                meetings: Meetings::default(),
             }),
         })
     }
@@ -579,7 +673,7 @@ impl Receiver {
                         &shared.identity.id(),
                         shared.cfg.psk.as_ref(),
                     );
-                    let (punch, cancel) = (puncher.clone(), shared.cancel.clone());
+                    let (punch, meeting) = (puncher.clone(), shared.clone());
                     crate::nat::dht::spawn_rendezvous(
                         dht,
                         key,
@@ -587,17 +681,7 @@ impl Receiver {
                         puncher.subscribe(),
                         shared.cancel.clone(),
                         move |peer| {
-                            let (punch, cancel) = (punch.clone(), cancel.clone());
-                            tokio::spawn(async move {
-                                punch
-                                    .run_for(
-                                        peer,
-                                        crate::nat::card::NatHints::unknown(),
-                                        crate::nat::punch::MEET_DURATION,
-                                        &cancel,
-                                    )
-                                    .await;
-                            });
+                            meeting.meet(&punch, peer, crate::nat::card::NatHints::unknown(), None);
                         },
                     );
                 }
@@ -681,13 +765,13 @@ impl Receiver {
                 Some(key) = done_rx.recv() => d.forget(&key),
                 Some(card) = cards_rx.recv() => {
                     #[cfg(feature = "nat-traversal")]
-                    meet_card(&puncher, &cancel, card);
+                    meet_card(&shared, &puncher, card);
                     #[cfg(not(feature = "nat-traversal"))]
                     match card {}
                 }
                 Some(addr) = addrs_rx.recv() => {
                     #[cfg(feature = "nat-traversal")]
-                    meet_addr(&puncher, &cancel, addr);
+                    meet_addr(&shared, &puncher, addr);
                     #[cfg(not(feature = "nat-traversal"))]
                     let _ = addr;
                 }
@@ -1146,8 +1230,8 @@ const RELAY_RESOLVE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// person may take to hand the peer this receiver's own.
 #[cfg(feature = "nat-traversal")]
 fn meet_card(
+    shared: &Arc<Shared>,
     puncher: &Arc<crate::nat::punch::Puncher>,
-    cancel: &CancellationToken,
     card: crate::nat::card::Card,
 ) {
     if let Some(why) = card.staleness() {
@@ -1160,12 +1244,7 @@ fn meet_card(
         targets.len()
     );
     for (addr, hints) in targets {
-        let (puncher, cancel) = (puncher.clone(), cancel.clone());
-        tokio::spawn(async move {
-            puncher
-                .run_for(addr, hints, crate::nat::punch::MEET_DURATION, &cancel)
-                .await;
-        });
+        shared.meet(puncher, addr, hints, Some(card.id));
     }
 }
 
@@ -1173,23 +1252,9 @@ fn meet_card(
 /// may take to hand the peer this receiver's own. Nothing is known of the
 /// NAT in front of it, so the ways that suit each kind are tried in turn.
 #[cfg(feature = "nat-traversal")]
-fn meet_addr(
-    puncher: &Arc<crate::nat::punch::Puncher>,
-    cancel: &CancellationToken,
-    addr: SocketAddr,
-) {
+fn meet_addr(shared: &Arc<Shared>, puncher: &Arc<crate::nat::punch::Puncher>, addr: SocketAddr) {
     tracing::info!("peer address {}: punching towards it", addr);
-    let (puncher, cancel) = (puncher.clone(), cancel.clone());
-    tokio::spawn(async move {
-        puncher
-            .run_for(
-                addr,
-                crate::nat::card::NatHints::unknown(),
-                crate::nat::punch::MEET_DURATION,
-                &cancel,
-            )
-            .await;
-    });
+    shared.meet(puncher, addr, crate::nat::card::NatHints::unknown(), None);
 }
 
 /// The relays this receiver is registered with that are written with an
@@ -1686,6 +1751,10 @@ struct Session {
     peer: SocketAddr,
     /// An address the sender claims but has not proven yet.
     path: PathProbe,
+    /// The proven address the meetings at its host were last ended for (see
+    /// [`Shared::met`]).
+    #[cfg(feature = "nat-traversal")]
+    met_at: Option<SocketAddr>,
     secure: Option<Secure>,
     tx_buf: Vec<u8>,
 
@@ -1752,6 +1821,8 @@ impl Session {
             sender: key.0,
             peer,
             path: PathProbe::new(),
+            #[cfg(feature = "nat-traversal")]
+            met_at: None,
             secure: None,
             tx_buf: Vec::with_capacity(MAX_CONTROL_DATAGRAM),
             file_name: String::new(),
@@ -2693,6 +2764,14 @@ impl Session {
     /// ACKs (and, on the sending side, the data stream) at a third party.
     fn note_alive(&mut self, from: SocketAddr, at: Instant, len: usize) {
         self.last_rx = at;
+        // A transport packet from the address the handshake came from proves
+        // that address: it takes the keys our answer to the handshake made,
+        // and the answer went there. (The handshake alone proves nothing
+        // of where it came from: a copy may have had its source forged.)
+        #[cfg(feature = "nat-traversal")]
+        if from == self.peer {
+            self.met_directly();
+        }
         if self.stalled {
             self.stalled = false;
             emit(
@@ -2713,6 +2792,16 @@ impl Session {
                 0,
                 &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
             );
+        }
+    }
+
+    /// The session runs at a proven address of the sender now: the punching
+    /// at that host for a meeting has done its work (see [`Shared::met`]).
+    #[cfg(feature = "nat-traversal")]
+    fn met_directly(&mut self) {
+        if self.met_at != Some(self.peer) {
+            self.met_at = Some(self.peer);
+            self.shared.met(&self.sender, self.peer);
         }
     }
 
@@ -2790,6 +2879,8 @@ impl Session {
                 if let Some(addr) = self.path.on_response(c.from, p.data) {
                     tracing::info!("sender address {} proven; moving the session there", addr);
                     self.peer = addr;
+                    #[cfg(feature = "nat-traversal")]
+                    self.met_directly();
                 }
             }
             Message::FinAck(f) => {
@@ -3464,5 +3555,44 @@ impl Session {
         self.last_progress_at = now;
         self.last_progress_bytes = stats.bytes_done;
         emit(&self.events, TransferEvent::Progress(stats));
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod tests {
+    use super::*;
+    use crate::crypto::Identity;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// A session running directly to a peer's host ends the punching at it:
+    /// every meeting there without a card, and the one on that sender's card
+    /// — not another sender's card at the same host, nor another host's; and
+    /// a session carried by a server, which runs at the server's address,
+    /// ends none.
+    #[test]
+    fn a_direct_session_ends_the_meetings_at_its_host() {
+        let m = Meetings::default();
+        let root = CancellationToken::new();
+        let (a, b) = (Identity::generate().id(), Identity::generate().id());
+        let a_card = m.add(sa("203.0.113.7:4000"), Some(a), &root);
+        let b_card = m.add(sa("203.0.113.7:4001"), Some(b), &root);
+        let typed = m.add(sa("203.0.113.7:5000"), None, &root);
+        let elsewhere = m.add(sa("198.51.100.1:4000"), None, &root);
+        assert_eq!(m.met(&a, sa("192.0.2.50:3478")), 0);
+        // The sender's NAT may give the session another port than the card's.
+        assert_eq!(m.met(&a, sa("203.0.113.7:4999")), 2);
+        assert!(a_card.is_cancelled() && typed.is_cancelled());
+        assert!(!b_card.is_cancelled() && !elsewhere.is_cancelled());
+        // IPv4 written as IPv6 is the same host.
+        assert_eq!(m.met(&b, sa("[::ffff:203.0.113.7]:4001")), 1);
+        assert!(b_card.is_cancelled());
+        // The receiver stopping stops the rest; what is over is forgotten.
+        root.cancel();
+        assert!(elsewhere.is_cancelled());
+        let _ = m.add(sa("192.0.2.1:1"), None, &CancellationToken::new());
+        assert_eq!(m.0.lock().len(), 1);
     }
 }

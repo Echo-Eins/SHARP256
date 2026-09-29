@@ -186,6 +186,157 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   how much — and its control messages travel in the clear, so an observer
   on the path sees the same.
 
+### Getting through NAT, in full (laboratory-proven)
+Every way through that makes sense for a UDP transfer, checked on the
+real kernel's NAT against independent implementations (`docs/NAT.md`,
+`scripts/natlab`); what could not be checked is said there too.
+- **Find out and hand over.** `sharp-probe` measures what the internet sees
+  of this host (address, port, what the NAT does, per family), asks the
+  router for a forward, and prints a *contact card* (`shc1-…`, one line, to
+  be sent by chat). Given the other side's card it sends at every address on
+  it the way a transfer would and says whether a packet got through — no
+  file sent. The sender takes the receiver's card in place of an address;
+  the receiver takes cards on the command line or pasted into the running
+  process. A program says so when a card is more than an hour old.
+- **Punching, all of it.** Simultaneous open, learning a peer's port from
+  its punch (peer-reflexive), prediction for NATs that count ports up,
+  the birthday method for one that draws at random against one that keeps
+  its port, IPv6 stateful firewalls, and both address families at once:
+  a relay now passes on each peer's address in the *other* family too, so
+  two peers whose IPv4 NATs cannot meet get through over IPv6 (9 of 9
+  firewall pairs, IPv6-only and dual-stack). What a NAT does is told with the
+  address (six bytes, advice not authority) and the plan follows it;
+  with no hints (an address from a DHT or a name) the passes go through the
+  ways a peer of each harder kind would need. An address that lets in by
+  address alone is sent to from one socket.
+- **Port forwards, IPv4 and IPv6.** PCP, NAT-PMP and UPnP-IGD (v1 and v2)
+  for IPv4; for IPv6 the router's firewall is opened for this host (PCP, and
+  IGD2's `AddPinhole`/`UpdatePinhole`/`DeletePinhole`), the gateway found
+  from the IPv6 routing table (Linux's `/proc/net/ipv6_route`, and the output
+  of `route get` on macOS/BSD and `route print` on Windows; the two are read
+  by parsers tested on captured output, not run on those systems here).
+- **UPnP pinholes are asked for over IPv6.** The UPnP client used to speak to
+  the router over IPv4 only, and miniupnpd — like any router that follows the
+  IGD v2 recommendation — lets a host open a pinhole for its own address
+  only, judged by the address the request comes from: it answered every
+  `AddPinhole` with error 606 ("not authorized", the requester being an IPv4
+  address), which the laboratory showed once PCP, the other way in, was
+  switched off. The search now also goes to `ff02::c` and `ff05::c` on every
+  network with IPv6, an answer is believed only from an address on the network
+  it came in on, and the request leaves from the address the pinhole is for.
+- **A receiver can be given a bare address.** `sharp-receiver --peer-addr
+  IP:PORT` (or the address pasted into the running receiver) starts sending
+  there as a card would, for a sender whose side printed only an address; so
+  does `sharp-probe --peer-addr`. With no hints about the NAT in front of it
+  every way of getting through is tried in turn. `sharp-probe` and
+  `sharp-sender --card` print the address (`Addresses:`), the latter for a
+  receiver given by address, which used to make the sender say nothing of
+  itself.
+- **Addresses typed in by hand meet as cards do.** The laboratory's matrix of
+  the two people who swap `IP:PORT`s instead of cards (`matrix --via addr`,
+  new in CI) came out 27 of 36, the same nine pairs every run, for two
+  reasons. A receiver behind a NAT that numbers its ports per destination
+  published no outside address at all, so a sender given its `Senders use:`
+  line did not know its IP and ignored its punches (only a punch from an IP
+  the sender has reason to try is answered): that address now ends the line,
+  after everything that can work. And a sender given addresses only sent
+  handshakes there; one asked for its own (`--card`) now punches at them the
+  way it does at a DHT's — the ways each kind of NAT needs, in turn — and
+  waits for the receiver as long as with a card. 36 of 36 now, as the theory
+  says (the four pairs of two port-per-destination NATs need a relay).
+- **Punching for a meeting stops when it has done its work.** A sender's
+  punches at the addresses on a receiver's card went on for five minutes
+  after the transfer had ended (in a program that outlives one transfer; the
+  command-line sender exits); and on both sides the punching at a peer —
+  card, typed address, DHT — went on for those five minutes even with a
+  session already running directly to it, sprays of guessed ports included.
+  It now stops once a session with that peer runs directly to its host (one
+  carried by a relay or a TURN server keeps it going: that is how a direct
+  path opens), and a sender's stops with its transfer.
+- **A direct path that dies goes back to the server.** A sender whose NAT
+  draws ports at random meets its receiver on a socket of its own (the
+  birthday method), and moving the session there dropped the socket it had
+  started on — the one a relay knows it by and a TURN shim is connected to.
+  When the direct path then died, the session had no way back and the
+  transfer stopped. The first socket is now kept and read, whatever goes to
+  a relay or a TURN server leaves from it, and a session that goes back to
+  one goes back to it. The laboratory's new `fallback` scenario cuts the
+  direct path in the middle of a transfer, the server still reachable: before
+  the change a relayed pair of that kind never came back (nothing delivered
+  in 150 s), after it every case is carried by its server again 20–26 s after
+  the cut (the stall timeout, then a round of re-handshakes), and delivered.
+  A relay keeps an idle pair's port for a minute (`--idle`), so later than
+  that only a TURN server is a way back.
+- **What an adversarial review of this round found, fixed.** An address on a
+  TURN server was on the lines people copy (`Senders use:`, `Addresses:`),
+  and a peer given it punched at it as at a host whose NAT is unknown —
+  sprays of guessed ports at somebody else's server; only a card carries one
+  now, marked as what it is. A receiver ended its punching at a sender on a
+  handshake alone, whose source a copy may have forged; now only once the
+  sender has shown it receives there (a transport packet from the
+  handshake's address, or an answered challenge). A sender's asking of its
+  relays outlived the transfer (bound to the sender, not to the transfer),
+  and multicast DNS readers outlived their question. Birthday meetings had
+  no bound for the process: four at once used up the 1024 descriptors Linux
+  gives a process by default, and one the 256 of macOS, leaving none for the
+  file being received; they now share one allowance (half the limit, at most
+  two meetings' worth), and a meeting that finds less opens less.
+- **Laboratory scenarios that could not fail, can.** `early` did not require
+  the sender to have asked again, `timeout` judged the last samples rather
+  than those after the receiver adapted, and a transfer counted as "long"
+  (long enough to move off a server) by its rate alone, whatever its size.
+  A rule a scenario put in the laboratory's core namespace outlived that
+  scenario and cut the paths of the next one in the same run.
+- **Multicast DNS did nothing on a network with only IPv6.** The library that
+  lists this host's addresses leaves the link-local IPv6 ones out (on purpose:
+  it says so in its source), and the question was asked only on networks with
+  a link-local address, so a sender on an IPv6-only network found no sockets
+  to ask on and gave up after 35 ms. Found by the laboratory's `lan --v6`, not
+  by any test: no unit test asks a real network. Now any IPv6 address means a
+  network that does IPv6. The wait after the last question also spun for a
+  moment instead of waiting.
+- **Finding each other without a server of ours.** Multicast DNS on the local
+  network (`--announce-lan`, `--lan`), and the Mainline DHT (`--dht`, BEP 5,
+  read-only, on its own socket): both opt-in, and both say what they tell
+  whoever listens.
+- **Relays, own and other people's.** TURN (RFC 8656, RFC 6156) over UDP:
+  `--turn USER:PASSWORD@HOST` (or `SHARP256_TURN`), for the sender, the
+  receiver and `sharp-probe`; the engine still speaks plain UDP, each peer
+  through a loopback shim. `sharp-relay` also answers as an RFC 5780 STUN
+  server. Any number of relays and TURN servers may be given; the first to
+  answer wins.
+- **A relay is a step, not a destination.** While a session is carried, the
+  sender asks the receiver's other addresses with authenticated pings; when
+  one answers, address validation moves the session there. That includes a
+  meeting made by many sockets (a NAT that draws its ports at random) after
+  the handshake: the socket is kept, pinged from, and becomes the session's
+  once the receiver has proven the address. Before, such a session stayed on
+  the server to the end.
+- **A relay is asked as long as it may yet answer.** A sender told that the
+  relay has no registration for the receiver — two people starting together,
+  a registration being renewed — asks again for up to two minutes; a relay
+  that did not answer is asked again for up to a minute. Giving up at the
+  first "unknown" lost the introduction for good, which showed in CI as two
+  IPv6-only pairs failing in one run and not in the next.
+- **`sharp-probe` predicts what a transfer does.** Its test with a peer's
+  card meets by many sockets too: it used to report "nothing got through" for
+  pairs a transfer connects in a second (a random-port NAT against an
+  ordinary one), and told people to look for a relay they did not need. All
+  36 pairs of the six NAT kinds are checked (`natlab.py probe --all`).
+- **Reports** name the family a measurement is for; IPv6 gateways are found
+  and pinholes reported; the relay answers a question from the address it was
+  asked at (it has several on one interface with IPv6).
+- **The laboratory** (`scripts/natlab`) runs in network namespaces on the
+  host's own kernel or, for IPv6, in a virtual machine: the six NAT kinds of
+  RFC 4787 checked by an independent oracle first; matrices of every pair
+  through a relay, by cards, through coturn and through a DHT; miniupnpd for
+  PCP, NAT-PMP, UPnP and IPv6 pinholes (with a control); a carrier-grade NAT
+  in front; two hosts behind one NAT; a NAT that forgets a flow in seconds;
+  networks that cannot reach each other at all. CI runs it on every push.
+- **Fuzzing** covers what the new code reads: multicast DNS, TURN and STUN
+  messages, ChannelData, bencoding and DHT answers, contact cards, relay
+  messages.
+
 ### Relay access and quotas
 - A relay carries traffic on its operator's bandwidth, so the operator
   decides who may use it. `--allow-receiver ID` / `--allowed-receivers FILE`

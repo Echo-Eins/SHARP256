@@ -40,17 +40,91 @@ impl std::fmt::Debug for Hit {
     }
 }
 
+/// Sockets for one meeting, and the share of the process's allowance they
+/// hold until the meeting is over (see [`open_sockets`]).
+pub struct Sockets {
+    list: Vec<Arc<UdpSocket>>,
+    _allowance: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for Sockets {
+    type Target = [Arc<UdpSocket>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+/// Sockets open for birthday meetings at once, in the whole process. Each is
+/// a descriptor, and a program that has run out of those cannot open the
+/// file it is receiving into, nor a socket for anything else: half of what
+/// the system lets a process have (where it says — Linux gives 1024 by
+/// default, macOS 256), and never more than two meetings' worth. A meeting
+/// that finds less opens less, and one that finds none waits for nothing:
+/// it is only the less likely to meet.
+fn allowance() -> &'static Arc<tokio::sync::Semaphore> {
+    static ALLOWANCE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    ALLOWANCE.get_or_init(|| {
+        let most = 2 * crate::nat::punch::BIRTHDAY_SOCKETS;
+        let n = descriptor_limit().map_or(most, |limit| (limit / 2).min(most));
+        Arc::new(tokio::sync::Semaphore::new(n))
+    })
+}
+
+/// How many descriptors the system lets this process have open, if it says.
+#[cfg(unix)]
+fn descriptor_limit() -> Option<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    usize::try_from(limit.rlim_cur).ok()
+}
+
+/// Windows counts sockets otherwise, and has room for many thousands.
+#[cfg(not(unix))]
+fn descriptor_limit() -> Option<usize> {
+    None
+}
+
 /// Opens up to `count` sockets of the same kind as `like` — the same local
-/// address, dual-stack where it is — each on a port of its own. Fewer come
-/// back if the system runs out of descriptors, which is not an error: the
-/// meeting is only less likely.
-pub fn open_sockets(like: &UdpSocket, count: usize) -> Vec<Arc<UdpSocket>> {
+/// address, dual-stack where it is — each on a port of its own: as many as
+/// the process's allowance for meetings has left (half the descriptors the
+/// system lets the process have, and never more than two meetings' worth),
+/// and fewer if the system runs out of descriptors. Fewer is not an error:
+/// the meeting is only less likely.
+pub fn open_sockets(like: &UdpSocket, count: usize) -> Sockets {
+    open_within(allowance(), like, count)
+}
+
+/// [`open_sockets`], out of `allowance`.
+fn open_within(allowance: &Arc<tokio::sync::Semaphore>, like: &UdpSocket, count: usize) -> Sockets {
+    let none = || Sockets {
+        list: Vec::new(),
+        _allowance: None,
+    };
     let Ok(local) = like.local_addr() else {
-        return Vec::new();
+        return none();
+    };
+    let share = count.min(allowance.available_permits());
+    let Some(permit) = u32::try_from(share)
+        .ok()
+        .filter(|n| *n > 0)
+        .and_then(|n| allowance.clone().try_acquire_many_owned(n).ok())
+    else {
+        tracing::debug!("birthday: no sockets left in the allowance for meetings");
+        return none();
     };
     let bind = SocketAddr::new(local.ip(), 0);
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut out = Vec::with_capacity(share);
+    for _ in 0..share {
         match crate::transport::socket::bind_udp(bind, 64 * 1024) {
             Ok(s) => out.push(Arc::new(s)),
             Err(e) => {
@@ -59,7 +133,10 @@ pub fn open_sockets(like: &UdpSocket, count: usize) -> Vec<Arc<UdpSocket>> {
             }
         }
     }
-    out
+    Sockets {
+        list: out,
+        _allowance: Some(permit),
+    }
 }
 
 /// Sends a punch to `base` from each of `sockets`, again and again for
@@ -68,7 +145,7 @@ pub fn open_sockets(like: &UdpSocket, count: usize) -> Vec<Arc<UdpSocket>> {
 /// packet got in, and the peer needs ours to know which port it was — and
 /// returned; the others are closed.
 pub async fn meet(
-    sockets: Vec<Arc<UdpSocket>>,
+    sockets: Sockets,
     base: SocketAddr,
     duration: Duration,
     cancel: &CancellationToken,
@@ -79,7 +156,7 @@ pub async fn meet(
     let (tx, mut rx) = mpsc::channel::<Hit>(8);
     let peer_ip = crate::address::canonical(base).ip();
     let mut readers = Vec::with_capacity(sockets.len());
-    for socket in &sockets {
+    for socket in sockets.iter() {
         let (socket, tx) = (socket.clone(), tx.clone());
         readers.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -107,7 +184,7 @@ pub async fn meet(
     let start = Instant::now();
     let mut round = 0u32;
     let hit = loop {
-        for s in &sockets {
+        for s in sockets.iter() {
             let _ = s.send_to(&msg, base).await;
         }
         round += 1;
@@ -295,6 +372,33 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// What meetings may open is shared by the whole process, and given
+    /// back when a meeting's sockets go.
+    #[tokio::test]
+    async fn meetings_share_one_allowance_of_sockets() {
+        let like = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The process's own allowance is shared with the tests that run
+        // alongside; the rule is the same for one of this test's own.
+        let budget = Arc::new(tokio::sync::Semaphore::new(10));
+        let first = open_within(&budget, &like, 7);
+        assert_eq!(first.len(), 7);
+        let second = open_within(&budget, &like, 256);
+        assert_eq!(second.len(), 3, "only what is left");
+        let third = open_within(&budget, &like, 256);
+        assert!(third.is_empty(), "nothing is left");
+        drop(first);
+        assert_eq!(budget.available_permits(), 7);
+        drop((second, third));
+        assert_eq!(budget.available_permits(), 10);
+        // And the process's own is there, and never more than two meetings.
+        let total = allowance().available_permits();
+        assert!(
+            total <= 2 * crate::nat::punch::BIRTHDAY_SOCKETS,
+            "{}",
+            total
+        );
     }
 
     #[tokio::test]

@@ -3927,3 +3927,135 @@ async fn a_receiver_sends_at_a_bare_address_it_is_given() {
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(15), task).await;
 }
+
+/// A sender given the receiver's address by hand and asked to give its own
+/// in return (`give_card`, `sharp-sender --card`) punches at the address:
+/// the receiver's side punches back once it is handed ours, and a meeting
+/// takes both. Not asked, it only tries the address with handshakes.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sender_meeting_by_hand_punches_at_the_address_it_was_given() {
+    use sharp256::relay::Message;
+
+    init_test_logging();
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, _out, state) = dirs(&tmp);
+    let file = make_file(&src, "meet.bin", 4096, 0x3EE7);
+    for give_card in [true, false] {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = sender_cfg(
+            &file,
+            peer.local_addr().unwrap(),
+            Identity::generate().id(),
+            &state,
+        );
+        cfg.give_card = give_card;
+        cfg.transport.handshake_timeout = Duration::from_secs(2);
+        let sender = tokio::spawn(run_sender(cfg));
+        let mut punched = false;
+        let mut buf = [0u8; 2048];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        while let Ok(Ok((n, _))) = tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await
+        {
+            if matches!(Message::decode(&buf[..n]), Some(Message::Punch)) {
+                punched = true;
+                break;
+            }
+        }
+        assert_eq!(punched, give_card, "give_card = {}", give_card);
+        // Nobody answers there: the sender gives up after its handshake
+        // timeout, and the punching stops with it.
+        let result = tokio::time::timeout(Duration::from_secs(10), sender)
+            .await
+            .expect("the sender ends")
+            .expect("the sender task");
+        assert!(result.is_err(), "nobody was there to receive");
+    }
+}
+
+/// Forwards datagrams between one client and `target`, counting the punches
+/// (a relay's `Punch` message, which is what punching sends) the client
+/// sends towards the target.
+#[cfg(feature = "nat-traversal")]
+async fn counting_forwarder(
+    target: SocketAddr,
+) -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    use sharp256::relay::Message;
+
+    let outer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let inner = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = outer.local_addr().unwrap();
+    let punches = Arc::new(AtomicU64::new(0));
+    let count = punches.clone();
+    let task = tokio::spawn(async move {
+        let mut client: Option<SocketAddr> = None;
+        let (mut a, mut b) = (vec![0u8; 65536], vec![0u8; 65536]);
+        loop {
+            // A receive error (an ICMP "port unreachable" on Windows) is
+            // not the end of the forwarding.
+            tokio::select! {
+                r = outer.recv_from(&mut a) => {
+                    let Ok((n, from)) = r else { continue };
+                    client = Some(from);
+                    if matches!(Message::decode(&a[..n]), Some(Message::Punch)) {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = inner.send_to(&a[..n], target).await;
+                }
+                r = inner.recv_from(&mut b) => {
+                    let Ok((n, _)) = r else { continue };
+                    if let Some(c) = client {
+                        let _ = outer.send_to(&b[..n], c).await;
+                    }
+                }
+            }
+        }
+    });
+    (addr, punches, task)
+}
+
+/// Punching that meets a receiver stops once the session runs directly to
+/// it: it has done its work, and a transfer that lasts is not accompanied by
+/// punches at the receiver all the way.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_meeting_stops_punching_once_the_session_is_direct() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    // Long enough to outlast the first round of punches (6 s): 1 MiB at
+    // 1.5 Mbit/s takes about 5.6 s, and the window below ends before it.
+    let file = make_file(&src, "unhurried.bin", 1 << 20, 0x5709);
+    let r = start_receiver(&out, &state, |_| {}).await;
+    let (via, punches, forwarding) = counting_forwarder(r.addr).await;
+    let mut cfg = sender_cfg(&file, via, r.id, &state);
+    cfg.give_card = true;
+    cfg.transport.max_rate_bytes = Some(1_500_000 / 8);
+    let sender = tokio::spawn(run_sender(cfg));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while punches.load(Ordering::Relaxed) == 0 {
+        assert!(Instant::now() < deadline, "no punch was sent at all");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The session is up on loopback in a moment; the punching stops at the
+    // engine's next look round.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = punches.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !sender.is_finished(),
+        "the transfer ended before the window did, so this proved nothing"
+    );
+    assert_eq!(
+        punches.load(Ordering::Relaxed),
+        before,
+        "punches went on after the session ran directly"
+    );
+    tokio::time::timeout(Duration::from_secs(30), sender)
+        .await
+        .expect("in time")
+        .expect("the sender task")
+        .expect("the transfer completes");
+    assert_same(&file, &out.join("unhurried.bin"));
+    forwarding.abort();
+    stop_receiver(r).await;
+}

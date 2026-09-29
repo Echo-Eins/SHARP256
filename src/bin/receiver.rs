@@ -383,7 +383,10 @@ async fn run_receiver(
                 let mut last = last_card.lock().unwrap_or_else(|e| e.into_inner());
                 if last.as_deref() != Some(card.as_str()) {
                     println!("Your card:   {}", card);
-                    println!("             (give it to the sender: sharp-sender <file> <card>)");
+                    println!(
+                        "             (give it to the sender: sharp-sender <file> <card>; paste \
+                         the card or the addresses it prints here, and press Enter)"
+                    );
                     *last = Some(card);
                 }
             }

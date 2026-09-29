@@ -659,6 +659,10 @@ pub async fn find(id: &SharpId, wait: Duration) -> Vec<SocketAddr> {
     let ifaces = interfaces();
     let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr, u32)>(64);
     let mut sockets: Vec<(Arc<UdpSocket>, SocketAddr)> = Vec::new();
+    // The readers end with this function, whichever way it returns: a
+    // network where nobody answers would otherwise keep a socket and a task
+    // for ever.
+    let mut readers = tokio::task::JoinSet::new();
     for i in &ifaces {
         if let Some((ip, _)) = i.v4.first() {
             if let Ok(s) = reusable_socket(false) {
@@ -670,7 +674,12 @@ pub async fn find(id: &SharpId, wait: Duration) -> Vec<SocketAddr> {
                 if ok.is_ok() {
                     if let Ok(u) = UdpSocket::from_std(s.into()) {
                         sockets.push((Arc::new(u), SocketAddr::from((GROUP_V4, PORT))));
-                        spawn_reader(sockets.last().expect("pushed").0.clone(), i.index, &tx);
+                        spawn_reader(
+                            &mut readers,
+                            sockets.last().expect("pushed").0.clone(),
+                            i.index,
+                            &tx,
+                        );
                     }
                 }
             }
@@ -688,7 +697,12 @@ pub async fn find(id: &SharpId, wait: Duration) -> Vec<SocketAddr> {
                     if let Ok(u) = UdpSocket::from_std(s.into()) {
                         let to = SocketAddr::V6(SocketAddrV6::new(GROUP_V6, PORT, 0, i.index));
                         sockets.push((Arc::new(u), to));
-                        spawn_reader(sockets.last().expect("pushed").0.clone(), i.index, &tx);
+                        spawn_reader(
+                            &mut readers,
+                            sockets.last().expect("pushed").0.clone(),
+                            i.index,
+                            &tx,
+                        );
                     }
                 }
             }
@@ -752,9 +766,14 @@ pub async fn find(id: &SharpId, wait: Duration) -> Vec<SocketAddr> {
     found
 }
 
-fn spawn_reader(socket: Arc<UdpSocket>, index: u32, tx: &mpsc::Sender<(Vec<u8>, SocketAddr, u32)>) {
+fn spawn_reader(
+    readers: &mut tokio::task::JoinSet<()>,
+    socket: Arc<UdpSocket>,
+    index: u32,
+    tx: &mpsc::Sender<(Vec<u8>, SocketAddr, u32)>,
+) {
     let tx = tx.clone();
-    tokio::spawn(async move {
+    readers.spawn(async move {
         let mut buf = vec![0u8; 1500];
         while let Ok((n, from)) = socket.recv_from(&mut buf).await {
             if tx.send((buf[..n].to_vec(), from, index)).await.is_err() {

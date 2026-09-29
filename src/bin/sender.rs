@@ -69,9 +69,11 @@ struct Args {
 
     /// Find out how the internet sees this sender (STUN, and a port forward
     /// from the router) and print its contact card and addresses, for the
-    /// receiver's user to hand to sharp-receiver (--peer-card, or --peer-addr):
-    /// a receiver given by address is told nothing of this side otherwise.
-    /// With the receiver's own card, --turn or --dht it is done anyway
+    /// receiver's user to paste into the running sharp-receiver: a receiver
+    /// given by address is told nothing of this side otherwise. The sender
+    /// then also punches at the receiver's addresses, and waits for it as
+    /// long as with a card. With the receiver's own card, --turn or --dht the
+    /// card is printed anyway
     #[arg(long, conflicts_with = "no_nat")]
     card: bool,
 
@@ -245,8 +247,9 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     cfg.dht = args.dht && cfg!(feature = "nat-traversal");
     cfg.dht_bootstrap = args.dht_bootstrap.clone();
     #[cfg(feature = "nat-traversal")]
-    if cfg.dht {
-        // The receiver may take a while to turn up in the DHT.
+    if cfg.dht || cfg.give_card {
+        // The receiver may take a while to turn up in the DHT, or its user to
+        // be handed this sender's addresses and paste them in.
         cfg.transport.handshake_timeout = sharp256::nat::punch::MEET_DURATION;
     }
     cfg.stun_servers = args.stun.clone();
@@ -317,8 +320,8 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
                 println!("Network:   {}", summary);
                 println!("Your card: {}", card);
                 println!(
-                    "           (give it to the receiver: sharp-receiver --peer-card <card>, \
-                     or paste it into the running receiver)"
+                    "           (paste it into the running receiver, or start the receiver \
+                     with --peer-card <card>)"
                 );
                 // Where the outside sees this host, for a receiver whose user
                 // would rather type an address than a card.
@@ -331,8 +334,8 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
                         let list: Vec<String> = addresses.iter().map(|a| a.to_string()).collect();
                         println!("Addresses: {}", list.join("  "));
                         println!(
-                            "           (or just these: sharp-receiver --peer-addr <address>, \
-                             or paste one into the running receiver)"
+                            "           (or just these: paste them into the running receiver, \
+                             or start it with --peer-addr <address>)"
                         );
                     }
                 }

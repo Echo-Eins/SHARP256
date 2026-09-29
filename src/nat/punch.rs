@@ -395,6 +395,10 @@ impl Puncher {
         duration: Duration,
         cancel: &CancellationToken,
     ) {
+        // Stopped before it began: not a round, not a socket.
+        if cancel.is_cancelled() {
+            return;
+        }
         let Ok(local) = self.socket.local_addr() else {
             return;
         };
@@ -412,6 +416,9 @@ impl Puncher {
             turn.permit(base.ip());
         }
         let mine = self.hints_when_known().await.for_addr(&base);
+        if cancel.is_cancelled() {
+            return;
+        }
         let schedule = schedule(&mine, &theirs, base);
         let started = Instant::now();
         // Sockets for a birthday meeting are opened once, by the first plan
@@ -424,6 +431,9 @@ impl Puncher {
             let Some(handler) = &self.on_hit else {
                 return;
             };
+            if cancel.is_cancelled() {
+                return;
+            }
             let sockets = birthday::open_sockets(&self.socket, count);
             let left = duration.saturating_sub(started.elapsed());
             if let Some(hit) = birthday::meet(sockets, base, left, cancel).await {

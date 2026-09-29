@@ -41,10 +41,12 @@ client.
     scripts/natlab/natlab.py portmap6               # IPv6 pinholes (PCP, UPnP IGD2), with a control
     scripts/natlab/natlab.py lan [--v6]             # multicast DNS on one network (with IPv6 only)
     scripts/natlab/natlab.py early                  # a sender that starts before its receiver has registered
+    scripts/natlab/natlab.py fallback               # a direct path that dies: back to the relay or TURN server
     scripts/natlab/natlab.py v6                     # IPv6 firewalls, and both families together
     scripts/natlab/natlab.py probe port_restricted symmetric_random   # sharp-probe on both hosts
     scripts/natlab/natlab.py probe --all --wait 12  # ... for every pair: does its verdict match what a transfer does?
     scripts/natlab/natlab.py probe --v6 --wait 12   # ... over IPv6, for every pair of firewalls
+    scripts/natlab/natlab.py probe --all --addr --wait 45   # ... with addresses swapped instead of cards
 """
 
 import argparse
@@ -168,6 +170,11 @@ class Lab:
             return ""
 
     def close(self):
+        # The core ("I") is this process's own namespace and outlives every
+        # laboratory made in it: what a scenario put there must not be
+        # there for the next one (a cut direct path, an isolation).
+        for table in ("cut", "isolate"):
+            sh("nft", "delete", "table", "inet", table, check=False)
         for p in reversed(self.children):
             try:
                 os.killpg(p.pid, signal.SIGTERM)
@@ -631,8 +638,15 @@ def rate_args():
 
 
 def long_transfers():
-    """Whether the transfers last long enough for a move off a server."""
-    return bool(os.environ.get("NATLAB_MAX_RATE"))
+    """Whether the transfers last long enough for a move off a server: ten
+    seconds at least, at the rate they are held to (a move takes a few)."""
+    rate = os.environ.get("NATLAB_MAX_RATE", "").strip()
+    if not rate:
+        return False
+    mult = {"k": 1e3, "m": 1e6, "g": 1e9}.get(rate[-1].lower())
+    bits_per_second = float(rate[:-1] if mult else rate) * (mult or 1.0)
+    size = int(os.environ.get("NATLAB_SIZE_MB", "1")) * (1 << 20) * 8
+    return size / bits_per_second >= 10
 
 
 def session_path(log, topo, turn=False):
@@ -744,7 +758,7 @@ def relay_may_only_introduce(lab, v6):
 
 
 def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=False, verbose=False,
-             via="relay", human_delay=2.0, v6=None, v4=True, isolate=False):
+             via="relay", human_delay=2.0, v6=None, v4=True, isolate=False, during=None):
     """One real transfer, sender behind `a_nat`, receiver behind `b_nat`.
 
     `via` is how the two find each other: "relay" (a relay introduces them),
@@ -759,6 +773,9 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
     announce in a DHT — a one-node one on the server host, written
     independently of the client — and the sender is given the receiver's ID
     alone).
+    `during(lab, topo)`, if given, is called every fifth of a second while
+    the transfer runs: what a scenario does to the network in the middle of
+    one.
     Returns (ok, path, seconds, detail)."""
     lab = Lab(keep=keep)
     try:
@@ -796,7 +813,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         rid = m.group(1)
         if via in ("card", "turn", "addr"):
             return transfer_by_cards(lab, topo, d, human_delay, timeout, verbose,
-                                     turn=(via == "turn"), plain=(via == "addr"))
+                                     turn=(via == "turn"), plain=(via == "addr"), during=during)
         if via == "dht":
             return transfer_by_dht(lab, topo, d, timeout, verbose)
         data, want = make_payload(d)
@@ -826,9 +843,12 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
             "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info",
         ]
         sender = lab.spawn("A", send_args, "sender.log")
-        try:
-            sender.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        end = time.time() + timeout
+        while sender.poll() is None and time.time() < end:
+            if during:
+                during(lab, topo)
+            time.sleep(0.2)
+        if sender.poll() is None:
             sender.kill()
         took = time.time() - start
         log = lab.log("sender.log")
@@ -861,7 +881,7 @@ def last_card(lab, log, pattern):
     return found[-1] if found else None
 
 
-def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False, plain=False):
+def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False, plain=False, during=None):
     """The part of `transfer` that needs no relay: two people, two cards.
     With `turn`, both hosts also hold an allocation on a TURN server, whose
     address is on their cards. With `plain`, no cards: two addresses each way,
@@ -937,12 +957,16 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False, p
         return False, "none", 0, "the sender printed no " + ("address" if plain else "card") + ":\n" + lab.log("sender.log")
     samples = []
     end = time.time() + timeout
+    sampled = 0.0
     while sender.poll() is None and time.time() < end:
-        if os.environ.get("NATLAB_SAMPLE"):
+        if os.environ.get("NATLAB_SAMPLE") and time.time() - sampled >= 2:
+            sampled = time.time()
             ct = conntrack(lab, "RA")
             n = sum(1 for l in ct.splitlines() if "dst=11.2.0.1" in l.split("src=")[1] if "udp" in l)
             samples.append(f"{time.time() - start:.0f}s:{n}")
-        time.sleep(2)
+        if during:
+            during(lab, topo)
+        time.sleep(0.2)
     if sender.poll() is None:
         sender.kill()
     took = time.time() - start
@@ -1019,14 +1043,18 @@ def cmd_probe(args):
     """`sharp-probe` on both hosts of a pair: each prints what it sees and
     its card, the cards are swapped by hand (through standard input), and
     each says whether a packet from the other arrived. With `--all`, every
-    pair of NAT kinds, one line each."""
+    pair of NAT kinds, one line each. With `--addr`, what is swapped is the
+    `Addresses:` line instead of the card: nothing is known then of the
+    other side's NAT, and the passes that try each kind in turn take longer
+    (give `--wait` 45 s or so)."""
+    by = "addr" if args.addr else "card"
     if args.v6:
         print(f"{'scenario':46} {'A firewall':12} {'B firewall':12} punch test")
         bad = total = 0
         for name, an, bn, has_v4 in V6_SCENARIOS:
             for fa in FW6_KINDS:
                 for fb in FW6_KINDS:
-                    ok, want_ok = probe_pair(an, bn, args.wait, quiet=True, v6=(fa, fb), v4=has_v4)
+                    ok, want_ok = probe_pair(an, bn, args.wait, quiet=True, v6=(fa, fb), v4=has_v4, by=by)
                     total += 1
                     bad += ok != want_ok
                     print(f"{name:46} {fa:12} {fb:12} {'a packet got through both ways' if ok else 'nothing got through':32} "
@@ -1036,13 +1064,13 @@ def cmd_probe(args):
     if not args.all:
         if not (args.a and args.b):
             raise SystemExit("name two NAT kinds, or --all")
-        ok, want_ok = probe_pair(args.a, args.b, args.wait)
+        ok, want_ok = probe_pair(args.a, args.b, args.wait, by=by)
         return 0 if ok == want_ok else 1
     print(f"{'host A behind':18} {'host B behind':18} punch test")
     bad = 0
     for a in NAT_KINDS:
         for b in NAT_KINDS:
-            ok, want_ok = probe_pair(a, b, args.wait, quiet=True)
+            ok, want_ok = probe_pair(a, b, args.wait, quiet=True, by=by)
             bad += ok != want_ok
             print(f"{a:18} {b:18} {'a packet got through both ways' if ok else 'nothing got through':32} "
                   f"{'as expected' if ok == want_ok else 'UNEXPECTED'}", flush=True)
@@ -1050,9 +1078,10 @@ def cmd_probe(args):
     return 1 if bad else 0
 
 
-def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True):
+def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True, by="card"):
     """One pair; (did a packet get through both ways, did it have to). With
-    `v6`, a pair of IPv6 firewall kinds: every such pair has to get through."""
+    `v6`, a pair of IPv6 firewall kinds: every such pair has to get through.
+    `by` is what the two swap: "card", or "addr" — the `Addresses:` line."""
     args = argparse.Namespace(a=a_nat, b=b_nat, wait=wait)
     lab = Lab(keep=False)
     try:
@@ -1077,16 +1106,18 @@ def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True):
                 f"probe_{name}.log",
                 stdin=subprocess.PIPE,
             )
+        given = r"^(shc1-\S+)$" if by == "card" else r"^Addresses:\s+(\S.*)$"
         for name in ("a", "b"):
             m = None
             end = time.time() + 40
             while time.time() < end and not m:
-                m = re.search(r"^(shc1-\S+)$", lab.log(f"probe_{name}.log"), re.M)
+                m = re.search(given, lab.log(f"probe_{name}.log"), re.M)
                 time.sleep(0.2)
             if not m:
-                print(f"host {name.upper()} printed no card:\n" + lab.log(f"probe_{name}.log")[-1500:])
+                print(f"host {name.upper()} printed no {'card' if by == 'card' else 'addresses'}:\n"
+                      + lab.log(f"probe_{name}.log")[-1500:])
                 return False, True
-            cards[name] = m.group(1)
+            cards[name] = m.group(1).strip()
             report = lab.log(f"probe_{name}.log").split("Your card")[0]
             if not quiet:
                 print(f"--- host {name.upper()} behind {args.a if name == 'a' else args.b}\n{report.split('Measuring')[-1]}")
@@ -1100,7 +1131,7 @@ def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True):
             except subprocess.TimeoutExpired:
                 p.kill()
         codes = [procs[n].returncode for n in ("a", "b")]
-        want_ok = True if v6 else expected(args.a, args.b, False, "card")[0]
+        want_ok = True if v6 else expected(args.a, args.b, False, by)[0]
         ok = all(c == 0 for c in codes)
         if not quiet:
             for name in ("a", "b"):
@@ -1826,9 +1857,11 @@ def cmd_early(args):
             log = lab.log("sender.log")
             conn = re.search(r"Connected to (\S+)", log)
             path = classify(conn.group(1) if conn else None, topo, 5560) if got == want else "none"
-            ok = got == want and is_direct(path)
-            ok_all &= ok
             asked_again = "asking again" in log
+            # Put through, directly, and because it asked again: a sender
+            # that got in without having to would show nothing of the kind.
+            ok = got == want and is_direct(path) and asked_again
+            ok_all &= ok
             print(f"{a_nat:18} {b_nat:18} {'ok  ' if ok else 'FAIL'} {path} in {took:.1f}s "
                   f"(the sender {'asked again' if asked_again else 'did not ask again'} for its receiver, which started "
                   f"{args.delay:.1f}s after it)", flush=True)
@@ -1912,19 +1945,126 @@ def cmd_timeout(args):
             if not f.endswith(".sharp-part"):
                 got = hashlib.sha256(open(f"{d}/out/{f}", "rb").read()).hexdigest()
         conn = re.search(r"Connected to (\S+)", lab.log("sender.log"))
-        # The last few samples: the interval takes effect at the refresh after
-        # the one it was measured in.
-        after = alive[-4:]
-        kept = bool(shortened) and bool(after) and all(n > 0 for n in after)
+        # The samples after the receiver found out how short the NAT's memory
+        # is, less one: the interval takes effect at the refresh after the one
+        # it was measured in. Three at least, or nothing was shown.
+        after = alive[adapted_at + 1:] if adapted_at is not None else []
+        kept = bool(shortened) and len(after) >= 3 and all(n > 0 for n in after)
         ok = got == want and kept
         print(f"a sender put through after the wait: {'ok' if got == want else 'FAILED'} via {conn.group(1) if conn else 'nothing'}; "
-              f"mapping kept alive at the end of the wait: {'yes' if kept else 'NO'}")
+              f"mapping kept alive in the {len(after)} sample(s) after the receiver adapted: {'yes' if kept else 'NO'}")
         if not ok:
             print(log[-1500:])
             print(lab.log("sender.log")[-1500:])
         return 0 if ok else 1
     finally:
         lab.close()
+
+
+class Cut:
+    """Cuts the direct path between the two networks once the sender's
+    session runs on it, and leaves the server reachable from both: what a
+    direct path that dies looks like to the two ends — a gateway that
+    reboots and forgets its mappings, a firewall rule, a route that goes.
+    Then follows, in the sender's log, where the session goes."""
+
+    RULES = """table inet cut {
+  chain cut {
+    type filter hook forward priority filter - 2; policy accept;
+    ip saddr 11.1.0.0/16 ip daddr 11.2.0.0/16 drop
+    ip saddr 11.2.0.0/16 ip daddr 11.1.0.0/16 drop
+  }
+}
+"""
+    # Where the session is, as the sender says it: the address it connected
+    # to, one that answered a handshake, one that was proven.
+    PATH = r"Connected to (\S+)|receiver answered at (\S+)|receiver address (\S+) proven"
+
+    def __init__(self, turn):
+        self.turn = turn
+        self.started = time.time()
+        self.at = None       # when the cut was made
+        self.direct = None   # seconds from the start to the direct path
+        self.offset = 0      # how much of the sender's log came before the cut
+        self.back = None     # seconds from the cut to a server carrying again
+        self.trail = []      # the paths after the cut, in order
+        self.told = []       # the sender's lines about its path
+
+    def paths(self, log, topo):
+        return [classify(next(g for g in m.groups() if g), topo, 5560, turn=self.turn)
+                for m in re.finditer(self.PATH, log)]
+
+    # What the sender says of where its session goes, kept for the report:
+    # the logs are gone with the laboratory.
+    TOLD = re.compile(r"Connected to|answered at|proven|claims address|NAT let|runs from|carried by|"
+                      r"punching towards|no packets from|receiver is back|birthday")
+
+    def __call__(self, lab, topo):
+        log = lab.log("sender.log")
+        self.told = [l[:220] for l in log.splitlines() if self.TOLD.search(l)]
+        if self.at is None:
+            paths = self.paths(log, topo)
+            if paths and paths[-1].startswith("direct"):
+                lab.nft("I", self.RULES)
+                self.at = time.time()
+                self.direct = self.at - self.started
+                self.offset = len(log)
+            return
+        self.trail = self.paths(log[self.offset:], topo)
+        if self.back is None and self.trail and is_carried(self.trail[-1]):
+            self.back = time.time() - self.at
+
+
+# A session that began through a server and moved to a direct path: on its
+# own socket (two NATs that keep one mapping), and on the socket of a
+# birthday meeting (the sender's NAT draws ports at random) — the case in
+# which the way back leaves from another socket than the one the session is
+# on: the one the server knows.
+FALLBACK_CASES = [
+    ("port_restricted", "port_restricted", "relay"),
+    ("symmetric_random", "port_restricted", "relay"),
+    ("port_restricted", "port_restricted", "turn"),
+    ("symmetric_random", "port_restricted", "turn"),
+]
+
+
+def cmd_fallback(args):
+    """A session that went direct loses its direct path in the middle of a
+    transfer while the server it began through is still there: it is
+    expected to go back to that server and finish, not to wait for the
+    direct path to come back. The sender notices the silence after its
+    stall timeout (20 s) and then asks every address the receiver is known
+    by, the server's among them. How long a server keeps the way open is its
+    own business: a relay releases a pair's port after a minute without
+    traffic (so the cut is made as soon as the session is direct), a TURN
+    server keeps an allocation as long as its owner refreshes it."""
+    os.environ.setdefault("NATLAB_SIZE_MB", "40")
+    os.environ.setdefault("NATLAB_MAX_RATE", "16M")
+    cases = [c for c in FALLBACK_CASES if not args.via or c[2] == args.via]
+    ok_all = True
+    print(f"{'sender behind':18} {'receiver behind':18} {'via':6} result")
+    for a, b, via in cases:
+        cut = Cut(turn=(via == "turn"))
+        # The logs are kept whatever happens: a transfer that got through
+        # may still not have done what was asked of it.
+        ok, path, took, detail = transfer(a, b, timeout=args.timeout, via=via, verbose=True, during=cut)
+        trail = [p for i, p in enumerate(cut.trail) if i == 0 or p != cut.trail[i - 1]]
+        if cut.at is None:
+            good = False
+            verdict = "the session never ran directly: nothing was cut"
+        else:
+            good = ok and cut.back is not None
+            verdict = f"direct after {cut.direct:.1f}s, then cut; " + (
+                f"carried by the {cut.trail[-1] if cut.trail else '?'} again {cut.back:.1f}s later"
+                if cut.back is not None else "never carried again")
+            verdict += f" (after the cut: {' -> '.join(trail) or 'nothing'})"
+        ok_all &= good
+        print(f"{a:18} {b:18} {via:6} {'ok  ' if good else 'FAIL'} {'delivered' if ok else 'NOT delivered'} "
+              f"in {took:.1f}s; {verdict}", flush=True)
+        if args.verbose or not good:
+            print("--- what the sender said of its path\n" + "\n".join(cut.told[-60:]), flush=True)
+            print(detail, flush=True)
+    return 0 if ok_all else 1
 
 
 def cmd_oracle(args):
@@ -1969,6 +2109,7 @@ def main():
     probe.add_argument("b", nargs="?", choices=list(NAT_KINDS))
     probe.add_argument("--all", action="store_true", help="every pair of NAT kinds")
     probe.add_argument("--v6", action="store_true", help="IPv6: every pair of firewall kinds, IPv6 only and dual stack")
+    probe.add_argument("--addr", action="store_true", help="swap the Addresses: lines instead of the cards")
     probe.add_argument("--wait", type=int, default=20)
     v6 = sub.add_parser("v6")
     v6.add_argument("--scenario", default=None, help="only the scenarios whose name has this in it")
@@ -1988,6 +2129,10 @@ def main():
     early = sub.add_parser("early")
     early.add_argument("--delay", type=float, default=2.5, help="seconds the receiver starts after the sender")
     early.add_argument("--timeout", type=int, default=45)
+    fb = sub.add_parser("fallback")
+    fb.add_argument("--via", choices=["relay", "turn"], default=None, help="only the cases through this server")
+    fb.add_argument("--timeout", type=int, default=150)
+    fb.add_argument("-v", "--verbose", action="store_true")
     to = sub.add_parser("timeout")
     to.add_argument("--memory", type=int, default=8, help="seconds the NAT keeps a UDP flow")
     to.add_argument("--wait", type=int, default=60, help="seconds the receiver is left idle")
@@ -2011,7 +2156,7 @@ def main():
     matrix.add_argument("-v", "--verbose", action="store_true", help="the logs of every pair that was not as expected")
     args = ap.parse_args()
     sh("ip", "link", "set", "lo", "up")
-    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "timeout": cmd_timeout, "lan": cmd_lan, "early": cmd_early}[args.cmd](args))
+    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "timeout": cmd_timeout, "lan": cmd_lan, "early": cmd_early, "fallback": cmd_fallback}[args.cmd](args))
 
 
 if __name__ == "__main__":

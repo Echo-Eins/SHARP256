@@ -928,12 +928,31 @@ impl Reachability {
     }
 
     /// The candidates as a sender writes them: `ID@host:port,host:port,…`.
+    ///
+    /// Behind a NAT whose mapping changes with the destination the address a
+    /// STUN server saw is no candidate — it is where *that server* reaches us
+    /// — but it is what a sender who was told nothing else needs: its IP is
+    /// where our punches will come from, which is how the sender knows them
+    /// for ours, and its port is the base the sender predicts ours from. So
+    /// it ends the line, after every address that could work (with a card
+    /// the same is said, and better: see [`Reachability::card`]).
+    ///
+    /// An address on a TURN server is left out: written as a bare `IP:PORT`
+    /// nothing says it is one, and a sender that punches at the addresses it
+    /// was given, as one asked for its own does, would spray somebody else's
+    /// server with guessed ports. A card says what each address is.
     pub fn address_string(&self, id: &crate::crypto::SharpId) -> Option<String> {
-        let list: Vec<String> = self
-            .candidates()
+        let candidates = self.candidates();
+        let mut list: Vec<String> = candidates
             .iter()
+            .filter(|c| c.kind != CandidateKind::Relayed)
             .map(|c| c.addr.to_string())
             .collect();
+        if let Some(p) = self.public_addr {
+            if !candidates.iter().any(|c| c.addr == p) && list.len() < MAX_CANDIDATES {
+                list.push(p.to_string());
+            }
+        }
         if list.is_empty() {
             return None;
         }
@@ -1612,6 +1631,68 @@ mod tests {
             r.candidates()
         );
         assert_eq!(r.advertised(), None);
+    }
+
+    /// An address on a TURN server is no host's, and a bare `IP:PORT` cannot
+    /// say so: it stays off the line a person copies (a card carries it).
+    #[test]
+    fn a_turn_address_is_not_on_the_line_a_person_copies() {
+        let id = crate::crypto::Identity::generate().id();
+        let mut r = reach(
+            nat(Mapping::EndpointIndependent, Filtering::AddressDependent),
+            None,
+            Some("203.0.113.9:50000"),
+        );
+        r.relayed = vec!["198.51.100.20:49200".parse().unwrap()];
+        assert!(r
+            .candidates()
+            .iter()
+            .any(|c| c.kind == CandidateKind::Relayed));
+        let text = r.address_string(&id).expect("an address to give");
+        assert!(!text.contains("198.51.100.20"), "{}", text);
+        let card = r.card(&id, card::Role::Receiver, &[]);
+        assert!(card
+            .candidates
+            .iter()
+            .any(|c| c.kind == card::Kind::Relayed));
+        assert!(!card
+            .outside_addrs()
+            .contains(&"198.51.100.20:49200".parse().unwrap()));
+    }
+
+    /// What a person copies into the sender's command line still has to say
+    /// where the punches will come from: the address the STUN server saw ends
+    /// it, after everything that could work, and only where it is not a
+    /// candidate already.
+    #[test]
+    fn a_symmetric_nats_address_ends_the_line_a_person_copies() {
+        let id = crate::crypto::Identity::generate().id();
+        let r = reach(
+            nat(
+                Mapping::AddressAndPortDependent,
+                Filtering::AddressAndPortDependent,
+            ),
+            None,
+            Some("203.0.113.9:50000"),
+        );
+        let text = r.address_string(&id).expect("an address to give");
+        let (_, hosts) = crate::address::parse_peer(&text).expect("parses back");
+        assert_eq!(hosts.last().unwrap(), "203.0.113.9:50000", "{}", text);
+        assert_eq!(hosts.len(), r.candidates().len() + 1, "{}", text);
+        // A stable mapping is a candidate already, and is said once.
+        let r = reach(
+            nat(Mapping::EndpointIndependent, Filtering::AddressDependent),
+            None,
+            Some("203.0.113.9:50000"),
+        );
+        let text = r.address_string(&id).expect("an address to give");
+        let (_, hosts) = crate::address::parse_peer(&text).expect("parses back");
+        assert_eq!(
+            hosts.iter().filter(|h| *h == "203.0.113.9:50000").count(),
+            1,
+            "{}",
+            text
+        );
     }
 
     /// A stable mapping is worth publishing even behind a filter: the sender
