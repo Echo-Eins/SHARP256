@@ -127,6 +127,76 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: sh scripts/netns-tests.sh
 
+  natlab:
+    # The NAT laboratory: real translation and filtering in the kernel
+    # (network namespaces, conntrack, nftables), against independent
+    # implementations — miniupnpd for PCP, NAT-PMP and UPnP, coturn for TURN,
+    # a script for a DHT node. Each job is one claim of docs/NAT.md; a claim
+    # that stops holding fails here. The IPv6 parts run on the runner's own
+    # kernel, which has IPv6.
+    name: NAT laboratory (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: NAT kinds checked by the oracle
+            run: python3 scripts/natlab/natlab.py oracle
+          - name: every pair through a relay that carries
+            run: python3 scripts/natlab/natlab.py matrix
+          - name: every pair through a relay that only introduces
+            run: python3 scripts/natlab/natlab.py matrix --direct-only
+          - name: every pair by contact cards, no relay
+            run: python3 scripts/natlab/natlab.py matrix --via card
+          - name: every pair through a TURN server
+            run: NATLAB_SIZE_MB=100 python3 scripts/natlab/natlab.py matrix --via turn --timeout 60
+          - name: every pair through the DHT alone
+            run: python3 scripts/natlab/natlab.py matrix --via dht --timeout 60
+          - name: networks that cannot reach each other, relay
+            run: python3 scripts/natlab/natlab.py matrix --isolate
+          - name: networks that cannot reach each other, TURN
+            run: NATLAB_SIZE_MB=20 python3 scripts/natlab/natlab.py matrix --via turn --isolate --timeout 60
+          - name: port forwards (PCP, NAT-PMP, UPnP)
+            run: python3 scripts/natlab/natlab.py portmap
+          - name: IPv6 firewalls, and both families at once
+            run: python3 scripts/natlab/natlab.py v6 --direct-only
+          - name: IPv6 pinholes
+            run: python3 scripts/natlab/natlab.py portmap6
+          - name: local network, one NAT, forgetful NAT
+            run: |
+              python3 scripts/natlab/natlab.py lan
+              python3 scripts/natlab/natlab.py samenat
+              python3 scripts/natlab/natlab.py timeout
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: natlab-${{ hashFiles('Cargo.lock') }}
+      - name: The routers' and the TURN server's own software
+        run: |
+          # Installing a daemon starts it; these are started by the laboratory
+          # in namespaces of its own.
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables iproute2 miniupnpd miniupnpd-nftables coturn python3
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts them through AppArmor by default.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Build (no GUI)
+        run: cargo build --release --no-default-features --features nat-traversal --bins
+      - name: ${{ matrix.name }}
+        env:
+          SHARP_BIN_DIR: ${{ github.workspace }}/target/release
+        run: ${{ matrix.run }}
+
   fuzz:
     name: Fuzzing (short run of every target)
     runs-on: ubuntu-latest

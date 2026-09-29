@@ -409,7 +409,7 @@ class Topo:
             # still reach the server. Whatever gets the transfer across is
             # the server's doing.
             lab.nft("I", """table inet isolate {
-  chain fwd {
+  chain cut {
     type filter hook forward priority filter - 1; policy accept;
     ip saddr 11.1.0.0/16 ip daddr 11.2.0.0/16 drop
     ip saddr 11.2.0.0/16 ip daddr 11.1.0.0/16 drop
@@ -1638,15 +1638,22 @@ def cmd_timeout(args):
         print(f"the NAT in front of the receiver forgets a UDP flow after {args.memory} s; waiting {args.wait} s idle")
         end = time.time() + args.wait
         alive = []
+        adapted_at = None
         while time.time() < end:
-            time.sleep(max(1, args.wait // 6))
+            time.sleep(max(1, args.wait // 12))
             ct = lab.x("RB", "cat", "/proc/net/nf_conntrack", check=False).stdout
             flows = [l for l in ct.splitlines() if "udp" in l and "dst=11.9.0.10" in l.split("src=")[1] and "dport=5560" in l]
             alive.append(len(flows))
+            # Until the receiver has found out how short the NAT's memory is
+            # its refreshes may be too far apart: the mapping is allowed to
+            # lapse then, and what is asked is that it does not afterwards.
+            if adapted_at is None and re.search(r"an idle mapping lasts", lab.log("receiver.log")):
+                adapted_at = len(alive)
         log = lab.log("receiver.log")
-        shortened = re.findall(r"refreshing every ([\d.]+\w*) from now on", log)
+        shortened = re.findall(r"keeping ours alive every ([\d.]+\w*)", log)
         print(f"flows towards the relay at the receiver's NAT, sampled while idle: {alive}")
-        print(f"the receiver's keepalive was shortened to: {shortened[-1] if shortened else 'not needed (or not seen)'}")
+        print(f"the receiver measured how long the NAT remembers a flow and now refreshes every: "
+              f"{shortened[-1] if shortened else 'it did not measure it'}")
         sender = lab.spawn(
             "A",
             [f"{BIN}/sharp-sender", data, address, "--relay", f"{S1}:5560", "--headless", "--stun", f"{S1}:3478",
@@ -1662,10 +1669,13 @@ def cmd_timeout(args):
             if not f.endswith(".sharp-part"):
                 got = hashlib.sha256(open(f"{d}/out/{f}", "rb").read()).hexdigest()
         conn = re.search(r"Connected to (\S+)", lab.log("sender.log"))
-        kept = all(n > 0 for n in alive)
+        # The last few samples: the interval takes effect at the refresh after
+        # the one it was measured in.
+        after = alive[-4:]
+        kept = bool(shortened) and bool(after) and all(n > 0 for n in after)
         ok = got == want and kept
         print(f"a sender put through after the wait: {'ok' if got == want else 'FAILED'} via {conn.group(1) if conn else 'nothing'}; "
-              f"mapping kept alive throughout: {'yes' if kept else 'NO'}")
+              f"mapping kept alive at the end of the wait: {'yes' if kept else 'NO'}")
         if not ok:
             print(log[-1500:])
             print(lab.log("sender.log")[-1500:])
