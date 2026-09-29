@@ -706,6 +706,7 @@ fn seed_relay() -> Vec<Vec<u8>> {
             flags: 1,
             stamp: 42,
             proof: [2; PROOF_LEN],
+            nonce: [0x5a; 16],
         },
         Message::Register {
             hints: Hints::none(),
@@ -714,16 +715,19 @@ fn seed_relay() -> Vec<Vec<u8>> {
             flags: 0,
             stamp: 43,
             proof: [2; PROOF_LEN],
+            nonce: [0x5a; 16],
         },
         Message::Connect {
             hints: with_v4,
             target: id,
             token: [3; TOKEN_LEN],
+            nonce: [0x5a; 16],
         },
         Message::Connect {
             hints: Hints::none(),
             target: id,
             token: [3; TOKEN_LEN],
+            nonce: [0x5a; 16],
         },
         Message::ConnectAs {
             hints: with_v6,
@@ -731,31 +735,37 @@ fn seed_relay() -> Vec<Vec<u8>> {
             token: [3; TOKEN_LEN],
             id,
             proof: [4; PROOF_LEN],
+            nonce: [0x5a; 16],
         },
         Message::Allocated {
             hints: sequential,
             port: 40000,
             peer: "203.0.113.5:4000".parse().expect("literal"),
             ticket: [5; TOKEN_LEN],
+            tag: [0; 16],
         },
         Message::Allocated {
             hints: with_v6,
             port: 40000,
             peer: "203.0.113.5:4000".parse().expect("literal"),
             ticket: [5; TOKEN_LEN],
+            tag: [0; 16],
         },
         Message::Incoming {
             hints: with_v4,
             port: 40001,
             peer: "[2001:db8::7]:4000".parse().expect("literal"),
             ticket: [6; TOKEN_LEN],
+            tag: [0; 16],
         },
         Message::Registered {
             lease: 120,
             observed: "[2001:db8::1]:5555".parse().expect("literal"),
+            tag: [0; 16],
         },
         Message::Error {
             code: Refusal::Forbidden,
+            tag: [0; 16],
         },
         Message::Punch,
     ]

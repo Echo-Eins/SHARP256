@@ -1,1 +1,3 @@
-<s:Envelope><s:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>203.0.113.9</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>
+HTTP/1.1 200 OK
+LOCATION: http://[fe80::1%25eth0]:5000/rootDesc.xml
+

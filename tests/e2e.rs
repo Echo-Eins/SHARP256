@@ -1085,15 +1085,6 @@ impl FakeSender {
         self.sock.send_to(&buf, self.to).await.unwrap();
     }
 
-    /// The `received_bytes` of every ACK that arrives within `within`.
-    async fn acked_bytes(&mut self, within: Duration) -> Vec<u64> {
-        self.acks(within)
-            .await
-            .into_iter()
-            .map(|a| a.received_bytes)
-            .collect()
-    }
-
     /// Every ACK that arrives within `within`.
     async fn acks(&mut self, within: Duration) -> Vec<sharp256::protocol::wire::Ack> {
         use sharp256::protocol::wire::{self, Message};
@@ -1173,27 +1164,45 @@ async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
         timestamp: 1,
         payload: b"x",
     };
-    // What the receiver holds now, asked afresh: whatever it acknowledged
-    // earlier may be stale, and while a flood comes in its last word can
-    // be lost in our own full socket buffer. Anything sent is acknowledged
-    // within its ACK interval; the largest figure in the window is the
-    // latest.
-    async fn now_held(fake: &mut FakeSender, prompt: Data<'_>) -> u64 {
-        fake.send(&Message::Data(prompt)).await;
-        fake.acked_bytes(Duration::from_millis(500))
-            .await
-            .into_iter()
-            .max()
-            .unwrap_or(0)
+    // What the receiver holds once it has dealt with `prompt`, asked
+    // afresh: whatever it acknowledged earlier may be stale, and while a
+    // flood comes in its last word can be lost in our own full socket
+    // buffer. A marker follows the prompt — the first piece again, with a
+    // timestamp of its own, which the receiver takes whatever its limits:
+    // it holds that piece already (or, early on, is far from them) — and
+    // the ACK that echoes it was sent after the prompt was dealt with,
+    // since the receiver deals with datagrams in the order they arrive,
+    // however long it takes over a flood. (The largest figure acknowledged
+    // within half a second used to stand for this, and a receiver slower
+    // than that, with the other tests running beside it, made it 0.)
+    async fn now_held(fake: &mut FakeSender, prompt: Data<'_>, marker: u32) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            // Both again, until the marker's echo comes: a receiver still
+            // busy with the flood may find no room for either. The prompt
+            // changes nothing the second time.
+            fake.send(&Message::Data(prompt.clone())).await;
+            fake.send(&Message::Data(Data {
+                offset: 1,
+                timestamp: marker,
+                payload: b"x",
+            }))
+            .await;
+            let acks = fake.acks(Duration::from_millis(500)).await;
+            if let Some(ack) = acks.iter().find(|a| a.echo_ts == marker) {
+                return ack.received_bytes;
+            }
+        }
+        panic!("the receiver never acknowledged the marker {}", marker);
     }
 
     // The two pieces that [2, 5) is going to join, made sure of first: at
     // the limit, data that joins nothing is refused, and one of these lost
     // on the way would make the last check fail for the wrong reason.
     let mut first = 0;
-    for _ in 0..20 {
+    for attempt in 0..20 {
         fake.send(&Message::Data(piece(0))).await;
-        first = now_held(&mut fake, piece(1)).await;
+        first = now_held(&mut fake, piece(1), 1000 + attempt).await;
         if first == 2 {
             break;
         }
@@ -1219,6 +1228,7 @@ async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
             timestamp: 1,
             payload: b"z",
         },
+        2001,
     )
     .await;
     let held = with_start - 1;
@@ -1237,6 +1247,7 @@ async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
             timestamp: 1,
             payload: b"w",
         },
+        2002,
     )
     .await;
     assert_eq!(
@@ -1253,6 +1264,7 @@ async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
             timestamp: 1,
             payload: b"yyy",
         },
+        2003,
     )
     .await;
     assert_eq!(

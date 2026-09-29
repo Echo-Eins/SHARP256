@@ -20,7 +20,7 @@
 //! * an allocated port carries traffic only between the two addresses that
 //!   presented its tickets, and forgets it when it goes quiet.
 
-use super::{is_control, Hints, Message, Refusal, TOKEN_LEN};
+use super::{is_control, tagged, Hints, Message, Refusal, NONCE_LEN, TAG_LEN, TOKEN_LEN};
 use crate::crypto::{Identity, SharpId};
 use crate::transport::io::PktSocket;
 use rand::RngCore;
@@ -489,6 +489,11 @@ struct Registration {
     /// The relay address the registration was sent to, which is where what
     /// is sent to the owner later — an introduction — has to come from.
     via: Option<std::net::IpAddr>,
+    /// What everything sent to the owner is tagged with (see
+    /// [`super::relay_tag`]): the key its registration was proven with, and
+    /// the nonce it registered with.
+    key: [u8; 32],
+    nonce: [u8; NONCE_LEN],
 }
 
 impl Registration {
@@ -665,20 +670,28 @@ impl Relay {
         let _ = self.socket.send(to, self.via, &msg.encode()).await;
     }
 
-    /// [`Relay::reply`] to somebody other than who asked, from the address
-    /// it knows the relay by.
-    async fn reply_via(&self, to: SocketAddr, via: Option<std::net::IpAddr>, msg: Message) {
-        let _ = self.socket.send(to, via, &msg.encode()).await;
+    /// A message to a receiver whose registration was proven, closed with
+    /// the tag only this relay could make for it (see [`super::relay_tag`]).
+    async fn reply_tagged(
+        &self,
+        to: SocketAddr,
+        key: &[u8; 32],
+        nonce: &[u8; NONCE_LEN],
+        msg: Message,
+    ) {
+        let _ = self
+            .socket
+            .send(to, self.via, &tagged(key, nonce, &msg))
+            .await;
     }
 
-    /// Whether a message carries a proof that only the identity's owner
-    /// could have made. Both sides work the key out from their long-term
-    /// keys alone, so there is nothing to exchange and nothing to store.
-    fn owns(&self, id: &SharpId, raw: &[u8]) -> bool {
-        let Some(key) = super::auth_key(&self.identity, id, id, &self.identity.id()) else {
-            return false;
-        };
-        super::proof_is_good(&key, raw)
+    /// The key a message's proof was made with, when it carries one that
+    /// only the identity's owner could have made. Both sides work the key
+    /// out from their long-term keys alone, so there is nothing to exchange
+    /// and nothing to store.
+    fn owner_key(&self, id: &SharpId, raw: &[u8]) -> Option<[u8; 32]> {
+        let key = super::auth_key(&self.identity, id, id, &self.identity.id())?;
+        super::proof_is_good(&key, raw).then_some(key)
     }
 
     async fn on_message(&mut self, msg: Message, from: SocketAddr, raw: &[u8], now: Instant) {
@@ -689,6 +702,7 @@ impl Relay {
                 flags,
                 stamp,
                 hints,
+                nonce,
                 proof: _,
             } => {
                 // An unproven address gets a token and nothing else: a
@@ -696,7 +710,8 @@ impl Relay {
                 // this relay's traffic at somebody who never asked for it.
                 if !self.tokens.accepts(&token, from, now) {
                     let token = self.tokens.issue(from, now);
-                    self.reply(from, Message::Challenge { token }).await;
+                    self.reply(from, Message::Challenge { token, tag: nonce })
+                        .await;
                     return;
                 }
                 // And an unproven *identity* gets nothing at all. Without
@@ -704,17 +719,18 @@ impl Relay {
                 // register it here and have senders put through to them
                 // instead — the handshake would fail, but the transfer
                 // would fail with it.
-                if !self.owns(&id, raw) {
+                let Some(key) = self.owner_key(&id, raw) else {
                     tracing::debug!("relay: {} cannot prove it owns {}", from, id.short());
                     self.reply(
                         from,
                         Message::Error {
                             code: Refusal::BadToken,
+                            tag: nonce,
                         },
                     )
                     .await;
                     return;
-                }
+                };
                 // And a proven identity that is not one this relay serves
                 // gets told so. Only after the proof: whether an identity
                 // is on the list is nothing to tell someone who does not
@@ -726,10 +742,13 @@ impl Relay {
                     .is_some_and(|l| !l.contains(&id))
                 {
                     tracing::info!("relay: {} is not on the list of receivers", id.short());
-                    self.reply(
+                    self.reply_tagged(
                         from,
+                        &key,
+                        &nonce,
                         Message::Error {
                             code: Refusal::Forbidden,
+                            tag: [0; TAG_LEN],
                         },
                     )
                     .await;
@@ -748,10 +767,13 @@ impl Relay {
                     .or_else(|| self.forgotten.get(&id).map(|(s, _)| *s));
                 if newest.is_some_and(|n| stamp <= n) {
                     tracing::debug!("relay: stale registration of {} from {}", id.short(), from);
-                    self.reply(
+                    self.reply_tagged(
                         from,
+                        &key,
+                        &nonce,
                         Message::Error {
                             code: Refusal::Stale,
+                            tag: [0; TAG_LEN],
                         },
                     )
                     .await;
@@ -783,10 +805,13 @@ impl Relay {
                                 mine
                             );
                         }
-                        self.reply(
+                        self.reply_tagged(
                             from,
+                            &key,
+                            &nonce,
                             Message::Error {
                                 code: Refusal::Busy,
+                                tag: [0; TAG_LEN],
                             },
                         )
                         .await;
@@ -803,16 +828,21 @@ impl Relay {
                         stamp,
                         hints: hints.screened(from),
                         via: self.via,
+                        key,
+                        nonce,
                     },
                 );
                 if !known {
                     tracing::info!("relay: {} registered at {}", id.short(), from);
                 }
-                self.reply(
+                self.reply_tagged(
                     from,
+                    &key,
+                    &nonce,
                     Message::Registered {
                         lease: self.cfg.lease.as_secs().min(u32::MAX as u64) as u32,
                         observed: crate::address::canonical(from),
+                        tag: [0; TAG_LEN],
                     },
                 )
                 .await;
@@ -821,10 +851,12 @@ impl Relay {
                 target,
                 token,
                 hints,
+                nonce,
             } => {
                 if !self.tokens.accepts(&token, from, now) {
                     let token = self.tokens.issue(from, now);
-                    self.reply(from, Message::Challenge { token }).await;
+                    self.reply(from, Message::Challenge { token, tag: nonce })
+                        .await;
                     return;
                 }
                 // A relay with a list of senders has to know who is asking.
@@ -833,32 +865,36 @@ impl Relay {
                         from,
                         Message::Error {
                             code: Refusal::Forbidden,
+                            tag: nonce,
                         },
                     )
                     .await;
                     return;
                 }
-                self.put_through(target, from, hints.screened(from), now)
+                self.put_through(target, from, hints.screened(from), nonce, now)
                     .await;
             }
             Message::ConnectAs {
                 target,
                 token,
                 hints,
+                nonce,
                 id,
                 ..
             } => {
                 if !self.tokens.accepts(&token, from, now) {
                     let token = self.tokens.issue(from, now);
-                    self.reply(from, Message::Challenge { token }).await;
+                    self.reply(from, Message::Challenge { token, tag: nonce })
+                        .await;
                     return;
                 }
-                if !self.owns(&id, raw) {
+                if self.owner_key(&id, raw).is_none() {
                     tracing::debug!("relay: {} cannot prove it owns {}", from, id.short());
                     self.reply(
                         from,
                         Message::Error {
                             code: Refusal::BadToken,
+                            tag: nonce,
                         },
                     )
                     .await;
@@ -875,16 +911,21 @@ impl Relay {
                         from,
                         Message::Error {
                             code: Refusal::Forbidden,
+                            tag: nonce,
                         },
                     )
                     .await;
                     return;
                 }
-                self.put_through(target, from, hints.screened(from), now)
+                self.put_through(target, from, hints.screened(from), nonce, now)
                     .await;
             }
             Message::Bye {
-                id, token, stamp, ..
+                id,
+                token,
+                stamp,
+                nonce,
+                ..
             } => {
                 // A token that has gone stale gets a fresh one, as for every
                 // other request. The owner holds on to its last token until
@@ -893,7 +934,8 @@ impl Relay {
                 // of its lease — for a fair share of goodbyes.
                 if !self.tokens.accepts(&token, from, now) {
                     let token = self.tokens.issue(from, now);
-                    self.reply(from, Message::Challenge { token }).await;
+                    self.reply(from, Message::Challenge { token, tag: nonce })
+                        .await;
                     return;
                 }
                 // Only from the address that holds the registration, with a
@@ -901,7 +943,7 @@ impl Relay {
                 // ends: otherwise anyone who knew an identity could evict
                 // its owner, or an old goodbye sent again could end a
                 // registration made since.
-                if !self.owns(&id, raw) {
+                if self.owner_key(&id, raw).is_none() {
                     return;
                 }
                 if self
@@ -935,6 +977,7 @@ impl Relay {
         target: SharpId,
         from: SocketAddr,
         sender_hints: Hints,
+        nonce: [u8; NONCE_LEN],
         now: Instant,
     ) {
         let Some(reg) = self.registrations.get(&target).filter(|r| r.fresh(now)) else {
@@ -942,6 +985,7 @@ impl Relay {
                 from,
                 Message::Error {
                     code: Refusal::Unknown,
+                    tag: nonce,
                 },
             )
             .await;
@@ -949,6 +993,8 @@ impl Relay {
         };
         let receiver = reg.addr;
         let receiver_via = reg.via;
+        // What the receiver checks an introduction by.
+        let receiver_tag = (reg.key, reg.nonce);
         // An owner that asked to stay hidden is not described to
         // the caller; there is then no direct path to try and the
         // pair meets at the relay's port.
@@ -987,13 +1033,21 @@ impl Relay {
                         from,
                         Message::Error {
                             code: Refusal::Busy,
+                            tag: nonce,
                         },
                     )
                     .await;
                     return;
                 }
-                self.allocate(from, receiver, receiver_via, disclose, sender_hints)
-                    .await
+                self.allocate(
+                    from,
+                    receiver,
+                    receiver_via,
+                    receiver_tag,
+                    disclose,
+                    sender_hints,
+                )
+                .await
             }
         };
         match granted {
@@ -1008,20 +1062,26 @@ impl Relay {
                         peer: shown(receiver, disclose),
                         ticket: sender_ticket,
                         hints: receiver_hints,
+                        tag: nonce,
                     },
                 )
                 .await;
-                self.reply_via(
-                    receiver,
-                    receiver_via,
-                    Message::Incoming {
-                        port,
-                        peer: shown(from, disclose),
-                        ticket: receiver_ticket,
-                        hints: sender_hints,
-                    },
-                )
-                .await;
+                let (key, receiver_nonce) = receiver_tag;
+                let incoming = Message::Incoming {
+                    port,
+                    peer: shown(from, disclose),
+                    ticket: receiver_ticket,
+                    hints: sender_hints,
+                    tag: [0; TAG_LEN],
+                };
+                let _ = self
+                    .socket
+                    .send(
+                        receiver,
+                        receiver_via,
+                        &tagged(&key, &receiver_nonce, &incoming),
+                    )
+                    .await;
                 tracing::info!(
                     "relay: port {} carries {} <-> {} ({})",
                     port,
@@ -1035,6 +1095,7 @@ impl Relay {
                     from,
                     Message::Error {
                         code: Refusal::Busy,
+                        tag: nonce,
                     },
                 )
                 .await
@@ -1068,6 +1129,7 @@ impl Relay {
         sender: SocketAddr,
         receiver: SocketAddr,
         receiver_via: Option<std::net::IpAddr>,
+        receiver_tag: ([u8; 32], [u8; NONCE_LEN]),
         disclose: bool,
         sender_hints: Hints,
     ) -> Option<(u16, [u8; TOKEN_LEN], [u8; TOKEN_LEN])> {
@@ -1101,6 +1163,7 @@ impl Relay {
             sender_hints,
             receiver_control: receiver,
             receiver_via,
+            receiver_tag,
             idle: self.cfg.idle,
             meter: self.meter.clone(),
             pair_bytes: self.cfg.quotas.pair_bytes,
@@ -1198,6 +1261,9 @@ struct Carried {
     receiver_control: SocketAddr,
     /// The relay address the receiver knows the control port by.
     receiver_via: Option<std::net::IpAddr>,
+    /// What the receiver checks an introduction by: the key and nonce of
+    /// its registration (see [`super::relay_tag`]).
+    receiver_tag: ([u8; 32], [u8; NONCE_LEN]),
     idle: Duration,
     /// The relay's account of what it carries, and what this pair may carry
     /// in all (0: no limit).
@@ -1258,6 +1324,7 @@ async fn carry(c: Carried) {
         sender_hints,
         receiver_control,
         receiver_via,
+        receiver_tag,
         idle,
         meter,
         pair_bytes,
@@ -1428,9 +1495,11 @@ async fn carry(c: Carried) {
                         peer: sender_shown,
                         ticket: receiver_ticket,
                         hints: sender_hints,
+                        tag: [0; TAG_LEN],
                     };
+                    let (key, nonce) = &receiver_tag;
                     let _ = control
-                        .send(receiver_control, receiver_via, &msg.encode())
+                        .send(receiver_control, receiver_via, &tagged(key, nonce, &msg))
                         .await;
                 }
             }
@@ -1562,7 +1631,7 @@ mod wire_tests {
         make: impl Fn([u8; TOKEN_LEN]) -> Message,
     ) -> Option<Message> {
         match ask(sock, relay, make([0; TOKEN_LEN])).await? {
-            Message::Challenge { token } => ask(sock, relay, make(token)).await,
+            Message::Challenge { token, .. } => ask(sock, relay, make(token)).await,
             other => Some(other),
         }
     }
@@ -1641,11 +1710,12 @@ mod wire_tests {
             flags: 0,
             stamp: 0,
             proof: [0; crate::relay::PROOF_LEN],
+            nonce: [0x5a; 16],
         };
         sock.send_to(&ask.encode(), relay).await.expect("send");
         for _ in 0..8 {
             match recv_message(sock, Duration::from_secs(2)).await {
-                Some(Message::Challenge { token }) => return token,
+                Some(Message::Challenge { token, .. }) => return token,
                 Some(_) => continue,
                 None => break,
             }
@@ -1678,6 +1748,109 @@ mod wire_tests {
         register_hinted(sock, relay, relay_id, identity, flags, Hints::none()).await
     }
 
+    /// The next datagram at `sock`, as it came.
+    async fn recv_raw(sock: &UdpSocket, within: Duration) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(within, sock.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        Some(buf[..n].to_vec())
+    }
+
+    /// What the relay sends a receiver carries a tag only this relay could
+    /// make, for this receiver and this run of it: the introduction that
+    /// makes a receiver push datagrams at somebody, and the confirmation
+    /// that tells it where it is seen. What it sends a sender gives the
+    /// sender's nonce back. Nobody who cannot see the requests can answer
+    /// them, and nobody without the relay's key can speak for it to a
+    /// receiver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_a_relay_sends_carries_what_only_it_could() {
+        let (relay, relay_id, cancel) = start_relay().await;
+        let owner = Identity::generate();
+        let key = crate::relay::auth_key(&owner, &relay_id, &owner.id(), &relay_id).unwrap();
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // The confirmation of a registration: tagged for this receiver.
+        let (_, registration) = register_raw(&rc, relay, &relay_id, &owner, 0)
+            .await
+            .unwrap();
+        let again = Message::decode(&registration).unwrap();
+        let Message::Register { token, .. } = again else {
+            panic!("not a registration");
+        };
+        let resent = signed(
+            &key,
+            Message::Register {
+                id: owner.id(),
+                token,
+                flags: 0,
+                stamp: stamp(),
+                hints: Hints::none(),
+                nonce: REGISTRATION_NONCE,
+                proof: [0; crate::relay::PROOF_LEN],
+            },
+        );
+        rc.send_to(&resent, relay).await.unwrap();
+        let confirmation = recv_raw(&rc, Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            Message::decode(&confirmation),
+            Some(Message::Registered { .. })
+        ));
+        assert!(crate::relay::relay_tag_is_good(
+            &key,
+            &REGISTRATION_NONCE,
+            &confirmation
+        ));
+        // Not for another run of the receiver (another nonce), nor under
+        // anybody else's key.
+        assert!(!crate::relay::relay_tag_is_good(
+            &key,
+            &[1; NONCE_LEN],
+            &confirmation
+        ));
+        let stranger = Identity::generate();
+        let theirs =
+            crate::relay::auth_key(&stranger, &relay_id, &stranger.id(), &relay_id).unwrap();
+        assert!(!crate::relay::relay_tag_is_good(
+            &theirs,
+            &REGISTRATION_NONCE,
+            &confirmation
+        ));
+
+        // A sender asking: its nonce comes back on the allocation, and the
+        // receiver's introduction is tagged for the receiver.
+        let asked = [0x33; NONCE_LEN];
+        let allocated = with_token(&sc, relay, |token| Message::Connect {
+            target: owner.id(),
+            token,
+            hints: Hints::none(),
+            nonce: asked,
+        })
+        .await;
+        let Some(Message::Allocated { tag, .. }) = allocated else {
+            panic!("expected an allocation, got {:?}", allocated);
+        };
+        assert_eq!(tag, asked);
+        let introduction = recv_raw(&rc, Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            Message::decode(&introduction),
+            Some(Message::Incoming { .. })
+        ));
+        assert!(crate::relay::relay_tag_is_good(
+            &key,
+            &REGISTRATION_NONCE,
+            &introduction
+        ));
+        assert!(!crate::relay::echoes(&asked, &introduction));
+        cancel.cancel();
+    }
+
+    /// The nonce every registration these tests make carries.
+    const REGISTRATION_NONCE: [u8; NONCE_LEN] = [0x5a; NONCE_LEN];
+
     /// [`register_raw`], saying what the receiver's NAT does.
     async fn register_hinted(
         sock: &UdpSocket,
@@ -1700,11 +1873,12 @@ mod wire_tests {
                     flags,
                     stamp: stamp(),
                     proof: [0; crate::relay::PROOF_LEN],
+                    nonce: REGISTRATION_NONCE,
                 },
             );
             sock.send_to(&msg, relay).await.ok()?;
             match recv_message(sock, Duration::from_secs(2)).await? {
-                Message::Challenge { token: t } => token = t,
+                Message::Challenge { token: t, .. } => token = t,
                 other => return Some((other, msg)),
             }
         }
@@ -1739,6 +1913,7 @@ mod wire_tests {
                 flags: 0,
                 stamp: stamp(),
                 proof: crate::relay::proof_for(&key, &[]),
+                nonce: [0x5a; 16],
             },
         )
         .await;
@@ -1754,6 +1929,7 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         let Some(Message::Allocated {
@@ -1761,6 +1937,7 @@ mod wire_tests {
             port,
             peer,
             ticket: sender_ticket,
+            ..
         }) = allocated
         else {
             panic!("expected an allocation, got {:?}", allocated);
@@ -1778,6 +1955,7 @@ mod wire_tests {
             port: rport,
             peer: speer,
             ticket: receiver_ticket,
+            ..
         }) = recv_message(&rc, Duration::from_secs(2)).await
         else {
             panic!("the receiver was not introduced");
@@ -1853,13 +2031,15 @@ mod wire_tests {
             target,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         assert!(
             matches!(
                 answer,
                 Some(Message::Error {
-                    code: Refusal::Unknown
+                    code: Refusal::Unknown,
+                    ..
                 })
             ),
             "got {:?}",
@@ -1914,6 +2094,7 @@ mod wire_tests {
                 token: stolen,
                 stamp: stamp(),
                 proof: [0; crate::relay::PROOF_LEN],
+                nonce: [0x5a; 16],
             },
         );
         impostor.send_to(&forged, relay).await.unwrap();
@@ -1923,6 +2104,7 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         assert!(
@@ -1941,6 +2123,7 @@ mod wire_tests {
                 token,
                 stamp: stamp(),
                 proof: [0; crate::relay::PROOF_LEN],
+                nonce: [0x5a; 16],
             },
         );
         rc.send_to(&bye, relay).await.unwrap();
@@ -1950,13 +2133,15 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         assert!(
             matches!(
                 gone,
                 Some(Message::Error {
-                    code: Refusal::Unknown
+                    code: Refusal::Unknown,
+                    ..
                 })
             ),
             "got {:?}",
@@ -1990,17 +2175,19 @@ mod wire_tests {
                     flags: 0,
                     stamp: stamp(),
                     proof: [0; crate::relay::PROOF_LEN],
+                    nonce: [0x5a; 16],
                 },
             );
             sock.send_to(&msg, relay).await.unwrap();
             match recv_message(&sock, Duration::from_secs(2)).await {
-                Some(Message::Challenge { token: t }) => token = t,
+                Some(Message::Challenge { token: t, .. }) => token = t,
                 other => {
                     assert!(
                         matches!(
                             other,
                             Some(Message::Error {
-                                code: Refusal::BadToken
+                                code: Refusal::BadToken,
+                                ..
                             })
                         ),
                         "an identity was registered without proof: {:?}",
@@ -2016,13 +2203,15 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         assert!(
             matches!(
                 answer,
                 Some(Message::Error {
-                    code: Refusal::Unknown
+                    code: Refusal::Unknown,
+                    ..
                 })
             ),
             "got {:?}",
@@ -2064,6 +2253,7 @@ mod wire_tests {
                     flags: 0,
                     stamp: stamp(),
                     proof: [0; crate::relay::PROOF_LEN],
+                    nonce: [0x5a; 16],
                 },
             );
             sock.send_to(&msg, relay).await.unwrap();
@@ -2072,7 +2262,8 @@ mod wire_tests {
                 matches!(
                     answer,
                     Some(Message::Error {
-                        code: Refusal::BadToken
+                        code: Refusal::BadToken,
+                        ..
                     })
                 ),
                 "{:02x?} was registered by somebody who holds nothing: {:?}",
@@ -2115,6 +2306,7 @@ mod wire_tests {
                 flags: 0,
                 stamp: 0,
                 proof: [0; crate::relay::PROOF_LEN],
+                nonce: [0x5a; 16],
             };
             sock.send_to(&ask.encode(), to).await.unwrap();
             let mut buf = [0u8; 256];
@@ -2192,6 +2384,7 @@ mod wire_tests {
                 target: id,
                 token,
                 hints: sender_hints,
+                nonce: [0x5a; 16],
             })
             .await;
             let Some(Message::Allocated { hints, .. }) = answer else {
@@ -2255,6 +2448,7 @@ mod wire_tests {
                 target: id,
                 token,
                 hints,
+                nonce: [0x5a; 16],
             })
             .await;
             let Some(Message::Allocated { hints: told, .. }) = answer else {
@@ -2294,6 +2488,7 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         let Some(Message::Allocated { peer, port, .. }) = answer else {
@@ -2364,6 +2559,7 @@ mod wire_tests {
                 target: id,
                 token,
                 hints: Hints::none(),
+                nonce: [0x5a; 16],
             })
             .await
         else {
@@ -2373,7 +2569,8 @@ mod wire_tests {
             with_token(&second, relay, |token| Message::Connect {
                 hints: Hints::none(),
                 target: id,
-                token
+                token,
+                nonce: [0x5a; 16],
             })
             .await,
             Some(Message::Allocated { .. })
@@ -2384,11 +2581,13 @@ mod wire_tests {
             with_token(&third, relay, |token| Message::Connect {
                 hints: Hints::none(),
                 target: id,
-                token
+                token,
+                nonce: [0x5a; 16],
             })
             .await,
             Some(Message::Error {
-                code: Refusal::Busy
+                code: Refusal::Busy,
+                ..
             })
         ));
 
@@ -2397,6 +2596,7 @@ mod wire_tests {
             hints: Hints::none(),
             target: id,
             token,
+            nonce: [0x5a; 16],
         })
         .await;
         let Some(Message::Allocated {
@@ -2447,7 +2647,8 @@ mod wire_tests {
             matches!(
                 answer,
                 Some(Message::Error {
-                    code: Refusal::Stale
+                    code: Refusal::Stale,
+                    ..
                 })
             ),
             "an old registration was taken again: {:?}",
@@ -2459,6 +2660,7 @@ mod wire_tests {
                 target: id,
                 token,
                 hints: Hints::none(),
+                nonce: [0x5a; 16],
             })
             .await
         else {
@@ -2484,6 +2686,7 @@ mod wire_tests {
                 token,
                 stamp: stamp(),
                 proof: [0; crate::relay::PROOF_LEN],
+                nonce: [0x5a; 16],
             },
         );
         rc.send_to(&bye, relay).await.unwrap();
@@ -2501,6 +2704,7 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         assert!(
@@ -2523,6 +2727,7 @@ mod wire_tests {
                 token,
                 stamp: stamp(),
                 proof: [0; crate::relay::PROOF_LEN],
+                nonce: [0x5a; 16],
             },
         );
         other.send_to(&leave, relay).await.unwrap();
@@ -2538,7 +2743,8 @@ mod wire_tests {
             matches!(
                 answer,
                 Some(Message::Error {
-                    code: Refusal::Stale
+                    code: Refusal::Stale,
+                    ..
                 })
             ),
             "a registration from before a goodbye was taken after it: {:?}",
@@ -2570,11 +2776,13 @@ mod wire_tests {
                     token,
                     stamp: stamp(),
                     proof: [0; crate::relay::PROOF_LEN],
+                    nonce: [0x5a; 16],
                 },
             )
         };
         rc.send_to(&bye([0x55; TOKEN_LEN]), relay).await.unwrap();
-        let Some(Message::Challenge { token }) = recv_message(&rc, Duration::from_secs(2)).await
+        let Some(Message::Challenge { token, .. }) =
+            recv_message(&rc, Duration::from_secs(2)).await
         else {
             panic!("a goodbye with a stale token was dropped without a word");
         };
@@ -2585,12 +2793,14 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await;
         assert!(matches!(
             gone,
             Some(Message::Error {
-                code: Refusal::Unknown
+                code: Refusal::Unknown,
+                ..
             })
         ));
         cancel.cancel();
@@ -2620,6 +2830,7 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await
         else {
@@ -2726,6 +2937,7 @@ mod wire_tests {
             target: id,
             token,
             hints: Hints::none(),
+            nonce: [0x5a; 16],
         })
         .await
         else {
@@ -2775,11 +2987,17 @@ mod wire_tests {
             register(&a, relay, &relay_id, &ours, 0).await,
             Some(Message::Registered { .. })
         ));
+        // Told so with the tag only this relay could make for that
+        // identity: a refusal anybody could send would take a receiver off
+        // its relay.
+        let key = crate::relay::auth_key(&stranger, &relay_id, &stranger.id(), &relay_id).unwrap();
+        let refusal = Message::Error {
+            code: Refusal::Forbidden,
+            tag: [0; TAG_LEN],
+        };
         assert_eq!(
             register(&b, relay, &relay_id, &stranger, 0).await,
-            Some(Message::Error {
-                code: Refusal::Forbidden
-            })
+            Message::decode(&crate::relay::tagged(&key, &REGISTRATION_NONCE, &refusal))
         );
         // Without the proof, not even that much is said.
         let unproven = with_token(&b, relay, |token| Message::Register {
@@ -2789,12 +3007,16 @@ mod wire_tests {
             flags: 0,
             stamp: stamp(),
             proof: [0; crate::relay::PROOF_LEN],
+            nonce: [0x5a; 16],
         })
         .await;
+        // ... and with no more than the nonce given back: the relay has no
+        // key to tag it with.
         assert_eq!(
             unproven,
             Some(Message::Error {
-                code: Refusal::BadToken
+                code: Refusal::BadToken,
+                tag: REGISTRATION_NONCE,
             })
         );
         cancel.cancel();
@@ -2824,12 +3046,14 @@ mod wire_tests {
             hints: Hints::none(),
             target: receiver.id(),
             token,
+            nonce: [0x5a; 16],
         })
         .await;
         assert_eq!(
             plain,
             Some(Message::Error {
-                code: Refusal::Forbidden
+                code: Refusal::Forbidden,
+                tag: [0x5a; 16],
             })
         );
         let token = token_for(&sc, relay, receiver.id()).await;
@@ -2843,15 +3067,18 @@ mod wire_tests {
                     token,
                     id: who.id(),
                     proof: [0; crate::relay::PROOF_LEN],
+                    nonce: [0x5a; 16],
                 },
             )
         };
         // Someone else claiming the listed identity cannot make its proof.
         sc.send_to(&as_who(&listed, &other), relay).await.unwrap();
+        // (Every answer to a sender gives its nonce back.)
         assert_eq!(
             recv_message(&sc, Duration::from_secs(2)).await,
             Some(Message::Error {
-                code: Refusal::BadToken
+                code: Refusal::BadToken,
+                tag: [0x5a; 16],
             })
         );
         // Proven, but not listed.
@@ -2859,7 +3086,8 @@ mod wire_tests {
         assert_eq!(
             recv_message(&sc, Duration::from_secs(2)).await,
             Some(Message::Error {
-                code: Refusal::Forbidden
+                code: Refusal::Forbidden,
+                tag: [0x5a; 16],
             })
         );
         // Proven and listed.

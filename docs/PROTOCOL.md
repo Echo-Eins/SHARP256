@@ -1059,20 +1059,52 @@ these, with nothing left over, is ignored.
 
 | kind | message | direction | body |
 |---|---|---|---|
-| 1 | Register | receiver → relay | `id[32] token[16] flags:u8 stamp:u64 hints proof[16]` (flag 0x01: private) |
-| 2 | Challenge | relay → peer | `token[16]` |
-| 3 | Registered | relay → receiver | `lease:u32 observed:addr` |
-| 4 | Connect | sender → relay | `target[32] token[16] hints` |
-| 5 | Allocated | relay → sender | `port:u16 peer:addr ticket[16] hints` (peer unspecified: private) |
-| 6 | Incoming | relay → receiver | `port:u16 peer:addr ticket[16] hints` |
-| 7 | Error | relay → peer | `code:u8` (1 unknown, 2 bad token or proof, 3 busy, 4 stale) |
+| 1 | Register | receiver → relay | `id[32] token[16] flags:u8 stamp:u64 hints nonce[16] proof[16]` (flag 0x01: private) |
+| 2 | Challenge | relay → peer | `token[16] tag[16]` |
+| 3 | Registered | relay → receiver | `lease:u32 observed:addr tag[16]` |
+| 4 | Connect | sender → relay | `target[32] token[16] hints nonce[16]` |
+| 5 | Allocated | relay → sender | `port:u16 peer:addr ticket[16] hints tag[16]` (peer unspecified: private) |
+| 6 | Incoming | relay → receiver | `port:u16 peer:addr ticket[16] hints tag[16]` |
+| 7 | Error | relay → peer | `code:u8 tag[16]` (1 unknown, 2 bad token or proof, 3 busy, 4 stale) |
 | 8 | Open | peer → allocated port | `ticket[16] proof[16]` (proof zero: asking) |
 | 9 | Punch | peer → peer | — |
-| 10 | Bye | receiver → relay | `id[32] token[16] stamp:u64 proof[16]` |
+| 10 | Bye | receiver → relay | `id[32] token[16] stamp:u64 nonce[16] proof[16]` |
 | 11 | Confirm | allocated port → peer | `proof[16]` |
-| 12 | ConnectAs | sender → relay | `target[32] token[16] hints id[32] proof[16]` |
+| 12 | ConnectAs | sender → relay | `target[32] token[16] hints nonce[16] id[32] proof[16]` |
 
 Refusal 5 is *forbidden*: the relay serves only identities on its list.
+
+**Every answer a relay gives is one only it could give.** A datagram's
+source address is anybody's to write, and a peer used to believe whatever
+came "from the relay's address": a forged `Incoming` had a receiver push
+datagrams at any address it named — with hints claiming a NAT that draws
+ports at random, a spray of 2048 — a forged refusal took a receiver off its
+relay for ten minutes, and a forged `Registered` told it a made-up address
+and shortened its keepalive. Now every request carries a `nonce` (a
+receiver picks one when it starts and puts it in all its registrations and
+its goodbye; a sender picks one per attempt to be put through), and every
+message the relay sends closes with a `tag`:
+
+* To a receiver whose registration it has checked — `Registered`,
+  `Incoming`, and the refusals it gives after checking (`busy` for a full
+  share, `stale`, `forbidden`) — the tag is
+  `BLAKE3-keyed(K', nonce || message up to it)[0..16]`, with
+  `K' = BLAKE3-derive_key("sharp256 relay v1 relay to peer", K)` and `K` the
+  registration key below. Only the relay and the receiver can compute it,
+  and it holds for this run of the receiver only.
+* To anybody else, and before a registration's proof is checked
+  (`Challenge`, a `busy` under load, `bad token or proof`, and everything a
+  sender is told), the tag is the nonce of the request it answers, given
+  back: somebody who cannot see the requests cannot answer them.
+
+A receiver acts on `Registered`, `Incoming`, `stale` and `forbidden` only
+with the MAC, and on anything else only with one of the two; a sender only
+on answers that give its nonce back. Anything else from the relay's address
+is ignored. What is left is a party *on the path* to the relay: it sees a
+sender's nonce and can answer in the relay's name — as it could drop the
+sender's datagrams anyway — and a `forbidden` it forges still makes a sender
+that knows the relay's ID name itself (`docs/THREAT_MODEL.md`, Р11). A
+receiver's messages it cannot forge: the MAC needs the key.
 
 **Hints** are `nat[6] alt`, where `alt` is either the single byte `0` (nothing
 to say) or `addr nat[6]`: the peer's address in the *other* address family

@@ -289,6 +289,30 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   end now follows the other to a relay's port, an address on a TURN server
   or a TURN shim while its direct address was heard from in the last three
   seconds; a direct path that stays quiet longer is left as before.
+- **Only the relay speaks for the relay.** A peer believed whatever came
+  from its relay's address, and the source address of a datagram is anybody's
+  to write: a forged `Incoming` had a receiver push datagrams at any address
+  it named — with hints claiming a NAT that draws ports at random, a spray of
+  2048, which made receivers reflectors with an amplification in the hundreds
+  — a forged refusal took a receiver off its relay for ten minutes, and a
+  forged `Registered` gave it a made-up address and a shorter keepalive.
+  Every request now carries a nonce and every answer a tag: to a receiver, a
+  MAC on the key its registration was proven with, over the message and the
+  nonce of this run of the receiver; to a sender, the nonce of its request
+  given back. What does not carry its tag is ignored. On the previous code a
+  test that forges an introduction from the relay's address had the receiver
+  send 7 datagrams at a stranger in two seconds; now it sends none, and the
+  real introduction works as before. This changes the relay's wire format:
+  relays and peers are updated together.
+- **A test that failed on a busy machine.**
+  `a_sender_cannot_shatter_the_receivers_bookkeeping` read "what the receiver
+  holds" as the largest figure acknowledged within half a second, and 0 when
+  nothing came: on a CI runner
+  busy with the other tests it subtracted 1 from 0 (it failed once, in one of
+  two runs of the same commit). Pinned to one core beside three busy loops it
+  failed 5 times out of 5. It now waits for the acknowledgement of a marker
+  sent after its question — the receiver deals with datagrams in the order
+  they arrive — and passes 5 times out of 5 under the same load.
 - **What an adversarial review of this round found, fixed.** An address on a
   TURN server was on the lines people copy (`Senders use:`, `Addresses:`),
   and a peer given it punched at it as at a host whose NAT is unknown —

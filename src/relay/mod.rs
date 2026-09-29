@@ -59,6 +59,15 @@ pub const TOKEN_LEN: usize = 16;
 /// Proof that a registration is made by whoever owns the identity it
 /// claims.
 pub const PROOF_LEN: usize = 16;
+/// A random number a peer puts in its requests, which every answer to them
+/// carries back: whoever cannot see the requests cannot answer them.
+pub const NONCE_LEN: usize = 16;
+/// What closes every message a relay sends a peer: the nonce of the
+/// request it answers, given back, or — to a receiver whose registration
+/// the relay has checked — a MAC on the key the two share ([`relay_tag`]).
+pub const TAG_LEN: usize = 16;
+// A nonce given back is a tag.
+const _: () = assert!(NONCE_LEN == TAG_LEN);
 
 /// A registration asks the relay to send people to us. Whoever owns the
 /// identity is the only one who should be able to ask.
@@ -111,6 +120,55 @@ pub fn proof_is_good(key: &[u8; 32], pkt: &[u8]) -> bool {
     };
     let (signed, given) = pkt.split_at(split);
     bool::from(proof_for(key, signed).ct_eq(given))
+}
+
+/// The tag a relay closes a message to a registered receiver with: a MAC,
+/// on the key their registration was proven with ([`auth_key`]), over the
+/// message and the nonce the receiver's registrations carry. Nobody but
+/// the relay can make it — the source address of a datagram is anybody's
+/// to write, and before this an introduction or a refusal "from the relay"
+/// was believed on its address alone — and it holds for this run of the
+/// receiver only: another run registers with another nonce.
+pub fn relay_tag(key: &[u8; 32], nonce: &[u8; NONCE_LEN], unsigned: &[u8]) -> [u8; TAG_LEN] {
+    // A key of its own, so that nothing the relay tags could ever pass for
+    // a peer's proof, or the other way round.
+    let own = blake3::derive_key("sharp256 relay v1 relay to peer", key);
+    let mut mac = blake3::Hasher::new_keyed(&own);
+    mac.update(nonce);
+    mac.update(unsigned);
+    let mut out = [0u8; TAG_LEN];
+    out.copy_from_slice(&mac.finalize().as_bytes()[..TAG_LEN]);
+    out
+}
+
+/// Encodes a message a relay sends a registered receiver, closed with its
+/// [`relay_tag`] (whatever tag the message was built with is replaced).
+pub fn tagged(key: &[u8; 32], nonce: &[u8; NONCE_LEN], msg: &Message) -> Vec<u8> {
+    let mut bytes = msg.encode();
+    let split = bytes.len() - TAG_LEN;
+    let tag = relay_tag(key, nonce, &bytes[..split]);
+    bytes[split..].copy_from_slice(&tag);
+    bytes
+}
+
+/// Whether `pkt`, a message from a relay, ends in the tag only that relay
+/// could have made for this receiver ([`relay_tag`]).
+pub fn relay_tag_is_good(key: &[u8; 32], nonce: &[u8; NONCE_LEN], pkt: &[u8]) -> bool {
+    let Some(split) = pkt.len().checked_sub(TAG_LEN) else {
+        return false;
+    };
+    let (unsigned, given) = pkt.split_at(split);
+    bool::from(relay_tag(key, nonce, unsigned).ct_eq(given))
+}
+
+/// Whether `pkt`, a message from a relay, ends in `nonce` given back: it
+/// answers a request of ours, which somebody who cannot see our requests
+/// could not have done.
+pub fn echoes(nonce: &[u8; NONCE_LEN], pkt: &[u8]) -> bool {
+    let Some(split) = pkt.len().checked_sub(TAG_LEN) else {
+        return false;
+    };
+    bool::from(pkt[split..].ct_eq(&nonce[..]))
 }
 
 /// Registration flags.
@@ -304,6 +362,10 @@ pub enum Message {
         /// authority: the proof covers it, but only so that nobody on the
         /// way can change it.
         hints: Hints,
+        /// Chosen by the receiver when it starts, the same in all its
+        /// registrations; what the relay sends it is tagged with it (see
+        /// [`relay_tag`]).
+        nonce: [u8; NONCE_LEN],
         /// Proof that this is the identity's owner asking.
         proof: [u8; PROOF_LEN],
     },
@@ -311,12 +373,16 @@ pub enum Message {
     /// registration with this token.
     Challenge {
         token: [u8; TOKEN_LEN],
+        /// The nonce of the request it answers.
+        tag: [u8; TAG_LEN],
     },
     /// Relay → peer: registered, for this many seconds, and this is the
     /// address the relay sees you at.
     Registered {
         lease: u32,
         observed: SocketAddr,
+        /// [`relay_tag`].
+        tag: [u8; TAG_LEN],
     },
     /// Sender → relay: "put me through to this identity".
     Connect {
@@ -324,6 +390,8 @@ pub enum Message {
         token: [u8; TOKEN_LEN],
         /// The sender's own, for the receiver to be told.
         hints: Hints,
+        /// Fresh for each attempt; the answer gives it back.
+        nonce: [u8; NONCE_LEN],
     },
     /// Sender → relay: the same, saying who is asking and proving it, for a
     /// relay that serves only identities on its list. The proof is made as
@@ -333,6 +401,7 @@ pub enum Message {
         target: SharpId,
         token: [u8; TOKEN_LEN],
         hints: Hints,
+        nonce: [u8; NONCE_LEN],
         id: SharpId,
         proof: [u8; PROOF_LEN],
     },
@@ -347,6 +416,8 @@ pub enum Message {
         /// What the receiver said of its NAT when it registered: how to aim
         /// at it when its address alone is not enough.
         hints: Hints,
+        /// The nonce of the request it answers.
+        tag: [u8; TAG_LEN],
     },
     /// Relay → receiver: somebody is coming through on this port, and they
     /// appear to be at this address. Send an [`Message::Open`] to the port
@@ -357,10 +428,15 @@ pub enum Message {
         ticket: [u8; TOKEN_LEN],
         /// What the sender said of its NAT.
         hints: Hints,
+        /// [`relay_tag`]: an introduction makes a receiver push datagrams
+        /// at the address it names, so one that anybody could send would be
+        /// a way to have receivers fire at a stranger.
+        tag: [u8; TAG_LEN],
     },
-    Error {
-        code: Refusal,
-    },
+    /// Relay → peer: no. Tagged as the relay can: a refusal of a
+    /// registration it has checked with [`relay_tag`], anything else with
+    /// the nonce of the request it answers.
+    Error { code: Refusal, tag: [u8; TAG_LEN] },
     /// Peer → relay, at an allocated port: nothing to carry. It says which
     /// side is speaking and, just as importantly, opens the way back
     /// through the NAT — which is why the relay cannot simply assume a
@@ -380,9 +456,7 @@ pub enum Message {
         proof: [u8; TOKEN_LEN],
     },
     /// Relay → peer, from an allocated port: repeat your Open with this.
-    Confirm {
-        proof: [u8; TOKEN_LEN],
-    },
+    Confirm { proof: [u8; TOKEN_LEN] },
     /// Peer → peer, not to the relay at all: a datagram whose only purpose
     /// is to make the sender's own NAT open a way back for the other side.
     /// The receiver sends a few of these the moment the relay introduces
@@ -399,6 +473,8 @@ pub enum Message {
         /// Newer than the registration it ends; see `Register::stamp`. An
         /// old goodbye sent again must not end a registration made since.
         stamp: u64,
+        /// The registrations' nonce, for the answer to carry back.
+        nonce: [u8; NONCE_LEN],
         proof: [u8; PROOF_LEN],
     },
 }
@@ -445,6 +521,13 @@ fn put_addr(out: &mut Vec<u8>, addr: SocketAddr) {
             out.extend_from_slice(&v6.octets());
         }
     }
+}
+
+/// Sixteen bytes: a token, a nonce, a tag.
+fn take_16(buf: &[u8], pos: &mut usize) -> Option<[u8; 16]> {
+    let out = buf.get(*pos..*pos + 16)?.try_into().ok()?;
+    *pos += 16;
+    Some(out)
 }
 
 fn take_addr(buf: &[u8], pos: &mut usize) -> Option<SocketAddr> {
@@ -518,6 +601,7 @@ impl Message {
                 flags,
                 stamp,
                 hints,
+                nonce,
                 proof,
             } => {
                 out.push(Kind::Register as u8);
@@ -526,31 +610,41 @@ impl Message {
                 out.push(*flags);
                 out.extend_from_slice(&stamp.to_be_bytes());
                 put_hints(&mut out, hints);
+                out.extend_from_slice(nonce);
                 out.extend_from_slice(proof);
             }
-            Message::Challenge { token } => {
+            Message::Challenge { token, tag } => {
                 out.push(Kind::Challenge as u8);
                 out.extend_from_slice(token);
+                out.extend_from_slice(tag);
             }
-            Message::Registered { lease, observed } => {
+            Message::Registered {
+                lease,
+                observed,
+                tag,
+            } => {
                 out.push(Kind::Registered as u8);
                 out.extend_from_slice(&lease.to_be_bytes());
                 put_addr(&mut out, *observed);
+                out.extend_from_slice(tag);
             }
             Message::Connect {
                 target,
                 token,
                 hints,
+                nonce,
             } => {
                 out.push(Kind::Connect as u8);
                 out.extend_from_slice(target.as_bytes());
                 out.extend_from_slice(token);
                 put_hints(&mut out, hints);
+                out.extend_from_slice(nonce);
             }
             Message::ConnectAs {
                 target,
                 token,
                 hints,
+                nonce,
                 id,
                 proof,
             } => {
@@ -558,6 +652,7 @@ impl Message {
                 out.extend_from_slice(target.as_bytes());
                 out.extend_from_slice(token);
                 put_hints(&mut out, hints);
+                out.extend_from_slice(nonce);
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(proof);
             }
@@ -566,28 +661,33 @@ impl Message {
                 peer,
                 ticket,
                 hints,
+                tag,
             } => {
                 out.push(Kind::Allocated as u8);
                 out.extend_from_slice(&port.to_be_bytes());
                 put_addr(&mut out, *peer);
                 out.extend_from_slice(ticket);
                 put_hints(&mut out, hints);
+                out.extend_from_slice(tag);
             }
             Message::Incoming {
                 port,
                 peer,
                 ticket,
                 hints,
+                tag,
             } => {
                 out.push(Kind::Incoming as u8);
                 out.extend_from_slice(&port.to_be_bytes());
                 put_addr(&mut out, *peer);
                 out.extend_from_slice(ticket);
                 put_hints(&mut out, hints);
+                out.extend_from_slice(tag);
             }
-            Message::Error { code } => {
+            Message::Error { code, tag } => {
                 out.push(Kind::Error as u8);
                 out.push(*code as u8);
+                out.extend_from_slice(tag);
             }
             Message::Open { ticket, proof } => {
                 out.push(Kind::Open as u8);
@@ -603,12 +703,14 @@ impl Message {
                 id,
                 token,
                 stamp,
+                nonce,
                 proof,
             } => {
                 out.push(Kind::Bye as u8);
                 out.extend_from_slice(id.as_bytes());
                 out.extend_from_slice(token);
                 out.extend_from_slice(&stamp.to_be_bytes());
+                out.extend_from_slice(nonce);
                 out.extend_from_slice(proof);
             }
         }
@@ -640,6 +742,7 @@ impl Message {
                         let stamp = u64::from_be_bytes(body.get(pos..pos + 8)?.try_into().ok()?);
                         pos += 8;
                         let hints = take_hints(body, &mut pos)?;
+                        let nonce = take_16(body, &mut pos)?;
                         let proof: [u8; PROOF_LEN] =
                             body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
                         pos += PROOF_LEN;
@@ -649,20 +752,24 @@ impl Message {
                             flags,
                             stamp,
                             hints,
+                            nonce,
                             proof,
                         }
                     }
                     Kind::Connect => {
                         let hints = take_hints(body, &mut pos)?;
+                        let nonce = take_16(body, &mut pos)?;
                         Message::Connect {
                             target: id,
                             token,
                             hints,
+                            nonce,
                         }
                     }
                     _ => {
                         let stamp = u64::from_be_bytes(body.get(pos..pos + 8)?.try_into().ok()?);
                         pos += 8;
+                        let nonce = take_16(body, &mut pos)?;
                         let proof: [u8; PROOF_LEN] =
                             body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
                         pos += PROOF_LEN;
@@ -670,6 +777,7 @@ impl Message {
                             id,
                             token,
                             stamp,
+                            nonce,
                             proof,
                         }
                     }
@@ -680,6 +788,7 @@ impl Message {
                 let token: [u8; TOKEN_LEN] = body.get(32..32 + TOKEN_LEN)?.try_into().ok()?;
                 pos = 32 + TOKEN_LEN;
                 let hints = take_hints(body, &mut pos)?;
+                let nonce = take_16(body, &mut pos)?;
                 let id: [u8; 32] = body.get(pos..pos + 32)?.try_into().ok()?;
                 pos += 32;
                 let proof: [u8; PROOF_LEN] = body.get(pos..pos + PROOF_LEN)?.try_into().ok()?;
@@ -688,22 +797,26 @@ impl Message {
                     target: SharpId::from_public(target),
                     token,
                     hints,
+                    nonce,
                     id: SharpId::from_public(id),
                     proof,
                 }
             }
             Kind::Challenge => {
-                pos = TOKEN_LEN;
-                Message::Challenge {
-                    token: body.get(0..TOKEN_LEN)?.try_into().ok()?,
-                }
+                pos = 0;
+                let token = take_16(body, &mut pos)?;
+                let tag = take_16(body, &mut pos)?;
+                Message::Challenge { token, tag }
             }
             Kind::Registered => {
                 let lease = u32::from_be_bytes(body.get(0..4)?.try_into().ok()?);
                 pos = 4;
+                let observed = take_addr(body, &mut pos)?;
+                let tag = take_16(body, &mut pos)?;
                 Message::Registered {
                     lease,
-                    observed: take_addr(body, &mut pos)?,
+                    observed,
+                    tag,
                 }
             }
             Kind::Allocated | Kind::Incoming => {
@@ -713,12 +826,14 @@ impl Message {
                 let ticket: [u8; TOKEN_LEN] = body.get(pos..pos + TOKEN_LEN)?.try_into().ok()?;
                 pos += TOKEN_LEN;
                 let hints = take_hints(body, &mut pos)?;
+                let tag = take_16(body, &mut pos)?;
                 if kind == Kind::Allocated {
                     Message::Allocated {
                         port,
                         peer,
                         ticket,
                         hints,
+                        tag,
                     }
                 } else {
                     Message::Incoming {
@@ -726,14 +841,15 @@ impl Message {
                         peer,
                         ticket,
                         hints,
+                        tag,
                     }
                 }
             }
             Kind::Error => {
                 pos = 1;
-                Message::Error {
-                    code: Refusal::from_u8(*body.first()?)?,
-                }
+                let code = Refusal::from_u8(*body.first()?)?;
+                let tag = take_16(body, &mut pos)?;
+                Message::Error { code, tag }
             }
             Kind::Open => {
                 pos = 2 * TOKEN_LEN;
@@ -812,6 +928,7 @@ mod tests {
                 target: id,
                 token: [1; TOKEN_LEN],
                 hints,
+                nonce: [0x5a; 16],
             });
             roundtrip(Message::ConnectAs {
                 target: id,
@@ -819,6 +936,7 @@ mod tests {
                 hints,
                 id,
                 proof: [9; PROOF_LEN],
+                nonce: [0x5a; 16],
             });
             roundtrip(Message::Register {
                 id,
@@ -827,18 +945,21 @@ mod tests {
                 stamp: 5,
                 hints,
                 proof: [9; PROOF_LEN],
+                nonce: [0x5a; 16],
             });
             roundtrip(Message::Allocated {
                 port: 40000,
                 peer: "203.0.113.1:5".parse().unwrap(),
                 ticket: [2; TOKEN_LEN],
                 hints,
+                tag: [0; 16],
             });
             roundtrip(Message::Incoming {
                 port: 40001,
                 peer: "[2001:db8::1]:5".parse().unwrap(),
                 ticket: [3; TOKEN_LEN],
                 hints,
+                tag: [0; 16],
             });
         }
         // A value this version would not write is refused, not guessed at.
@@ -847,9 +968,10 @@ mod tests {
             peer: "203.0.113.1:5".parse().unwrap(),
             ticket: [3; TOKEN_LEN],
             hints: plain,
+            tag: [0; 16],
         }
         .encode();
-        let at = bytes.len() - 1 - NatHints::WIRE_LEN;
+        let at = bytes.len() - TAG_LEN - 1 - NatHints::WIRE_LEN;
         bytes[at] = 99;
         assert_eq!(Message::decode(&bytes), None);
         // So is a family byte that is neither "none" nor an address, and an
@@ -859,10 +981,11 @@ mod tests {
             peer: "203.0.113.1:5".parse().unwrap(),
             ticket: [3; TOKEN_LEN],
             hints: with_v6,
+            tag: [0; 16],
         }
         .encode();
         let mut bytes = good.clone();
-        let family = good.len() - (19 + NatHints::WIRE_LEN);
+        let family = good.len() - TAG_LEN - (19 + NatHints::WIRE_LEN);
         assert_eq!(bytes[family], 6);
         bytes[family] = 5;
         assert_eq!(Message::decode(&bytes), None);
@@ -874,6 +997,7 @@ mod tests {
             hints: with_v6,
             id,
             proof: [9; PROOF_LEN],
+            nonce: [0x5a; 16],
         }
         .encode();
         assert!(longest.len() <= MAX_MESSAGE, "{} bytes", longest.len());
@@ -1009,6 +1133,7 @@ mod tests {
             flags: REGISTER_PRIVATE,
             stamp: 77,
             proof: [0; PROOF_LEN],
+            nonce: [0x5a; 16],
         }
         .encode();
         let split = bytes.len() - PROOF_LEN;
@@ -1024,6 +1149,7 @@ mod tests {
                 flags: REGISTER_PRIVATE,
                 stamp: 77,
                 proof,
+                nonce: [0x5a; 16],
             })
         );
 
@@ -1059,6 +1185,7 @@ mod tests {
             flags: 0,
             stamp: 0,
             proof: [0; PROOF_LEN],
+            nonce: [0x5a; 16],
         });
         roundtrip(Message::Register {
             hints: Hints::none(),
@@ -1067,22 +1194,27 @@ mod tests {
             flags: REGISTER_PRIVATE,
             stamp: u64::MAX,
             proof: [1; PROOF_LEN],
+            nonce: [0x5a; 16],
         });
         roundtrip(Message::Challenge {
             token: [9; TOKEN_LEN],
+            tag: [0; 16],
         });
         roundtrip(Message::Registered {
             lease: 300,
             observed: "203.0.113.4:41000".parse().unwrap(),
+            tag: [0; 16],
         });
         roundtrip(Message::Registered {
             lease: 0,
             observed: "[2001:db8::1]:5555".parse().unwrap(),
+            tag: [0; 16],
         });
         roundtrip(Message::Connect {
             hints: Hints::none(),
             target: id,
             token: [3; TOKEN_LEN],
+            nonce: [0x5a; 16],
         });
         roundtrip(Message::ConnectAs {
             hints: Hints::none(),
@@ -1090,18 +1222,21 @@ mod tests {
             token: [3; TOKEN_LEN],
             id: Identity::generate().id(),
             proof: [9; PROOF_LEN],
+            nonce: [0x5a; 16],
         });
         roundtrip(Message::Allocated {
             hints: Hints::none(),
             port: 50001,
             peer: "198.51.100.9:6000".parse().unwrap(),
             ticket: [5; TOKEN_LEN],
+            tag: [0; 16],
         });
         roundtrip(Message::Incoming {
             hints: Hints::none(),
             port: 50001,
             peer: "[2001:db8::2]:6000".parse().unwrap(),
             ticket: [6; TOKEN_LEN],
+            tag: [0; 16],
         });
         for code in [
             Refusal::Unknown,
@@ -1110,7 +1245,7 @@ mod tests {
             Refusal::Stale,
             Refusal::Forbidden,
         ] {
-            roundtrip(Message::Error { code });
+            roundtrip(Message::Error { code, tag: [0; 16] });
         }
         roundtrip(Message::Open {
             ticket: [8; TOKEN_LEN],
@@ -1129,6 +1264,7 @@ mod tests {
             token: [2; TOKEN_LEN],
             stamp: 1 << 40,
             proof: [3; PROOF_LEN],
+            nonce: [0x5a; 16],
         });
     }
 
@@ -1145,6 +1281,7 @@ mod tests {
             flags: 0,
             stamp: 9,
             proof: [1; PROOF_LEN],
+            nonce: [0x5a; 16],
         }
         .encode();
 
@@ -1171,6 +1308,7 @@ mod tests {
         assert!(Message::decode(&bad_kind).is_none());
         let mut bad_code = Message::Error {
             code: Refusal::Busy,
+            tag: [0; 16],
         }
         .encode();
         bad_code[HEADER_LEN] = 42;
@@ -1178,6 +1316,7 @@ mod tests {
         let mut bad_family = Message::Registered {
             lease: 1,
             observed: "10.0.0.1:1".parse().unwrap(),
+            tag: [0; 16],
         }
         .encode();
         bad_family[HEADER_LEN + 4] = 9;

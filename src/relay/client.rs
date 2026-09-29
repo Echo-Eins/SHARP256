@@ -12,7 +12,7 @@
 //! registration made from any other socket would describe a way in that
 //! does not exist.
 
-use super::{Alt, Hints, Message, Refusal, PROOF_LEN, TOKEN_LEN};
+use super::{Alt, Hints, Message, Refusal, NONCE_LEN, PROOF_LEN, TOKEN_LEN};
 use crate::crypto::{Identity, SharpId};
 use crate::nat::card::NatHints;
 use crate::nat::punch::Puncher;
@@ -131,6 +131,10 @@ pub async fn connect(
     hints: Hints,
 ) -> Result<Introduction, ConnectError> {
     let mut token = [0u8; TOKEN_LEN];
+    // What every answer to us has to carry back: without it, anybody who
+    // can write the relay's address on a datagram could answer for it —
+    // refuse us, or point our punches at whoever they liked.
+    let nonce: [u8; NONCE_LEN] = rand::random();
     // Set once the relay has refused us as a stranger.
     let mut identify: Option<(SharpId, [u8; 32])> = None;
     // Since when the relay has been saying it does not know the receiver,
@@ -151,6 +155,7 @@ pub async fn connect(
                     target,
                     token,
                     hints,
+                    nonce,
                     id,
                     proof: [0; PROOF_LEN],
                 },
@@ -159,6 +164,7 @@ pub async fn connect(
                 target,
                 token,
                 hints,
+                nonce,
             }
             .encode(),
         };
@@ -168,14 +174,19 @@ pub async fn connect(
                 relay, e
             )));
         }
-        match wait_for(incoming, relay, REPLY_WAIT).await {
+        match wait_for(incoming, relay, REPLY_WAIT, |pkt| {
+            super::echoes(&nonce, pkt)
+        })
+        .await
+        {
             // The relay wants us to prove we receive where we say we do.
-            Some(Message::Challenge { token: t }) => token = t,
+            Some(Message::Challenge { token: t, .. }) => token = t,
             Some(Message::Allocated {
                 port,
                 peer,
                 ticket,
                 hints: peer_hints,
+                ..
             }) => {
                 // The relay may decline to say where the receiver is,
                 // because the receiver asked it not to. There is then no
@@ -210,6 +221,7 @@ pub async fn connect(
             // are, if we can prove it to this relay.
             Some(Message::Error {
                 code: Refusal::Forbidden,
+                ..
             }) if identify.is_none() => {
                 let proven = auth.and_then(|(identity, relay_id)| {
                     let id = identity.id();
@@ -228,6 +240,7 @@ pub async fn connect(
             }
             Some(Message::Error {
                 code: Refusal::Unknown,
+                ..
             }) => {
                 let (since, pause) = unknown.get_or_insert((Instant::now(), UNKNOWN_PAUSE));
                 if since.elapsed() >= UNKNOWN_PATIENCE {
@@ -250,7 +263,7 @@ pub async fn connect(
                 // Waiting for the receiver is not a try that failed.
                 tries -= 1;
             }
-            Some(Message::Error { code }) => {
+            Some(Message::Error { code, .. }) => {
                 return Err(ConnectError::Refused(code.describe().to_string()))
             }
             _ => {}
@@ -360,6 +373,12 @@ pub async fn serve(
         tracing::warn!("relay {}: its identity is not a usable key", relay);
         return;
     };
+    // Chosen now and put in every registration: what the relay sends us is
+    // tagged with it and with the key above, and nothing it does not carry
+    // is acted on — a datagram's source address is anybody's to write, and
+    // a forged introduction would have us push datagrams at whoever it
+    // named, a forged refusal take us off the relay (see `relay_tag`).
+    let nonce: [u8; NONCE_LEN] = rand::random();
     let reach = crate::address::Reach::of(&socket);
     let mut hints_changed = puncher.subscribe();
     let mut watching_hints = true;
@@ -439,6 +458,7 @@ pub async fn serve(
                     flags,
                     stamp: stamps.next(),
                     hints: Hints::told_to(&puncher.mine(), relay),
+                    nonce,
                     proof: [0; PROOF_LEN],
                 },
             );
@@ -492,7 +512,7 @@ pub async fn serve(
             }
             _ = cancel.cancelled() => {
                 if registered {
-                    goodbye(&socket, relay, &key, id, token, &mut stamps, &mut incoming).await;
+                    goodbye(&socket, relay, &key, id, token, nonce, &mut stamps, &mut incoming).await;
                 }
                 return;
             }
@@ -521,16 +541,24 @@ pub async fn serve(
             }
             continue;
         }
+        // Made by the relay for this run of ours, or at least an answer to
+        // a request of ours; nothing else from its address is believed.
+        let authentic = super::relay_tag_is_good(&key, &nonce, &pkt);
+        if !authentic && !super::echoes(&nonce, &pkt) {
+            tracing::debug!("relay {}: a message not made for us; ignored", relay);
+            continue;
+        }
         unanswered = 0;
         match msg {
-            Message::Challenge { token: t } => {
+            Message::Challenge { token: t, .. } => {
                 token = t;
                 next_send = Instant::now();
             }
             Message::Registered {
                 lease: secs,
                 observed: seen,
-            } => {
+                ..
+            } if authentic => {
                 lease = Duration::from_secs(secs.clamp(10, 3600) as u64);
                 confirmed_at = Instant::now();
                 match observed {
@@ -577,7 +605,8 @@ pub async fn serve(
                 peer,
                 ticket,
                 hints: peer_hints,
-            } => {
+                ..
+            } if authentic => {
                 let relayed = SocketAddr::new(relay.ip(), port);
                 // The relay repeats an introduction until our side of the
                 // port is bound, because a lost one would otherwise fail the
@@ -671,19 +700,20 @@ pub async fn serve(
                     );
                 });
             }
-            Message::Error { code } => {
+            Message::Error { code, .. } => {
                 match code {
-                    // Worth retrying, later.
+                    // Worth retrying, later. (Before it has checked who we
+                    // are, a relay under load can only give our nonce back.)
                     Refusal::Busy => next_send = Instant::now() + Duration::from_secs(30),
                     // Our clock is behind what the relay last took from us.
                     // Nothing to do but wait for it to forget.
-                    Refusal::Stale => {
+                    Refusal::Stale if authentic => {
                         tracing::warn!("relay {}: {}", relay, code.describe());
                         next_send = Instant::now() + Duration::from_secs(60);
                     }
                     // Not on the relay's list. Its operator may add us, so
                     // ask again now and then, not in a tight loop.
-                    Refusal::Forbidden => {
+                    Refusal::Forbidden if authentic => {
                         if registered || unanswered == 0 {
                             tracing::warn!(
                                 "relay {} serves only receivers on its list, and not this one",
@@ -730,12 +760,14 @@ const GOODBYE_WAIT: Duration = Duration::from_millis(700);
 ///
 /// The token we hold may have expired since the last keepalive; the relay
 /// then answers with a fresh one, and the goodbye is sent again with it.
+#[allow(clippy::too_many_arguments)]
 async fn goodbye(
     socket: &UdpSocket,
     relay: SocketAddr,
     key: &[u8; 32],
     id: SharpId,
     mut token: [u8; TOKEN_LEN],
+    nonce: [u8; NONCE_LEN],
     stamps: &mut Stamps,
     incoming: &mut mpsc::Receiver<Incoming>,
 ) {
@@ -746,14 +778,19 @@ async fn goodbye(
                 id,
                 token,
                 stamp: stamps.next(),
+                nonce,
                 proof: [0; PROOF_LEN],
             },
         );
         if socket.send_to(&bye, relay).await.is_err() {
             return;
         }
-        match wait_for(incoming, relay, GOODBYE_WAIT).await {
-            Some(Message::Challenge { token: t }) => token = t,
+        match wait_for(incoming, relay, GOODBYE_WAIT, |pkt| {
+            super::echoes(&nonce, pkt)
+        })
+        .await
+        {
+            Some(Message::Challenge { token: t, .. }) => token = t,
             _ => return,
         }
     }
@@ -788,11 +825,15 @@ async fn announce(socket: &UdpSocket, allocated: SocketAddr, ticket: [u8; TOKEN_
     }
 }
 
-/// Reads until a relay message from `relay` arrives, or the time is up.
+/// Reads until a relay message from `relay` that `answers_us` takes
+/// arrives, or the time is up. One it refuses — that does not carry what an
+/// answer to us must — is passed over, as anything from elsewhere is: the
+/// relay's address on a datagram proves nothing.
 async fn wait_for(
     incoming: &mut mpsc::Receiver<Incoming>,
     relay: SocketAddr,
     within: Duration,
+    answers_us: impl Fn(&[u8]) -> bool,
 ) -> Option<Message> {
     let deadline = Instant::now() + within;
     loop {
@@ -804,8 +845,197 @@ async fn wait_for(
         if from != relay {
             continue;
         }
+        if !answers_us(&pkt) {
+            tracing::debug!(
+                "relay {}: a message that answers nothing of ours; ignored",
+                relay
+            );
+            continue;
+        }
         if let Some(m) = Message::decode(&pkt) {
             return Some(m);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::{auth_key, tagged, TAG_LEN};
+
+    /// A relay of our own making on loopback: it answers the receiver's
+    /// registrations as a real one does, and can send it anything else.
+    struct FakeRelay {
+        sock: UdpSocket,
+        identity: Identity,
+    }
+
+    impl FakeRelay {
+        /// The next registration from the receiver, its nonce, and where it
+        /// came from.
+        async fn registration(&self) -> ([u8; NONCE_LEN], SocketAddr) {
+            let mut buf = [0u8; 512];
+            loop {
+                let (n, from) = self.sock.recv_from(&mut buf).await.unwrap();
+                if let Some(Message::Register { nonce, .. }) = Message::decode(&buf[..n]) {
+                    return (nonce, from);
+                }
+            }
+        }
+    }
+
+    /// Nothing that arrives at `sock` within `within`: its datagrams.
+    async fn heard(sock: &UdpSocket, within: Duration) -> usize {
+        let mut buf = [0u8; 512];
+        let mut n = 0;
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::timeout_at(deadline, sock.recv_from(&mut buf))
+            .await
+            .is_ok()
+        {
+            n += 1;
+        }
+        n
+    }
+
+    /// Only what the relay made for this receiver is acted on. An
+    /// introduction "from the relay" with anything else for a tag — which
+    /// anybody who can write the relay's address on a datagram could send —
+    /// has the receiver push not a single datagram at the address it names,
+    /// and a confirmation with a made-up address changes nothing; the real
+    /// ones, tagged with the key the registration was proven with and the
+    /// receiver's nonce, work as they always did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_what_the_relay_made_for_us_is_acted_on() {
+        let relay = FakeRelay {
+            sock: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            identity: Identity::generate(),
+        };
+        let relay_addr = relay.sock.local_addr().unwrap();
+        let relay_id = relay.identity.id();
+        let receiver = Identity::generate();
+        let rid = receiver.id();
+        let key = auth_key(&relay.identity, &rid, &rid, &relay_id).unwrap();
+
+        // The receiver's socket, and the engine's part: handing it what the
+        // relay sends.
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let reader = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    if tx.send((buf[..n].to_vec(), from)).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let serving = {
+            let told = told.clone();
+            tokio::spawn(serve(
+                socket.clone(),
+                vec![relay_addr],
+                relay_id,
+                receiver,
+                false,
+                rx,
+                cancel.clone(),
+                Arc::new(parking_lot::Mutex::new(
+                    crate::nat::keepalive::Keepalive::new(Duration::from_secs(15)),
+                )),
+                Arc::new(Puncher::without_hints(socket.clone())),
+                move |_relay, seen| told.lock().push(seen),
+            ))
+        };
+
+        // Registered, as a relay does it: a challenge, then the confirmation.
+        let (nonce, from) = relay.registration().await;
+        let challenge = Message::Challenge {
+            token: [7; TOKEN_LEN],
+            tag: nonce,
+        };
+        relay.sock.send_to(&challenge.encode(), from).await.unwrap();
+        let (again, _) = relay.registration().await;
+        assert_eq!(again, nonce, "one nonce for all of a run's registrations");
+        let registered = Message::Registered {
+            lease: 60,
+            observed: from,
+            tag: [0; TAG_LEN],
+        };
+        let bytes = tagged(&key, &nonce, &registered);
+        relay.sock.send_to(&bytes, from).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            told.lock().as_slice(),
+            &[from],
+            "the real confirmation counts"
+        );
+
+        // A confirmation with a made-up address and no tag of the relay's:
+        // not believed.
+        let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let forged = Message::Registered {
+            lease: 60,
+            observed: elsewhere,
+            tag: nonce,
+        };
+        relay.sock.send_to(&forged.encode(), from).await.unwrap();
+
+        // An introduction naming a stranger, with a tag that is not the
+        // relay's for us (the nonce alone, and nothing at all).
+        let victim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spare = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for tag in [nonce, [0; TAG_LEN]] {
+            let forged = Message::Incoming {
+                port: spare.local_addr().unwrap().port(),
+                peer: victim.local_addr().unwrap(),
+                ticket: [1; TOKEN_LEN],
+                hints: Hints::none(),
+                tag,
+            };
+            relay.sock.send_to(&forged.encode(), from).await.unwrap();
+        }
+        assert_eq!(
+            heard(&victim, Duration::from_millis(1500)).await,
+            0,
+            "a forged introduction had the receiver push datagrams at a stranger"
+        );
+        assert_eq!(heard(&spare, Duration::from_millis(100)).await, 0);
+        assert_eq!(
+            told.lock().as_slice(),
+            &[from],
+            "a forged confirmation was believed"
+        );
+
+        // The relay's own introduction is acted on.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let real = Message::Incoming {
+            port: spare.local_addr().unwrap().port(),
+            peer: sender.local_addr().unwrap(),
+            ticket: [2; TOKEN_LEN],
+            hints: Hints::none(),
+            tag: [0; TAG_LEN],
+        };
+        relay
+            .sock
+            .send_to(&tagged(&key, &nonce, &real), from)
+            .await
+            .unwrap();
+        assert!(
+            heard(&sender, Duration::from_millis(1500)).await > 0,
+            "the real introduction was not acted on"
+        );
+        assert!(
+            heard(&spare, Duration::from_millis(500)).await > 0,
+            "the receiver did not take its side of the relay's port"
+        );
+
+        cancel.cancel();
+        let _ = serving.await;
+        reader.abort();
     }
 }
