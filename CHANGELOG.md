@@ -384,6 +384,60 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   pairs a transfer connects in a second (a random-port NAT against an
   ordinary one), and told people to look for a relay they did not need. All
   36 pairs of the six NAT kinds are checked (`natlab.py probe --all`).
+- **What a program says of its NAT is checked against the NAT.** Behind a
+  NAT that lets in only the hosts it was sent to (a "restricted cone":
+  endpoint-independent mapping, address-dependent filtering), `sharp-probe`,
+  the receiver's `Network:` line and every card said "lets in packets from
+  anyone". The mapping tests of RFC 5780 send from the same socket to the
+  STUN server's other address, and such a NAT lets that address in from
+  then on; asked afterwards to answer from there, the server got through.
+  The filtering tests now run on a new socket of the same kind, which has
+  sent to nothing but the server's primary address. Transfers were not
+  affected (a peer's filtering decides how it is approached only when it has
+  no NAT), but the reconnaissance was wrong for one NAT kind in six. The
+  laboratory's `probe` now holds each host's report — the address the
+  internet sees, mapping, filtering, port numbering, hairpinning — against
+  the NAT it built: 60 of 72 reports were right before, 72 of 72 after. The
+  unit tests' simulated NAT did not remember what a mapping had sent to and
+  could not show it; it does now, per socket.
+- **Tests that nobody answered are run again.** A receiver whose first
+  round of NAT tests got no answer at all — no STUN server reachable yet: a
+  laptop just woken, a link still coming up — kept that for as long as it
+  ran: no outside address published, nothing kept alive (so did a sender
+  that prints its card or looks in the DHT). The tests now run
+  again 5 s later, then twice as long each time up to five minutes, until
+  something answers, and what they find is reported as the first round's
+  would have been. Found while looking into the next item: the laboratory's
+  routers held the first packets through them for a second (duplicate
+  address detection of their own link-local addresses, during which Linux
+  solicits no neighbour for a packet it forwards), and on CI's fast machines
+  an IPv6-only host's `sharp-probe`, which measures IPv6 the moment it
+  starts, said "IPv6: not measured" behind every firewall (18 of 36 reports
+  wrong; the slow virtual machine, 36 of 36). The laboratory now has DAD
+  off everywhere.
+- **A forward when the port is taken.** A receiver asks for the outside port
+  equal to its own; when somebody else has it, PCP and NAT-PMP servers pick
+  another, an IGDv2 router one through `AddAnyPortMapping`, and on an IGDv1
+  router the receiver tries a few of its own. All four ran only against a
+  simulated router until `portmap --taken` (in CI): miniupnpd with port
+  5555 forwarded elsewhere first, 16 of 16 transfers through the port it
+  picked. Every `portmap` row now also finds the forward in the router's
+  own nftables rules, not only in the daemon's log, whose NAT-PMP line names
+  the port asked for rather than the one given.
+- **Hairpinning, both ways.** A NAT that loops back what an inside host sends
+  to the outside address (RFC 4787 REQ-9) is a case of `samenat` now: the
+  two hosts meet at their outside addresses with the relay only introducing,
+  and the receiver reports "hairpinning works" (behind the NAT without the
+  loop, "no hairpinning"). The laboratory could not show this before: its
+  router's bridge, with br_netfilter, put what it only switches through the
+  NAT's rules, and a packet looped back to the host it came from went back
+  untranslated and was dropped.
+- **The laboratory notices a method that is gone.** Two builds of the same
+  commit, each with one method switched off by a one-line change: port
+  prediction (a window of the named port alone) and the birthday method (no
+  extra sockets, no spray). The pairs that need them connect on the commit's
+  own binaries and fail on the builds without (`docs/evidence/nat/
+  mutation.log`).
 - **Reports** name the family a measurement is for; IPv6 gateways are found
   and pinholes reported; the relay answers a question from the address it was
   asked at (it has several on one interface with IPv6).
