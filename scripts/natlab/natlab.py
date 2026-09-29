@@ -221,6 +221,23 @@ def nat_rules(kind, inside, lan="lan", wan="wan"):
 """
 
 
+def gateway_input(wan="wan"):
+    """What every real home gateway does for packets addressed to itself
+    from outside: nothing, unless they answer something it sent. Without
+    this the router accepts a stray packet, replies "port unreachable" and
+    keeps a confirmed conntrack entry for it — which then collides with the
+    outgoing packet that would have opened the port for the peer. A router
+    that drops it keeps no entry."""
+    return f"""table inet gw {{
+  chain input {{
+    type filter hook input priority filter;
+    iifname "{wan}" ct state established,related accept
+    iifname "{wan}" drop
+  }}
+}}
+"""
+
+
 # ----- the topology ----------------------------------------------------------
 
 S1, S2 = "11.9.0.10", "11.9.0.11"
@@ -261,6 +278,7 @@ class Topo:
                 lab.addr(cg, "cw", f"{wan_net}.1/24", f"{wan_net}.254")
                 lab.addr("I", iface, f"{wan_net}.254/24")
                 lab.x(cg, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+                lab.nft(cg, gateway_input("cw"))
                 lab.nft(cg, nat_rules(cgn, "100.64.0.1", lan="cl", wan="cw").replace("$WANIP", f"{wan_net}.1"))
                 self.wan_ip[host] = f"{wan_net}.1"
             else:
@@ -272,6 +290,7 @@ class Topo:
                 # A public host: its network is routed to, not translated.
                 lab.x("I", "ip", "route", "add", f"{lan_net}.0/24", "via", f"{wan_net}.1")
             lab.x(gw, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+            lab.nft(gw, gateway_input())
             rules = nat_rules(kind, f"{lan_net}.2")
             if rules:
                 lab.nft(gw, rules.replace("$WANIP", f"{wan_net}.1"))
@@ -400,6 +419,144 @@ def oracle(kind):
         lab.close()
 
 
+# ----- real transfers -------------------------------------------------------
+
+
+def wait_for(lab, log, pattern, seconds):
+    """The first match of `pattern` in a process's log, waiting up to `seconds`."""
+    end = time.time() + seconds
+    while time.time() < end:
+        m = re.search(pattern, lab.log(log))
+        if m:
+            return m
+        time.sleep(0.2)
+    return None
+
+
+def classify(connected, topo, relay_port):
+    """Which kind of path a session ended up on, from the address it uses."""
+    if connected is None:
+        return "none"
+    ip, port = connected.rsplit(":", 1)
+    if ip == S1 and int(port) != relay_port:
+        return "relay"
+    if ip in topo.wan_ip.values():
+        return "direct-via-nat"
+    if ip.startswith(("10.", "100.64.")):
+        return "lan"
+    return f"direct({ip})"
+
+
+def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=False, verbose=False):
+    """One real transfer, sender behind `a_nat`, receiver behind `b_nat`.
+    Returns (ok, path, seconds, detail)."""
+    lab = Lab(keep=keep)
+    try:
+        topo = Topo(lab, a_nat, b_nat, a_cgn, b_cgn)
+        d = lab.dir
+        if not carry:
+            # The relay may introduce the two, and tell them what each looks
+            # like from outside — but it cannot carry anything: only what a
+            # direct path could do is left.
+            lab.nft("S", f"""table ip filter {{
+  chain in {{
+    type filter hook input priority filter;
+    udp dport {{ 5560, 3478, 3479 }} accept
+    ip protocol udp drop
+  }}
+}}
+""")
+        relay = lab.spawn(
+            "S",
+            [f"{BIN}/sharp-relay", "--bind", "0.0.0.0:5560", "--stun", S1, "--stun", S2,
+             "--identity", f"{d}/relay.key", "--log", "info"],
+            "relay.log",
+        )
+        m = wait_for(lab, "relay.log", r"Receivers: --relay (sh-\S+?)@", 10)
+        if not m:
+            return False, "none", 0, "the relay did not start:\n" + lab.log("relay.log")
+        rid = m.group(1)
+        data = os.path.join(d, "payload.bin")
+        with open(data, "wb") as f:
+            f.write(os.urandom(1 << 20))
+        want = hashlib.sha256(open(data, "rb").read()).hexdigest()
+        os.makedirs(f"{d}/out", exist_ok=True)
+        recv_args = [
+            f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
+            "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
+            "--relay", f"{rid}@{S1}:5560", "--log-level", "info",
+        ]
+        lab.spawn("B", recv_args, "receiver.log")
+        m = wait_for(lab, "receiver.log", r"Senders use: (sh-\S+)", 15)
+        if not m:
+            return False, "none", 0, "the receiver did not start:\n" + lab.log("receiver.log")
+        # Its address once the NAT tests are done: the same line again, now
+        # with addresses in place of "<this host>".
+        m = wait_for(lab, "receiver.log", r"Senders use: (sh-\S+@\d+\.\d+\.\d+\.\d+:\d+\S*)", 30)
+        if m:
+            address = m.group(1)
+        else:
+            # Nothing was published (a NAT that gives no address worth
+            # publishing): a sender has only the relay to go by.
+            address = f"{re.search(r'Senders use: (sh-[a-z0-9]+)', lab.log('receiver.log')).group(1)}@{S1}:9"
+        start = time.time()
+        send_args = [
+            f"{BIN}/sharp-sender", data, address, "--relay", f"{S1}:5560", "--headless",
+            "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info",
+        ]
+        sender = lab.spawn("A", send_args, "sender.log")
+        try:
+            sender.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            sender.kill()
+        took = time.time() - start
+        log = lab.log("sender.log")
+        conn = re.search(r"Connected to (\S+)", log)
+        path = classify(conn.group(1) if conn else None, topo, 5560)
+        got = None
+        for name in os.listdir(f"{d}/out"):
+            if not name.endswith(".sharp-part"):
+                got = hashlib.sha256(open(f"{d}/out/{name}", "rb").read()).hexdigest()
+        ok = got == want
+        detail = f"receiver published {address}"
+        if verbose or not ok:
+            for gw in ("RA", "RB"):
+                ct = lab.x(gw, "cat", "/proc/net/nf_conntrack", check=False).stdout
+                detail += f"\n--- conntrack in {gw}\n" + "\n".join(
+                    l[:170] for l in ct.splitlines() if "udp" in l
+                )
+            detail += "\n--- sender.log\n" + log[-1500:] + "\n--- receiver.log\n" + lab.log("receiver.log")[-1500:]
+        return ok, path, took, detail
+    finally:
+        lab.close()
+
+
+def cmd_pair(args):
+    ok, path, took, detail = transfer(args.a, args.b, args.a_cgn, args.b_cgn, carry=not args.direct_only,
+                                      verbose=args.verbose, keep=args.keep)
+    print(f"sender behind {args.a}{'+cgn:' + args.a_cgn if args.a_cgn else ''}, receiver behind {args.b}: "
+          f"{'OK' if ok else 'FAILED'} via {path} in {took:.1f}s")
+    print(detail)
+    return 0 if ok else 1
+
+
+def cmd_matrix(args):
+    kinds = args.kinds or list(NAT_KINDS)
+    for k in kinds:
+        if k not in NAT_KINDS:
+            raise SystemExit(f"unknown NAT kind {k}; choose from {' '.join(NAT_KINDS)}")
+    rows = []
+    print(f"{'sender behind':18} {'receiver behind':18} result")
+    for a in kinds:
+        for b in kinds:
+            ok, path, took, detail = transfer(a, b, carry=not args.direct_only, timeout=args.timeout)
+            rows.append((a, b, ok, path, took))
+            print(f"{a:18} {b:18} {'ok  ' if ok else 'FAIL'} {path:16} {took:5.1f}s", flush=True)
+    failed = [r for r in rows if not r[2]]
+    print(f"\n{len(rows) - len(failed)} of {len(rows)} pairs connected")
+    return 1 if failed and not args.allow_failures else 0
+
+
 def cmd_oracle(args):
     bad = 0
     print(f"{'kind':18} {'measured mapping':44} {'measured filtering':30} verdict")
@@ -426,9 +583,22 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("oracle")
+    pair = sub.add_parser("pair")
+    pair.add_argument("a", choices=list(NAT_KINDS))
+    pair.add_argument("b", choices=list(NAT_KINDS))
+    pair.add_argument("--a-cgn", choices=list(NAT_KINDS), default=None)
+    pair.add_argument("--b-cgn", choices=list(NAT_KINDS), default=None)
+    pair.add_argument("-v", "--verbose", action="store_true")
+    pair.add_argument("--keep", action="store_true")
+    pair.add_argument("--direct-only", action="store_true", help="the relay may introduce but not carry")
+    matrix = sub.add_parser("matrix")
+    matrix.add_argument("kinds", nargs="*", help="a subset of: " + " ".join(NAT_KINDS))
+    matrix.add_argument("--allow-failures", action="store_true")
+    matrix.add_argument("--direct-only", action="store_true", help="the relay may introduce but not carry")
+    matrix.add_argument("--timeout", type=int, default=30)
     args = ap.parse_args()
     sh("ip", "link", "set", "lo", "up")
-    sys.exit({"oracle": cmd_oracle}[args.cmd](args))
+    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "matrix": cmd_matrix}[args.cmd](args))
 
 
 if __name__ == "__main__":

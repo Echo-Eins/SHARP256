@@ -912,6 +912,15 @@ struct Engine {
     /// A candidate that answered an attempt we could not adopt. Worth going
     /// straight back to rather than finishing the round.
     answered_at: Option<SocketAddr>,
+    /// The addresses (without ports) the receiver is known to be at: what
+    /// it published, what a relay says. A punch from one of them, from a
+    /// port we were never told, is the receiver's NAT telling us which port
+    /// it gave the receiver for us — the one place a peer behind a NAT
+    /// that numbers its ports per destination can be reached.
+    peer_ips: std::collections::HashSet<std::net::IpAddr>,
+    /// Ports learned that way: how many initiations each has had, and when
+    /// the last went.
+    reflexive: std::collections::HashMap<SocketAddr, (u32, Instant)>,
     /// Initiations sent so far; while this is below the number of
     /// candidates, there are still untried addresses and probing stays
     /// brisk.
@@ -1072,6 +1081,8 @@ impl Engine {
             found_rx,
             unresolved,
             answered_at: None,
+            peer_ips: std::collections::HashSet::new(),
+            reflexive: std::collections::HashMap::new(),
             probes_sent: 0,
             answer: None,
             negotiating: true,
@@ -1322,7 +1333,61 @@ impl Engine {
             return;
         }
         tracing::debug!("another address to try: {}", addr);
+        self.peer_ips.insert(crate::address::canonical(addr).ip());
         self.candidates.push(addr);
+    }
+
+    /// A punch from an address that is not one we were given, but whose IP
+    /// is the receiver's: it opens a hole from its side to ours, and the
+    /// port it comes from is where the receiver's NAT will take our packets.
+    /// Answer it at once, from here, so that the hole is used while it is
+    /// open — the first initiation to the same address that would otherwise
+    /// wait for its turn in the rotation is lost to a NAT that has not heard
+    /// from us yet, and the next may come after the receiver has stopped.
+    ///
+    /// Punches are unauthenticated, so what this does is bounded: only an
+    /// address whose IP we already had reason to try, a few addresses, a
+    /// few initiations each, spaced apart. It never changes who is trusted:
+    /// only the receiver's key can answer.
+    #[cfg(feature = "nat-traversal")]
+    fn on_punch(&mut self, from: SocketAddr) -> Result<(), SendError> {
+        /// Ports a receiver may be seen from before we stop believing it.
+        const MAX_REFLEXIVE: usize = 16;
+        /// Initiations one such port gets.
+        const PER_ADDRESS: u32 = 12;
+        /// Least time between two.
+        const GAP: Duration = Duration::from_millis(80);
+        if self.secure.is_some() {
+            return Ok(());
+        }
+        let ip = crate::address::canonical(from).ip();
+        if !self.peer_ips.contains(&ip) {
+            return Ok(());
+        }
+        let local = self.socket.local_addr().unwrap_or(self.peer);
+        if !crate::address::class::is_sendable_hint(from, local) {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if !self.reflexive.contains_key(&from) && self.reflexive.len() >= MAX_REFLEXIVE {
+            return Ok(());
+        }
+        let entry = self.reflexive.entry(from).or_insert((0, now - GAP));
+        if entry.0 >= PER_ADDRESS || now.saturating_duration_since(entry.1) < GAP {
+            return Ok(());
+        }
+        let first = entry.0 == 0;
+        entry.0 += 1;
+        entry.1 = now;
+        if first {
+            tracing::info!(
+                "the receiver's NAT let a datagram through from {}; answering it there",
+                from
+            );
+            self.add_candidate(Found::Relay(from));
+            self.answered_at = Some(from);
+        }
+        self.send_initiation_to(self.reach.native(from))
     }
 
     /// Starts a new handshake attempt: a fresh ephemeral key and connection
@@ -2457,6 +2522,13 @@ impl Engine {
                 .find(|(a, _)| a.ip() == from.ip())
             {
                 let _ = tx.try_send((pkt.to_vec(), from));
+                return Ok(());
+            }
+            if matches!(
+                crate::relay::Message::decode(pkt),
+                Some(crate::relay::Message::Punch)
+            ) {
+                return self.on_punch(from);
             }
             return Ok(());
         }

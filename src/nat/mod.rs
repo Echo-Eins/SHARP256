@@ -27,6 +27,7 @@
 //! Authentication settles that, so a lie costs a wasted attempt.
 
 pub mod behaviour;
+pub mod card;
 pub mod keepalive;
 pub mod portmap;
 pub mod stun;

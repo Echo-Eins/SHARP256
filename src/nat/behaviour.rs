@@ -61,6 +61,50 @@ pub enum Filtering {
 }
 
 /// What it takes for a peer to reach us.
+/// How a NAT numbers the external ports of new mappings — the difference
+/// between a symmetric NAT that can be reached by guessing (each new port is
+/// the last one plus a step) and one that cannot (ports drawn at random).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Allocation {
+    Unknown,
+    /// The external port is the internal one.
+    Preserved,
+    /// Each new mapping's port is a small step from the previous one's.
+    Sequential,
+    Random,
+}
+
+/// The allocation a run of external ports, one per new destination in the
+/// order they were made, shows: `(kind, step)`. Three ports are the least
+/// that can show a pattern; a steady small step is a sequential allocator
+/// (with other traffic in between giving the occasional larger step, which
+/// the search around a guess covers), anything else is random.
+pub fn classify_allocation(ports: &[u16]) -> (Allocation, i16) {
+    if ports.len() < 3 {
+        return (Allocation::Unknown, 0);
+    }
+    let steps: Vec<i32> = ports
+        .windows(2)
+        .map(|w| {
+            let d = i32::from(w[1]) - i32::from(w[0]);
+            // Across the wrap of the port range.
+            if d > 32768 {
+                d - 65536
+            } else if d < -32768 {
+                d + 65536
+            } else {
+                d
+            }
+        })
+        .collect();
+    let same_direction = steps.iter().all(|&d| d > 0) || steps.iter().all(|&d| d < 0);
+    if same_direction && steps.iter().all(|d| d.abs() <= 32) {
+        let smallest = steps.iter().copied().min_by_key(|d| d.abs()).unwrap_or(1);
+        return (Allocation::Sequential, smallest as i16);
+    }
+    (Allocation::Random, 0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reachable {
     /// No NAT in the way.
@@ -93,6 +137,11 @@ pub struct Behaviour {
     pub open_internet: bool,
     /// The server the behaviour tests ran against, if any could.
     pub tested_with: Option<SocketAddr>,
+    /// How the NAT numbers the ports of new mappings, and the step between
+    /// them when it counts. Only measured against a server that gives
+    /// several destinations to send to (an RFC 5780 one).
+    pub allocation: Allocation,
+    pub alloc_step: i16,
     /// The full RFC 5780 tests ran; otherwise the weaker cross-check
     /// between two independent servers was used.
     pub rfc5780: bool,
@@ -108,6 +157,8 @@ impl Default for Behaviour {
             hairpinning: None,
             open_internet: false,
             tested_with: None,
+            allocation: Allocation::Unknown,
+            alloc_step: 0,
             rfc5780: false,
         }
     }
@@ -148,7 +199,13 @@ impl Behaviour {
         let mapping = match self.mapping {
             Mapping::EndpointIndependent => "one port for every destination",
             Mapping::AddressDependent => "a port per destination host",
-            Mapping::AddressAndPortDependent => "a port per destination host and port (symmetric)",
+            Mapping::AddressAndPortDependent => match self.allocation {
+                Allocation::Sequential => {
+                    "a port per destination host and port (symmetric, counting up: guessable)"
+                }
+                Allocation::Random => "a port per destination host and port (symmetric, random)",
+                _ => "a port per destination host and port (symmetric)",
+            },
             Mapping::Unknown => "unknown mapping",
         };
         let filtering = match self.filtering {
@@ -306,8 +363,18 @@ pub async fn discover_with(
     if let Some(other) = other {
         out.rfc5780 = true;
         if !out.open_internet {
-            out.mapping =
+            let (mapping, ports) =
                 mapping_behaviour(socket, &client, responses, server, other, first.mapped).await;
+            out.mapping = mapping;
+            if mapping == Mapping::EndpointIndependent {
+                if out.port_preserved == Some(true) {
+                    out.allocation = Allocation::Preserved;
+                }
+            } else {
+                let (kind, step) = classify_allocation(&ports);
+                out.allocation = kind;
+                out.alloc_step = step;
+            }
         }
         out.filtering = filtering_behaviour(socket, &client, responses, server).await;
     } else if !out.open_internet {
@@ -443,6 +510,8 @@ async fn answer(
 }
 
 /// RFC 5780 section 4.3: does the external port follow the destination?
+/// Also returns the external ports the destinations got, in the order they
+/// were tried, which show how a NAT that varies them numbers them.
 async fn mapping_behaviour(
     socket: &UdpSocket,
     client: &StunClient,
@@ -450,17 +519,19 @@ async fn mapping_behaviour(
     server: SocketAddr,
     other: SocketAddr,
     first_mapped: SocketAddr,
-) -> Mapping {
+) -> (Mapping, Vec<u16>) {
+    let mut ports = vec![first_mapped.port()];
     // Test II: the server's other IP address, its primary port.
     let second = SocketAddr::new(other.ip(), server.port());
     let Ok(Some(r2)) = client
         .transaction(socket, second, responses, false, false)
         .await
     else {
-        return Mapping::Unknown;
+        return (Mapping::Unknown, ports);
     };
+    ports.push(r2.response.mapped.port());
     if r2.response.mapped == first_mapped {
-        return Mapping::EndpointIndependent;
+        return (Mapping::EndpointIndependent, ports);
     }
     // Test III: the server's other IP address and other port.
     let Ok(Some(r3)) = client
@@ -469,13 +540,24 @@ async fn mapping_behaviour(
     else {
         // The mapping is not endpoint-independent, but we cannot tell how
         // far it varies. Report the weaker of the two claims.
-        return Mapping::AddressDependent;
+        return (Mapping::AddressDependent, ports);
     };
-    if r3.response.mapped == r2.response.mapped {
+    ports.push(r3.response.mapped.port());
+    // A fourth destination, only for the numbering: the primary address on
+    // the other port.
+    let fourth = SocketAddr::new(server.ip(), other.port());
+    if let Ok(Some(r4)) = client
+        .transaction(socket, fourth, responses, false, false)
+        .await
+    {
+        ports.push(r4.response.mapped.port());
+    }
+    let mapping = if r3.response.mapped == r2.response.mapped {
         Mapping::AddressDependent
     } else {
         Mapping::AddressAndPortDependent
-    }
+    };
+    (mapping, ports)
 }
 
 /// RFC 5780 section 4.4: which inbound packets get through?
@@ -589,6 +671,43 @@ mod tests {
     // NAT whose behaviour we choose. Nothing here is a mock of the code
     // under test: `discover` sends real datagrams and draws its conclusions
     // from what comes back, so the whole decision tree is exercised.
+
+    #[test]
+    fn a_run_of_ports_says_how_the_nat_numbers_them() {
+        // Counting up by one, however it starts and across the wrap.
+        assert_eq!(
+            classify_allocation(&[40000, 40001, 40002, 40003]),
+            (Allocation::Sequential, 1)
+        );
+        assert_eq!(
+            classify_allocation(&[65534, 65535, 0, 1]),
+            (Allocation::Sequential, 1)
+        );
+        // Counting down, and by twos.
+        assert_eq!(
+            classify_allocation(&[50010, 50008, 50006]),
+            (Allocation::Sequential, -2)
+        );
+        // Other traffic took a few ports in between: still counting.
+        assert_eq!(
+            classify_allocation(&[40001, 40002, 40007, 40008]),
+            (Allocation::Sequential, 1)
+        );
+        // Anything else is random, and two ports show nothing.
+        assert_eq!(
+            classify_allocation(&[15701, 6297, 14345, 24954]).0,
+            Allocation::Random
+        );
+        assert_eq!(
+            classify_allocation(&[40000, 40001, 40000]).0,
+            Allocation::Random
+        );
+        assert_eq!(
+            classify_allocation(&[40000, 41000, 42000]).0,
+            Allocation::Random
+        );
+        assert_eq!(classify_allocation(&[40000, 40001]).0, Allocation::Unknown);
+    }
 
     /// Loopback answers at once, so the tests need not wait like the real
     /// thing does. The silences a filtering test relies on still happen.
