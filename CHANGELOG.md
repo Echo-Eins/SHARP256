@@ -337,6 +337,10 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
   the receiver asks PCP first, so PCP made every one of those forwards (the
   daemon's log says so); PCP is now dropped at the router for them, and
   every row quotes the daemon's line for the request that made its forward.
+  A laboratory left the ends of its links in its own namespace until the
+  kernel got round to destroying the namespaces of their peers, and the next
+  one could try to make links of the same names first: `samenat` failed so
+  once ("File exists"), before any transfer. They are deleted on closing.
 - **A carrier-grade NAT in front of the home router is a scenario of its
   own** (`cgn`, in CI): two NATs in a row, the outer one keeping ports or
   drawing them at random, on either side. Punching and the birthday method

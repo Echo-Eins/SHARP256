@@ -93,6 +93,9 @@ class Lab:
         self.pid = {}
         self.children = []
         self.core_ns = os.readlink("/proc/self/ns/net")
+        # Link ends made in this process's own namespace (the core, "I"):
+        # see `close`.
+        self.core_links = []
 
     # ----- namespaces -----------------------------------------------------
 
@@ -125,6 +128,8 @@ class Lab:
         for ns, ifn in ((ns1, if1), (ns2, if2)):
             if ns != "I":
                 sh("ip", "link", "set", ifn, "netns", str(self.pid[ns]))
+            else:
+                self.core_links.append(ifn)
 
     def addr(self, ns, ifn, cidr, gw=None):
         self.x(ns, "ip", "addr", "add", cidr, "dev", ifn)
@@ -178,6 +183,14 @@ class Lab:
         # there for the next one (a cut direct path, an isolation).
         for table in ("cut", "isolate"):
             sh("nft", "delete", "table", "inet", table, check=False)
+        # So are the ends of links made here, which would otherwise go only
+        # when the kernel gets round to destroying the namespaces their
+        # peers were moved to — possibly after the next laboratory has tried
+        # to make links of the same names ("File exists": `samenat` met it).
+        # Deleting an end deletes the pair, at once.
+        for ifn in self.core_links:
+            sh("ip", "link", "del", ifn, check=False)
+        self.core_links = []
         for p in reversed(self.children):
             try:
                 os.killpg(p.pid, signal.SIGTERM)
@@ -1799,6 +1812,7 @@ def cmd_samenat(args):
             sh("ip", "link", "add", "s0", "type", "veth", "peer", "name", "iS")
             for ns, ifn in (("A", "vA"), ("A2", "vA2"), ("RA", "pA"), ("RA", "pA2"), ("RA", "wan0"), ("S", "s0")):
                 sh("ip", "link", "set", ifn, "netns", str(lab.pid[ns]))
+            lab.core_links += ["iA", "iS"]
             sh("ip", "link", "set", "iA", "up")
             sh("ip", "link", "set", "iS", "up")
             lab.x("RA", "ip", "link", "set", "wan0", "name", "wan")
