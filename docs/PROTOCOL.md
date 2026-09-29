@@ -39,6 +39,27 @@ first use and stored in the per-user data directory
 (`~/.local/share/sharp-256/identity.key`, `%APPDATA%\sharp-256\identity.key`,
 ...) with owner-only permissions.
 
+The identity file is text: comment lines naming the ID, then the private
+key, either as 64 hex digits (the default) or sealed:
+
+```
+sharp256-identity-2 <public> passphrase argon2id <memory KiB> <passes> <lanes> <salt[16]> <nonce[24]> <sealed[48]>
+sharp256-identity-2 <public> keystore secret-service|keychain <nonce[24]> <sealed[48]>
+sharp256-identity-2 <public> keystore dpapi <blob> <nonce[24]> <sealed[48]>
+```
+
+(every value in hex). `sealed` is the private key encrypted with
+XChaCha20-Poly1305 under a key that is either `Argon2id(passphrase, salt)`
+with the parameters written before it (256 MiB and 3 passes by default) or
+a random 32-byte key the operating system keeps for the user: in the
+Secret Service (attributes `application=sharp-256`, `identity=<ID>`), in
+the Keychain (service `sharp-256`, account `identity <ID>`), or sealed by
+DPAPI to the Windows account, with `"sharp256 identity " || public` as its
+entropy, and carried in the file as `blob`. The associated data is the
+line up to the nonce, with single spaces; the key that comes out must have
+`public` as its public key. A file is always replaced whole: written next
+to the old one, flushed, renamed over it, and the directory flushed.
+
 A **SHARP ID** is the public key in text form: `sh-` followed by 56
 lower-case base32 characters (RFC 4648 alphabet, no padding) encoding the
 32-byte public key and a 3-byte checksum,
@@ -188,6 +209,17 @@ direction gets the secret
 Keys change every 2^22 packets without any signalling (both sides derive
 the epoch from the packet number), which keeps every key far inside the
 usage limits of AES-GCM.
+
+The epoch of a received packet is the one its packet number names, and
+until the packet authenticates that is only a claim. A recipient keeps the
+keys of the newest epoch `e` that has carried an authentic packet and of
+`e − 1` and `e + 1`, and moves on only when an authentic packet of a later
+epoch arrives. A packet naming an epoch from `e + 2` to `e + 16` is tried
+with a key made for it alone (kept if it authenticates); one naming any
+other epoch is opened with the key of `e`, and fails. A sender never has
+more than 2^19 packets unacknowledged, so an authentic packet is always
+within an epoch of `e`; the look-ahead is margin. The key for a packet is
+chosen without a branch on its epoch.
 
 ### Attempts and retries
 
@@ -1511,7 +1543,9 @@ server, reachable — only the answer is withheld from strangers. Anyone who
 knows a receiver's ID (and its secret, if one is set) can offer transfers
 unless the receiver uses an allow-list or asks its user. IDs must be
 exchanged over a channel the users trust; the protocol cannot detect a
-substituted ID. Identity files are protected only by file permissions.
+substituted ID. Identity files are protected by file permissions, and
+optionally sealed with a passphrase or by the operating system's key store
+(section 1); by default they are not sealed.
 
 ## 10. Implementation notes
 
@@ -1548,6 +1582,14 @@ substituted ID. Identity files are protected only by file permissions.
   otherwise a small buffer is reported with the `sysctl` command that raises
   it. On Windows, `SIO_UDP_CONNRESET` is disabled so that an ICMP "port
   unreachable" does not break the receive loop.
+* **Secrets.** Every key that lives longer than one computation — the
+  identity, the pre-shared key, the state of a handshake in progress, each
+  session's keys, cookie and token secrets — is kept in memory locked in
+  RAM and left out of core dumps, and wiped when dropped
+  (`crypto::secret`); the Noise handshake is implemented in `crypto::noise`
+  so that its states are wiped too (it writes exactly what snow wrote). MAC
+  and tag comparisons are constant-time, and `docs/evidence/crypto/`
+  records timing measurements of them.
 * **Untrusted input is fuzzed.** Every parser of what arrives from others —
   transport frames, handshake payloads, whole datagrams, manifests, relay
   messages, STUN, PCP and NAT-PMP, UPnP's HTTP and XML, addresses and text —
