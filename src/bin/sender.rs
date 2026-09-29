@@ -36,6 +36,37 @@ struct Args {
     #[arg(long = "stun", value_name = "HOST:PORT")]
     stun: Vec<String>,
 
+    /// A TURN server, USER:PASSWORD@HOST[:PORT] (RFC 8656): this sender
+    /// gets an address on it, which goes on the card the sender prints for
+    /// the receiver's user, and reaches the receiver through it as well as
+    /// directly. Only TURN over UDP is spoken. Everything through it is
+    /// sealed end to end, and costs the server's owner the bandwidth. A
+    /// colon in a user name is written %3A. Repeat it for several, or set
+    /// SHARP256_TURN (servers separated by spaces), which keeps the password
+    /// off the command line
+    #[arg(
+        long = "turn",
+        value_name = "USER:PASSWORD@HOST[:PORT]",
+        env = "SHARP256_TURN",
+        hide_env_values = true,
+        value_delimiter = ' '
+    )]
+    turn: Vec<String>,
+
+    /// Look for the receiver in the Mainline DHT (the one BitTorrent uses),
+    /// which it has to be announced in too (sharp-receiver --dht), so that
+    /// <RECEIVER> may be its ID alone. Every DHT node asked learns this
+    /// host's address, and without --secret anybody who knows the receiver's
+    /// ID can see that a sender is looking for it. Needs the NAT tests (no
+    /// --no-nat)
+    #[arg(long)]
+    dht: bool,
+
+    /// A DHT node (host:port) to start from instead of the well-known ones;
+    /// repeat it for several
+    #[arg(long = "dht-bootstrap", value_name = "HOST:PORT")]
+    dht_bootstrap: Vec<String>,
+
     /// Look for the receiver on the local network with multicast DNS: it
     /// has to be started with --announce-lan, and <RECEIVER> may then be its
     /// ID alone. The question tells everybody on the network whom you are
@@ -159,10 +190,11 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
         None => sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?,
     };
     // A receiver reached only through a relay publishes no address.
-    if card_id.is_none() && hosts.is_empty() && args.relays.is_empty() && !args.lan {
+    if card_id.is_none() && hosts.is_empty() && args.relays.is_empty() && !args.lan && !args.dht {
         anyhow::bail!(
             "{} has no address: write it as <ID>@<host>:<port>, or name the relay it \
-             registered with using --relay",
+             registered with using --relay, or ask the local network (--lan) or the \
+             DHT (--dht)",
             receiver
         );
     }
@@ -184,6 +216,23 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     cfg.bind = args.bind;
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
     cfg.find_lan = args.lan && cfg!(feature = "nat-traversal");
+    #[cfg(feature = "nat-traversal")]
+    for t in &args.turn {
+        t.parse::<sharp256::nat::turn::Server>()
+            .map_err(|e| anyhow::anyhow!("--turn: {}", e))?;
+    }
+    #[cfg(not(feature = "nat-traversal"))]
+    if !args.turn.is_empty() {
+        anyhow::bail!("--turn needs a build with the nat-traversal feature");
+    }
+    cfg.turn_servers = args.turn.clone();
+    cfg.dht = args.dht && cfg!(feature = "nat-traversal");
+    cfg.dht_bootstrap = args.dht_bootstrap.clone();
+    #[cfg(feature = "nat-traversal")]
+    if cfg.dht {
+        // The receiver may take a while to turn up in the DHT.
+        cfg.transport.handshake_timeout = sharp256::nat::punch::MEET_DURATION;
+    }
     cfg.stun_servers = args.stun.clone();
     cfg.relays.extend(args.relays.iter().cloned());
     cfg.state_dir = args.state_dir.clone();

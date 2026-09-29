@@ -56,7 +56,11 @@ pub enum Kind {
     Mapped,
     /// Granted by the router — UPnP, NAT-PMP, PCP.
     PortMapped,
-    /// A port on a relay that carries what arrives at it.
+    /// An address on a TURN server that carries what arrives at it to its
+    /// owner (see `nat::turn`): the owner's NAT is out of the way, and the
+    /// server's price is bandwidth. It passes only what the owner has
+    /// permitted, so the owner has to know the sender's address first —
+    /// which the sender's own card tells it.
     Relayed,
 }
 
@@ -297,19 +301,32 @@ impl Card {
     }
 
     /// The addresses worth punching towards, each with what the NAT in
-    /// front of it does: everything but the relays' ports, which are
-    /// somewhere to be carried and not somewhere to be reached.
+    /// front of it does. An address on a TURN server is one: what is sent
+    /// there is passed to its owner, and the server needs to hear from us
+    /// first only in the sense that our sending makes it worth passing.
+    /// Nothing is translated in front of it, so it is aimed at as it is.
     pub fn punch_targets(&self) -> Vec<(SocketAddr, NatHints)> {
         let mut out: Vec<(SocketAddr, NatHints)> = Vec::new();
         for c in &self.candidates {
-            if c.kind != Kind::Relayed && !out.iter().any(|(a, _)| *a == c.addr) {
-                out.push((
-                    c.addr,
-                    self.hints_for(&c.addr)
-                        .copied()
-                        .unwrap_or(NatHints::unknown()),
-                ));
+            if out.iter().any(|(a, _)| *a == c.addr) {
+                continue;
             }
+            let hints = if c.kind == Kind::Relayed {
+                // Nothing is translated in front of it, and what it lets in
+                // is by address only (a permission is for an IP, whatever
+                // port it sends from): one socket of ours, from any port, is
+                // all it takes — no spray of sockets to guess a port with.
+                NatHints {
+                    mapping: 4,
+                    filtering: 2,
+                    ..NatHints::unknown()
+                }
+            } else {
+                self.hints_for(&c.addr)
+                    .copied()
+                    .unwrap_or(NatHints::unknown())
+            };
+            out.push((c.addr, hints));
         }
         out
     }

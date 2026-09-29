@@ -331,7 +331,7 @@ impl Sender {
                                 );
                                 let _ = found.send(Found::Relay(alt.addr));
                             }
-                            let _ = found.send(Found::Relay(i.relayed));
+                            let _ = found.send(Found::Carrier(i.relayed));
                             // Push outwards at where the receiver appears
                             // to be, aimed by what it says its NAT does,
                             // while its own punches come the other way.
@@ -547,12 +547,18 @@ impl Sender {
         let first = match candidates.first() {
             Some(&first) => first,
             // Nothing to try until a relay or a name turns something up.
-            None if !self.cfg.relays.is_empty() || names_pending || self.cfg.find_lan => {
+            None if !self.cfg.relays.is_empty()
+                || names_pending
+                || self.cfg.find_lan
+                || self.cfg.dht =>
+            {
                 if !names_pending {
                     tracing::info!(
                         "no direct address for the receiver; asking {}",
                         if self.cfg.find_lan {
                             "the local network and the relays"
+                        } else if self.cfg.dht {
+                            "the DHT and the relays"
                         } else {
                             "the relays"
                         }
@@ -582,43 +588,46 @@ impl Sender {
             tokio::sync::watch::channel(crate::nat::card::FamilyHints::unknown());
         #[cfg(feature = "nat-traversal")]
         let (hits_tx, hits_rx) = mpsc::unbounded_channel();
+        // Stops what the NAT machinery started — the router's forward, the
+        // TURN allocations — once the transfer is over.
+        #[cfg(feature = "nat-traversal")]
+        let nat_cancel = self.cancel.child_token();
+        // TURN servers this sender was given: each makes an allocation in
+        // the background, whose address goes on the sender's card, and lets
+        // in whoever is punched at.
+        #[cfg(feature = "nat-traversal")]
+        let turns =
+            crate::nat::turn::start_all(&self.cfg.turn_servers, &self.socket.udp(), &nat_cancel);
         #[cfg(feature = "nat-traversal")]
         let puncher = Arc::new(
-            crate::nat::punch::Puncher::new(self.socket.udp(), hints_rx).with_hit_handler(
-                Arc::new(move |hit| {
+            crate::nat::punch::Puncher::new(self.socket.udp(), hints_rx)
+                .with_hit_handler(Arc::new(move |hit| {
                     let _ = hits_tx.send(hit);
-                }),
-            ),
+                }))
+                .with_turns(turns.clone()),
         );
         // With a relay, or the receiver's card: what our own NAT does is
         // told to the receiver (through the relay, or on the card we give
         // it), and the punches are aimed by both.
         #[cfg(feature = "nat-traversal")]
         let meeting = self.cfg.peer_card.is_some();
+        // A card is given to the peer when we were given theirs, and when
+        // there is a TURN server, whose address only a card can tell.
         #[cfg(feature = "nat-traversal")]
-        let nat_cancel = self.cancel.child_token();
+        let wants_card = meeting || !self.cfg.turn_servers.is_empty();
+        // What discovery finds and what the TURN servers give go on the card
+        // together, and the card is given again when either changes.
         #[cfg(feature = "nat-traversal")]
-        let nat_task = if self.cfg.nat_traversal && (!self.cfg.relays.is_empty() || meeting) {
-            let mut c = crate::nat::NatConfig {
-                // A card is only useful to the peer if we can be reached:
-                // ask the router for a port, and look after it until we are
-                // done — and give it back.
-                enable_port_mapping: meeting,
-                maintain: meeting,
-                ..crate::nat::NatConfig::default()
-            };
-            if !self.cfg.stun_servers.is_empty() {
-                c.stun_servers = self.cfg.stun_servers.clone();
-            }
+        let reports = {
             let events = self.cfg.events.clone();
             let id = self.identity.id();
             let relay_refs = literal_relays(&self.cfg.relays);
-            crate::nat::spawn_discovery(
-                self.socket.udp(),
-                c,
-                Default::default(),
-                hints_tx,
+            crate::nat::RelayedReports::new(
+                self.socket.local_addr().unwrap_or(self.cfg.bind),
+                turns.clone(),
                 nat_cancel.clone(),
+                self.cfg.nat_traversal
+                    && (!self.cfg.relays.is_empty() || wants_card || self.cfg.dht),
                 move |r| {
                     emit(
                         &events,
@@ -629,6 +638,37 @@ impl Sender {
                             summary: r.describe(),
                         },
                     )
+                },
+            )
+        };
+        #[cfg(feature = "nat-traversal")]
+        let nat_task = if self.cfg.nat_traversal
+            && (!self.cfg.relays.is_empty() || wants_card || self.cfg.dht)
+        {
+            let mut c = crate::nat::NatConfig {
+                // A card is only useful to the peer if we can be reached:
+                // ask the router for a port, and look after it until we are
+                // done — and give it back.
+                enable_port_mapping: wants_card || self.cfg.dht,
+                maintain: wants_card || self.cfg.dht,
+                ..crate::nat::NatConfig::default()
+            };
+            if !self.cfg.stun_servers.is_empty() {
+                c.stun_servers = self.cfg.stun_servers.clone();
+            }
+            let reports = reports.clone();
+            crate::nat::spawn_discovery(
+                self.socket.udp(),
+                c,
+                Default::default(),
+                hints_tx,
+                nat_cancel.clone(),
+                // Only when there is a card to give: relays alone want the
+                // hints, not a card nobody asked for.
+                move |r| {
+                    if wants_card {
+                        reports.update(r)
+                    }
                 },
             )
         } else {
@@ -665,7 +705,7 @@ impl Sender {
             }
         }
         #[cfg(feature = "nat-traversal")]
-        let relay_inboxes = self.spawn_relay_introductions(found_tx.clone(), puncher);
+        let relay_inboxes = self.spawn_relay_introductions(found_tx.clone(), puncher.clone());
         #[cfg(not(feature = "nat-traversal"))]
         let relay_inboxes = RelayInboxes::default();
         let unresolved = self.spawn_name_resolution(reach, found_tx.clone());
@@ -687,6 +727,55 @@ impl Sender {
                     let _ = found.send(Found::Named(a));
                 }
             });
+        }
+        // Each of the receiver's addresses is also reached through each
+        // TURN server, in case the sender cannot send to it directly.
+        #[cfg(feature = "nat-traversal")]
+        spawn_turn_dials(&turns, &candidates, found_tx.clone(), nat_cancel.clone());
+        // The DHT, if asked: this sender announced there and the receiver
+        // looked for; what turns up is tried in the handshake and punched at.
+        #[cfg(feature = "nat-traversal")]
+        if self.cfg.dht {
+            match crate::nat::dht::Dht::start(self.cfg.dht_bootstrap.clone(), nat_cancel.clone()) {
+                Ok(dht) => {
+                    tracing::info!(
+                        "looking for the receiver in the DHT: every node asked learns this host's address{}",
+                        if self.cfg.psk.is_none() {
+                            ", and anybody who knows the receiver's ID can see it (a shared secret prevents that)"
+                        } else {
+                            ""
+                        }
+                    );
+                    let key = crate::nat::dht::rendezvous_key(
+                        &self.cfg.receiver_id,
+                        self.cfg.psk.as_ref(),
+                    );
+                    let (punch, cancel, found) =
+                        (puncher.clone(), nat_cancel.clone(), found_tx.clone());
+                    crate::nat::dht::spawn_rendezvous(
+                        dht,
+                        key,
+                        crate::nat::dht::Role::Sender,
+                        puncher.subscribe(),
+                        nat_cancel.clone(),
+                        move |peer| {
+                            let _ = found.send(Found::Relay(peer));
+                            let (punch, cancel) = (punch.clone(), cancel.clone());
+                            tokio::spawn(async move {
+                                punch
+                                    .run_for(
+                                        peer,
+                                        crate::nat::card::NatHints::unknown(),
+                                        crate::nat::punch::MEET_DURATION,
+                                        &cancel,
+                                    )
+                                    .await;
+                            });
+                        },
+                    );
+                }
+                Err(e) => tracing::warn!("cannot use the DHT: {}", e),
+            }
         }
         self.spawn_nat64(&given, reach, found_tx);
 
@@ -714,6 +803,18 @@ impl Sender {
         {
             engine.stun_inbox = stun_inbox;
             engine.hits = Some(hits_rx);
+            engine.turns = turns;
+            // The addresses on the receiver's card that are on a TURN
+            // server: where the transfer is carried, not where it is.
+            if let Some(card) = &self.cfg.peer_card {
+                for c in &card.candidates {
+                    if c.kind == crate::nat::card::Kind::Relayed {
+                        if let Some(a) = reach.native(c.addr) {
+                            engine.relayed.insert(crate::address::canonical(a));
+                        }
+                    }
+                }
+            }
         }
         let result = engine.run(hash_task).await;
         // The NAT task gives back the port it asked the router for.
@@ -722,6 +823,9 @@ impl Sender {
             nat_cancel.cancel();
             if let Some(done) = nat_done {
                 let _ = tokio::time::timeout(Duration::from_secs(4), done).await;
+            }
+            for t in &engine.turns {
+                t.finished(Duration::from_secs(2)).await;
             }
         }
 
@@ -986,6 +1090,64 @@ enum Found {
     /// From a name the user gave, or the NAT64 translation of an address
     /// the user gave.
     Named(SocketAddr),
+    /// A loopback address that reaches a peer through one of our TURN
+    /// allocations (see `nat::turn`): ours, and so worth sending to, though
+    /// no address on loopback is otherwise.
+    #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
+    Turn(SocketAddr),
+    /// A port a relay set aside for the pair: from a relay, like
+    /// [`Found::Relay`], but one that carries and is not the receiver. A
+    /// transfer over it is worth moving to a direct path once one opens.
+    #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
+    Carrier(SocketAddr),
+}
+
+/// Each of `candidates` — as many as three, the ones the internet routes —
+/// reached through each TURN allocation too, once it has an address: the
+/// loopback address that stands for the receiver through the server joins
+/// the attempts. It costs the server nothing until it is the one that
+/// answers.
+#[cfg(feature = "nat-traversal")]
+fn spawn_turn_dials(
+    turns: &[crate::nat::turn::Turn],
+    candidates: &[SocketAddr],
+    found: mpsc::UnboundedSender<Found>,
+    cancel: CancellationToken,
+) {
+    let targets: Vec<SocketAddr> = candidates
+        .iter()
+        .map(|a| crate::address::canonical(*a))
+        .filter(|a| crate::address::class::is_global(a.ip()) && a.port() != 0)
+        .take(3)
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    for turn in turns {
+        let (turn, found, cancel, targets) =
+            (turn.clone(), found.clone(), cancel.clone(), targets.clone());
+        tokio::spawn(async move {
+            // Until the server has given an address there is nothing to go
+            // through, and how long that takes is not ours to decide.
+            let mut changes = turn.subscribe();
+            let ready = tokio::time::timeout(Duration::from_secs(20), async {
+                while turn.relayed().is_empty() {
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+            tokio::select! {
+                r = ready => if r.is_err() { return },
+                _ = cancel.cancelled() => return,
+            }
+            for addr in targets {
+                if let Some(shim) = turn.dial(addr).await {
+                    let _ = found.send(Found::Turn(shim));
+                }
+            }
+        });
+    }
 }
 
 /// The relays written with an identity and an address literal, as a card
@@ -1123,6 +1285,18 @@ struct Engine {
     /// the last went.
     #[cfg(feature = "nat-traversal")]
     reflexive: std::collections::HashMap<SocketAddr, (u32, Instant)>,
+    /// TURN allocations, whose loopback addresses are places the receiver
+    /// can be sent to and be heard from.
+    #[cfg(feature = "nat-traversal")]
+    turns: Vec<crate::nat::turn::Turn>,
+    /// Addresses that carry the transfer and are not the receiver: a
+    /// relay's port for the pair, a TURN server's relayed address. A
+    /// session over one keeps asking the other addresses whether a direct
+    /// path has opened (see `probe_direct`).
+    relayed: std::collections::HashSet<SocketAddr>,
+    /// When the next such question goes out, and how many rounds have.
+    next_direct_probe: Instant,
+    direct_probes: u32,
     /// Initiations sent so far; while this is below the number of
     /// candidates, there are still untried addresses and probing stays
     /// brisk.
@@ -1294,6 +1468,11 @@ impl Engine {
             peer_ips,
             #[cfg(feature = "nat-traversal")]
             reflexive: std::collections::HashMap::new(),
+            #[cfg(feature = "nat-traversal")]
+            turns: Vec::new(),
+            relayed: std::collections::HashSet::new(),
+            next_direct_probe: now,
+            direct_probes: 0,
             probes_sent: 0,
             answer: None,
             negotiating: true,
@@ -1556,8 +1735,16 @@ impl Engine {
     fn add_candidate(&mut self, found: Found) {
         let local = self.socket.local_addr().unwrap_or(self.peer);
         let (addr, usable) = match found {
-            Found::Relay(a) => (a, crate::address::class::is_sendable_hint(a, local)),
+            Found::Relay(a) | Found::Carrier(a) => {
+                (a, crate::address::class::is_sendable_hint(a, local))
+            }
             Found::Named(a) => (a, crate::address::class::is_sendable_named(a, local)),
+            // Only an address one of our own allocations made; anybody else's
+            // loopback is what the screen above exists to refuse.
+            #[cfg(feature = "nat-traversal")]
+            Found::Turn(a) => (a, self.turns.iter().any(|t| t.is_shim(a))),
+            #[cfg(not(feature = "nat-traversal"))]
+            Found::Turn(a) => (a, false),
         };
         if !usable {
             tracing::debug!("ignoring {}: not an address worth sending to", addr);
@@ -1572,7 +1759,14 @@ impl Engine {
             return;
         }
         tracing::debug!("another address to try: {}", addr);
-        self.peer_ips.insert(crate::address::canonical(addr).ip());
+        // What a relay carries is not where the receiver is, and is no
+        // evidence of where it might turn up from: it is somewhere to be
+        // carried, and a way through until a direct one opens.
+        if matches!(found, Found::Carrier(_)) {
+            self.relayed.insert(crate::address::canonical(addr));
+        } else {
+            self.peer_ips.insert(crate::address::canonical(addr).ip());
+        }
         self.candidates.push(addr);
     }
 
@@ -1596,16 +1790,26 @@ impl Engine {
         const PER_ADDRESS: u32 = 12;
         /// Least time between two.
         const GAP: Duration = Duration::from_millis(80);
-        if self.secure.is_some() {
+        // A session that is already direct has nothing to gain; one that is
+        // being carried does, and what the receiver's punch shows of where
+        // it can be reached directly is what it is looking for.
+        let carried = self.secure.is_some() && self.is_relayed(self.peer);
+        if self.secure.is_some() && !carried {
             return Ok(());
         }
-        let ip = crate::address::canonical(from).ip();
-        if !self.peer_ips.contains(&ip) {
-            return Ok(());
-        }
-        let local = self.socket.local_addr().unwrap_or(self.peer);
-        if !crate::address::class::is_sendable_hint(from, local) {
-            return Ok(());
+        // A punch that came through one of our own TURN allocations is the
+        // receiver's, sent to the address on the server we gave it: what it
+        // sent from is one address on loopback, and the only way to answer.
+        let via_turn = self.turns.iter().any(|t| t.is_shim(from));
+        if !via_turn {
+            let ip = crate::address::canonical(from).ip();
+            if !self.peer_ips.contains(&ip) {
+                return Ok(());
+            }
+            let local = self.socket.local_addr().unwrap_or(self.peer);
+            if !crate::address::class::is_sendable_hint(from, local) {
+                return Ok(());
+            }
         }
         let now = Instant::now();
         if !self.reflexive.contains_key(&from) && self.reflexive.len() >= MAX_REFLEXIVE {
@@ -1623,8 +1827,23 @@ impl Engine {
                 "the receiver's NAT let a datagram through from {}; answering it there",
                 from
             );
-            self.add_candidate(Found::Relay(from));
-            self.answered_at = Some(from);
+            self.add_candidate(if via_turn {
+                Found::Turn(from)
+            } else {
+                Found::Relay(from)
+            });
+            if !carried {
+                self.answered_at = Some(from);
+            }
+        }
+        if carried {
+            // The session is up; what is asked is whether the receiver
+            // answers on this path too (see `probe_direct`).
+            let ping = self.ping_message();
+            if let Some(to) = self.reach.native(from) {
+                let _ = self.send_frame_to(to, 0, &ping);
+            }
+            return Ok(());
         }
         self.send_initiation_to(self.reach.native(from))
     }
@@ -2106,6 +2325,13 @@ impl Engine {
         // carries.
         let mut candidates: Vec<u16> =
             vec![self.chunk, DEFAULT_CHUNK, DEFAULT_CHUNK_V6, SAFE_CHUNK];
+        // Through a TURN server the way is longer by the server's framing,
+        // and the loopback the engine sends to says nothing of it: only the
+        // size every path carries is known to fit.
+        #[cfg(feature = "nat-traversal")]
+        if self.turns.iter().any(|t| t.is_shim(self.peer)) {
+            candidates = vec![SAFE_CHUNK];
+        }
         candidates.retain(|&c| c <= self.chunk && c >= MIN_CHUNK);
         candidates.sort_unstable_by(|a, b| b.cmp(a));
         candidates.dedup();
@@ -3287,6 +3513,73 @@ impl Engine {
     /// holes) do not postpone the probe, and the probe fires no later than
     /// the RTO would, which it then postpones (RFC 8985 section 7.2): a lost
     /// tail is repaired with the current window instead of a collapsed one.
+    /// Whether `addr` carries the transfer without being the receiver: a
+    /// port a relay set aside, or an address on a TURN server, or a
+    /// loopback address that stands for the receiver through one.
+    fn is_relayed(&self, addr: SocketAddr) -> bool {
+        let addr = crate::address::canonical(addr);
+        #[cfg(feature = "nat-traversal")]
+        if self.turns.iter().any(|t| t.is_shim(addr)) {
+            return true;
+        }
+        self.relayed.contains(&addr)
+    }
+
+    fn ping_message(&self) -> Message<'static> {
+        let ts = self.clock.now_us();
+        Message::Ping(Ping { timestamp: ts })
+    }
+
+    /// While a session is carried by a relay, asks the receiver's other
+    /// addresses whether a direct path has opened: an authenticated ping to
+    /// each, which the receiver answers from where it arrived if it arrives
+    /// at all, and then moves the session to (each end proving the other's
+    /// address first, as for any change of address). A relay is somewhere to
+    /// stand until the way opens, not a place to stay: it costs whoever runs
+    /// it the bandwidth and is slower than what the two ends can manage
+    /// between them.
+    ///
+    /// Bounded: a few addresses, a datagram each, once a second at first
+    /// and then every few seconds, and only while the session is carried.
+    fn probe_direct(&mut self, now: Instant) {
+        /// Addresses asked in a round.
+        const ADDRESSES: usize = 4;
+        /// Rounds at the brisk pace, and how long the slow pace waits.
+        const BRISK_ROUNDS: u32 = 30;
+        const BRISK: Duration = Duration::from_secs(1);
+        const SLOW: Duration = Duration::from_secs(4);
+        if self.secure.is_none() || now < self.next_direct_probe || !self.is_relayed(self.peer) {
+            return;
+        }
+        self.direct_probes += 1;
+        self.next_direct_probe = now
+            + if self.direct_probes <= BRISK_ROUNDS {
+                BRISK
+            } else {
+                SLOW
+            };
+        let asked: Vec<SocketAddr> = self
+            .candidates
+            .iter()
+            .copied()
+            .filter(|a| *a != self.peer && !self.is_relayed(*a))
+            .take(ADDRESSES)
+            .collect();
+        if asked.is_empty() {
+            return;
+        }
+        if self.direct_probes == 1 {
+            tracing::info!(
+                "carried by {}: asking the receiver's other address(es) whether a direct path has opened",
+                self.peer
+            );
+        }
+        let ping = self.ping_message();
+        for a in asked {
+            let _ = self.send_frame_to(a, 0, &ping);
+        }
+    }
+
     fn maybe_send_tail_probe(&mut self, now: Instant) -> Result<(), SendError> {
         if self.inflight.is_empty()
             || self.stalled
@@ -3385,6 +3678,7 @@ impl Engine {
                 &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
             );
         }
+        self.probe_direct(now);
         self.maybe_send_tail_probe(now)?;
         // Retransmission timeout.
         let rto = self.rtt.rto();

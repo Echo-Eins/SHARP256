@@ -461,19 +461,55 @@ impl Receiver {
         #[cfg(feature = "nat-traversal")]
         let (hints_tx, hints_rx) =
             tokio::sync::watch::channel(crate::nat::card::FamilyHints::unknown());
+        // TURN servers this receiver was given: each makes an allocation in
+        // the background, and lets in whoever is punched at.
         #[cfg(feature = "nat-traversal")]
-        let puncher = Arc::new(
-            crate::nat::punch::Puncher::new(shared.socket.udp(), hints_rx).with_hit_handler({
-                let routes = shared.routes.clone();
-                Arc::new(move |hit| routes.adopt(hit))
-            }),
+        let turns = crate::nat::turn::start_all(
+            &shared.cfg.turn_servers,
+            &shared.socket.udp(),
+            &shared.cancel,
         );
         #[cfg(feature = "nat-traversal")]
-        let nat = if shared.cfg.nat_traversal && !shared.cfg.relay_only() {
+        let puncher = Arc::new(
+            crate::nat::punch::Puncher::new(shared.socket.udp(), hints_rx)
+                .with_hit_handler({
+                    let routes = shared.routes.clone();
+                    Arc::new(move |hit| routes.adopt(hit))
+                })
+                .with_turns(turns.clone()),
+        );
+        // What discovery finds and what the TURN servers give are reported
+        // together, and again when either changes.
+        #[cfg(feature = "nat-traversal")]
+        let reports = {
             let events = shared.cfg.events.clone();
             let id = shared.identity.id();
             let relay_refs = relay_refs(&shared.cfg.relays);
+            crate::nat::RelayedReports::new(
+                shared.socket.local_addr().unwrap_or(shared.cfg.bind),
+                turns.clone(),
+                shared.cancel.clone(),
+                shared.cfg.nat_traversal && !shared.cfg.relay_only(),
+                move |r| {
+                    emit(
+                        &events,
+                        TransferEvent::Reachability {
+                            advertised: r.advertised().map(|a| a.to_string()),
+                            address: r.address_string(&id),
+                            card: Some(
+                                r.card(&id, crate::nat::card::Role::Receiver, &relay_refs)
+                                    .to_text(),
+                            ),
+                            summary: r.describe(),
+                        },
+                    )
+                },
+            )
+        };
+        #[cfg(feature = "nat-traversal")]
+        let nat = if shared.cfg.nat_traversal && !shared.cfg.relay_only() {
             let puncher = puncher.clone();
+            let reports = reports.clone();
             crate::nat::spawn_discovery(
                 shared.socket.udp(),
                 {
@@ -493,18 +529,7 @@ impl Receiver {
                     // The tests are over: what is known of this NAT is what
                     // it will be, for the punches that wait for it.
                     puncher.settle();
-                    emit(
-                        &events,
-                        TransferEvent::Reachability {
-                            advertised: r.advertised().map(|a| a.to_string()),
-                            address: r.address_string(&id),
-                            card: Some(
-                                r.card(&id, crate::nat::card::Role::Receiver, &relay_refs)
-                                    .to_text(),
-                            ),
-                            summary: r.describe(),
-                        },
-                    )
+                    reports.update(r);
                 },
             )
         } else {
@@ -513,6 +538,53 @@ impl Receiver {
         #[cfg(feature = "nat-traversal")]
         if nat.is_none() {
             puncher.settle();
+        }
+
+        // Announced in the DHT, when asked to be, and the sender looked for
+        // there: what turns up is punched at, as an address on a card is.
+        #[cfg(feature = "nat-traversal")]
+        if shared.cfg.dht {
+            match crate::nat::dht::Dht::start(
+                shared.cfg.dht_bootstrap.clone(),
+                shared.cancel.clone(),
+            ) {
+                Ok(dht) => {
+                    tracing::info!(
+                        "announcing in the DHT: every node asked learns this host's address{}",
+                        if shared.cfg.psk.is_none() {
+                            ", and anybody who knows this receiver's ID can look it up (a shared secret prevents that)"
+                        } else {
+                            ""
+                        }
+                    );
+                    let key = crate::nat::dht::rendezvous_key(
+                        &shared.identity.id(),
+                        shared.cfg.psk.as_ref(),
+                    );
+                    let (punch, cancel) = (puncher.clone(), shared.cancel.clone());
+                    crate::nat::dht::spawn_rendezvous(
+                        dht,
+                        key,
+                        crate::nat::dht::Role::Receiver,
+                        puncher.subscribe(),
+                        shared.cancel.clone(),
+                        move |peer| {
+                            let (punch, cancel) = (punch.clone(), cancel.clone());
+                            tokio::spawn(async move {
+                                punch
+                                    .run_for(
+                                        peer,
+                                        crate::nat::card::NatHints::unknown(),
+                                        crate::nat::punch::MEET_DURATION,
+                                        &cancel,
+                                    )
+                                    .await;
+                            });
+                        },
+                    );
+                }
+                Err(e) => tracing::warn!("cannot use the DHT: {}", e),
+            }
         }
 
         // Announced on the local network, when asked to be: a sender there
@@ -629,6 +701,10 @@ impl Receiver {
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                         for t in tasks {
                             let _ = tokio::time::timeout_at(deadline, t).await;
+                        }
+                        // And the TURN allocations are given back.
+                        for t in &turns {
+                            t.finished(Duration::from_secs(2)).await;
                         }
                     }
                     return Ok(());

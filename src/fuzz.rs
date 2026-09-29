@@ -296,6 +296,78 @@ pub fn upnp(data: &[u8]) {
     let _ = location.join(&s);
 }
 
+/// Multicast DNS, as a receiver reads questions from anyone on its network
+/// and a sender reads answers from anyone there.
+#[cfg(feature = "nat-traversal")]
+pub fn mdns(data: &[u8]) {
+    use crate::nat::mdns;
+    let id = fixture().receiver;
+    if let Some(m) = mdns::Message::decode(data) {
+        // Whatever it says, answering it and reading it as an answer must
+        // not panic, and what is answered decodes again.
+        let host = mdns::Announcement {
+            id,
+            port: 5555,
+            addresses: vec![
+                "192.0.2.7".parse().expect("literal"),
+                "2001:db8::7".parse().expect("literal"),
+            ],
+        };
+        if let Some(answer) = host.answer(&m) {
+            if let Some(bytes) = answer.encode() {
+                assert!(
+                    mdns::Message::decode(&bytes).is_some(),
+                    "an answer that cannot be read back"
+                );
+            }
+        }
+        let _ = mdns::addresses_in(&m, &id);
+        let _ = m.encode();
+    }
+}
+
+/// TURN and STUN messages as a client reads them from a server it was told
+/// to use, and ChannelData framing.
+#[cfg(feature = "nat-traversal")]
+pub fn turn(data: &[u8]) {
+    use crate::nat::turn::wire;
+    if let Some(m) = wire::parse(data) {
+        let _ = m.xor_address(wire::ATTR_XOR_PEER_ADDRESS);
+        let _ = m.xor_address(wire::ATTR_XOR_RELAYED_ADDRESS);
+        let _ = m.lifetime();
+        let _ = m.error();
+        let _ = m.text(wire::ATTR_REALM);
+        let _ = m.attrs_of(wire::ATTR_XOR_PEER_ADDRESS).count();
+        let key = wire::Credentials::new("user", "realm", "password", b"nonce");
+        let _ = m.integrity_is_good(key.key());
+    }
+    if let Some((channel, payload)) = wire::parse_channel_data(data) {
+        assert!((wire::CHANNEL_MIN..=0x7fff).contains(&channel));
+        assert!(payload.len() <= data.len());
+        // What is framed is read back the same.
+        let framed = wire::channel_data(channel, payload);
+        assert_eq!(wire::parse_channel_data(&framed), Some((channel, payload)));
+    }
+    let _ = wire::looks_like_channel_data(data);
+    let _ = wire::parse_xor_address(data, &[1; 12]);
+}
+
+/// The DHT: bencoding, and a node's answer to a query.
+#[cfg(feature = "nat-traversal")]
+pub fn dht(data: &[u8]) {
+    use crate::nat::dht::bencode;
+    if let Some(v) = bencode::decode(data) {
+        // What is read is written the one way, and that reads the same.
+        let again = bencode::encode(&v);
+        assert_eq!(
+            bencode::decode(&again).as_ref(),
+            Some(&v),
+            "bencoding does not survive a round trip"
+        );
+        crate::nat::dht::fuzz_reply(&v);
+    }
+}
+
 /// One entry point: what reads the bytes.
 pub type Target = fn(&[u8]);
 
@@ -317,6 +389,12 @@ pub const TARGETS: &[(&str, Target)] = &[
     ("portmap", portmap),
     #[cfg(feature = "nat-traversal")]
     ("upnp", upnp),
+    #[cfg(feature = "nat-traversal")]
+    ("mdns", mdns),
+    #[cfg(feature = "nat-traversal")]
+    ("turn", turn),
+    #[cfg(feature = "nat-traversal")]
+    ("dht", dht),
 ];
 
 /// Well-formed inputs for each target, made by the encoders: the starting
@@ -415,6 +493,92 @@ pub fn seeds(target: &str) -> Vec<Vec<u8>> {
 203.0.113.9</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>"
                 .to_vec(),
         ],
+        #[cfg(feature = "nat-traversal")]
+        "mdns" => {
+            use crate::nat::mdns;
+            let id = fixture().receiver;
+            let host = mdns::Announcement {
+                id,
+                port: 5555,
+                addresses: vec![
+                    "192.0.2.7".parse().expect("literal"),
+                    "2001:db8::7".parse().expect("literal"),
+                ],
+            };
+            let query = mdns::query_for(&id);
+            let mut out = Vec::new();
+            out.extend(query.encode());
+            out.extend(host.answer(&query).and_then(|a| a.encode()));
+            out
+        }
+        #[cfg(feature = "nat-traversal")]
+        "turn" => {
+            use crate::nat::turn::wire::*;
+            let tid = [5u8; 12];
+            let cred = Credentials::new("alice", "example.org", "s3cret", b"nonce");
+            let peer: std::net::SocketAddr = "198.51.100.7:4000".parse().expect("literal");
+            vec![
+                Builder::new(ALLOCATE, Class::Request, &tid)
+                    .attr(ATTR_REQUESTED_TRANSPORT, &[TRANSPORT_UDP, 0, 0, 0])
+                    .finish_authenticated(&cred),
+                Builder::new(ALLOCATE, Class::Success, &tid)
+                    .xor_address(
+                        ATTR_XOR_RELAYED_ADDRESS,
+                        "203.0.113.9:49152".parse().expect("literal"),
+                    )
+                    .xor_address(
+                        ATTR_XOR_MAPPED_ADDRESS,
+                        "[2001:db8::5]:40000".parse().expect("literal"),
+                    )
+                    .attr(ATTR_LIFETIME, &600u32.to_be_bytes())
+                    .finish_with_integrity(cred.key()),
+                Builder::new(DATA, Class::Indication, &tid)
+                    .xor_address(ATTR_XOR_PEER_ADDRESS, peer)
+                    .attr(ATTR_DATA, b"payload")
+                    .finish(),
+                Builder::new(ALLOCATE, Class::Error, &tid)
+                    .attr(ATTR_ERROR_CODE, &[0, 0, 4, 1, b'n', b'o'])
+                    .attr(ATTR_REALM, b"example.org")
+                    .attr(ATTR_NONCE, b"nonce")
+                    .finish(),
+                channel_data(0x4001, b"a datagram"),
+            ]
+        }
+        #[cfg(feature = "nat-traversal")]
+        "dht" => {
+            use crate::nat::dht::bencode::{encode, Value};
+            let mut nodes = Vec::new();
+            for i in 0..3u8 {
+                nodes.extend_from_slice(&[i; 20]);
+                nodes.extend_from_slice(&[10, 0, 0, i, 0x1a, 0xe1]);
+            }
+            vec![
+                encode(&Value::dict(vec![
+                    ("t", Value::bytes(b"abcd")),
+                    ("y", Value::bytes(b"r")),
+                    (
+                        "r",
+                        Value::dict(vec![
+                            ("id", Value::bytes(&[5; 20])),
+                            ("token", Value::bytes(b"tok")),
+                            ("nodes", Value::Bytes(nodes)),
+                            (
+                                "values",
+                                Value::List(vec![Value::bytes(&[1, 2, 3, 4, 0x1f, 0x90])]),
+                            ),
+                        ]),
+                    ),
+                ])),
+                encode(&Value::dict(vec![
+                    ("t", Value::bytes(b"abcd")),
+                    ("y", Value::bytes(b"e")),
+                    (
+                        "e",
+                        Value::List(vec![Value::Int(203), Value::bytes(b"bad token")]),
+                    ),
+                ])),
+            ]
+        }
         _ => Vec::new(),
     }
 }
@@ -696,6 +860,18 @@ mod tests {
         #[cfg(feature = "nat-traversal")]
         for c in seeds("card") {
             assert!(crate::nat::card::Card::decode(&c).is_ok());
+        }
+        #[cfg(feature = "nat-traversal")]
+        for m in seeds("mdns") {
+            assert!(crate::nat::mdns::Message::decode(&m).is_some());
+        }
+        #[cfg(feature = "nat-traversal")]
+        for m in seeds("turn").iter().take(4) {
+            assert!(crate::nat::turn::wire::parse(m).is_some());
+        }
+        #[cfg(feature = "nat-traversal")]
+        for m in seeds("dht") {
+            assert!(crate::nat::dht::bencode::decode(&m).is_some());
         }
     }
 

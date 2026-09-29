@@ -42,6 +42,9 @@ pub struct Options {
     pub id: SharpId,
     pub role: Role,
     pub relays: Vec<RelayRef>,
+    /// TURN servers, `USER:PASSWORD@HOST[:PORT]`: each is asked for an
+    /// address, which goes on the card, and is used in [`Probe::punch_test`].
+    pub turn: Vec<String>,
 }
 
 /// A running probe: the socket it measured with, and what was found.
@@ -54,8 +57,13 @@ pub struct Probe {
     datagrams: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     cancel: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    turns: Vec<super::turn::Turn>,
+    /// What came of each TURN server asked, in words.
+    turn_notes: Vec<String>,
 }
 
+/// How long a TURN server is waited for, at most.
+const TURN_WAIT: Duration = Duration::from_secs(8);
 /// How long the tests are waited for, at most.
 const TESTS_WAIT: Duration = Duration::from_secs(25);
 /// How long, after the tests, a router is given to answer a port-forward
@@ -149,6 +157,38 @@ impl Probe {
                 }
             }
         }
+        // The TURN servers, if any were given: each asked for an address.
+        let turns = super::turn::start_all(&options.turn, &socket, &cancel);
+        let mut turn_notes = Vec::new();
+        for (t, name) in turns.iter().zip(&options.turn) {
+            let mut changes = t.subscribe();
+            let _ = tokio::time::timeout(TURN_WAIT, async {
+                while t.relayed().is_empty() {
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+            .await;
+            let who = name
+                .parse::<super::turn::Server>()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| name.clone());
+            let got = t.relayed();
+            turn_notes.push(if got.is_empty() {
+                format!(
+                    "{}: no address in {:?} (the credentials, or UDP to the server, are what to check)",
+                    who, TURN_WAIT
+                )
+            } else {
+                format!(
+                    "{}: relaying at {}",
+                    who,
+                    got.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                )
+            });
+            reach.relayed.extend(got);
+        }
         let card = reach.card(&options.id, options.role, &options.relays);
         Ok(Self {
             socket,
@@ -159,14 +199,20 @@ impl Probe {
             datagrams: data_rx,
             cancel,
             tasks: vec![reader, forward, task.task],
+            turns,
+            turn_notes,
         })
     }
 
-    /// Ends the probe and gives back whatever the router granted.
+    /// Ends the probe and gives back whatever the router granted and the
+    /// servers allocated.
     pub async fn finish(self) {
         self.cancel.cancel();
         for t in self.tasks {
             let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
+        }
+        for t in &self.turns {
+            t.finished(Duration::from_secs(2)).await;
         }
     }
 
@@ -226,6 +272,13 @@ impl Probe {
                 );
             }
         }
+        if !self.turn_notes.is_empty() {
+            let mut said = false;
+            for note in &self.turn_notes {
+                line(if said { "" } else { "TURN:" }, note.clone());
+                said = true;
+            }
+        }
         line("Relays on the card:", self.card.relays.len().to_string());
         out.push_str(&format!(
             "\nYour card (give it to the other side):\n{}\n",
@@ -238,7 +291,9 @@ impl Probe {
     /// listens for the peer doing the same: the two of you both running
     /// this within `duration` of each other is the test.
     pub async fn punch_test(&mut self, peer: &Card, duration: Duration) -> Outcome {
-        let puncher = Arc::new(Puncher::new(self.socket.clone(), self.hints.clone()));
+        let puncher = Arc::new(
+            Puncher::new(self.socket.clone(), self.hints.clone()).with_turns(self.turns.clone()),
+        );
         let cancel = self.cancel.child_token();
         let targets = peer.punch_targets();
         let mut runs = Vec::new();

@@ -67,6 +67,38 @@ struct Args {
     #[arg(long = "stun", value_name = "HOST:PORT")]
     stun: Vec<String>,
 
+    /// A TURN server, USER:PASSWORD@HOST[:PORT] (RFC 8656), that reaches
+    /// this receiver when nothing direct does: it gives an address that
+    /// goes on the receiver's card, and lets in a sender once its address is
+    /// known (from its card, or a relay's introduction). Only TURN over UDP
+    /// is spoken. Everything through it is sealed end to end, and costs the
+    /// server's owner the bandwidth. A colon in a user name is written %3A.
+    /// Repeat it for several, or set SHARP256_TURN (servers separated by
+    /// spaces), which keeps the password off the command line
+    #[arg(
+        long = "turn",
+        value_name = "USER:PASSWORD@HOST[:PORT]",
+        env = "SHARP256_TURN",
+        hide_env_values = true,
+        value_delimiter = ' '
+    )]
+    turn: Vec<String>,
+
+    /// Announce this receiver in the Mainline DHT (the one BitTorrent uses)
+    /// and look there for the sender, so that the two find each other's
+    /// addresses with nothing to go by but this receiver's ID — and the
+    /// shared secret, if there is one. Every DHT node asked learns this
+    /// host's address, and without --secret anybody who knows this
+    /// receiver's ID can look it up in the DHT: it is as public as an
+    /// address that had been published. Needs the NAT tests (no --no-nat)
+    #[arg(long)]
+    dht: bool,
+
+    /// A DHT node (host:port) to start from instead of the well-known ones;
+    /// repeat it for several
+    #[arg(long = "dht-bootstrap", value_name = "HOST:PORT")]
+    dht_bootstrap: Vec<String>,
+
     /// Announce this receiver on the local network with multicast DNS, so
     /// that a sender there (sharp-sender --lan) that knows the receiver ID
     /// finds it without being told an address. The announcement tells
@@ -157,6 +189,18 @@ async fn main() -> Result<()> {
     cfg.announce_lan = args.announce_lan && cfg!(feature = "nat-traversal");
     cfg.nat_keepalive = std::time::Duration::from_secs(args.keepalive.clamp(1, 3600));
     cfg.stun_servers = args.stun.clone();
+    #[cfg(feature = "nat-traversal")]
+    for t in &args.turn {
+        t.parse::<sharp256::nat::turn::Server>()
+            .map_err(|e| anyhow::anyhow!("--turn: {}", e))?;
+    }
+    #[cfg(not(feature = "nat-traversal"))]
+    if !args.turn.is_empty() {
+        anyhow::bail!("--turn needs a build with the nat-traversal feature");
+    }
+    cfg.turn_servers = args.turn.clone();
+    cfg.dht = args.dht && cfg!(feature = "nat-traversal");
+    cfg.dht_bootstrap = args.dht_bootstrap.clone();
     cfg.state_dir = args.state_dir.clone();
     if let Some(c) = args.chunk_size {
         cfg.transport.max_chunk = c;

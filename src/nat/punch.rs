@@ -163,6 +163,13 @@ pub fn plan(mine: &NatHints, theirs: &NatHints, base: SocketAddr) -> Plan {
         spray: 0,
         sockets: 0,
     };
+    // Nothing translated in front of the peer, and what it lets in decided
+    // by address alone (or not at all): which port we send from cannot
+    // matter to it, so one socket is all it takes, whatever our own NAT
+    // does with ports. A TURN server's relayed address is exactly this.
+    if theirs.mapping == 4 && matches!(theirs.filtering, 1 | 2) {
+        return direct(Verdict::Direct);
+    }
     match (ports_of(mine), ports_of(theirs)) {
         (Ports::Random, Ports::Stable | Ports::Preserved) => Plan {
             verdict: Verdict::BirthdayHard,
@@ -203,6 +210,65 @@ pub fn plan(mine: &NatHints, theirs: &NatHints, base: SocketAddr) -> Plan {
     }
 }
 
+/// What a peer whose NAT nothing has been said of may be, beyond the easy
+/// case every first pass assumes: tried in turn on the passes that follow.
+/// One that draws ports at random is here too, though against another that
+/// draws at random nothing can be done ([`Verdict::RelayOnly`] is left out
+/// of a schedule: it is no way of punching).
+fn assumptions() -> [NatHints; 3] {
+    let symmetric = |allocation, delta| NatHints {
+        mapping: 3,
+        filtering: 3,
+        allocation,
+        delta,
+        ..NatHints::unknown()
+    };
+    [
+        // Keeps one port for every destination, and lets in only the exact
+        // address and port it was sent to.
+        NatHints {
+            mapping: 1,
+            filtering: 3,
+            ..NatHints::unknown()
+        },
+        symmetric(Allocation::Sequential, 1),
+        symmetric(Allocation::Random, 0),
+    ]
+}
+
+/// The plans a punch goes through, one to a pass: the one `theirs` calls
+/// for; and, where nothing is known of the peer's NAT (an address from a
+/// DHT, a name, a hand-written list) and the address is one the internet
+/// routes, the ways a peer of each other kind would have to be approached —
+/// so that a peer that needs a predicted or a guessed port is not left
+/// waiting for a hint that no such source can give. Bounded as any pass
+/// is: the datagrams are nine bytes, and a spray is at most one in
+/// [`SPRAY_SPACING`] to an address.
+fn schedule(mine: &NatHints, theirs: &NatHints, base: SocketAddr) -> Vec<Plan> {
+    let direct = || Plan {
+        verdict: Verdict::Direct,
+        ports: vec![base.port()],
+        spray: 0,
+        sockets: 0,
+    };
+    // Working out where a peer's NAT will put a port only means something
+    // for an address the internet routes: a private one is the peer's own
+    // network, which is no place for a spray.
+    if !crate::address::class::is_global(base.ip()) {
+        return vec![direct()];
+    }
+    let mut out = vec![plan(mine, theirs, base)];
+    if theirs.mapping == 0 && theirs.filtering == 0 {
+        for assumed in assumptions() {
+            let p = plan(mine, &assumed, base);
+            if p.verdict != Verdict::RelayOnly && !out.iter().any(|q| q.verdict == p.verdict) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Sends the punches a [`Plan`] calls for, on the socket the transfer uses:
 /// the NAT mapping a punch opens is the one the peer's packets must find.
 pub struct Puncher {
@@ -217,6 +283,9 @@ pub struct Puncher {
     /// one, an end whose NAT draws ports at random can only punch from the
     /// one socket, which is a hope and not a method.
     on_hit: Option<HitHandler>,
+    /// TURN allocations, which pass only what comes from an address they
+    /// were told to: every address punched at is one that may need it.
+    turns: Vec<super::turn::Turn>,
 }
 
 /// Takes over a socket that a peer got through to (see [`super::birthday`]).
@@ -241,7 +310,14 @@ impl Puncher {
             settled: CancellationToken::new(),
             last_spray: parking_lot::Mutex::new(std::collections::HashMap::new()),
             on_hit: None,
+            turns: Vec::new(),
         }
+    }
+
+    /// Lets each address punched at send through these TURN allocations.
+    pub fn with_turns(mut self, turns: Vec<super::turn::Turn>) -> Self {
+        self.turns = turns;
+        self
     }
 
     /// Says what becomes of the socket a birthday meeting is made at.
@@ -330,48 +406,57 @@ impl Puncher {
             tracing::debug!("punch: {} is not worth sending to", base);
             return;
         }
-        let mine = self.hints_when_known().await.for_addr(&base);
-        // Working out where a peer's NAT will put a port only means
-        // something for an address the internet routes: a private one on a
-        // card is the peer's own network, which is no place for a spray.
-        let plan = if crate::address::class::is_global(base.ip()) {
-            plan(&mine, &theirs, base)
-        } else {
-            Plan {
-                verdict: Verdict::Direct,
-                ports: vec![base.port()],
-                spray: 0,
-                sockets: 0,
-            }
-        };
-        tracing::info!("punching towards {}: {}", base, plan.verdict.describe());
-        let mut spray = plan.spray;
-        if spray > 0 {
-            let now = Instant::now();
-            let mut last = self.last_spray.lock();
-            last.retain(|_, t| now.saturating_duration_since(*t) < SPRAY_SPACING);
-            if last.contains_key(&base.ip()) || last.len() >= 8 {
-                tracing::debug!("punch: not spraying at {} again so soon", base.ip());
-                spray = 0;
-            } else {
-                last.insert(base.ip(), now);
-            }
+        // Whoever is punched at may be sending through a TURN server, which
+        // drops it unless the address has been permitted.
+        for turn in &self.turns {
+            turn.permit(base.ip());
         }
+        let mine = self.hints_when_known().await.for_addr(&base);
+        let schedule = schedule(&mine, &theirs, base);
+        let started = Instant::now();
+        // Sockets for a birthday meeting are opened once, by the first plan
+        // that asks for them, and kept for the rest of the punch.
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel::<usize>();
         let aux = async {
+            let Ok(count) = open_rx.await else {
+                return;
+            };
             let Some(handler) = &self.on_hit else {
                 return;
             };
-            if plan.sockets == 0 {
-                return;
-            }
-            let sockets = birthday::open_sockets(&self.socket, plan.sockets);
-            if let Some(hit) = birthday::meet(sockets, base, duration, cancel).await {
+            let sockets = birthday::open_sockets(&self.socket, count);
+            let left = duration.saturating_sub(started.elapsed());
+            if let Some(hit) = birthday::meet(sockets, base, left, cancel).await {
                 handler(hit);
             }
         };
         let passes = async {
-            let start = Instant::now();
+            let mut open_tx = Some(open_tx);
+            let mut pass = 0usize;
             loop {
+                let plan = &schedule[pass % schedule.len()];
+                // Said when it changes: the first pass, and each that tries
+                // something else.
+                if pass < schedule.len() {
+                    tracing::info!("punching towards {}: {}", base, plan.verdict.describe());
+                }
+                if plan.sockets > 0 {
+                    if let Some(tx) = open_tx.take() {
+                        let _ = tx.send(plan.sockets);
+                    }
+                }
+                let mut spray = plan.spray;
+                if spray > 0 {
+                    let now = Instant::now();
+                    let mut last = self.last_spray.lock();
+                    last.retain(|_, t| now.saturating_duration_since(*t) < SPRAY_SPACING);
+                    if last.contains_key(&base.ip()) || last.len() >= 8 {
+                        tracing::debug!("punch: not spraying at {} again so soon", base.ip());
+                        spray = 0;
+                    } else {
+                        last.insert(base.ip(), now);
+                    }
+                }
                 // Ports to probe once each, spread over the pass's first
                 // rounds, so that the peer's side of it is open for some of
                 // them whenever it opens.
@@ -384,7 +469,8 @@ impl Puncher {
                     random = all;
                 }
                 self.send_rounds(base, &plan.ports, &random, cancel).await;
-                if cancel.is_cancelled() || start.elapsed() + SPRAY_SPACING >= duration {
+                pass += 1;
+                if cancel.is_cancelled() || started.elapsed() + SPRAY_SPACING >= duration {
                     return;
                 }
                 tokio::select! {
@@ -475,6 +561,91 @@ mod tests {
             assert_eq!(p.ports, vec![40000]);
             assert_eq!((p.spray, p.sockets), (0, 0));
         }
+    }
+
+    /// An address with nothing translated in front of it that lets in by
+    /// address alone — a TURN server's relayed address — is sent to from
+    /// one socket, however our own NAT numbers its ports. Without this a
+    /// sender behind a symmetric NAT opened hundreds of sockets to guess a
+    /// port that nothing was guarding.
+    #[test]
+    fn an_address_that_lets_in_by_address_alone_needs_no_port_games() {
+        let relayed = |filtering: u8| NatHints {
+            mapping: 4,
+            filtering,
+            ..NatHints::unknown()
+        };
+        let ours = [
+            NatHints::unknown(),
+            hints(3, Allocation::Random, 0),
+            hints(3, Allocation::Sequential, 2),
+        ];
+        for mine in ours {
+            for filtering in [1, 2] {
+                let p = plan(&mine, &relayed(filtering), base());
+                assert_eq!(
+                    p.verdict,
+                    Verdict::Direct,
+                    "{:?} against filtering {}",
+                    mine,
+                    filtering
+                );
+                assert_eq!((p.spray, p.sockets), (0, 0));
+            }
+        }
+        // But one that also filters by port, or has not said, is still
+        // approached with what the port requires.
+        let p = plan(&hints(3, Allocation::Random, 0), &relayed(3), base());
+        assert_eq!(p.verdict, Verdict::BirthdayHard);
+        let p = plan(&hints(3, Allocation::Random, 0), &relayed(0), base());
+        assert_eq!(p.verdict, Verdict::BirthdayHard);
+    }
+
+    /// Where the peer's NAT is not known the first pass is the easy case,
+    /// and the passes after it are what a peer of each harder kind would
+    /// need — except where nothing could be done anyway.
+    #[test]
+    fn an_unknown_peer_is_approached_in_every_way_that_could_work() {
+        // An address the internet routes (the documentation ranges are not).
+        let base = || -> SocketAddr { "11.9.0.9:40000".parse().unwrap() };
+        let stable = NatHints::unknown();
+        let random = hints(3, Allocation::Random, 0);
+        let verdicts = |mine: &NatHints, theirs: &NatHints, addr: SocketAddr| -> Vec<Verdict> {
+            schedule(mine, theirs, addr)
+                .iter()
+                .map(|p| p.verdict)
+                .collect()
+        };
+        assert_eq!(
+            verdicts(&stable, &NatHints::unknown(), base()),
+            [
+                Verdict::Direct,
+                Verdict::Predict { step: 1 },
+                Verdict::BirthdayEasy
+            ],
+        );
+        // Ours draws at random: the sockets are needed from the start, and
+        // against another that draws at random there is nothing to try.
+        assert_eq!(
+            verdicts(&random, &NatHints::unknown(), base()),
+            [Verdict::BirthdayHard, Verdict::Predict { step: 1 }],
+        );
+        // Said, it is believed: one plan, the one it calls for.
+        assert_eq!(
+            verdicts(&stable, &hints(1, Allocation::Preserved, 0), base()),
+            [Verdict::Direct]
+        );
+        assert_eq!(
+            verdicts(&stable, &hints(3, Allocation::Sequential, 2), base()),
+            [Verdict::Predict { step: 2 }],
+        );
+        // A private address is the peer's own network: no spray, and no
+        // guessing which NAT it is behind.
+        let lan: SocketAddr = "192.168.1.7:5555".parse().unwrap();
+        assert_eq!(
+            verdicts(&random, &NatHints::unknown(), lan),
+            [Verdict::Direct]
+        );
     }
 
     #[test]

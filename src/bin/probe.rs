@@ -41,6 +41,20 @@ struct Args {
     #[arg(long)]
     no_port_mapping: bool,
 
+    /// A TURN server, USER:PASSWORD@HOST[:PORT] (RFC 8656), to ask for an
+    /// address: it goes on the card, and is used in the test with a peer's
+    /// card. The way to find out whether a server's credentials work and
+    /// what it gives. Repeat it for several, or set SHARP256_TURN (servers
+    /// separated by spaces)
+    #[arg(
+        long = "turn",
+        value_name = "USER:PASSWORD@HOST[:PORT]",
+        env = "SHARP256_TURN",
+        hide_env_values = true,
+        value_delimiter = ' '
+    )]
+    turn: Vec<String>,
+
     /// The other side's contact card (shc1-…), or @FILE with one in it.
     /// Sends at its addresses for --wait seconds, listens for the other
     /// side doing the same, and reports whether a packet got through. Both
@@ -101,6 +115,7 @@ async fn main() -> Result<()> {
             Role::Sender
         },
         relays: Vec::new(),
+        turn: args.turn.clone(),
     })
     .await
     .context("the tests could not be run")?;

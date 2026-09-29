@@ -56,6 +56,13 @@ rfd = { version = "0.12", optional = true }
 
 # NAT traversal (optional)
 if-addrs = { version = "0.6", optional = true }
+# TURN long-term credentials (RFC 8489 section 9.2): the key is an MD5 of
+# the user's name, the realm and the password, and every request carries
+# an HMAC-SHA1 over itself. Nothing here protects data: transfers are sealed
+# end to end, and this only proves to a TURN server who is asking.
+md-5 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -72,7 +79,7 @@ tempfile = "3"
 [features]
 default = ["gui", "nat-traversal"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd"]
-nat-traversal = ["dep:if-addrs"]
+nat-traversal = ["dep:if-addrs", "dep:md-5", "dep:sha1", "dep:hmac"]
 
 [[bin]]
 name = "sharp-sender"

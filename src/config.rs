@@ -178,6 +178,19 @@ pub struct SenderConfig {
     /// A question tells everybody on the network whom this sender is
     /// looking for, so it is not asked unless asked for.
     pub find_lan: bool,
+    /// TURN servers this sender may be reached through, and may reach the
+    /// receiver through: `USER:PASSWORD@HOST[:PORT]` (see `nat::turn`). The
+    /// address each gives is on the sender's card, and the receiver's
+    /// addresses are tried through each as well.
+    pub turn_servers: Vec<String>,
+    /// Find the receiver's address through the Mainline DHT (see
+    /// `nat::dht`): announce this sender and look for the receiver under
+    /// infohashes derived from the receiver's ID and the shared secret.
+    /// Tells every DHT node asked this host's address, and — without a
+    /// shared secret — lets anybody who knows the receiver's ID see it.
+    pub dht: bool,
+    /// DHT nodes to start from, `host:port`; empty means the well-known ones.
+    pub dht_bootstrap: Vec<String>,
     pub events: Option<EventCallback>,
 }
 
@@ -198,6 +211,8 @@ impl std::fmt::Debug for SenderConfig {
             .field("nat_traversal", &self.nat_traversal)
             .field("stun_servers", &self.stun_servers)
             .field("find_lan", &self.find_lan)
+            .field("turn_servers", &self.turn_servers.len())
+            .field("dht", &self.dht)
             .field("events", &self.events.is_some())
             .finish()
     }
@@ -243,6 +258,9 @@ impl SenderConfig {
             #[cfg(feature = "nat-traversal")]
             peer_card: None,
             find_lan: false,
+            turn_servers: Vec::new(),
+            dht: false,
+            dht_bootstrap: Vec::new(),
             events: None,
         }
     }
@@ -333,6 +351,19 @@ pub struct ReceiverConfig {
     /// an address. Off unless asked for: the announcement tells everybody on
     /// the network that this host receives SHARP-256 transfers.
     pub announce_lan: bool,
+    /// TURN servers this receiver is reached through when nothing direct
+    /// works: `USER:PASSWORD@HOST[:PORT]` (see `nat::turn`). The address
+    /// each gives is published with the others, and a sender is let in once
+    /// its address is known (from its card or a relay's introduction).
+    pub turn_servers: Vec<String>,
+    /// Announce this receiver in the Mainline DHT and look there for the
+    /// sender (see `nat::dht`), so that the two find each other's addresses
+    /// with nothing but the receiver's ID (and the shared secret) to go by.
+    /// Tells every DHT node asked this host's address, and — without a
+    /// shared secret — lets anybody who knows the receiver's ID see it.
+    pub dht: bool,
+    /// DHT nodes to start from, `host:port`; empty means the well-known ones.
+    pub dht_bootstrap: Vec<String>,
     pub accept: AcceptPolicy,
     /// Our identity; `None` = load (or create) the per-user identity file.
     pub identity: Option<Identity>,
@@ -368,6 +399,8 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("nat_keepalive", &self.nat_keepalive)
             .field("stun_servers", &self.stun_servers)
             .field("announce_lan", &self.announce_lan)
+            .field("turn_servers", &self.turn_servers.len())
+            .field("dht", &self.dht)
             .field("accept", &self.accept)
             .field("identity", &self.identity)
             .field("psk", &self.psk.is_some())
@@ -425,6 +458,9 @@ impl ReceiverConfig {
             nat_keepalive: Duration::from_secs(15),
             stun_servers: Vec::new(),
             announce_lan: false,
+            turn_servers: Vec::new(),
+            dht: false,
+            dht_bootstrap: Vec::new(),
             accept: AcceptPolicy::AcceptAll,
             identity: None,
             psk: None,

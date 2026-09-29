@@ -29,6 +29,7 @@
 pub mod behaviour;
 pub mod birthday;
 pub mod card;
+pub mod dht;
 pub mod keepalive;
 pub mod mdns;
 pub mod portmap;
@@ -36,6 +37,7 @@ pub mod probe;
 pub mod punch;
 pub mod stun;
 pub mod stunserver;
+pub mod turn;
 pub mod upnp;
 
 use self::behaviour::{Allocation, Behaviour, Reachable};
@@ -653,6 +655,9 @@ pub enum CandidateKind {
     ServerReflexive,
     /// A port the router agreed to forward to us.
     PortForward,
+    /// An address on a TURN server that reaches us (see [`turn`]): slower
+    /// and somebody else's bandwidth, but it needs nothing of our NAT.
+    Relayed,
 }
 
 impl CandidateKind {
@@ -661,6 +666,7 @@ impl CandidateKind {
             CandidateKind::Host => "host",
             CandidateKind::ServerReflexive => "seen from outside",
             CandidateKind::PortForward => "port forward",
+            CandidateKind::Relayed => "relayed",
         }
     }
 }
@@ -702,9 +708,30 @@ pub struct Reachability {
     /// This host's own addresses worth publishing, best first (see
     /// `host_addresses`).
     pub host: Vec<IpAddr>,
+    /// Addresses on TURN servers that reach this host. Not found by
+    /// discovery: whoever runs the allocations puts them here.
+    pub relayed: Vec<SocketAddr>,
 }
 
 impl Reachability {
+    /// The reachability of a host that has looked at nothing: for the one
+    /// that is to be reached through a TURN server alone.
+    pub fn bare(local_addr: SocketAddr) -> Self {
+        Self {
+            local_addr,
+            public_addr: None,
+            behaviour: Behaviour::default(),
+            behaviour6: None,
+            upnp_addr: None,
+            pinhole6: None,
+            forwards: Vec::new(),
+            mapping_notes: Vec::new(),
+            double_nat: false,
+            host: Vec::new(),
+            relayed: Vec::new(),
+        }
+    }
+
     /// What is known of the NAT or firewall in front of each family, in the
     /// form a peer is told: over a relay, or in a contact card.
     pub fn hints(&self) -> card::FamilyHints {
@@ -830,6 +857,16 @@ impl Reachability {
                 CandidateKind::Host,
             );
         }
+        // Somebody else's bandwidth, so last — but never left out for lack
+        // of room: with the others failing, it is what a sender has.
+        for a in &self.relayed {
+            if !out.iter().any(|c| c.addr == *a) {
+                out.push(Candidate {
+                    addr: *a,
+                    kind: CandidateKind::Relayed,
+                });
+            }
+        }
         out
     }
 
@@ -879,6 +916,9 @@ impl Reachability {
         }
         for ip in self.host.iter().filter(|ip| ip.is_ipv4()) {
             add(SocketAddr::new(*ip, port), Kind::Host);
+        }
+        for a in &self.relayed {
+            add(*a, Kind::Relayed);
         }
         let hints = self.hints();
         c.v4 = (hints.v4.mapping != 0).then_some(hints.v4);
@@ -1013,6 +1053,79 @@ fn reachability(
         mapping_notes: forwards.notes.clone(),
         double_nat,
         host: host_addresses(local_addr, publish_lan),
+        relayed: Vec::new(),
+    }
+}
+
+/// Reports what discovery found together with what the TURN allocations
+/// have given, and again whenever either changes: an allocation is made
+/// while the NAT tests run, and finishes before or after them.
+pub struct RelayedReports {
+    local: SocketAddr,
+    turns: Vec<turn::Turn>,
+    /// Whether a discovery is running, whose result is still to come.
+    discovering: bool,
+    latest: parking_lot::Mutex<Option<Reachability>>,
+    report: Box<dyn Fn(&Reachability) + Send + Sync>,
+}
+
+impl RelayedReports {
+    /// `report` is called with each new state. Nothing is reported until
+    /// there is something to say: a discovery result, or — where none is
+    /// coming (`discovering` is false) — an address on a TURN server. A
+    /// card handed out before the tests are done would be one with the
+    /// server's address alone, and the person who copies the first card
+    /// they see would be handing over the poorer one.
+    pub fn new(
+        local: SocketAddr,
+        turns: Vec<turn::Turn>,
+        cancel: CancellationToken,
+        discovering: bool,
+        report: impl Fn(&Reachability) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let this = Arc::new(Self {
+            local,
+            turns,
+            discovering,
+            latest: parking_lot::Mutex::new(None),
+            report: Box::new(report),
+        });
+        for t in &this.turns {
+            let (mut changes, this, cancel) = (t.subscribe(), this.clone(), cancel.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        c = changes.changed() => if c.is_err() { return },
+                        _ = cancel.cancelled() => return,
+                    }
+                    this.emit(None);
+                }
+            });
+        }
+        this
+    }
+
+    /// A discovery result.
+    pub fn update(&self, r: &Reachability) {
+        self.emit(Some(r.clone()));
+    }
+
+    fn emit(&self, found: Option<Reachability>) {
+        let relayed: Vec<SocketAddr> = self.turns.iter().flat_map(|t| t.relayed()).collect();
+        let mut latest = self.latest.lock();
+        if let Some(r) = found {
+            *latest = Some(r);
+        }
+        // Without a discovery result an address on a server is worth telling
+        // only if there is no discovery to wait for.
+        let mut r = match latest.clone() {
+            Some(r) => r,
+            None if !relayed.is_empty() && !self.discovering => Reachability::bare(self.local),
+            None => return,
+        };
+        drop(latest);
+        r.relayed = relayed;
+        (self.report)(&r);
     }
 }
 
@@ -1467,6 +1580,7 @@ mod tests {
             mapping_notes: Vec::new(),
             double_nat: false,
             host: Vec::new(),
+            relayed: Vec::new(),
         }
     }
 
@@ -1977,6 +2091,7 @@ garbage line
             mapping_notes: Vec::new(),
             double_nat: false,
             host: host_addresses("127.0.0.1:5555".parse().unwrap(), true),
+            relayed: Vec::new(),
         };
         assert!(r.candidates().is_empty());
         for ip in host_addresses("0.0.0.0:1".parse().unwrap(), true) {
