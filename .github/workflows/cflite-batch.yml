@@ -1,0 +1,41 @@
+# Fuzzing that does not stop, on ClusterFuzzLite: every six hours five hours
+# of every target, on all the runner's cores, from the corpus the last run
+# left and back into it. A crash fails the run and is kept as an artifact.
+# Schedules run from the default branch only. docs/FUZZING.md says what the
+# hours come to, per target. Actions are pinned by commit.
+name: Fuzzing, batch
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+# One run at a time writes the corpus: this and the pruning
+# (cflite-upkeep.yml) wait for each other.
+concurrency:
+  group: cflite-corpus
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Batch fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Build (AddressSanitizer)
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+      - name: Fuzz
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 18000
+          mode: batch
+          sanitizer: address
+          parallel-fuzzing: true

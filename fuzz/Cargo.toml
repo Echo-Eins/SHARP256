@@ -4,9 +4,13 @@
 #     cargo +nightly fuzz run relay_message
 #
 # Each target hands libFuzzer's input to one entry point of
-# `sharp256::fuzz` (src/fuzz.rs); the same entry points run on mutated seeds
-# in every `cargo test`. Seeds are in corpus/<target>, written by
-# `SHARP_WRITE_CORPUS=1 cargo test --lib write_seed_corpus`.
+# `sharp256::fuzz` (src/fuzz/); the same entry points run on mutated seeds
+# in every `cargo test`. Most take the input as a datagram or a file to
+# parse; `roundtrip`, `handshake`, `session` and `relay` read it as a plan
+# instead (what to encode, what peers send) and check what must hold. Seeds
+# are in corpus/<target>, written by
+# `SHARP_WRITE_CORPUS=1 cargo test --lib write_seed_corpus`. They run
+# continuously on ClusterFuzzLite (.clusterfuzzlite/, docs/FUZZING.md).
 [package]
 name = "sharp256-fuzz"
 version = "0.0.0"
@@ -121,6 +125,34 @@ bench = false
 [[bin]]
 name = "dht"
 path = "fuzz_targets/dht.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay"
+path = "fuzz_targets/relay.rs"
 test = false
 doc = false
 bench = false

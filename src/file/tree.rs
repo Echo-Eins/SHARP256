@@ -485,9 +485,7 @@ impl Builder {
                 name
             ));
         }
-        if meta.mode.is_some_and(|m| m > 0o7777)
-            || meta.mtime.is_some_and(|(_, ns)| ns >= 1_000_000_000)
-        {
+        if !valid_meta(&meta) {
             return Err(format!("invalid metadata for {:?}", name));
         }
         match kind {
@@ -529,6 +527,12 @@ impl Builder {
     /// Lays out the stream: file contents start after `encoded_len` bytes
     /// of manifest.
     fn finish(mut self, encoded_len: u64) -> Result<Manifest, String> {
+        // The root's metadata is checked here, as each entry's is in
+        // `push`: a listing with a root the decoder refuses would be one a
+        // sender could send and no receiver take.
+        if !valid_meta(&self.m.root) {
+            return Err("invalid metadata for the root".to_string());
+        }
         encoded_len
             .checked_add(self.m.data_len)
             .ok_or_else(|| "total size overflows".to_string())?;
@@ -545,6 +549,44 @@ impl Builder {
         self.m.encoded_len = encoded_len;
         Ok(self.m)
     }
+}
+
+/// A listing put together entry by entry, checked as a scan checks it:
+/// for the fuzzing targets, which make listings of every shape the builder
+/// takes, encode them and read them back.
+#[cfg(any(test, fuzzing))]
+pub struct ListingBuilder(Builder);
+
+#[cfg(any(test, fuzzing))]
+impl ListingBuilder {
+    pub fn new(root: Meta) -> Self {
+        Self(Builder::new(root, 0))
+    }
+
+    /// The entry's slot, for its children to name as their parent; or why
+    /// a scan would not have made it.
+    pub fn push(
+        &mut self,
+        parent: u32,
+        name: &str,
+        kind: EntryKind,
+        size: u64,
+        meta: Meta,
+    ) -> Result<u32, String> {
+        self.0.push(parent, name, kind, size, meta)
+    }
+
+    pub fn finish(self) -> Result<Manifest, String> {
+        let bytes = self.0.m.encode();
+        self.0.finish(bytes.len() as u64)
+    }
+}
+
+/// Metadata the decoder takes: permission bits only, nanoseconds within a
+/// second.
+fn valid_meta(meta: &Meta) -> bool {
+    !(meta.mode.is_some_and(|m| m > 0o7777)
+        || meta.mtime.is_some_and(|(_, ns)| ns >= 1_000_000_000))
 }
 
 /// A single path component that every system can at least represent.

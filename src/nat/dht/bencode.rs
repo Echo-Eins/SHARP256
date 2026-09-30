@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 
 /// Deepest nesting read. A real message has three levels.
-const MAX_DEPTH: usize = 8;
+pub(crate) const MAX_DEPTH: usize = 8;
 /// Elements one list or dictionary may have. A real one has a dozen.
-const MAX_ITEMS: usize = 512;
+pub(crate) const MAX_ITEMS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {

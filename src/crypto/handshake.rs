@@ -354,20 +354,7 @@ impl Initiator {
 
     /// Decrypts a cookie reply to this attempt's latest initiation.
     pub fn read_cookie_reply(&self, pkt: &[u8]) -> Option<[u8; MAC_LEN]> {
-        if pkt.len() != COOKIE_REPLY_LEN || pkt[..CID_LEN] != self.cid.to_be_bytes() {
-            return None;
-        }
-        let nonce = &pkt[CID_LEN..CID_LEN + 24];
-        let tag = &pkt[CID_LEN + 40..];
-        // Sealed to the mac1 of the datagram it answers: any of ours.
-        self.last_mac1.iter().find_map(|m1| {
-            let mut cookie = [0u8; MAC_LEN];
-            cookie.copy_from_slice(&pkt[CID_LEN + 24..CID_LEN + 40]);
-            XChaCha20Poly1305::new((&self.receiver_cookie_key).into())
-                .decrypt_in_place_detached(nonce.into(), m1, &mut cookie, tag.into())
-                .ok()
-                .map(|()| cookie)
-        })
+        open_cookie(&self.receiver_cookie_key, &self.last_mac1, self.cid, pkt)
     }
 
     /// Completes the handshake with the receiver's response. Returns the
@@ -424,6 +411,78 @@ impl Initiator {
         }
         let split = self.noise.split().expect("the response was read");
         Ok((responder_cid, payload.to_vec(), split))
+    }
+}
+
+/// The cookie in a reply to a datagram of `cid`, sealed with a receiver's
+/// cookie `key` to the mac1 of the datagram it answers: any of `sent`.
+fn open_cookie(
+    key: &[u8; 32],
+    sent: &[[u8; MAC_LEN]],
+    cid: u64,
+    pkt: &[u8],
+) -> Option<[u8; MAC_LEN]> {
+    if pkt.len() != COOKIE_REPLY_LEN || pkt[..CID_LEN] != cid.to_be_bytes() {
+        return None;
+    }
+    let nonce = &pkt[CID_LEN..CID_LEN + 24];
+    let tag = &pkt[CID_LEN + 40..];
+    sent.iter().find_map(|m1| {
+        let mut cookie = [0u8; MAC_LEN];
+        cookie.copy_from_slice(&pkt[CID_LEN + 24..CID_LEN + 40]);
+        XChaCha20Poly1305::new(key.into())
+            .decrypt_in_place_detached(nonce.into(), m1, &mut cookie, tag.into())
+            .ok()
+            .map(|()| cookie)
+    })
+}
+
+/// What anybody who knows a receiver's ID can make: the MACs on datagrams
+/// of their own choosing, and the cookie in a reply that reaches their own
+/// address. For the fuzzing targets, which have to get past `mac1` (the
+/// check that stops whoever does not know the ID) to reach what is behind
+/// it.
+#[cfg(any(test, fuzzing))]
+pub mod forge {
+    use super::*;
+
+    /// `body` — a version 3 initiation up to its MACs, or a version 4
+    /// fragment — with its `mac1`, and the `mac2` of `cookie` if one has
+    /// come to the forger; the datagram, and its `mac1`.
+    pub fn stamp(
+        receiver: &SharpId,
+        version: Version,
+        body: &[u8],
+        cookie: Option<&[u8; MAC_LEN]>,
+    ) -> (Vec<u8>, [u8; MAC_LEN]) {
+        let key = match version {
+            Version::V3 => mac1_key(receiver.as_bytes()),
+            Version::V4 => mac1_key_v4(receiver.as_bytes()),
+        };
+        let m1 = mac(&key, body);
+        let mut out = body.to_vec();
+        out.extend_from_slice(&m1);
+        let m2: [u8; MAC_LEN] = match cookie {
+            Some(c) => keyed_mac(&mac2_key(c), &[&out]),
+            None => [0; MAC_LEN],
+        };
+        out.extend_from_slice(&m2);
+        (out, m1)
+    }
+
+    /// The cookie in `reply`, to a datagram of `cid` stamped with `mac1`.
+    pub fn open_cookie_reply(
+        receiver: &SharpId,
+        cid: u64,
+        mac1: &[u8; MAC_LEN],
+        reply: &[u8],
+    ) -> Option<[u8; MAC_LEN]> {
+        open_cookie(
+            &cookie_key(receiver.as_bytes()),
+            std::slice::from_ref(mac1),
+            cid,
+            reply,
+        )
     }
 }
 

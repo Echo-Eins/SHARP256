@@ -632,16 +632,7 @@ impl Relay {
                     self.via = got.dst;
                     // One datagram, or a run the system handed over together.
                     for pkt in buf[..got.len].chunks(got.stride.max(1)) {
-                        let now = Instant::now();
-                        self.prune(now);
-                        // Anything that is not a control message on the control
-                        // port is not ours; the relay never answers it, so it
-                        // cannot be used to probe for one.
-                        let Some(msg) = Message::decode(pkt) else { continue };
-                        if !self.limiter.allow(from, now) {
-                            continue;
-                        }
-                        self.on_message(msg, from, pkt, now).await;
+                        self.handle(pkt, from, Instant::now()).await;
                     }
                 }
                 _ = cancel.cancelled() => {
@@ -653,6 +644,21 @@ impl Relay {
                 }
             }
         }
+    }
+
+    /// One datagram on the control port, at `now`.
+    async fn handle(&mut self, pkt: &[u8], from: SocketAddr, now: Instant) {
+        self.prune(now);
+        // Anything that is not a control message on the control port is not
+        // ours; the relay never answers it, so it cannot be used to probe
+        // for one.
+        let Some(msg) = Message::decode(pkt) else {
+            return;
+        };
+        if !self.limiter.allow(from, now) {
+            return;
+        }
+        self.on_message(msg, from, pkt, now).await;
     }
 
     async fn reply(&self, to: SocketAddr, msg: Message) {
@@ -1278,6 +1284,54 @@ struct Tally {
     port: u16,
     carried: u64,
     refused: u64,
+}
+
+/// A relay driven by hand, for the fuzzing targets: every datagram to its
+/// control port goes in as its loop hands it over, at the time the target
+/// says; the pairs it allocates run on the caller's runtime.
+#[cfg(any(test, fuzzing))]
+pub struct RelayHarness(Relay);
+
+#[cfg(any(test, fuzzing))]
+impl RelayHarness {
+    pub async fn bind(cfg: Config) -> io::Result<Self> {
+        Ok(Self(Relay::bind(cfg, CancellationToken::new()).await?))
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    pub fn id(&self) -> SharpId {
+        self.0.id()
+    }
+
+    /// One datagram to the control port from `from`.
+    pub async fn datagram(&mut self, pkt: &[u8], from: SocketAddr, now: Instant) {
+        self.0.via = None;
+        self.0.handle(pkt, from, now).await;
+    }
+
+    /// Registrations and allocations held.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.0.registrations.len(), self.0.allocations.len())
+    }
+
+    /// Ends every pair, and passes on the panic of any that panicked.
+    pub async fn finish(mut self) {
+        let mut panicked = None;
+        for a in self.0.allocations.drain(..) {
+            a.task.abort();
+            if let Err(e) = a.task.await {
+                if e.is_panic() && panicked.is_none() {
+                    panicked = Some(e.into_panic());
+                }
+            }
+        }
+        if let Some(p) = panicked {
+            std::panic::resume_unwind(p);
+        }
+    }
 }
 
 impl Drop for Tally {

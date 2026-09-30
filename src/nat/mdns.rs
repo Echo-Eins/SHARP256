@@ -58,8 +58,8 @@ const CLASS_IN: u16 = 1;
 const HIGH_BIT: u16 = 0x8000;
 /// Records kept from one message, per section, and the longest name: all a
 /// packet from a stranger is allowed to make us hold.
-const MAX_RECORDS: usize = 64;
-const MAX_NAME: usize = 255;
+pub(crate) const MAX_RECORDS: usize = 64;
+pub(crate) const MAX_NAME: usize = 255;
 /// Compression pointers followed in one name.
 const MAX_JUMPS: usize = 16;
 /// Lifetime of what an announcement says, in seconds (RFC 6762's 75 minutes

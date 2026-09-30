@@ -1,0 +1,54 @@
+# The corpus's upkeep, on ClusterFuzzLite, once a day between two batch runs
+# (cflite-batch.yml): pruned to the inputs that still add coverage, and a
+# coverage report of it (lines, regions and branches), kept as the
+# artifact cifuzz-coverage-latest. Actions are pinned by commit.
+name: Fuzzing, upkeep
+
+on:
+  schedule:
+    - cron: "40 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  prune:
+    name: Corpus pruning
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: cflite-corpus
+      cancel-in-progress: false
+    steps:
+      - name: Build (AddressSanitizer)
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+      - name: Prune
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: prune
+          sanitizer: address
+
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Build (coverage)
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: coverage
+      - name: Report
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: coverage
+          sanitizer: coverage

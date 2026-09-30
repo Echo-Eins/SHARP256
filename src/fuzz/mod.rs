@@ -16,6 +16,16 @@ use crate::address::{self, class, dns, nat64};
 use crate::protocol::wire;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
+pub mod gen;
+mod receiver;
+#[cfg(feature = "nat-traversal")]
+mod relay;
+mod roundtrip;
+pub use receiver::{handshake, session};
+#[cfg(feature = "nat-traversal")]
+pub use relay::relay;
+pub use roundtrip::roundtrip;
+
 /// A transport frame: a type byte and a body, as a session delivers them
 /// after decryption — from a peer that holds the keys, but is not trusted.
 pub fn wire_frame(data: &[u8]) {
@@ -402,6 +412,11 @@ pub const TARGETS: &[(&str, Target)] = &[
     ("turn", turn),
     #[cfg(feature = "nat-traversal")]
     ("dht", dht),
+    ("roundtrip", roundtrip),
+    ("handshake", handshake),
+    ("session", session),
+    #[cfg(feature = "nat-traversal")]
+    ("relay", relay),
 ];
 
 /// Well-formed inputs for each target, made by the encoders: the starting
@@ -442,6 +457,22 @@ pub fn seeds(target: &str) -> Vec<Vec<u8>> {
             vec![init, pkt]
         }
         "manifest" => Vec::new(),
+        // Steps of every kind: the bytes are read as choices.
+        "handshake" | "session" | "relay" => (0..12u8)
+            .map(|c| {
+                (0..400u32)
+                    .map(|i| (i as u8).wrapping_mul(29).wrapping_add(c * 17))
+                    .collect()
+            })
+            .collect(),
+        // One per format: the first byte chooses it, the rest is its value.
+        "roundtrip" => (0..16u8)
+            .map(|c| {
+                let mut v = vec![c];
+                v.extend((0..64u8).map(|i| i.wrapping_mul(37).wrapping_add(c)));
+                v
+            })
+            .collect(),
         "text" => vec![
             b"sh-aaaa@203.0.113.5:5555,[2001:db8::1]:5555,example.org:1".to_vec(),
             b"[fe80::1%eth0]:5555".to_vec(),
@@ -836,6 +867,13 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000);
         for (name, target) in TARGETS {
+            // The receiver's targets make handshakes and sessions, some
+            // hundred times the work of a parser's input: fewer of them.
+            let rounds = if matches!(*name, "handshake" | "session" | "relay") {
+                rounds / 15
+            } else {
+                rounds
+            };
             let mut seeds = seeds(name);
             // Inputs that once crashed a target are kept in its corpus, and
             // run here on every toolchain.

@@ -1574,6 +1574,65 @@ impl Dispatcher {
     }
 }
 
+/// A receiver's dispatcher driven by hand, for the fuzzing targets: every
+/// datagram goes in as the socket loop hands it over, at the time the
+/// target says, and the sessions it starts run on the caller's runtime.
+#[cfg(any(test, fuzzing))]
+pub struct DispatcherHarness {
+    d: Dispatcher,
+    _done: mpsc::Receiver<TransferKey>,
+}
+
+#[cfg(any(test, fuzzing))]
+impl DispatcherHarness {
+    /// A dispatcher as `receiver` runs one, fresh (and the transfers its
+    /// user declined forgotten). Made within a tokio runtime, whose tasks
+    /// the sessions become.
+    pub fn new(receiver: &Receiver) -> Self {
+        receiver.shared.declined.lock().clear();
+        let (tx, rx) = mpsc::channel(64);
+        Self {
+            d: Dispatcher::new(receiver.shared.clone(), tx),
+            _done: rx,
+        }
+    }
+
+    /// One datagram from `from`, and what it leaves for the sessions handed
+    /// to them.
+    pub fn datagram(&mut self, pkt: &[u8], from: SocketAddr, now: Instant) {
+        self.d.at = now;
+        self.d.on_datagram(pkt, from, now);
+        self.d.flush();
+    }
+
+    /// Sessions, version 4 handshakes waiting for their HELLO, fragments
+    /// held.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.d.sessions.len(),
+            self.d.pending.len(),
+            self.d.fragments.len(),
+        )
+    }
+
+    /// Ends every session, and passes on the panic of any that panicked,
+    /// which a runtime would only print.
+    pub async fn finish(mut self) {
+        let mut panicked = None;
+        for (_, s) in self.d.sessions.drain() {
+            s.task.abort();
+            if let Err(e) = s.task.await {
+                if e.is_panic() && panicked.is_none() {
+                    panicked = Some(e.into_panic());
+                }
+            }
+        }
+        if let Some(p) = panicked {
+            std::panic::resume_unwind(p);
+        }
+    }
+}
+
 /// A relay this receiver is registered with, and the channel the dispatcher
 /// hands its control messages over on.
 #[cfg(feature = "nat-traversal")]
