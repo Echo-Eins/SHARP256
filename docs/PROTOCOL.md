@@ -647,6 +647,36 @@ changed in between is sent afresh instead of failing the final hash check.
 State files older than 30 days are deleted when an endpoint starts,
 together with the partial files or staging directories they describe.
 
+**What a power cut leaves.** After a crash a disk holds what was flushed:
+a file's contents by an fsync of the file, its name — creation, rename,
+removal — by an fsync of the directory. The receiver orders its writes so
+that every moment leaves either the old state or the new one:
+
+* A state file is written beside the old one under a name of its own,
+  flushed, renamed over it, and the directory flushed; a removed one is
+  removed with its directory flushed.
+* A new partial file or staging directory has its name flushed with the
+  output directory before any state describing it is kept, so no state
+  outlives the file it describes.
+* When the writer has flushed the whole stream, the state is saved once
+  more saying so, before the stream is hashed: a cut during verification
+  resumes with every byte already there.
+* A directory's times and permissions are applied and every entry
+  flushed, then the staging directory, before the tree is moved into
+  place. A staging directory found on resume is made writable for its
+  owner again (a cut after the permissions and before the move may have
+  left read-only entries); the permissions are applied again at the end.
+* The output directory is flushed after the result is moved to its final
+  name and before FIN is sent: a sender that heard FIN has a result that
+  is on disk under that name.
+
+A cut after the move and before the state is removed leaves both; the
+sender, which heard no FIN, resumes, and the result is stored a second
+time under the next free name (`name (1)`) — a whole copy too, never a
+damaged one. Windows offers no way to flush a directory; there the
+receiver relies on NTFS's journal, which is not tested by a cut
+(`scripts/crashlab/`, docs/evidence/crash).
+
 **Session lifetime at the receiver.**
 
 * A session that received no data within `handshake_timeout` after
@@ -667,8 +697,9 @@ together with the partial files or staging directories they describe.
 
 When the receiver holds every byte it sends a final ACK and, in the
 background, closes the writer (fsync), hashes the stream with BLAKE3-256 and
-moves the result to its final name, answering HELLO, PING and PROBE all the
-while. It then sends FIN with the hash, repeating it after 200 ms and then
+moves the result to its final name, flushing the directory it is in
+(section 5, *What a power cut leaves*), answering HELLO, PING and PROBE all
+the while. It then sends FIN with the hash, repeating it after 200 ms and then
 with doubling intervals up to 3 s.
 
 The sender stops sending on the first FIN and answers FIN_ACK with its

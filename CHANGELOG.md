@@ -194,6 +194,43 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   directory flushed). `scripts/keystore-test.sh` tests the Secret Service
   against a gnome-keyring of its own, in a private D-Bus session.
 
+### Power cuts
+- A power cut at any moment of a transfer now leaves under a final name
+  nothing but what was sent, and the transfer resumes from bytes that are
+  really on disk. Before, the receiver's resume state was written and
+  renamed without any flush (after a cut: empty, cut off, or an older
+  one), a directory's manifest was flushed but its rename was not,
+  results were moved into place and state removed without flushing the
+  directory (a result reported to the sender as stored could be back
+  under its partial name), and a directory's times and permissions were
+  not flushed before the tree was moved into place. Everything kept now
+  goes through `file::durable`: a file is written beside the old one,
+  flushed, renamed over it, and the directory flushed; the output
+  directory is flushed after a partial file or staging directory is
+  created and after the result is moved into place, before FIN.
+- A directory whose finishing was cut short — its permissions applied,
+  the move not yet made — could never be resumed: read-only files and
+  closed directories refused every write, at every attempt. A resumed
+  tree is now made writable for its owner first; the permissions are
+  applied again at the end.
+- The resume state is saved once more when the writer has flushed the
+  whole stream, so a cut during verification resumes with every byte
+  there instead of sending again what came after the last periodic save.
+- `--overwrite` replaces the old file with one rename instead of removing
+  it first, which left a moment with neither file under the name.
+- A file system that does not report its size (a FUSE file system without
+  `statfs`, such as LazyFS) no longer makes the receiver refuse every
+  transfer for want of space; the check is skipped.
+- Temporary files that a replacement left behind (the process died in
+  the middle of it) are removed at start once they are an hour old.
+- `scripts/crashlab/crashlab.py`: power cuts at twenty moments of a file
+  and a directory transfer and at chosen operations, on LazyFS (which
+  drops what was not flushed), and an audit of the receiver's system
+  calls under strace for the names LazyFS does not model. Logs before and
+  after the fix in `docs/evidence/crash/`. A cut between moving the
+  result into place and FIN still has it received twice (`name (1)`),
+  both copies whole; on Windows directories cannot be flushed at all.
+
 ### Getting through NAT
 - The receiver measures what the NAT in front of it actually does, with the
   tests of RFC 5780 run on the transfer socket itself: whether the external
