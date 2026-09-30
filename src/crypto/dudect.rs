@@ -13,8 +13,9 @@
 //! byte. Measured: `subtle`'s comparison itself, the receiver's mac1 check
 //! of every datagram, cookies (mac2), the relay's proofs and tags, the AEADs'
 //! tag checks, and the rejection of a forged transport packet whatever its
-//! header unmasks to; and reading the private key out of the identity file,
-//! one key against random keys. Whether a MAC is valid is not secret — what
+//! header unmasks to; reading the private key out of the identity file,
+//! one key against random keys; and ML-KEM-768 decapsulation of a valid
+//! ciphertext against an altered one (version 4). Whether a MAC is valid is not secret — what
 //! happens next shows it — and where a check takes longer for a valid one,
 //! that is reported, not held against it.
 //!
@@ -516,5 +517,34 @@ mod tests {
                 black_box(&out);
             },
         ));
+    }
+
+    /// ML-KEM-768 decapsulation (version 4's hybrid key exchange): a
+    /// ciphertext made for the key against the same with one byte altered,
+    /// which decapsulation rejects implicitly — returning a pseudo-random
+    /// secret instead of an error. Whether it did must not show in its time
+    /// (the re-encryption and the comparison and selection after it are
+    /// meant to be constant-time); that is `ml-kem`'s code, measured here.
+    #[test]
+    #[ignore]
+    fn dudect_mlkem_decapsulation() {
+        use crate::crypto::kem::{encapsulate, KemSecret, CT_LEN};
+        let key = KemSecret::generate();
+        let v = report(measure(
+            "ML-KEM-768 decapsulation, valid / altered ciphertext",
+            N / 10,
+            1,
+            |altered, rng| {
+                let (mut ct, _) = encapsulate(key.public()).unwrap();
+                if altered {
+                    ct[rng.gen_range(0..CT_LEN)] ^= 1 << rng.gen_range(0..8);
+                }
+                Box::new(ct)
+            },
+            |ct: &mut Box<[u8; CT_LEN]>| {
+                black_box(key.decapsulate(black_box(ct)));
+            },
+        ));
+        assert!(!v.leaks(), "{}", v);
     }
 }
