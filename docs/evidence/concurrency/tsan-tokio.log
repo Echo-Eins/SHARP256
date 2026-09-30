@@ -1,0 +1,56 @@
+# ThreadSanitizer on the library's and the end-to-end tests before scripts/tsan.supp existed (the crate at
+# opt-level 0, on the tree that became 0d87b55, 2026-09-30): every report, by where it was;
+# then the first report in full, trimmed. Each involves tokio's ScheduledIo: one thread writes it (creating
+# it, registering a socket) and hands its address to the epoll poller through the kernel (epoll_ctl, then
+# epoll_wait on another thread), an ordering ThreadSanitizer cannot see.
+
+== library tests: 473 reports, 473 of them with tokio's scheduled_io in a stack
+    109  <std>/core/src/sync/atomic.rs:4320:24
+    109  <std>/core/src/sync/atomic.rs:4474:17
+     85  <std>/core/src/mem/mod.rs:977:22
+     85  <std>/core/src/mem/mod.rs:978:49
+     85  <registry>/tokio-1.45.1/src/util/linked_list.rs:278:24
+== end-to-end tests: 698 reports, 698 of them with tokio's scheduled_io in a stack
+    193  <std>/core/src/sync/atomic.rs:4320:24
+    193  <std>/core/src/sync/atomic.rs:4474:17
+    104  <std>/core/src/mem/mod.rs:977:22
+    104  <std>/core/src/mem/mod.rs:978:49
+    104  <registry>/tokio-1.45.1/src/util/linked_list.rs:278:24
+
+== the first report
+ (pid=1454176)
+  Atomic read of size 8 at 0x724000008790 by thread T137:
+    #0 core::sync::atomic::atomic_load::<usize, false> <std>/core/src/sync/atomic.rs:4320:24
+    #1 <core::sync::atomic::Atomic<usize>>::load <std>/core/src/sync/atomic.rs:3143:26
+    #2 <core::sync::atomic::Atomic<usize>>::try_update::<<tokio::runtime::io::scheduled_io::ScheduledIo>::set_readiness<<tokio::runtime::io::driver::Driver>::turn::{closure#0}>::{closure#0}> <std>/cor
+    #3 <core::sync::atomic::Atomic<usize>>::fetch_update::<<tokio::runtime::io::scheduled_io::ScheduledIo>::set_readiness<<tokio::runtime::io::driver::Driver>::turn::{closure#0}>::{closure#0}> <std>/c
+    #4 <tokio::runtime::io::scheduled_io::ScheduledIo>::set_readiness::<<tokio::runtime::io::driver::Driver>::turn::{closure#0}> <registry>/tokio-1.45.1/src/runtime/io/scheduled_io.rs:210:32
+    #5 <tokio::runtime::io::driver::Driver>::turn (.llvm.11598517194530009359) <registry>/tokio-1.45.1/src/runtime/io/driver.rs:179:20
+  Previous write of size 8 at 0x724000008790 by thread T136:
+    #0 __tsan_memcpy <null>
+    #1 <alloc::boxed::Box<alloc::rcs::arc::ArcInner<tokio::runtime::io::scheduled_io::ScheduledIo>>>::new <std>/alloc/src/boxed.rs:295:56
+    #2 <alloc::rcs::arc::Arc<tokio::runtime::io::scheduled_io::ScheduledIo>>::new <std>/alloc/src/rcs/arc.rs:437:25
+    #3 <tokio::runtime::io::registration_set::RegistrationSet>::allocate <registry>/tokio-1.45.1/src/runtime/io/registration_set.rs:64:19
+    #4 <tokio::runtime::io::driver::Handle>::add_source::<mio::net::udp::UdpSocket> <registry>/tokio-1.45.1/src/runtime/io/driver.rs:219:47
+    #5 <tokio::runtime::io::registration::Registration>::new_with_interest_and_handle::<mio::net::udp::UdpSocket> <registry>/tokio-1.45.1/src/runtime/io/registration.rs:78:43
+  Location is heap block of size 256 at 0x724000008700 allocated by thread T136:
+    #0 posix_memalign <null>
+    #1 std::sys::alloc::unix::aligned_malloc <std>/std/src/sys/alloc/unix.rs:99:32
+    #2 std::sys::alloc::unix::alloc <std>/std/src/sys/alloc/unix.rs:45:18
+    #3 __rustc::__rdl_alloc <std>/std/src/alloc.rs:471:13
+    #4 alloc::alloc::alloc <std>/alloc/src/alloc.rs:158:9
+    #5 <alloc::alloc::Global>::alloc_impl_runtime <std>/alloc/src/alloc.rs:335:73
+  Thread T137 'tokio-runtime-w' (tid=1454315, running) created by thread T136 at:
+    #0 pthread_create <null>
+    #1 <std::sys::thread::unix::Thread>::new <std>/std/src/sys/thread/unix.rs:107:19
+    #2 std::thread::lifecycle::spawn_unchecked::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()> <std>/std/src/thread/lifecycle.rs:116:26
+    #3 <std::thread::builder::Builder>::spawn_unchecked::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()> <std>/std/src/thread/builder.rs:261:32
+    #4 <std::thread::builder::Builder>::spawn::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()> <std>/std/src/thread/builder.rs:191:23
+    #5 <tokio::runtime::blocking::pool::Spawner>::spawn_thread <registry>/tokio-1.45.1/src/runtime/blocking/pool.rs:466:17
+  Thread T136 'nat::behaviour:' (tid=1454314, running) created by main thread at:
+    #0 pthread_create <null>
+    #1 <std::sys::thread::unix::Thread>::new <std>/std/src/sys/thread/unix.rs:107:19
+    #2 std::thread::lifecycle::spawn_unchecked::<test::run_test::{closure#1}, ()> <std>/std/src/thread/lifecycle.rs:116:26
+    #3 <std::thread::builder::Builder>::spawn_unchecked::<test::run_test::{closure#1}, ()> <std>/std/src/thread/builder.rs:261:32
+    #4 <std::thread::builder::Builder>::spawn::<test::run_test::{closure#1}, ()> <std>/std/src/thread/builder.rs:191:23
+    #5 test::run_test <std>/test/src/lib.rs:675:27

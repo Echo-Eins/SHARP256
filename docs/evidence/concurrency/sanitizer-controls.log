@@ -1,0 +1,16 @@
+# One defect of each kind planted in a crypto pool job (transport/parallel.rs tests, never committed), each run
+# under its sanitizer as scripts/sanitizers.sh runs the tests (-Zbuild-std, the crate at opt-level 1, four pool
+# workers, scripts/tsan.supp for ThreadSanitizer), on the tree of 2b0f5b2;
+# 2026-09-30T21:29Z, rustc 1.101.0-nightly (5c543b0b8 2026-09-29). Each is reported.
+
+== AddressSanitizer: a read one past the end of a 16-byte heap buffer
+    ==1782848==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7b293afe5020 at pc 0x5597764e2be3 bp 0x7b0937ae47d0 sp 0x7b0937ae47c8
+    SUMMARY: AddressSanitizer: heap-buffer-overflow <std>/core/src/ptr/mod.rs:2163:9 in core::ptr::read_volatile::<u8>
+== ThreadSanitizer (with scripts/tsan.supp): two jobs on two workers write one place
+    WARNING: ThreadSanitizer: data race (pid=1785433)
+    SUMMARY: ThreadSanitizer: data race src/transport/parallel.rs:117:26 in sharp256::transport::parallel::tests::planted_race_in_the_pool::{closure#0}
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 359 filtered out; finished in 0.22s
+    ThreadSanitizer: reported 1 warnings
+== MemorySanitizer: a branch on heap bytes never written
+    ==1787659==WARNING: MemorySanitizer: use-of-uninitialized-value
+    SUMMARY: MemorySanitizer: use-of-uninitialized-value src/transport/parallel.rs:113:16 in sharp256::transport::parallel::tests::planted_uninitialised_read_in_the_pool::{closure#0}

@@ -1,0 +1,31 @@
+# scripts/sanitizers.sh (all three) on 2b0f5b2 (its code that of 0d87b55), 2026-09-30T21:19Z to 2026-09-30T21:29Z, exit status 0
+# rustc 1.101.0-nightly (5c543b0b8 2026-09-29); -Zbuild-std; the crate at opt-level 1; SHARP256_CRYPTO_THREADS=4
+# reports from any sanitizer: 0
+
++ export SHARP256_CRYPTO_THREADS=4
++ export CARGO_PROFILE_DEV_OPT_LEVEL=1
+== address
++ RUSTFLAGS='-Zsanitizer=address '
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/address --no-default-features --features nat-traversal --lib -- --skip keys_are_locked_here
+test result: ok. 346 passed; 0 failed; 12 ignored; 0 measured; 1 filtered out; finished in 9.58s
+== address
++ RUSTFLAGS='-Zsanitizer=address '
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/address --no-default-features --features nat-traversal --test e2e --
+test result: ok. 66 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 24.62s
++ export 'TSAN_OPTIONS=suppressions=scripts/tsan.supp '
+== thread
++ RUSTFLAGS='-Zsanitizer=thread '
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/thread --no-default-features --features nat-traversal --lib -- --skip keys_are_locked_here
+test result: ok. 346 passed; 0 failed; 12 ignored; 0 measured; 1 filtered out; finished in 8.24s
+== thread
++ RUSTFLAGS='-Zsanitizer=thread '
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/thread --no-default-features --features nat-traversal --test e2e --
+test result: ok. 66 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 24.94s
+== memory
++ RUSTFLAGS='-Zsanitizer=memory '
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/memory --no-default-features --features nat-traversal,blake3/pure --lib -- --skip keys_are_locked_here
+test result: ok. 346 passed; 0 failed; 12 ignored; 0 measured; 1 filtered out; finished in 6.69s
+== memory
++ RUSTFLAGS='-Zsanitizer=memory '
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/memory --no-default-features --features nat-traversal,blake3/pure --test e2e --
+test result: ok. 66 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 24.63s

@@ -1,0 +1,55 @@
+# MemorySanitizer as first set up: the crate unoptimised (opt-level 0) and origins tracked
+# (-Zsanitizer-memory-track-origins), on the tree that became 0d87b55, 2026-09-30T20:59Z to 2026-09-30T21:10Z.
+# The library's tests pass; eleven end-to-end tests miss their time bounds, and no sanitizer reported
+# anything (MemorySanitizer ends the process at its first report; all 66 tests ran to their end).
+#
+# dead_relays_do_not_slow_down_a_direct_transfer (bound: 2 s) run alone in this set-up: 2.77 s; the same with
+# its three dead relays taken out of the test (a local edit, not kept): 2.67 s. The relays cost nothing;
+# the transfer itself is that slow, and all the more so beside the other tests (9.98 s in the full run).
+# With the crate at opt-level 1 and no origin tracking every test passes (sanitizers.log), and
+# MemorySanitizer still reports a planted read of memory never written (sanitizer-controls.log).
+# reports from MemorySanitizer: 0
+
+== memory
++ RUSTFLAGS='-Zsanitizer=memory -Zsanitizer-memory-track-origins'
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/memory --no-default-features --features nat-traversal,blake3/pure --lib -- --skip keys_are_locked_here --skip no_key_and_no_content_reaches_the_log
+test result: ok. 345 passed; 0 failed; 12 ignored; 0 measured; 2 filtered out; finished in 65.46s
+== memory
++ RUSTFLAGS='-Zsanitizer=memory -Zsanitizer-memory-track-origins'
++ cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --target-dir target/memory --no-default-features --features nat-traversal,blake3/pure --test e2e --
+test result: FAILED. 55 passed; 11 failed; 3 ignored; 0 measured; 0 filtered out; finished in 342.67s
+
+failures:
+---- dead_relays_do_not_slow_down_a_direct_transfer stdout ----
+thread 'dead_relays_do_not_slow_down_a_direct_transfer' panicked at tests/e2e.rs:2939:5:
+three unanswering relays cost 9.981620284s; they should cost nothing
+---- burst_loss_with_hundreds_of_holes_recovers_quickly stdout ----
+thread 'burst_loss_with_hundreds_of_holes_recovers_quickly' panicked at tests/e2e.rs:894:10:
+must not stall: Elapsed(())
+---- a_restarted_receiver_that_accepts_carries_on stdout ----
+thread 'a_restarted_receiver_that_accepts_carries_on' panicked at tests/e2e.rs:3583:10:
+the sender finishes: Elapsed(())
+---- directory_resumes_after_receiver_restart stdout ----
+thread 'directory_resumes_after_receiver_restart' panicked at tests/e2e.rs:1848:9:
+transfer did not progress
+---- a_path_that_silently_stops_carrying_full_packets_is_stepped_down_from stdout ----
+thread 'a_path_that_silently_stops_carrying_full_packets_is_stepped_down_from' panicked at tests/e2e.rs:3458:10:
+the transfer does not stall in the black hole: Elapsed(())
+---- a_transfer_runs_over_ipv6_in_packets_sized_for_it stdout ----
+thread 'a_transfer_runs_over_ipv6_in_packets_sized_for_it' panicked at tests/e2e.rs:3709:10:
+finishes in time: Elapsed(())
+---- resumes_after_receiver_restart_during_outage stdout ----
+thread 'resumes_after_receiver_restart_during_outage' panicked at tests/e2e.rs:508:9:
+transfer did not progress
+---- version_4_resumes_after_the_receiver_restarts stdout ----
+thread 'version_4_resumes_after_the_receiver_restarts' panicked at tests/e2e.rs:4486:9:
+transfer did not progress
+---- one_dual_stack_receiver_serves_both_families_at_once stdout ----
+thread 'one_dual_stack_receiver_serves_both_families_at_once' panicked at tests/e2e.rs:3752:7:
+IPv6 in time: Elapsed(())
+---- vanished_sender_is_reported_and_resumable stdout ----
+thread 'vanished_sender_is_reported_and_resumable' panicked at tests/e2e.rs:1364:5:
+assertion failed: summary.resumed_from > 0
+---- a_sender_cannot_shatter_the_receivers_bookkeeping stdout ----
+thread 'a_sender_cannot_shatter_the_receivers_bookkeeping' panicked at tests/e2e.rs:1200:9:
+the receiver never acknowledged the marker 2001

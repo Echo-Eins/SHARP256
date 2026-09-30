@@ -84,6 +84,24 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   walk, keys in memory, and the DPAPI answer as Windows code. It stops the
   code before each fix.
 
+### Sanitizers and loom
+- The receiver's budget for file data not yet on disk is claimed in one
+  step with its check, so sessions receiving at once no longer overshoot
+  it (by up to a receive batch each, as the threat model said).
+- The library's and the end-to-end tests run under AddressSanitizer,
+  ThreadSanitizer and MemorySanitizer, the standard library instrumented
+  too and the crate at opt-level 1 (`scripts/sanitizers.sh`, a CI job
+  each): all of them, less one that needs `mlock`, which the sanitizers
+  stub out; none reported anything. ThreadSanitizer cannot see tokio hand
+  a socket to its I/O thread through epoll, and that alone is suppressed.
+  A defect of each kind planted in a crypto pool job is found by its
+  sanitizer.
+- loom models (`scripts/loom.sh`, a CI job) of the receiver's memory
+  budget, the epochs of a session's keys under the crypto pool, and the
+  handshake timestamps, through `src/sync.rs`; each model catches the
+  synchronisation it checks broken on purpose. See
+  [docs/SANITIZERS.md](docs/SANITIZERS.md).
+
 ### Security
 - Long-term X25519 identities, created on first use and kept in the
   per-user data directory with owner-only permissions. A peer is addressed

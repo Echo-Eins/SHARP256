@@ -1,0 +1,13 @@
+# scripts/loom.sh on 0d87b55, 2026-09-30T21:36Z; loom 0.7.2, rustc 1.95.0 (59807616e 2026-04-14)
+
++ set -eu
++ cd scripts/..
++ RUSTFLAGS=' --cfg sharp_loom'
++ cargo test --release --no-default-features --features nat-traversal --lib --target-dir target/loom -- loom_
+test transport::receiver::loom_models::loom_a_part_that_shrinks_makes_room ... ok
+test transport::receiver::loom_models::loom_two_sessions_never_claim_past_the_budget ... ok
+test transport::receiver::loom_models::loom_the_queue_budget_is_taken_and_given_back ... ok
+test crypto::transport::tests::loom_epochs_move_on_under_threads ... ok
+test crypto::handshake::loom_models::loom_timestamps_are_unique_and_rise ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 359 filtered out; finished in 22.01s
+exit status: 0

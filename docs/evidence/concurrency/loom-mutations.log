@@ -1,0 +1,27 @@
+# loom models against each synchronisation of 0d87b55 broken in turn (scratchpad script; files restored from HEAD after each), 2026-09-30T20:16Z
+# loom 0.7.2, rustc 1.95.0 (59807616e 2026-04-14)
+
+== the budget checked first and added after, as the unwritten data was
+    test transport::receiver::loom_models::loom_two_sessions_never_claim_past_the_budget ... FAILED
+    thread 'transport::receiver::loom_models::loom_two_sessions_never_claim_past_the_budget' (1562088) panicked at src/transport/receiver.rs:4362:13:
+    both took 60 of 100
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.00s
+== the epochs moved on without looking again under the write lock
+    test crypto::transport::tests::loom_epochs_move_on_under_threads ... FAILED
+    thread 'crypto::transport::tests::loom_epochs_move_on_under_threads' (1566541) panicked at src/crypto/transport.rs:857:13:
+    assertion `left == right` failed
+      left: 1
+     right: 2
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.03s
+== the timestamp read and then written, not compared and swapped
+    test crypto::handshake::loom_models::loom_timestamps_are_unique_and_rise ... FAILED
+    thread 'crypto::handshake::loom_models::loom_timestamps_are_unique_and_rise' (1570874) panicked at src/crypto/handshake.rs:1438:13:
+    assertion failed: mine[0] < mine[1] && theirs[0] < theirs[1]
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.00s
+== as committed
+    test transport::receiver::loom_models::loom_a_part_that_shrinks_makes_room ... ok
+    test transport::receiver::loom_models::loom_two_sessions_never_claim_past_the_budget ... ok
+    test transport::receiver::loom_models::loom_the_queue_budget_is_taken_and_given_back ... ok
+    test crypto::transport::tests::loom_epochs_move_on_under_threads ... ok
+    test crypto::handshake::loom_models::loom_timestamps_are_unique_and_rise ... ok
+    test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 359 filtered out; finished in 22.20s

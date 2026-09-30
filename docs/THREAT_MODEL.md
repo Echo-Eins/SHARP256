@@ -604,10 +604,12 @@ ID получателя); вопрос сообщает, кого ищет от�
 * файловые данные, ожидающие записи, и «ранние» данные каталога — не более
   `3B/4` на всех вместе; сверх того каждая принимающая сессия держит не
   больше своей доли `min(ёмкость писателя, 3B/4 / принимающих)`, и именно
-  её предлагает отправителю как окно приёма. Общий счётчик проверяется при
-  приёме каждой пачки; две сессии, проверяющие одновременно, могут
-  превысить его не более чем на одну пачку приёма каждая (256 датаграмм,
-  ≤ 2,3 МиБ);
+  её предлагает отправителю как окно приёма. Место в общем счётчике
+  занимается при приёме данных одной атомарной операцией вместе с
+  проверкой, так что границу не превышают и сессии, принимающие
+  одновременно (раньше проверка и пополнение были раздельны, и каждая
+  могла превысить её на одну пачку приёма; модель loom
+  `loom_two_sessions_never_claim_past_the_budget`);
 * служебные структуры: до 65 536 диапазонов на сессию (≈ 2,5 МиБ),
   `ReplayGuard` на 100 000 отправителей (≈ 6 МиБ), ограничитель рукопожатий
   на 65 536 клиентов (≈ 3 МиБ).
@@ -1121,6 +1123,7 @@ Tor или аналогичные сети.
 | Версия 4: ML-KEM-768 сверен с Go на накопленных векторах, ключ проверяется по модулю; гибридное рукопожатие совпадает по ключам, каждое поле аутентично, подделка ничего не расходует; фрагменты собираются в любом порядке и в пределах, изменённые не собираются, cookie годится для каждого; передачи файлов и каталогов, докачка, отказы; на получателя без версии 4 — отказ, а не версия 3; ID `sh4-` и флаг карточки без тихой подмены | `the_accumulated_vectors_of_go_come_out`, `a_key_with_an_unreduced_coefficient_is_refused`, `the_hybrid_handshake_completes_and_is_its_own`, `every_byte_of_the_hybrid_handshake_counts`, `a_version_4_handshake_goes_in_fragments_and_agrees`, `altered_fragments_come_to_nothing`, `fragments_waiting_are_bounded`, `a_cookie_proves_the_address_of_every_fragment`, `version_4_carries_a_file_and_a_directory`, `version_4_resumes_after_the_receiver_restarts`, `version_4_refusals_reach_the_sender`, `a_version_4_sender_does_not_step_down_to_version_3`, `version_4_an_unproven_address_gets_back_no_more_than_it_sent`, `the_version_4_form_names_its_version_and_survives_no_slip`, `a_card_says_which_version_its_maker_speaks`; по запросу: `dudect_mlkem_decapsulation`, NAT-лаборатория (получатели печатают `sh4-`) |
 | Ни один разборщик недоверенного ввода не падает на изменённом вводе; найденные падения не возвращаются | `every_target_survives_mutated_input`, `the_seeds_are_well_formed`, регрессии `fuzz/corpus/*/regression-*`; libFuzzer: `cargo fuzz run <цель>` (CI — минута на цель) |
 | Небезопасный код только там, где он разрешён по имени, у каждого блока своё обоснование; список `getaddrinfo` читается с адресов по любому месту, пустой ответ DPAPI — пустое | lints `unsafe_code`, `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`, `unsafe_op_in_unsafe_fn` (clippy для Linux, Windows, macOS, FreeBSD); `addresses_are_read_from_the_list_wherever_they_lie`, `an_empty_blob_is_nothing` (Windows); Miri: `scripts/miri.sh` (CI); перечень — `docs/UNSAFE.md` |
+| Нет выхода за границы, использования после освобождения, утечек, гонок данных и чтения неинициализированной памяти там, где проходят тесты; общий бюджет памяти, окно эпох ключей и метки рукопожатия верны при любом чередовании потоков | `scripts/sanitizers.sh` (AddressSanitizer, ThreadSanitizer, MemorySanitizer на модульных и сквозных тестах, CI); модели loom `loom_*` (`scripts/loom.sh`, CI); подробности — `docs/SANITIZERS.md` |
 | Зависимости: ни одной известной уязвимости, небезопасного или брошенного крейта, кроме перечисленных с причинами; лицензии, дубли (и отдельно в сборке без GUI), источники; каждый крейт — с аудитом или исключением; бинарники Linux одинаковы у двух сборок, различающихся всем, кроме исходника и образа | `scripts/supply-chain.sh` (cargo-deny, cargo-audit, cargo-vet; CI при каждом изменении и ежедневно), `scripts/repro.sh check` (CI); журналы `docs/evidence/supply-chain/` |
 
 ---
