@@ -12,6 +12,7 @@ mod dudect;
 pub mod handshake;
 pub mod identity;
 pub mod identity_file;
+pub mod kem;
 pub mod keystore;
 pub mod noise;
 pub mod replay;

@@ -10,6 +10,24 @@
 //!   <- e, ee, se, psk
 //! ```
 //!
+//! and, for protocol version 4, the same with the tokens of Noise's hybrid
+//! forward secrecy (the Noise HFS draft; the IK layout I2P's proposal 169
+//! uses), `Noise_IKpsk2+hfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`:
+//!
+//! ```text
+//! IKpsk2+hfs:
+//!   <- s
+//!   ...
+//!   -> e, es, e1, s, ss
+//!   <- e, ee, ekem1, se, psk
+//! ```
+//!
+//! `e1` is the initiator's ephemeral ML-KEM-768 encapsulation key
+//! (`EncryptAndHash`), `ekem1` the responder's ciphertext to it
+//! (`EncryptAndHash`, then `MixKey` of the shared secret): the keys of the
+//! session then depend on X25519 and on ML-KEM alike, and traffic recorded
+//! today stays unreadable to whoever breaks only one of them later.
+//!
 //! This was the `snow` crate. No version of snow wipes anything, so every
 //! handshake left in freed memory a copy of the long-term private key, the
 //! ephemeral key, the pre-shared key and the chaining key the session's keys
@@ -26,6 +44,7 @@
 
 use crate::crypto::blake2s::{hash, hmac, HASH_LEN};
 use crate::crypto::identity::{Identity, KEY_LEN};
+use crate::crypto::kem::{self, KemSecret, CT_LEN, EK_LEN};
 use crate::crypto::secret::{Locked, SecretKey};
 use crate::crypto::CryptoError;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
@@ -34,12 +53,18 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const PROTOCOL_NAME: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+/// The hybrid handshake's name (version 4).
+pub const PROTOCOL_NAME_HFS: &str = "Noise_IKpsk2+hfs_25519+MLKEM768_ChaChaPoly_BLAKE2s";
 const TAG_LEN: usize = 16;
 /// Bytes message 1 adds to its payload: `e`, the encrypted `s` and the
 /// payload's tag.
 pub const INITIATION_LEN: usize = KEY_LEN + KEY_LEN + TAG_LEN + TAG_LEN;
 /// Bytes message 2 adds to its payload: `e` and the payload's tag.
 pub const RESPONSE_LEN: usize = KEY_LEN + TAG_LEN;
+/// The same for the hybrid handshake: message 1 carries the encrypted `e1`,
+/// message 2 the encrypted `ekem1`.
+pub const HFS_INITIATION_LEN: usize = INITIATION_LEN + EK_LEN + TAG_LEN;
+pub const HFS_RESPONSE_LEN: usize = RESPONSE_LEN + CT_LEN + TAG_LEN;
 
 /// What a completed handshake leaves: the two transport keys of Noise's
 /// `Split()` and the handshake hash, which binds whatever is derived from
@@ -198,11 +223,14 @@ impl Zeroize for SymmetricState {
 impl SymmetricState {
     /// `InitializeSymmetric(protocol_name)`, then the prologue and the
     /// responder's static key, which IK's pre-message makes known to both.
-    fn new(prologue: &[u8], responder_static: &[u8; KEY_LEN]) -> Locked<Self> {
+    fn new(name: &str, prologue: &[u8], responder_static: &[u8; KEY_LEN]) -> Locked<Self> {
         Locked::with(|state: &mut Self| {
-            // A name longer than a hash is hashed; this one is (37 bytes).
+            // A name longer than a hash is hashed; both are (37 and 52
+            // bytes).
             const { assert!(PROTOCOL_NAME.len() > HASH_LEN) };
-            state.h = *hash(&[PROTOCOL_NAME.as_bytes()]);
+            const { assert!(PROTOCOL_NAME_HFS.len() > HASH_LEN) };
+            debug_assert!(name.len() > HASH_LEN);
+            state.h = *hash(&[name.as_bytes()]);
             state.ck = state.h;
             state.mix_hash(prologue);
             state.mix_hash(responder_static);
@@ -299,6 +327,9 @@ pub struct Initiator {
     rs: [u8; KEY_LEN],
     psk: SecretKey,
     e: Option<SecretKey>,
+    /// The hybrid handshake: `e1`, made with message 1.
+    hybrid: bool,
+    e1: Option<KemSecret>,
     finished: bool,
 }
 
@@ -310,16 +341,33 @@ impl Initiator {
         prologue: &[u8],
     ) -> Self {
         Self {
-            state: SymmetricState::new(prologue, responder),
+            state: SymmetricState::new(PROTOCOL_NAME, prologue, responder),
             identity: identity.clone(),
             rs: *responder,
             psk: psk.clone(),
             e: None,
+            hybrid: false,
+            e1: None,
             finished: false,
         }
     }
 
-    /// Message 1, `-> e, es, s, ss`, carrying `payload`.
+    /// The initiator of the hybrid handshake (`IKpsk2+hfs`).
+    pub fn new_hybrid(
+        identity: &Identity,
+        responder: &[u8; KEY_LEN],
+        psk: &SecretKey,
+        prologue: &[u8],
+    ) -> Self {
+        Self {
+            state: SymmetricState::new(PROTOCOL_NAME_HFS, prologue, responder),
+            hybrid: true,
+            ..Self::new(identity, responder, psk, prologue)
+        }
+    }
+
+    /// Message 1, `-> e, es, s, ss` (or `-> e, es, e1, s, ss`), carrying
+    /// `payload`.
     pub fn write_initiation(&mut self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.write_initiation_with(SecretKey::random(), payload)
     }
@@ -332,11 +380,16 @@ impl Initiator {
         if self.e.is_some() {
             return Err(failed("message 1 was already written"));
         }
-        let mut out = Vec::with_capacity(INITIATION_LEN + payload.len());
+        let mut out = Vec::with_capacity(HFS_INITIATION_LEN + payload.len());
         let e_pub = public_of(e.expose());
         out.extend_from_slice(&e_pub);
         mix_ephemeral(&mut self.state, &e_pub);
         self.state.mix_key(&dh(e.expose(), &self.rs)?[..]); // es
+        if self.hybrid {
+            let e1 = KemSecret::generate();
+            self.state.encrypt_and_hash(e1.public(), &mut out)?; // e1
+            self.e1 = Some(e1);
+        }
         self.state
             .encrypt_and_hash(self.identity.public(), &mut out)?; // s
         self.state
@@ -346,7 +399,8 @@ impl Initiator {
         Ok(out)
     }
 
-    /// Reads message 2, `<- e, ee, se, psk`, and returns its payload.
+    /// Reads message 2, `<- e, ee, se, psk` (or `<- e, ee, ekem1, se,
+    /// psk`), and returns its payload.
     ///
     /// Nothing is used up by a message that fails: the state is worked on
     /// in a copy and taken only once the message has authenticated, so a
@@ -355,17 +409,30 @@ impl Initiator {
         let Some(e) = &self.e else {
             return Err(CryptoError::Malformed);
         };
-        if self.finished || msg.len() < RESPONSE_LEN {
+        let least = if self.hybrid {
+            HFS_RESPONSE_LEN
+        } else {
+            RESPONSE_LEN
+        };
+        if self.finished || msg.len() < least {
             return Err(CryptoError::Malformed);
         }
         let re: [u8; KEY_LEN] = msg[..KEY_LEN].try_into().expect("a key's length");
         let mut state = self.state.copy();
         mix_ephemeral(&mut state, &re);
         state.mix_key(&dh(e.expose(), &re)?[..]); // ee
+        let mut at = KEY_LEN;
+        if let Some(e1) = &self.e1 {
+            let mut ct = Vec::with_capacity(CT_LEN);
+            state.decrypt_and_hash(&msg[at..at + CT_LEN + TAG_LEN], &mut ct)?; // ekem1
+            at += CT_LEN + TAG_LEN;
+            let ct: [u8; CT_LEN] = ct.try_into().expect("a ciphertext's length");
+            state.mix_key(&e1.decapsulate(&ct)[..]);
+        }
         state.mix_key(&dh(self.identity.secret(), &re)?[..]); // se
         state.mix_key_and_hash(self.psk.expose()); // psk
-        let mut payload = Zeroizing::new(Vec::with_capacity(msg.len() - RESPONSE_LEN));
-        state.decrypt_and_hash(&msg[KEY_LEN..], &mut payload)?;
+        let mut payload = Zeroizing::new(Vec::with_capacity(msg.len() - at));
+        state.decrypt_and_hash(&msg[at..], &mut payload)?;
         self.state = state;
         self.finished = true;
         Ok(payload)
@@ -388,6 +455,8 @@ pub struct Responder {
     re: [u8; KEY_LEN],
     rs: [u8; KEY_LEN],
     psk: SecretKey,
+    /// The initiator's `e1`, in the hybrid handshake.
+    re1: Option<Box<[u8; EK_LEN]>>,
 }
 
 /// What message 1 said: who sent it, and its payload.
@@ -405,32 +474,70 @@ impl Responder {
         prologue: &[u8],
         msg: &[u8],
     ) -> Result<Initiation, CryptoError> {
-        if msg.len() < INITIATION_LEN {
+        Self::read(identity, psk, prologue, msg, false)
+    }
+
+    /// Reads message 1 of the hybrid handshake, `-> e, es, e1, s, ss`.
+    pub fn read_hybrid_initiation(
+        identity: &Identity,
+        psk: &SecretKey,
+        prologue: &[u8],
+        msg: &[u8],
+    ) -> Result<Initiation, CryptoError> {
+        Self::read(identity, psk, prologue, msg, true)
+    }
+
+    fn read(
+        identity: &Identity,
+        psk: &SecretKey,
+        prologue: &[u8],
+        msg: &[u8],
+        hybrid: bool,
+    ) -> Result<Initiation, CryptoError> {
+        let (name, least) = if hybrid {
+            (PROTOCOL_NAME_HFS, HFS_INITIATION_LEN)
+        } else {
+            (PROTOCOL_NAME, INITIATION_LEN)
+        };
+        if msg.len() < least {
             return Err(CryptoError::Malformed);
         }
-        let mut state = SymmetricState::new(prologue, identity.public());
+        let mut state = SymmetricState::new(name, prologue, identity.public());
         let re: [u8; KEY_LEN] = msg[..KEY_LEN].try_into().expect("a key's length");
         mix_ephemeral(&mut state, &re);
         state.mix_key(&dh(identity.secret(), &re)?[..]); // es
+        let mut at = KEY_LEN;
+        let mut re1 = None;
+        if hybrid {
+            let mut ek = Vec::with_capacity(EK_LEN);
+            state.decrypt_and_hash(&msg[at..at + EK_LEN + TAG_LEN], &mut ek)?; // e1
+            at += EK_LEN + TAG_LEN;
+            re1 = Some(Box::new(
+                <[u8; EK_LEN]>::try_from(ek).expect("a key's length"),
+            ));
+        }
         let mut rs = Vec::with_capacity(KEY_LEN);
-        state.decrypt_and_hash(&msg[KEY_LEN..2 * KEY_LEN + TAG_LEN], &mut rs)?; // s
+        state.decrypt_and_hash(&msg[at..at + KEY_LEN + TAG_LEN], &mut rs)?; // s
+        at += KEY_LEN + TAG_LEN;
         let rs: [u8; KEY_LEN] = rs.try_into().expect("a key's length");
         state.mix_key(&dh(identity.secret(), &rs)?[..]); // ss
-        let mut payload = Zeroizing::new(Vec::with_capacity(msg.len() - INITIATION_LEN));
-        state.decrypt_and_hash(&msg[2 * KEY_LEN + TAG_LEN..], &mut payload)?;
+        let mut payload = Zeroizing::new(Vec::with_capacity(msg.len() - at));
+        state.decrypt_and_hash(&msg[at..], &mut payload)?;
         Ok(Initiation {
             responder: Responder {
                 state,
                 re,
                 rs,
                 psk: psk.clone(),
+                re1,
             },
             initiator_static: rs,
             payload,
         })
     }
 
-    /// Message 2, `<- e, ee, se, psk`, carrying `payload`, and the keys.
+    /// Message 2, `<- e, ee, se, psk` (or `<- e, ee, ekem1, se, psk`),
+    /// carrying `payload`, and the keys.
     pub fn write_response(self, payload: &[u8]) -> Result<(Vec<u8>, Split), CryptoError> {
         self.write_response_with(SecretKey::random(), payload)
     }
@@ -440,11 +547,16 @@ impl Responder {
         e: SecretKey,
         payload: &[u8],
     ) -> Result<(Vec<u8>, Split), CryptoError> {
-        let mut out = Vec::with_capacity(RESPONSE_LEN + payload.len());
+        let mut out = Vec::with_capacity(HFS_RESPONSE_LEN + payload.len());
         let e_pub = public_of(e.expose());
         out.extend_from_slice(&e_pub);
         mix_ephemeral(&mut self.state, &e_pub);
         self.state.mix_key(&dh(e.expose(), &self.re)?[..]); // ee
+        if let Some(re1) = &self.re1 {
+            let (ct, shared) = kem::encapsulate(re1)?;
+            self.state.encrypt_and_hash(&ct, &mut out)?; // ekem1
+            self.state.mix_key(&shared[..]);
+        }
         self.state.mix_key(&dh(e.expose(), &self.rs)?[..]); // se
         self.state.mix_key_and_hash(self.psk.expose()); // psk
         self.state.encrypt_and_hash(payload, &mut out)?;
@@ -746,5 +858,77 @@ mod tests {
         let (mut m2, _) = read.responder.write_response(b"y").unwrap();
         m2[..32].copy_from_slice(&[0u8; 32]);
         assert!(ours.read_response(&m2).is_err());
+    }
+
+    /// The hybrid handshake completes with the same keys on both sides,
+    /// with messages of the lengths the wire format counts on; neither form
+    /// is read as the other (the protocol names differ, and so does every
+    /// key after them).
+    #[test]
+    fn the_hybrid_handshake_completes_and_is_its_own() {
+        let (init, resp) = (Identity::generate(), Identity::generate());
+        let psk = SecretKey::from_bytes(&[3u8; 32]);
+        let mut ours = Initiator::new_hybrid(&init, resp.public(), &psk, b"v4");
+        let m1 = ours.write_initiation(b"hello").unwrap();
+        assert_eq!(m1.len(), HFS_INITIATION_LEN + 5);
+        assert!(Responder::read_initiation(&resp, &psk, b"v4", &m1).is_err());
+        let read = Responder::read_hybrid_initiation(&resp, &psk, b"v4", &m1).unwrap();
+        assert_eq!(&read.payload[..], b"hello");
+        assert_eq!(read.initiator_static, *init.public());
+        let (m2, theirs) = read.responder.write_response(b"ack").unwrap();
+        assert_eq!(m2.len(), HFS_RESPONSE_LEN + 3);
+        assert_eq!(&ours.read_response(&m2).unwrap()[..], b"ack");
+        let mine = ours.split().unwrap();
+        assert_eq!(*mine.initiator_to_responder, *theirs.initiator_to_responder);
+        assert_eq!(*mine.responder_to_initiator, *theirs.responder_to_initiator);
+        assert_eq!(mine.hash, theirs.hash);
+
+        // A classical message 1 is not a hybrid one either.
+        let mut classical = Initiator::new(&init, resp.public(), &psk, b"v4");
+        let m1 = classical.write_initiation(b"hello").unwrap();
+        assert!(Responder::read_hybrid_initiation(&resp, &psk, b"v4", &m1).is_err());
+    }
+
+    /// Every byte of both hybrid messages counts: `e1` and `ekem1` as much
+    /// as the rest. A forged message 2 uses nothing up (the real one after
+    /// it completes), and a responder that encapsulated to another key —
+    /// here, a message 2 made for another message 1 — is refused.
+    #[test]
+    fn every_byte_of_the_hybrid_handshake_counts() {
+        let (init, resp) = (Identity::generate(), Identity::generate());
+        let psk = SecretKey::from_bytes(&[4u8; 32]);
+        let mut ours = Initiator::new_hybrid(&init, resp.public(), &psk, b"v4");
+        let m1 = ours.write_initiation(b"x").unwrap();
+        // A sample of positions, every region among them: e, e1, s, payload.
+        for i in (0..m1.len())
+            .step_by(37)
+            .chain([KEY_LEN, KEY_LEN + EK_LEN, m1.len() - 1])
+        {
+            let mut bad = m1.clone();
+            bad[i] ^= 0x01;
+            assert!(
+                Responder::read_hybrid_initiation(&resp, &psk, b"v4", &bad).is_err(),
+                "byte {} of message 1",
+                i
+            );
+        }
+        let read = Responder::read_hybrid_initiation(&resp, &psk, b"v4", &m1).unwrap();
+        let (m2, _) = read.responder.write_response(b"y").unwrap();
+        for i in (0..m2.len())
+            .step_by(29)
+            .chain([KEY_LEN, KEY_LEN + CT_LEN, m2.len() - 1])
+        {
+            let mut bad = m2.clone();
+            bad[i] ^= 0x01;
+            assert!(ours.read_response(&bad).is_err(), "byte {} of message 2", i);
+            assert!(!ours.is_finished());
+        }
+        // The answer to another initiator's message 1 (another e1).
+        let mut someone = Initiator::new_hybrid(&init, resp.public(), &psk, b"v4");
+        let other = someone.write_initiation(b"x").unwrap();
+        let read = Responder::read_hybrid_initiation(&resp, &psk, b"v4", &other).unwrap();
+        let (wrong, _) = read.responder.write_response(b"y").unwrap();
+        assert!(ours.read_response(&wrong).is_err());
+        assert_eq!(&ours.read_response(&m2).unwrap()[..], b"y");
     }
 }

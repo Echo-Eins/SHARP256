@@ -76,6 +76,9 @@ if-addrs = { version = "0.6", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
+# ML-KEM-768 (FIPS 203) for protocol version 4's hybrid key exchange. The
+# 0.2 series: 0.3 needs Rust 1.85, above this crate's 1.82.
+ml-kem = { version = "0.2.1", default-features = false, features = ["zeroize"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -97,6 +100,10 @@ tempfile = "3"
 # its keys). Test builds only.
 snow = { version = "=0.9.6", default-features = false, features = ["default-resolver", "risky-raw-split"] }
 blake2 = "0.10"
+# ML-KEM's deterministic key generation and encapsulation, and SHAKE-128,
+# for C2SP CCTV's accumulated vectors (`crypto::kem`). Test builds only.
+ml-kem = { version = "0.2.1", default-features = false, features = ["zeroize", "deterministic"] }
+sha3 = "0.10"
 
 [features]
 default = ["gui", "nat-traversal"]
