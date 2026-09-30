@@ -1,0 +1,15 @@
+# natlab evidence: cgn
+# code:      the commit this log is in (run on its working tree, before it was committed on top of 00b2dda)
+# binaries:  62d58ff51fb816fa sharp-sender, d4ec4e6219f7d3b7 sharp-receiver, ff0cc051150cdb86 sharp-relay (debug, --no-default-features --features nat-traversal)
+# date:      2026-09-30T03:02:43Z (the run ended)
+# kernel:    Linux 6.19.2-gentoo-dist
+# nftables:  nftables v1.1.6 (Commodore Bullmoose #7)
+# command:   scripts/natlab/natlab.py cgn
+
+sender behind                              receiver behind                            via    result
+port_restricted + carrier port_restricted  port_restricted                            card   ok   direct-via-nat     5.4s as expected
+port_restricted                            port_restricted + carrier port_restricted  card   ok   direct-via-nat     5.4s as expected
+port_restricted + carrier symmetric_random port_restricted                            card   ok   direct-via-nat     4.4s as expected
+port_restricted                            port_restricted + carrier symmetric_random card   ok   direct-via-nat     5.6s as expected
+port_restricted + carrier symmetric_random port_restricted + carrier symmetric_random card   FAIL none              64.2s as expected
+port_restricted + carrier symmetric_random port_restricted + carrier symmetric_random relay  ok   relay              0.8s as expected

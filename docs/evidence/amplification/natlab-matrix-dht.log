@@ -1,0 +1,48 @@
+# natlab evidence: matrix-dht
+# code:      the commit this log is in (run on its working tree, before it was committed on top of 00b2dda)
+# binaries:  62d58ff51fb816fa sharp-sender, d4ec4e6219f7d3b7 sharp-receiver, ff0cc051150cdb86 sharp-relay (debug, --no-default-features --features nat-traversal)
+# date:      2026-09-30T02:53:43Z (the run ended)
+# kernel:    Linux 6.19.2-gentoo-dist
+# nftables:  nftables v1.1.6 (Commodore Bullmoose #7)
+# command:   scripts/natlab/natlab.py matrix --via dht
+
+sender behind      receiver behind    result                         verdict
+open               open               ok   direct(11.2.1.2)   0.1s   as expected
+open               full_cone          ok   direct-via-nat     0.1s   as expected
+open               restricted         ok   direct-via-nat     1.9s   as expected
+open               port_restricted    ok   direct-via-nat     2.9s   as expected
+open               symmetric_seq      ok   direct-via-nat     1.9s   as expected
+open               symmetric_random   ok   direct-via-nat     2.1s   as expected
+full_cone          open               ok   direct(11.2.1.2)   0.1s   as expected
+full_cone          full_cone          ok   direct-via-nat     0.1s   as expected
+full_cone          restricted         ok   direct-via-nat     1.9s   as expected
+full_cone          port_restricted    ok   direct-via-nat     2.9s   as expected
+full_cone          symmetric_seq      ok   direct-via-nat     1.9s   as expected
+full_cone          symmetric_random   ok   direct-via-nat     2.1s   as expected
+restricted         open               ok   direct(11.2.1.2)   0.1s   as expected
+restricted         full_cone          ok   direct-via-nat     0.1s   as expected
+restricted         restricted         ok   direct-via-nat     1.9s   as expected
+restricted         port_restricted    ok   direct-via-nat     2.9s   as expected
+restricted         symmetric_seq      ok   direct-via-nat     1.9s   as expected
+restricted         symmetric_random   ok   direct-via-nat     2.1s   as expected
+port_restricted    open               ok   direct(11.2.1.2)   0.1s   as expected
+port_restricted    full_cone          ok   direct-via-nat     0.1s   as expected
+port_restricted    restricted         ok   direct-via-nat     1.9s   as expected
+port_restricted    port_restricted    ok   direct-via-nat     2.9s   as expected
+port_restricted    symmetric_seq      ok   direct-via-nat    11.9s   as expected
+port_restricted    symmetric_random   ok   direct-via-nat    20.2s   as expected
+symmetric_seq      open               ok   direct(11.2.1.2)   0.1s   as expected
+symmetric_seq      full_cone          ok   direct-via-nat     0.1s   as expected
+symmetric_seq      restricted         ok   direct-via-nat     2.1s   as expected
+symmetric_seq      port_restricted    ok   direct-via-nat    12.9s   as expected
+symmetric_seq      symmetric_seq      FAIL none              30.0s   as expected
+symmetric_seq      symmetric_random   FAIL none              30.0s   as expected
+symmetric_random   open               ok   direct(11.2.1.2)   0.2s   as expected
+symmetric_random   full_cone          ok   direct-via-nat     0.1s   as expected
+symmetric_random   restricted         ok   direct-via-nat     3.9s   as expected
+symmetric_random   port_restricted    ok   direct-via-nat    22.9s   as expected
+symmetric_random   symmetric_seq      FAIL none              30.0s   as expected
+symmetric_random   symmetric_random   FAIL none              30.0s   as expected
+
+32 of 36 pairs connected: 32 directly, 0 through a relay or TURN server
+36 of 36 as the theory says they must

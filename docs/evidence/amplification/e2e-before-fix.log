@@ -1,0 +1,16 @@
+# e2e: the same tests on the code before the fix
+# code:    commit 00b2dda, with tests/e2e.rs of the commit this log is in
+# command: cargo test --no-default-features --features nat-traversal --test e2e -- an_unproven_address a_session_begun declined_transfer unauthorized_sender idle_session abort_before_data
+# rustc:   rustc 1.95.0 (59807616e 2026-04-14)
+
+test declined_transfer_is_reported_to_sender ... ok
+test abort_before_data_releases_the_session_at_once ... ok
+test unauthorized_sender_is_rejected ... ok
+test idle_session_after_handshake_is_dropped ... ok
+test an_unproven_address_gets_back_no_more_than_it_sent ... FAILED
+test a_session_begun_by_a_copied_initiation_sends_nothing_more_there ... FAILED
+thread 'an_unproven_address_gets_back_no_more_than_it_sent' (2912808) panicked at tests/e2e.rs:2252:9:
+a copy of 35 bytes towards the sender drew 41 bytes back to where it came from
+thread 'a_session_begun_by_a_copied_initiation_sends_nothing_more_there' (2912806) panicked at tests/e2e.rs:2362:5:
+the copier's address sent 208 bytes and got 1783
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 58 filtered out; finished in 5.16s

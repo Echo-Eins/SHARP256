@@ -194,6 +194,49 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   directory flushed). `scripts/keystore-test.sh` tests the Secret Service
   against a gnome-keyring of its own, in a private D-Bus session.
 
+### Amplification
+- Nothing is sent to an address that has not shown it receives beyond what
+  came from it — strictly, where RFC 9000 allows three times. Measured on
+  the wire before the change: `sharp-relay`'s STUN server answered a bare
+  20-byte request with 56 bytes (IPv4, 2.8×) or 92 (IPv6, 4.6×); a copy of
+  an initiation sent ahead of the original from a forged address drew the
+  answer and then acknowledgements of the real sender's data, 208 bytes
+  in, 1783 out; a copied packet shorter than an address challenge drew
+  one; a copied PATH_CHALLENGE drew its answer and a challenge of ours,
+  twice its size; the mDNS responder answered a question of about 100
+  bytes with three to four times that (by the lengths its encoder writes).
+- The handshake answer is no longer than the initiation (holes and a
+  rejection's message are shortened to fit; with no room even for a bare
+  rejection there is no answer). A resuming sender pads its initiation to
+  1200 bytes inside the encryption, so that the holes fit; a fresh
+  transfer's initiations stay short. Receivers ignore the padding, as they
+  always ignored bytes after the payload.
+- A session begun at an address nobody has proven sends there only what
+  the initiation left over, until the address proves itself; a refusal
+  that does not fit waits for the sender's next decision poll.
+- Address challenges are held to what the address sent (was three times),
+  and the answer to a challenge is counted before a challenge of ours.
+  Pings to the receiver's unproven addresses while a session is carried by
+  a server are padded to 128 bytes, so that each still draws a challenge
+  at once (a bare one, 37 bytes, is shorter than a challenge; one run of
+  the NAT laboratory without the padding left on the relay a pair that
+  goes direct).
+- Binding requests are padded to 128 bytes with SOFTWARE; `sharp-relay`'s
+  STUN server answers only a request at least as long as its answer.
+- mDNS questions are padded to 1200 bytes (EDNS(0) padding, RFC 7830); the
+  responder's answer is no longer than the question.
+- The relay already answered an unproven address with less than it sent;
+  a test on the wire now holds it to that.
+- Tests on the wire: an on-path copier re-sends packets of both ends from
+  addresses of its own ahead of the originals, and every such address gets
+  back no more than it sent; a session begun by a copied initiation, with
+  the real address held back from proving itself. `scripts/amplab/`
+  measures the STUN server from outside. Logs in
+  `docs/evidence/amplification/`, with the table of everything that answers
+  and the budget of what goes to addresses others named (punching, DHT).
+- `scripts/crashlab`: the audit left its receivers running (a signal to
+  strace detaches it); it now stops the receiver itself.
+
 ### Power cuts
 - A power cut at any moment of a transfer now leaves under a final name
   nothing but what was sent, and the transfer resumes from bytes that are

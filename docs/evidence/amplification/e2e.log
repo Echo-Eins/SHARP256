@@ -1,0 +1,12 @@
+# e2e: the tests that measure what an unproven address gets back, on the wire
+# code:    the commit this log is in
+# command: cargo test --no-default-features --features nat-traversal --test e2e -- an_unproven_address a_session_begun declined_transfer unauthorized_sender idle_session abort_before_data
+# rustc:   rustc 1.95.0 (59807616e 2026-04-14)
+
+test abort_before_data_releases_the_session_at_once ... ok
+test unauthorized_sender_is_rejected ... ok
+test declined_transfer_is_reported_to_sender ... ok
+test idle_session_after_handshake_is_dropped ... ok
+test an_unproven_address_gets_back_no_more_than_it_sent ... ok
+test a_session_begun_by_a_copied_initiation_sends_nothing_more_there ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 5.18s

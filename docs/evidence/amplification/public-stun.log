@@ -1,0 +1,13 @@
+# amplab public
+# commit:  00b2dda (with local changes)
+
+  stun.l.google.com      bare       20 B -> 32 B
+  stun.l.google.com      SOFTWARE  128 B -> 32 B
+  stun.l.google.com      PADDING   128 B -> 32 B
+  stun1.l.google.com     bare       20 B -> 32 B
+  stun1.l.google.com     SOFTWARE  128 B -> 32 B
+  stun1.l.google.com     PADDING   128 B -> 32 B
+  stun.cloudflare.com    bare       20 B -> 32 B
+  stun.cloudflare.com    SOFTWARE  128 B -> 32 B
+  stun.cloudflare.com    PADDING   128 B -> 32 B
+public: every server answers a request padded with SOFTWARE

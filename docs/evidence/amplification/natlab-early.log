@@ -1,0 +1,12 @@
+# natlab evidence: early
+# code:      the commit this log is in (run on its working tree, before it was committed on top of 00b2dda)
+# binaries:  62d58ff51fb816fa sharp-sender, d4ec4e6219f7d3b7 sharp-receiver, ff0cc051150cdb86 sharp-relay (debug, --no-default-features --features nat-traversal)
+# date:      2026-09-30T03:00:55Z (the run ended)
+# kernel:    Linux 6.19.2-gentoo-dist
+# nftables:  nftables v1.1.6 (Commodore Bullmoose #7)
+# command:   scripts/natlab/natlab.py early
+
+sender behind      receiver behind    result
+open               port_restricted    ok   direct-via-nat in 4.3s (the sender asked again for its receiver, which started 2.5s after it)
+port_restricted    restricted         ok   direct-via-nat in 4.3s (the sender asked again for its receiver, which started 2.5s after it)
+full_cone          symmetric_random   ok   direct-via-nat in 4.4s (the sender asked again for its receiver, which started 2.5s after it)

@@ -1,0 +1,13 @@
+# natlab evidence: samenat
+# code:      the commit this log is in (run on its working tree, before it was committed on top of 00b2dda)
+# binaries:  62d58ff51fb816fa sharp-sender, d4ec4e6219f7d3b7 sharp-receiver, ff0cc051150cdb86 sharp-relay (debug, --no-default-features --features nat-traversal)
+# date:      2026-09-30T03:00:39Z (the run ended)
+# kernel:    Linux 6.19.2-gentoo-dist
+# nftables:  nftables v1.1.6 (Commodore Bullmoose #7)
+# command:   scripts/natlab/natlab.py samenat
+
+case                                                     result
+the receiver publishes its address on the network        ok   lan in 0.4s (the NAT says: no hairpinning)
+...keeps it back, and the relay carries                  ok   relay in 0.5s (the NAT says: no hairpinning)
+...keeps it back, and the relay only introduces          ok   none in 30.0s (the NAT says: no hairpinning)
+...and the NAT loops back (hairpinning)                  ok   direct-via-nat in 0.1s (the NAT says: hairpinning works)

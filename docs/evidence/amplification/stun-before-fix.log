@@ -1,0 +1,18 @@
+# amplab stun
+# commit:  00b2dda (with local changes)
+# binaries: /tmp/claude-1000/-home-EchoEins/85eadbca-8a13-4d1e-befb-ca41c9ba0cb5/scratchpad/before-d2-target/release
+# BEFORE THE FIX: sharp-relay built from commit 00b2dda, unchanged.
+
+  v4   bare                     20 B ->   56 B in 1 datagram(s)  2.80x  LONGER
+  v4   bare           padded   128 B ->   56 B in 1 datagram(s)  0.44x  ok
+  v4   change port              28 B ->   56 B in 1 datagram(s)  2.00x  LONGER
+  v4   change port    padded   128 B ->   56 B in 1 datagram(s)  0.44x  ok
+  v4   response port            28 B ->   56 B in 1 datagram(s)  2.00x  LONGER
+  v4   response port  padded   128 B ->   56 B in 1 datagram(s)  0.44x  ok
+  v6   bare                     20 B ->   92 B in 1 datagram(s)  4.60x  LONGER
+  v6   bare           padded   128 B ->   92 B in 1 datagram(s)  0.72x  ok
+  v6   change port              28 B ->   92 B in 1 datagram(s)  3.29x  LONGER
+  v6   change port    padded   128 B ->   92 B in 1 datagram(s)  0.72x  ok
+  v6   response port            28 B ->   92 B in 1 datagram(s)  3.29x  LONGER
+  v6   response port  padded   128 B ->   92 B in 1 datagram(s)  0.72x  ok
+stun: 6 answer(s) longer than the request

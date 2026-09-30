@@ -172,9 +172,27 @@ A receiver processes a datagram that belongs to no session as follows:
    same refusal (reason 5) instead of a new question.
 
 A handshake response goes to an address nobody has proven yet, so it is
-held to three times the size of the initiation that drew it (RFC 9000's
-anti-amplification factor): the HELLO_ACK hole list is shortened to fit,
-which only makes the sender resend more.
+no longer than the initiation that drew it — no more goes back than came
+in (RFC 9000 allows three times; here one): the HELLO_ACK hole list is
+shortened to fit, which only makes the sender resend more, a rejection's
+message is shortened or dropped, and an initiation too short for even that
+is not answered. A sender that resumes — a re-handshake of a running
+session, or a transfer id kept from an interrupted attempt — pads its
+initiation to 1200 bytes with zeros after the payload, inside the
+encryption (the payload's decoder ignores them), so that the answer has
+room for the holes of what the receiver holds; a fresh transfer's answer
+is short, and so are its initiations, which go round every address the
+receiver may be at.
+
+Until the session's address has proven itself — a transport packet from
+it under the keys the response made, or an answer to a challenge — the
+receiver sends nothing more there than what the initiations from there
+left over after the responses: a copy of an initiation sent ahead of the
+original from a forged address would otherwise start the session at that
+address and have acknowledgements of the real sender's data aimed at it.
+A refusal that does not fit (the user declined at once, say) waits for the
+sender's next decision poll, which proves the address, for at most five
+seconds.
 
 The PSK is verified by the sender when it reads the response: a receiver
 with a different secret produces a response that fails to decrypt, which
@@ -898,19 +916,22 @@ comes back **from the address it was sent to**.
   so an answer that is merely slower than the challenges still counts. On
   a path with a round trip over a second, a NAT rebinding used to be
   abandoned and restarted with a new token for ever.
-* Challenges to an unproven address are held to three times the bytes
-  received from it (RFC 9000's anti-amplification limit); more traffic from
-  it raises the allowance.
+* Challenges to an unproven address are held to the bytes received from it
+  (RFC 9000 allows three times); more traffic from it raises the allowance.
+  A packet that carries a PATH_CHALLENGE is answered with a PATH_RESPONSE
+  of its own size, and that answer is counted first: a copy of the peer's
+  challenge sent from a forged address draws the answer and no challenge
+  of ours on top.
 
 This follows QUIC (RFC 9000 section 8) and is needed for the same reason:
 authentication proves who made a packet, not where it was sent from. An
 attacker on the path can copy an authentic packet and re-send it with a
 forged source address; without validation both ends would aim their traffic
 at whatever address it chose, and on the sending side that is the whole
-file. Nothing but challenges — and a handshake response, itself held to
-three times the initiation — is ever sent to an unproven address. A
-repeated PATH_RESPONSE is caught by the packet-number window, and a token
-proves its claim once.
+file. Nothing but challenges, answers to challenges and a handshake
+response — together no longer than what came from the address — is ever
+sent to an unproven address. A repeated PATH_RESPONSE is caught by the
+packet-number window, and a token proves its claim once.
 
 Handshakes are treated the same way, since a handshake message is just as
 easy to capture and repeat from elsewhere as any other packet.
@@ -948,7 +969,16 @@ socket is the one that matters):
 The tests need a server with a second address and port. One that has none
 still reports the mapped address, and two independent servers still
 cross-check the mapping between them; where neither is possible the answer
-is "unknown", never a guess. The filtering test additionally requires that
+is "unknown", never a guess.
+
+Every Binding request is padded to 128 bytes with a SOFTWARE attribute
+(RFC 8489; a server may ignore it). `sharp-relay`'s STUN server (`--stun`)
+answers only a request at least as long as its answer — at most 92 bytes,
+three IPv6 addresses — since the answer goes to an address nobody has
+proven: a bare 20-byte request, which would draw 56 bytes (IPv4) or 92
+(IPv6), is not answered. RFC 5780's PADDING is the attribute made for this,
+but a server has to understand it or refuse the request (RFC 8489 section
+7.3.1); SOFTWARE works with every server. The filtering test additionally requires that
 the answer arrive *from the address it was asked to come from*: a server
 that ignores CHANGE-REQUEST answers from its primary address anyway, and
 reading that as "anything gets in" would send a peer punching at a NAT that
@@ -1411,7 +1441,12 @@ in multicast DNS (RFC 6762) for the service instance
 AAAA records of the host name `sharp-<first twelve characters of the ID>.local.`
 alongside. A sender started with `--lan` asks that one question once, from an
 ephemeral port with the unicast-response bit set (RFC 6762 section 5.4, 6.7)
-and takes the addresses in the answer as candidates. An answer is taken only
+and takes the addresses in the answer as candidates. The question is padded
+to 1200 bytes with an EDNS(0) OPT record carrying padding (RFC 6891, RFC
+7830), and the answer is never longer than the question: the responder
+leaves addresses out, last first, until it fits, or does not answer (an
+unpadded question, some 100 bytes, would draw four times that at whatever
+address it claimed to come from). An answer is taken only
 from an address on the same link (section 11), everything read is bounded
 (at most 64 records a section, 255 bytes a name, 16 compression pointers),
 and neither end does anything unless asked to: an announcement tells the
@@ -1476,7 +1511,10 @@ A relay's port and an address on a TURN server carry a session; neither is
 where the receiver is. While a session runs over one, the sender sends an
 authenticated `Ping` to each of the receiver's other addresses (four at
 most) every second for thirty rounds and every four seconds after, and keeps
-learning the receiver's punches as addresses. A receiver that gets the ping
+learning the receiver's punches as addresses. These pings are padded to 128
+bytes (zeros after the timestamp): the receiver sends an address it does
+not know no more than it got from it, and a bare ping (37 bytes) is shorter
+than the challenge (41) it is meant to draw. A receiver that gets the ping
 from an address it did not know treats it as any packet from a new address:
 it challenges the address (`PATH_CHALLENGE`, section 4), and on the answer
 moves the session there; the sender does the same for what the receiver then
@@ -1686,8 +1724,8 @@ Extensions planned on this basis:
 Fixed limits: 65 536 received ranges per transfer, 65 536 ranges queued by
 the sender on the receiver's word, four concurrent address claims per
 session (six challenges each, tokens honoured 30 s after giving up), a
-handshake answer at most three times the initiation, 65 536 clients in the
-handshake limiter.
+handshake answer no longer than the initiation, nothing to an unproven
+address beyond what came from it, 65 536 clients in the handshake limiter.
 
 The relay (`sharp-relay`): 4096 registrations and 256 carried pairs, of
 which one client may hold 128 and 16 (`--registrations-per-client`,
