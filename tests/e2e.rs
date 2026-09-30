@@ -2146,6 +2146,18 @@ async fn a_forged_source_address_never_redirects_the_session() {
 /// The transfer completes all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unproven_address_gets_back_no_more_than_it_sent() {
+    copier(sharp256::crypto::handshake::Version::V3).await;
+}
+
+/// The same in version 4, whose initiation is two fragments: both are
+/// copied from one address of the copier's, so that the receiver puts them
+/// together and answers there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_4_an_unproven_address_gets_back_no_more_than_it_sent() {
+    copier(sharp256::crypto::handshake::Version::V4).await;
+}
+
+async fn copier(version: sharp256::crypto::handshake::Version) {
     init_test_logging();
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
@@ -2193,7 +2205,26 @@ async fn an_unproven_address_gets_back_no_more_than_it_sent() {
         });
     }
 
+    // The first initiation, whole: one datagram in version 3, two fragments
+    // in version 4, all from one address of the copier's.
+    let first_count = match version {
+        sharp256::crypto::handshake::Version::V3 => 1,
+        sharp256::crypto::handshake::Version::V4 => 2,
+    };
+    let first_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let first_sent = Arc::new(AtomicU64::new(0));
+    let first_back = Arc::new(AtomicU64::new(0));
+    {
+        let (sock, counted) = (first_sock.clone(), first_back.clone());
+        listeners.lock().push(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, _)) = sock.recv_from(&mut buf).await {
+                counted.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }));
+    }
     let (f, l) = (forgers.clone(), listeners.clone());
+    let (first_out, first_bytes) = (first_sock.clone(), first_sent.clone());
     let relay = tokio::spawn(async move {
         let mut client: Option<SocketAddr> = None;
         let mut from_sender = vec![0u8; 65536];
@@ -2206,9 +2237,12 @@ async fn an_unproven_address_gets_back_no_more_than_it_sent() {
                     let Ok((n, from)) = res else { continue };
                     client = Some(from);
                     let pkt = &from_sender[..n];
-                    if (up == 0 || up % 37 == 5 || n < 41) && up_copies < 40 {
+                    if up < first_count {
+                        let _ = first_out.send_to(pkt, target).await;
+                        first_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    } else if (up % 37 == 5 || n < 41) && up_copies < 40 {
                         up_copies += 1;
-                        copy(pkt, target, "receiver", up == 0, &f, &l).await;
+                        copy(pkt, target, "receiver", false, &f, &l).await;
                     }
                     up += 1;
                     let _ = relay_out.send_to(pkt, target).await;
@@ -2228,7 +2262,9 @@ async fn an_unproven_address_gets_back_no_more_than_it_sent() {
         }
     });
 
-    let summary = run_sender(sender_cfg(&file, relay_addr, r.id, &state))
+    let mut cfg = sender_cfg(&file, relay_addr, r.id, &state);
+    cfg.receiver_version = version;
+    let summary = run_sender(cfg)
         .await
         .expect("the transfer completes despite the copies");
     assert_eq!(summary.file_size, size as u64);
@@ -2241,7 +2277,13 @@ async fn an_unproven_address_gets_back_no_more_than_it_sent() {
         t.abort();
     }
 
-    let forgers = std::mem::take(&mut *forgers.lock());
+    let mut forgers = std::mem::take(&mut *forgers.lock());
+    forgers.push(Forger {
+        towards: "receiver",
+        first: true,
+        sent: first_sent.load(Ordering::Relaxed) as usize,
+        back: first_back,
+    });
     assert!(
         forgers.iter().any(|f| f.sent < 41),
         "no packet shorter than a challenge was copied"
@@ -4311,4 +4353,161 @@ async fn a_meeting_stops_punching_once_the_session_is_direct() {
     assert_same(&file, &out.join("unhurried.bin"));
     forwarding.abort();
     stop_receiver(r).await;
+}
+
+// ---------------------------------------------------------------------------
+// Protocol version 4
+// ---------------------------------------------------------------------------
+
+fn v4(mut cfg: SenderConfig) -> SenderConfig {
+    cfg.receiver_version = sharp256::crypto::handshake::Version::V4;
+    cfg
+}
+
+/// Version 4 carries a file and a directory: the hybrid handshake in
+/// fragments, the HELLO after it under its keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_4_carries_a_file_and_a_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let file = make_file(&src, "v4.bin", 3 << 20, 0x44);
+    let summary = run_sender(v4(sender_cfg(&file, r.addr, r.id, &state)))
+        .await
+        .expect("version 4 transfer");
+    assert_eq!(summary.file_size, 3 << 20);
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("v4.bin"));
+
+    let root = make_tree(&src, "v4tree", 0x45, 1 << 20, 40);
+    run_sender(v4(sender_cfg(&root, r.addr, r.id, &state)))
+        .await
+        .expect("version 4 directory");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same_tree(&root, Path::new(&p));
+    } else {
+        panic!("{:?}", ev);
+    }
+    stop_receiver(r).await;
+}
+
+/// A sender told to speak version 4 speaks it and nothing else: to a
+/// receiver that knows no version 4 it fails, however long it tries, and
+/// never gets through by speaking version 3 — which the same receiver
+/// answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_version_4_sender_does_not_step_down_to_version_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |c| c.speak_v4 = false).await;
+    let file = make_file(&src, "old.bin", 100_000, 0x46);
+    let mut cfg = v4(sender_cfg(&file, r.addr, r.id, &state));
+    cfg.transport.handshake_timeout = Duration::from_secs(3);
+    match run_sender(cfg).await {
+        Err(SendError::HandshakeTimeout) => {}
+        other => panic!("expected no answer, got {:?}", other.map(|_| ())),
+    }
+    assert!(!out.join("old.bin").exists());
+    run_sender(sender_cfg(&file, r.addr, r.id, &state))
+        .await
+        .expect("version 3 is answered");
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("old.bin"));
+    stop_receiver(r).await;
+}
+
+/// Refusals reach a version 4 sender: one decided on the handshake (a
+/// sender not on the list), and one the user makes once the HELLO has come
+/// (declined).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_4_refusals_reach_the_sender() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let friend = Identity::generate();
+    let friend_id = friend.id();
+    let r = start_receiver(&out, &state, move |cfg| {
+        cfg.allowed_senders = Some([friend_id].into_iter().collect());
+        cfg.accept = AcceptPolicy::Ask(Arc::new(|_req, reply| {
+            let _ = reply.send(false);
+        }));
+    })
+    .await;
+    let file = make_file(&src, "no.bin", 10_000, 0x47);
+    match run_sender(v4(sender_cfg(&file, r.addr, r.id, &state))).await {
+        Err(SendError::Rejected { reason, .. }) => {
+            assert!(reason.contains("not authorized"), "{}", reason)
+        }
+        other => panic!("expected rejection, got {:?}", other.map(|_| ())),
+    }
+    let mut cfg = v4(sender_cfg(&file, r.addr, r.id, &state));
+    cfg.identity = Some(friend);
+    match run_sender(cfg).await {
+        Err(SendError::Rejected { reason, .. }) => {
+            assert!(reason.contains("declined"), "{}", reason)
+        }
+        other => panic!("expected the decline, got {:?}", other.map(|_| ())),
+    }
+    assert!(!out.join("no.bin").exists());
+    stop_receiver(r).await;
+}
+
+/// A version 4 transfer resumes after the receiver restarts in the middle
+/// of it: the re-handshake is version 4 too, and the answer to its HELLO
+/// says what the restarted receiver already holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_4_resumes_after_the_receiver_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 6 << 20;
+    let path = make_file(&src, "resume4.bin", size, 0x48);
+    let r1 = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(r1.addr, Impairment::none()).await;
+    let identity = r1.identity.clone();
+    let mut cfg = v4(sender_cfg(&path, proxy.addr, r1.id, &state));
+    cfg.transport.max_rate_bytes = Some(2_500_000);
+    let sender_task = tokio::spawn(run_sender(cfg));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while proxy.to_target_bytes.load(Ordering::Relaxed) < (size / 3) as u64 {
+        assert!(Instant::now() < deadline, "transfer did not progress");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    proxy.blackhole.store(true, Ordering::Relaxed);
+    stop_receiver(r1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut r2 = start_receiver(&out, &state, |c| c.identity = Some(identity.clone())).await;
+    *proxy.target.lock() = r2.addr;
+    proxy.blackhole.store(false, Ordering::Relaxed);
+    let summary = tokio::time::timeout(Duration::from_secs(90), sender_task)
+        .await
+        .expect("sender finished in time")
+        .unwrap()
+        .expect("send");
+    let mut resumed_from = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match tokio::time::timeout(deadline - Instant::now(), r2.events.recv()).await {
+            Ok(Some(TransferEvent::Started {
+                resumed_from: rf, ..
+            })) => resumed_from = Some(rf),
+            Ok(Some(TransferEvent::Completed { path: Some(p), .. })) => {
+                assert_same(&path, Path::new(&p));
+                break;
+            }
+            Ok(Some(TransferEvent::Failed { error, .. })) => panic!("receiver failed: {}", error),
+            Ok(Some(_)) => {}
+            _ => panic!("no completion from restarted receiver"),
+        }
+    }
+    assert!(
+        resumed_from.expect("started") > 0,
+        "resumed from saved state"
+    );
+    assert!(
+        summary.bytes_sent < (size as u64) + (size as u64) / 2,
+        "resume must not resend everything (sent {} of {})",
+        summary.bytes_sent,
+        size
+    );
+    stop_receiver(r2).await;
 }

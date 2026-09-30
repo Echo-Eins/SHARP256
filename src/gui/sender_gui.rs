@@ -85,13 +85,14 @@ impl SenderApp {
                 return;
             }
         };
-        let (receiver_id, hosts) = match crate::address::parse_peer(&self.receiver_addr) {
-            Ok(v) => v,
-            Err(e) => {
-                self.error = Some(e);
-                return;
-            }
-        };
+        let (receiver_id, version, hosts) =
+            match crate::address::parse_peer_versioned(&self.receiver_addr) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.error = Some(e);
+                    return;
+                }
+            };
         let bind: SocketAddr = match self.bind_addr.parse() {
             Ok(a) => a,
             Err(e) => {
@@ -152,6 +153,7 @@ impl SenderApp {
                 // Names are resolved by the sender itself, while it is
                 // already trying the literal addresses (RFC 8305).
                 let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file);
+                cfg.receiver_version = version;
                 cfg.bind = bind;
                 cfg.identity = Some(identity);
                 cfg.transport.max_rate_bytes = max_rate;

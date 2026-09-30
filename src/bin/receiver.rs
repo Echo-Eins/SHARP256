@@ -222,7 +222,8 @@ async fn main() -> Result<()> {
     let id = identity_file::id_of(&identity_path)
         .with_context(|| format!("identity {}", identity_path.display()))?;
     if args.id {
-        println!("{}", id);
+        // The form senders are to use: this receiver speaks version 4.
+        println!("{}", id.text(sharp256::crypto::handshake::Version::V4));
         return Ok(());
     }
 
@@ -332,7 +333,7 @@ async fn run_receiver(
     println!("{}", system_info());
     std::fs::create_dir_all(&cfg.output_dir)?;
     println!("Output:      {}", cfg.output_dir.canonicalize()?.display());
-    println!("Receiver ID: {}", id);
+    println!("Receiver ID: {}", cfg.id_text(&id));
     if cfg.relay_private && cfg.relays.is_empty() {
         println!("Warning:     --relay-private does nothing without --relay");
     }
@@ -349,6 +350,7 @@ async fn run_receiver(
     println!("Press Ctrl-C to stop.\n");
 
     let last_card: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let id_text = cfg.id_text(&id);
     cfg.events = Some(Arc::new(move |ev: TransferEvent| match ev {
         TransferEvent::IncomingRequest {
             peer,
@@ -426,7 +428,7 @@ async fn run_receiver(
             if let Some(full) = address {
                 println!("Senders use: {}", full);
             } else if let Some(addr) = advertised {
-                println!("From outside, senders use: {}@{}", id, addr);
+                println!("From outside, senders use: {}@{}", id_text, addr);
             }
         }
         TransferEvent::RelayRegistered { relay, private, .. } => {

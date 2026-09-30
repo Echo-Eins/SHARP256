@@ -201,6 +201,11 @@ impl Sender {
         &self.source
     }
 
+    /// The protocol version it speaks to the receiver.
+    pub fn receiver_version(&self) -> crate::crypto::handshake::Version {
+        self.cfg.receiver_version
+    }
+
     /// Starts asking each configured relay to put us through, in the
     /// background.
     ///
@@ -828,18 +833,28 @@ impl Sender {
                         nat_cancel.clone(),
                         move |peer, news| {
                             use crate::nat::dht::PeerNews;
-                            match news {
+                            // Tried in the handshake only once vouched for,
+                            // like the punching in earnest: an initiation
+                            // is a kilobyte and a half in version 4, and
+                            // the handshakes go round every candidate for
+                            // as long as the meeting lasts. A peer whose
+                            // punches get through becomes a candidate by
+                            // them anyway (`Engine::on_punch`).
+                            let vouched = match news {
                                 PeerNews::Vouched | PeerNews::Found { vouched: true } => {
-                                    punch.vouch(peer.ip())
+                                    punch.vouch(peer.ip());
+                                    true
                                 }
-                                PeerNews::Found { vouched: false } => {}
+                                PeerNews::Found { vouched: false } => false,
+                            };
+                            if vouched {
+                                let _ = found.send(Found::Relay(peer));
                             }
                             // Vouched for later: the punching started when
                             // it turned up, and only goes on in earnest now.
                             if news == PeerNews::Vouched {
                                 return;
                             }
-                            let _ = found.send(Found::Relay(peer));
                             let (punch, cancel) = (punch.clone(), cancel.clone());
                             tokio::spawn(async move {
                                 punch
@@ -865,6 +880,7 @@ impl Sender {
             Peer {
                 identity: self.identity.clone(),
                 receiver: self.cfg.receiver_id,
+                version: self.cfg.receiver_version,
                 psk: self.cfg.psk.clone().unwrap_or_else(crate::crypto::no_psk),
             },
             self.source.clone(),
@@ -1311,6 +1327,8 @@ const RELAY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 struct Peer {
     identity: Identity,
     receiver: SharpId,
+    /// The version to speak to it, and no other.
+    version: hs::Version,
     psk: crate::crypto::SecretKey,
 }
 
@@ -1366,6 +1384,9 @@ struct Engine {
     /// The transfer id is that of an interrupted attempt: the receiver may
     /// hold part of it, and its answer describe what is missing.
     resuming: bool,
+    /// When the HELLO of a version 4 handshake is to be sent again, while
+    /// it has no answer.
+    hello_due: Option<Instant>,
     clock: Clock,
     events: Option<EventCallback>,
     cancel: CancellationToken,
@@ -1598,6 +1619,7 @@ impl Engine {
             file_name,
             transfer_id,
             resuming: false,
+            hello_due: None,
             clock: Clock::new(),
             events,
             cancel,
@@ -2194,26 +2216,48 @@ impl Engine {
         let Some(to) = to.or_else(|| self.next_target()) else {
             return Ok(());
         };
-        let mut attempt = Initiator::new(&self.auth.identity, &self.auth.receiver, &self.auth.psk)
-            .map_err(|e| SendError::Handshake(e.to_string()))?;
-        let ts = self.clock.now_us().max(1);
-        let init = wire::Initiation {
-            timestamp: hs::initiation_timestamp(),
-            suites: Suite::ALL_BITS,
-            hardware_aes: Suite::hardware_aes(),
-            hello_flags: HELLO_FLAG_RESUME,
-            hello: self.hello(ts),
-        };
-        // The receiver's answer is no longer than the initiation, and only
-        // a resume's answer has much to say — the holes of what it holds.
-        // Padded then, so that they fit; a fresh transfer's answer is short,
-        // and its initiations — which go round every address the receiver
-        // may be at, found in the DHT or shown by a punch among them — stay
-        // as short as they are.
-        let payload = if self.secure.is_some() || self.resuming {
-            wire::encode_padded_initiation(&init)
-        } else {
-            wire::encode_initiation(&init)
+        let (mut attempt, payload) = match self.auth.version {
+            hs::Version::V3 => {
+                let attempt =
+                    Initiator::new(&self.auth.identity, &self.auth.receiver, &self.auth.psk)
+                        .map_err(|e| SendError::Handshake(e.to_string()))?;
+                let ts = self.clock.now_us().max(1);
+                let init = wire::Initiation {
+                    timestamp: hs::initiation_timestamp(),
+                    suites: Suite::ALL_BITS,
+                    hardware_aes: Suite::hardware_aes(),
+                    hello_flags: HELLO_FLAG_RESUME,
+                    hello: self.hello(ts),
+                };
+                // The receiver's answer is no longer than the initiation,
+                // and only a resume's answer has much to say — the holes of
+                // what it holds. Padded then, so that they fit; a fresh
+                // transfer's answer is short, and its initiations — which go
+                // round every address the receiver may be at, found in the
+                // DHT or shown by a punch among them — stay as short as they
+                // are.
+                let payload = if self.secure.is_some() || self.resuming {
+                    wire::encode_padded_initiation(&init)
+                } else {
+                    wire::encode_initiation(&init)
+                };
+                (attempt, payload)
+            }
+            // No HELLO in it: that goes after, under the keys (see
+            // `hs::Version`), and the answer to it with the holes of a
+            // resume goes to an address the HELLO has proven — nothing to
+            // pad for.
+            hs::Version::V4 => {
+                let attempt =
+                    Initiator::new_v4(&self.auth.identity, &self.auth.receiver, &self.auth.psk)
+                        .map_err(|e| SendError::Handshake(e.to_string()))?;
+                let payload = wire::encode_initiation_v4(&wire::InitiationV4 {
+                    timestamp: hs::initiation_timestamp(),
+                    suites: Suite::ALL_BITS,
+                    hardware_aes: Suite::hardware_aes(),
+                });
+                (attempt, payload)
+            }
         };
         // A cookie proves our address to one receiver, so it is only worth
         // anything at the address that issued it.
@@ -2223,10 +2267,13 @@ impl Engine {
                 *from == to && now.saturating_duration_since(*at) < hs::COOKIE_LIFETIME
             })
             .map(|(c, _, _)| c);
-        let pkt = attempt
-            .initiation(&payload, cookie.as_ref())
+        let datagrams = attempt
+            .initiation_datagrams(&payload, cookie.as_ref())
             .map_err(|e| SendError::Handshake(e.to_string()))?;
-        match self.socket_for(to).try_send(to, &pkt) {
+        let sent = datagrams
+            .iter()
+            .try_for_each(|pkt| self.socket_for(to).try_send(to, pkt));
+        match sent {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => {}
             // Never the end of the transfer. One unreachable address (a
@@ -2347,26 +2394,53 @@ impl Engine {
             return Ok(());
         }
         let cid = attempt.cid();
-        let resp = wire::decode_response(&payload)
-            .map_err(|e| SendError::Protocol(format!("bad handshake response: {}", e)))?;
-        // Busy is a state, not a verdict. In the middle of a transfer it
-        // means the receiver has no room for the session right now — after
-        // it restarted, say — and the transfer should wait and ask again,
-        // as for any silence, rather than end and throw its state away.
-        if resp.ack.status == HELLO_REJECTED
-            && resp.ack.reason == REASON_BUSY
-            && self.secure.is_some()
-        {
-            tracing::info!("the receiver has no room for the transfer right now; waiting");
-            return Ok(());
-        }
-        if resp.ack.status == HELLO_REJECTED {
-            return Err(SendError::Rejected {
-                reason: reason_name(resp.ack.reason).to_string(),
-                message: resp.ack.message,
-            });
-        }
-        let suite = Suite::from_u8(resp.suite)
+        let bad = |e| SendError::Protocol(format!("bad handshake response: {}", e));
+        // Version 3 answers with the receiver's state; version 4 with keys
+        // alone, the state coming in answer to the HELLO sent under them.
+        let (suite_byte, verdict) = match attempt.version() {
+            hs::Version::V3 => {
+                let resp = wire::decode_response(&payload).map_err(bad)?;
+                let refused = resp.ack.status == HELLO_REJECTED;
+                (
+                    resp.suite,
+                    if refused {
+                        Err((resp.ack.reason, resp.ack.message))
+                    } else {
+                        Ok(Some(resp.ack))
+                    },
+                )
+            }
+            hs::Version::V4 => {
+                let resp = wire::decode_response_v4(&payload).map_err(bad)?;
+                (
+                    resp.suite,
+                    if resp.suite == 0 {
+                        Err((resp.reason, String::new()))
+                    } else {
+                        Ok(None)
+                    },
+                )
+            }
+        };
+        let answer = match verdict {
+            // Busy is a state, not a verdict. In the middle of a transfer it
+            // means the receiver has no room for the session right now —
+            // after it restarted, say — and the transfer should wait and ask
+            // again, as for any silence, rather than end and throw its state
+            // away.
+            Err((REASON_BUSY, _)) if self.secure.is_some() => {
+                tracing::info!("the receiver has no room for the transfer right now; waiting");
+                return Ok(());
+            }
+            Err((reason, message)) => {
+                return Err(SendError::Rejected {
+                    reason: reason_name(reason).to_string(),
+                    message,
+                });
+            }
+            Ok(answer) => answer,
+        };
+        let suite = Suite::from_u8(suite_byte)
             .ok_or_else(|| SendError::Protocol("receiver chose an unknown cipher".into()))?;
         self.secure = Some(Secure {
             keys: Arc::new(SessionKeys::derive(&split, true, suite)),
@@ -2401,8 +2475,35 @@ impl Engine {
             self.auth.receiver.short(),
             suite.name()
         );
-        self.answer = Some(resp.ack);
+        match answer {
+            Some(ack) => self.answer = Some(ack),
+            // Version 4: the HELLO now, under the keys; asked again until it
+            // is answered.
+            None => {
+                self.send_state_query();
+                self.hello_due = Some(now + self.hello_retry());
+            }
+        }
         Ok(())
+    }
+
+    /// How long a HELLO sent after a version 4 handshake waits for its
+    /// answer before it is sent again.
+    fn hello_retry(&self) -> Duration {
+        (self.rtt.srtt() * 3).clamp(Duration::from_millis(250), Duration::from_secs(2))
+    }
+
+    /// Sends the HELLO of a version 4 handshake again if its answer is due.
+    /// Returns when it next is.
+    fn hello_again(&mut self, now: Instant) -> Option<Instant> {
+        let at = self.hello_due?;
+        if now < at {
+            return Some(at);
+        }
+        self.send_state_query();
+        let next = now + self.hello_retry();
+        self.hello_due = Some(next);
+        Some(next)
     }
 
     fn hello(&self, ts: u32) -> Hello {
@@ -2518,6 +2619,9 @@ impl Engine {
                 wake = wake.min(next_attempt);
             }
             if let Some(at) = next_poll {
+                wake = wake.min(at);
+            }
+            if let Some(at) = self.hello_again(now) {
                 wake = wake.min(at);
             }
             // An introduction can arrive at any point, including after the
@@ -2800,6 +2904,8 @@ impl Engine {
                 socket = self.socket.clone();
             }
             self.drain_socket()?;
+            // A version 4 re-handshake's HELLO, again if it went unanswered.
+            let _ = self.hello_again(Instant::now());
             // An answer to a re-handshake or state query: adopt the
             // receiver's view of what it holds.
             if let Some(ack) = self.answer.take() {
@@ -3467,6 +3573,7 @@ impl Engine {
                 {
                     self.probe_ts.clear();
                     self.answer = Some(ack);
+                    self.hello_due = None;
                 }
             }
             Message::Abort(a) => {

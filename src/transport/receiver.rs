@@ -143,10 +143,48 @@ enum Incoming {
         at: Instant,
     },
     Handshake(Box<Handshake>),
+    /// A version 4 handshake, answered, and the HELLO that came under its
+    /// keys.
+    Established(Box<Established>),
     /// The writer finished an fsync requested for persistence.
     FlushDone(io::Result<()>),
     /// Background close + hash + rename finished.
     Verified(Result<([u8; 32], PathBuf), String>),
+}
+
+/// A version 4 handshake answered whose HELLO has not come yet: keys, and
+/// nothing else. Nothing the initiation said is acted on until the HELLO,
+/// which is the first thing that proves the sender's key — message 1 can be
+/// written by anyone who holds the receiver's own key — and whose contents
+/// have the forward secrecy message 1 does not.
+struct PendingV4 {
+    keys: Arc<SessionKeys>,
+    sender: SharpId,
+    peer_cid: u64,
+    from: SocketAddr,
+    at: Instant,
+    /// Bytes the initiation's fragments came to, and the answer's.
+    len: usize,
+    answered: usize,
+}
+
+/// Version 4 handshakes waiting for their HELLO at once, and how long each
+/// waits.
+const PENDING_V4_CAPACITY: usize = 4096;
+const PENDING_V4_PATIENCE: Duration = Duration::from_secs(10);
+
+/// What a session is handed for a version 4 handshake: its keys, made and
+/// answered, and the HELLO that came under them (the datagram itself
+/// follows, as any other).
+struct Established {
+    keys: Arc<SessionKeys>,
+    cid: u64,
+    peer_cid: u64,
+    from: SocketAddr,
+    at: Instant,
+    len: usize,
+    answered: usize,
+    hello: Hello,
 }
 
 struct SessionHandle {
@@ -611,6 +649,12 @@ impl Receiver {
         self.shared.identity.id()
     }
 
+    /// The ID in the form senders are to use (see
+    /// [`ReceiverConfig::id_text`]).
+    pub fn id_text(&self) -> String {
+        self.shared.cfg.id_text(&self.id())
+    }
+
     /// Token that stops the receiver (sessions persist their state first).
     pub fn cancel_token(&self) -> CancellationToken {
         self.shared.cancel.clone()
@@ -673,6 +717,7 @@ impl Receiver {
         let reports = {
             let events = shared.cfg.events.clone();
             let id = shared.identity.id();
+            let id_text = shared.cfg.id_text(&id);
             let relay_refs = relay_refs(&shared.cfg.relays);
             crate::nat::RelayedReports::new(
                 shared.socket.local_addr().unwrap_or(shared.cfg.bind),
@@ -684,7 +729,7 @@ impl Receiver {
                         &events,
                         TransferEvent::Reachability {
                             advertised: r.advertised().map(|a| a.to_string()),
-                            address: r.address_string(&id),
+                            address: r.address_string(&id_text),
                             card: Some(
                                 r.card(&id, crate::nat::card::Role::Receiver, &relay_refs)
                                     .to_text(),
@@ -920,6 +965,10 @@ struct Dispatcher {
     replays: ReplayGuard,
     sessions: HashMap<TransferKey, SessionHandle>,
     by_cid: HashMap<u64, TransferKey>,
+    /// Version 4: initiations being put together, and handshakes answered
+    /// that wait for their HELLO.
+    fragments: hs::Fragments,
+    pending: HashMap<u64, PendingV4>,
     /// Datagrams collected for sessions during the current receive call.
     outbox: Vec<(TransferKey, Vec<Datagrams>)>,
     at: Instant,
@@ -948,6 +997,8 @@ impl Dispatcher {
             replays: ReplayGuard::new(REPLAY_GUARD_CAPACITY),
             sessions: HashMap::new(),
             by_cid: HashMap::new(),
+            fragments: hs::Fragments::default(),
+            pending: HashMap::new(),
             outbox: Vec::new(),
             at: Instant::now(),
             done_tx,
@@ -1013,6 +1064,13 @@ impl Dispatcher {
             // Deliver what arrived before it first, keeping the order.
             self.flush();
             self.on_initiation(pkt, from, now);
+        } else if !self.shared.cfg.speak_v4 {
+        } else if let Some(cid) = peek_cid(pkt).filter(|c| self.pending.contains_key(c)) {
+            self.flush();
+            self.on_pending(cid, pkt, from, now);
+        } else if let Some(f) = self.responder.fragment(pkt) {
+            self.flush();
+            self.on_fragment(pkt, f, from, now);
         }
     }
 
@@ -1171,26 +1229,28 @@ impl Dispatcher {
         }
 
         self.prune();
-        if self.sessions.len() >= self.shared.cfg.max_sessions {
+        if let Err(message) = self.room_for(&sender, from) {
             let Handshake { incoming, init, .. } = *handshake;
-            self.reject(
-                incoming,
-                &init,
-                (from, pkt.len()),
-                REASON_BUSY,
-                "too many concurrent transfers",
-            );
+            self.reject(incoming, &init, (from, pkt.len()), REASON_BUSY, message);
             return;
         }
-        // Without a per-sender share the session limit is
-        // first-come-first-served, and one authenticated sender could take
-        // every slot and lock everybody else out. Being on the allow-list
-        // does not make that acceptable.
+        self.spawn_session(key, from, cid, Incoming::Handshake(handshake));
+    }
+
+    /// Whether a new session for `sender` fits: the limit on sessions, and
+    /// its share of them — without one the limit is first-come-first-served,
+    /// and one authenticated sender could take every slot and lock
+    /// everybody else out. Being on the allow-list does not make that
+    /// acceptable.
+    fn room_for(&self, sender: &SharpId, from: SocketAddr) -> Result<(), &'static str> {
         let cfg = &self.shared.cfg;
+        if self.sessions.len() >= cfg.max_sessions {
+            return Err("too many concurrent transfers");
+        }
         let share = cfg
             .max_sessions_per_sender
             .clamp(1, cfg.max_sessions.max(1));
-        if self.sessions.keys().filter(|(s, _)| *s == sender).count() >= share {
+        if self.sessions.keys().filter(|(s, _)| s == sender).count() >= share {
             tracing::info!(
                 "transfer from {} ({}) refused: it already holds {} of {} sessions",
                 from,
@@ -1198,18 +1258,16 @@ impl Dispatcher {
                 share,
                 cfg.max_sessions
             );
-            let Handshake { incoming, init, .. } = *handshake;
-            self.reject(
-                incoming,
-                &init,
-                (from, pkt.len()),
-                REASON_BUSY,
-                "too many concurrent transfers from this sender",
-            );
-            return;
+            return Err("too many concurrent transfers from this sender");
         }
+        Ok(())
+    }
+
+    /// Starts the session for `key` at connection id `cid`, handing it
+    /// `first` (its handshake).
+    fn spawn_session(&mut self, key: TransferKey, from: SocketAddr, cid: u64, first: Incoming) {
         let (tx, rx) = mpsc::channel::<Incoming>(SESSION_QUEUE);
-        let _ = tx.try_send(Incoming::Handshake(handshake));
+        let _ = tx.try_send(first);
         let shared = self.shared.clone();
         let done_tx = self.done_tx.clone();
         let session_tx = tx.clone();
@@ -1230,6 +1288,203 @@ impl Dispatcher {
                 task,
             },
         );
+    }
+
+    // ----- version 4 -------------------------------------------------------
+
+    /// A fragment of a version 4 initiation. Under load each needs the mac2
+    /// of a cookie (a reply to any of them gives it); the whole initiation,
+    /// once in, counts against its client's rate like any other.
+    fn on_fragment(&mut self, pkt: &[u8], f: hs::Fragment, from: SocketAddr, now: Instant) {
+        let under_load = self.limiter.note_initiation(now);
+        if under_load && !self.cookies.mac2_ok(pkt, from, now) {
+            if let Some(reply) = self.cookies.reply(pkt, from, now) {
+                let _ = self.shared.send(from, &reply);
+            }
+            return;
+        }
+        let Some(whole) = self.fragments.add(pkt, f, from, now) else {
+            return;
+        };
+        if !self.limiter.allow(from, now) {
+            return;
+        }
+        self.on_initiation_v4(whole, from, now);
+    }
+
+    /// A version 4 initiation, put together: answered with keys and nothing
+    /// more (see [`PendingV4`]), or refused.
+    fn on_initiation_v4(&mut self, whole: hs::Assembled, from: SocketAddr, now: Instant) {
+        let incoming = match self
+            .responder
+            .read_initiation_v4(whole.sender_cid, &whole.msg)
+        {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::debug!("version 4 initiation from {} rejected: {}", from, e);
+                return;
+            }
+        };
+        let init = match wire::decode_initiation_v4(&incoming.payload) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::debug!("malformed initiation payload from {}: {}", from, e);
+                return;
+            }
+        };
+        let sender = incoming.sender;
+        if let Some(allowed) = &self.shared.cfg.allowed_senders {
+            if !allowed.contains(&sender) {
+                tracing::info!(
+                    "transfer from {} ({}) refused: sender not allowed",
+                    from,
+                    sender
+                );
+                self.refuse_v4(incoming, from, whole.len, REASON_UNAUTHORIZED);
+                return;
+            }
+        }
+        let sessions = &self.sessions;
+        if !self.replays.accept_keeping(&sender, init.timestamp, |id| {
+            sessions.keys().any(|(s, _)| s == id)
+        }) {
+            tracing::debug!("replayed initiation from {} ignored", from);
+            return;
+        }
+        let Some(suite) = Suite::choose(init.suites, init.hardware_aes) else {
+            self.refuse_v4(incoming, from, whole.len, REASON_NO_SUITE);
+            return;
+        };
+        self.pending
+            .retain(|_, p| now.saturating_duration_since(p.at) < PENDING_V4_PATIENCE);
+        if self.pending.len() >= PENDING_V4_CAPACITY {
+            if let Some(oldest) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, p)| p.at)
+                .map(|(c, _)| *c)
+            {
+                self.pending.remove(&oldest);
+            }
+        }
+        let cid = self.new_cid();
+        let peer_cid = incoming.sender_cid;
+        let payload = wire::encode_response_v4(&wire::ResponseV4 {
+            suite: suite as u8,
+            reason: REASON_NONE,
+        });
+        let Ok((pkt, split)) = incoming.respond(cid, &payload) else {
+            return;
+        };
+        // No more back than came in (it is shorter by construction).
+        if pkt.len() > whole.len {
+            return;
+        }
+        let _ = self.shared.send(from, &pkt);
+        self.pending.insert(
+            cid,
+            PendingV4 {
+                keys: Arc::new(SessionKeys::derive(&split, false, suite)),
+                sender,
+                peer_cid,
+                from,
+                at: now,
+                len: whole.len,
+                answered: pkt.len(),
+            },
+        );
+    }
+
+    /// Refuses a version 4 handshake in its answer: a reason, no keys.
+    fn refuse_v4(&self, incoming: hs::Incoming, to: SocketAddr, len: usize, reason: u8) {
+        let payload = wire::encode_response_v4(&wire::ResponseV4 { suite: 0, reason });
+        if let Ok((pkt, _)) = incoming.respond(self.new_cid(), &payload) {
+            if pkt.len() <= len {
+                let _ = self.shared.send(to, &pkt);
+            }
+        }
+    }
+
+    /// A datagram for a version 4 handshake that waits for its HELLO. The
+    /// HELLO, and only it, makes the session: it names the transfer, and it
+    /// is the first thing the sender's key stands behind. Anything else
+    /// before it is dropped. The datagram then goes to the session like any
+    /// other, which answers the HELLO.
+    fn on_pending(&mut self, cid: u64, pkt: &[u8], from: SocketAddr, now: Instant) {
+        let Some(p) = self.pending.get(&cid) else {
+            return;
+        };
+        let mut copy = pkt.to_vec();
+        let Ok((tb, _, body)) = p.keys.recv.open(&mut copy) else {
+            return;
+        };
+        let Ok((MsgType::Hello, _)) = parse_type_byte(tb) else {
+            return;
+        };
+        let Ok(Message::Hello(hello)) = wire::decode_body(MsgType::Hello, body) else {
+            return;
+        };
+        let p = self.pending.remove(&cid).expect("present");
+        let key = (p.sender, hello.transfer_id);
+        let established = Box::new(Established {
+            keys: p.keys.clone(),
+            cid,
+            peer_cid: p.peer_cid,
+            from: p.from,
+            at: p.at,
+            len: p.len,
+            answered: p.answered,
+            hello: hello.clone(),
+        });
+        let delivery = Datagrams {
+            buf: pkt.to_vec(),
+            stride: pkt.len(),
+            from,
+        };
+        // A new handshake of a transfer we already serve: the session moves
+        // to it.
+        if let Some(s) = self.sessions.get_mut(&key) {
+            if !s.task.is_finished() {
+                if s.tx.try_send(Incoming::Established(established)).is_ok() {
+                    self.by_cid.remove(&s.cid);
+                    s.cid = cid;
+                    self.by_cid.insert(cid, key);
+                    self.queue(key, delivery);
+                }
+                return;
+            }
+            self.drop_session(&key);
+        }
+        let refusal = {
+            let mut declined = self.shared.declined.lock();
+            declined.retain(|_, at| now.saturating_duration_since(*at) < DECLINE_MEMORY);
+            declined.contains_key(&key)
+        }
+        .then_some((REASON_DECLINED, "declined by user"));
+        self.prune();
+        let refusal = refusal.or_else(|| {
+            self.room_for(&p.sender, from)
+                .err()
+                .map(|message| (REASON_BUSY, message))
+        });
+        if let Some((reason, message)) = refusal {
+            // Sealed under the handshake's keys, and only to the address
+            // the HELLO has just proven: a transport packet from where the
+            // answer went.
+            if from == p.from {
+                let mut out = Vec::with_capacity(MAX_CONTROL_DATAGRAM);
+                begin_packet(&mut out, p.peer_cid, type_byte(MsgType::HelloAck, 0), 0);
+                let ack = rejection(hello.timestamp, reason, message);
+                wire::encode_body(&Message::HelloAck(ack), &mut out, MAX_CONTROL_BODY);
+                if p.keys.send.seal(&mut out).is_ok() {
+                    let _ = self.shared.send(from, &out);
+                }
+            }
+            tracing::info!("transfer from {} ({}) refused: {}", from, p.sender, message);
+            return;
+        }
+        self.spawn_session(key, p.from, cid, Incoming::Established(established));
+        self.queue(key, delivery);
     }
 
     /// Answers an authenticated initiation of `len` bytes with a rejection;
@@ -1254,7 +1509,7 @@ impl Dispatcher {
         loop {
             let c = rand::rngs::OsRng.next_u64();
             // Some values mean something else on the wire; see there.
-            if is_usable_cid(c) && !self.by_cid.contains_key(&c) {
+            if is_usable_cid(c) && !self.by_cid.contains_key(&c) && !self.pending.contains_key(&c) {
                 return c;
             }
         }
@@ -2093,14 +2348,15 @@ impl Session {
     /// Runs the session; returns its key when it ends.
     async fn run(mut self, mut rx: mpsc::Receiver<Incoming>) -> TransferKey {
         // The session was created for its first handshake.
-        let first = loop {
+        let decision = loop {
             match rx.recv().await {
-                Some(Incoming::Handshake(h)) => break h,
+                Some(Incoming::Handshake(h)) => break self.start(*h),
+                Some(Incoming::Established(e)) => break self.start_v4(*e),
                 Some(_) => {}
                 None => return self.key(),
             }
         };
-        let Some(mut decision) = self.start(*first) else {
+        let Some(mut decision) = decision else {
             return self.key();
         };
 
@@ -2205,6 +2461,13 @@ impl Session {
                 self.respond(*h);
                 ControlFlow::Continue(())
             }
+            Incoming::Established(e) => {
+                // The same in version 4: the handshake was answered; its
+                // HELLO follows, and is answered with our state.
+                self.last_rx = e.at;
+                self.take_keys(&e);
+                ControlFlow::Continue(())
+            }
             Incoming::FlushDone(result) => {
                 self.on_flush_done(result);
                 ControlFlow::Continue(())
@@ -2270,6 +2533,113 @@ impl Session {
                 self.respond(h);
                 Some(Some(rx))
             }
+        }
+    }
+
+    /// Starts the session of a version 4 handshake. The keys are in place
+    /// and the handshake answered; its HELLO — `e.hello`, whose datagram
+    /// comes next — is what the transfer is decided on. What is said back
+    /// (accepted, waiting for the user, refused) goes in answer to that
+    /// datagram, which is also what proves the sender's address.
+    fn start_v4(&mut self, e: Established) -> Option<Option<oneshot::Receiver<bool>>> {
+        self.peer = e.from;
+        self.peer_proven = false;
+        self.peer_allowance = e.len.saturating_sub(e.answered);
+        self.last_rx = e.at;
+        self.heard_peer_at = e.at;
+        self.take_keys(&e);
+        let hello = e.hello;
+        let refuse = |this: &mut Self, reason: u8, message: String| {
+            this.phase = Phase::Refusing {
+                reason,
+                message,
+                until: Instant::now() + REFUSAL_WAIT,
+            };
+            Some(None)
+        };
+        if let Err((reason, message)) = self.prepare(&hello) {
+            tracing::info!("rejected transfer from {}: {}", self.peer, message);
+            return refuse(self, reason, message);
+        }
+        emit(
+            &self.events,
+            TransferEvent::IncomingRequest {
+                transfer_id: self.tid_hex(),
+                peer: self.peer.to_string(),
+                sender_id: self.sender.to_string(),
+                file_name: self.file_name.clone(),
+                file_size: self.file_size,
+                directory: self.directory(),
+                resumed_bytes: self.received.total(),
+            },
+        );
+        match self.shared.cfg.accept.clone() {
+            AcceptPolicy::AcceptAll => {
+                if let Err(message) = self.create_file() {
+                    self.report_failure(message.clone(), false);
+                    return refuse(self, REASON_INTERNAL, message);
+                }
+                self.phase = Phase::Receiving;
+                self.on_accepted();
+                Some(None)
+            }
+            AcceptPolicy::Ask(cb) => {
+                let (tx, rx) = oneshot::channel();
+                cb(
+                    IncomingRequest {
+                        transfer_id: self.tid_hex(),
+                        peer: self.peer,
+                        sender_id: self.sender,
+                        file_name: self.file_name.clone(),
+                        file_size: self.file_size,
+                        directory: self.directory(),
+                        resumed_bytes: self.received.total(),
+                    },
+                    tx,
+                );
+                self.phase = Phase::Pending {
+                    deadline: Instant::now() + self.cfg.handshake_timeout,
+                };
+                Some(Some(rx))
+            }
+        }
+    }
+
+    /// Takes the keys of a version 4 handshake (the first, or one after an
+    /// outage). A handshake from an address other than the session's is a
+    /// claim like any other (see [`Session::respond`]).
+    fn take_keys(&mut self, e: &Established) {
+        let generation = self.secure.as_ref().map_or(1, |s| s.generation + 1);
+        let fresh = self.secure.is_none();
+        self.secure = Some(Secure {
+            keys: e.keys.clone(),
+            generation,
+            local_cid: e.cid,
+            peer_cid: e.peer_cid,
+            next_pn: 0,
+            replay: ReplayWindow::new(),
+            auth_failures: 0,
+        });
+        if fresh {
+            return;
+        }
+        self.path.reset();
+        let credit = e.len.saturating_sub(e.answered);
+        if e.from == self.peer {
+            if !self.peer_proven {
+                self.peer_allowance = self.peer_allowance.saturating_add(credit);
+            }
+        } else if let Some(c) = self.path.on_authentic(e.from, self.peer, e.at, credit, 0) {
+            tracing::info!(
+                "handshake from {} while the session is at {}; validating it",
+                c.to,
+                self.peer
+            );
+            self.send_to(
+                c.to,
+                0,
+                &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
+            );
         }
     }
 

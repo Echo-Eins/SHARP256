@@ -632,11 +632,11 @@ impl Fragments {
             .retain(|_, p| now.saturating_duration_since(p.first) < Self::PATIENCE);
         let key = (from, f.sender_cid);
         if !self.partial.contains_key(&key) {
-            let client = client_key(from);
+            let client = crate::address::client_key(from);
             let mine = self
                 .partial
                 .keys()
-                .filter(|(a, _)| client_key(*a) == client)
+                .filter(|(a, _)| crate::address::client_key(*a) == client)
                 .count();
             if mine >= Self::PER_CLIENT {
                 return None;
@@ -691,18 +691,6 @@ impl Fragments {
 
     pub fn is_empty(&self) -> bool {
         self.partial.is_empty()
-    }
-}
-
-/// An IPv4 address or an IPv6 /64: one subscriber, as far as limits go.
-fn client_key(addr: SocketAddr) -> IpAddr {
-    match crate::address::canonical(addr).ip() {
-        IpAddr::V4(v4) => IpAddr::V4(v4),
-        IpAddr::V6(v6) => {
-            let mut o = v6.octets();
-            o[8..].fill(0);
-            IpAddr::V6(o.into())
-        }
     }
 }
 

@@ -870,7 +870,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
              "--identity", f"{d}/relay.key", "--log", "info"],
             "relay.log",
         )
-        m = wait_for(lab, "relay.log", r"Receivers: --relay (sh-\S+?)@", 10)
+        m = wait_for(lab, "relay.log", r"Receivers: --relay (sh4?-\S+?)@", 10)
         if not m:
             return False, "none", 0, "the relay did not start:\n" + lab.log("relay.log")
         rid = m.group(1)
@@ -887,18 +887,18 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
             "--relay", f"{rid}@{srv}:5560", "--log-level", "info",
         ]
         lab.spawn("B", recv_args, "receiver.log")
-        m = wait_for(lab, "receiver.log", r"Senders use: (sh-\S+)", 15)
+        m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+)", 15)
         if not m:
             return False, "none", 0, "the receiver did not start:\n" + lab.log("receiver.log")
         # Its address once the NAT tests are done: the same line again, now
         # with addresses in place of "<this host>".
-        m = wait_for(lab, "receiver.log", r"Senders use: (sh-\S+@[\[\d]\S*)", 30)
+        m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+@[\[\d]\S*)", 30)
         if m:
             address = m.group(1)
         else:
             # Nothing was published (a NAT that gives no address worth
             # publishing): a sender has only the relay to go by.
-            address = f"{re.search(r'Senders use: (sh-[a-z0-9]+)', lab.log('receiver.log')).group(1)}@{srv}:9"
+            address = f"{re.search(r'Senders use: (sh4?-[a-z0-9]+)', lab.log('receiver.log')).group(1)}@{srv}:9"
         start = time.time()
         send_args = [
             f"{BIN}/sharp-sender", data, address, "--relay", f"{srv}:5560", "--headless",
@@ -967,7 +967,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False, p
     if plain:
         # What the receiver prints for a sender: its ID and its addresses,
         # once its tests are done (the line before that has none yet).
-        m = wait_for(lab, "receiver.log", r"Senders use: (sh-\S+@[\[\d]\S*)", 30)
+        m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+@[\[\d]\S*)", 30)
         if not m:
             return False, "none", 0, "the receiver printed no address:\n" + lab.log("receiver.log")
         rcard = m.group(1)
@@ -1075,7 +1075,7 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
          *stun_args(topo), *dht_args, "--log-level", "info"],
         "receiver.log",
     )
-    m = wait_for(lab, "receiver.log", r"Receiver ID: (sh-\S+)", 15)
+    m = wait_for(lab, "receiver.log", r"Receiver ID: (sh4?-\S+)", 15)
     if not m:
         return False, "none", 0, "the receiver did not start:\n" + lab.log("receiver.log")
     rid = m.group(1)
@@ -1484,7 +1484,7 @@ def cmd_lan(args):
                 + ["--log-level", "info"],
                 f"receiver-{name}.log",
             )
-            m = wait_for(lab, f"receiver-{name}.log", r"Receiver ID: (sh-\S+)", 15)
+            m = wait_for(lab, f"receiver-{name}.log", r"Receiver ID: (sh4?-\S+)", 15)
             if not m or (announce and not wait_for(lab, f"receiver-{name}.log", r"announced on the local network", 10)):
                 print(f"{name}: the receiver did not start:\n" + lab.log(f"receiver-{name}.log")[-1500:])
                 results.append(False)
@@ -1767,7 +1767,7 @@ def cmd_portmap(args):
                         ok_all = False
                         continue
                     forwarded = m.group(1)
-                    rid = re.search(r"Receiver ID: (sh-\S+)", log).group(1)
+                    rid = re.search(r"Receiver ID: (sh4?-\S+)", log).group(1)
                     start = time.time()
                     sender = lab.spawn(
                         "A",
@@ -1945,7 +1945,7 @@ def cmd_portmap6(args):
                  "--identity", f"{d}/r.key", "--bind", "[::]:5555", *stun_args(topo), "--log-level", "info"],
                 "receiver.log",
             )
-            rid = wait_for(lab, "receiver.log", r"Receiver ID: (sh-\S+)", 15)
+            rid = wait_for(lab, "receiver.log", r"Receiver ID: (sh4?-\S+)", 15)
             if not rid:
                 print("the receiver did not start:\n" + lab.log("receiver.log")[-1200:])
                 ok_all = False
@@ -1954,7 +1954,7 @@ def cmd_portmap6(args):
             time.sleep(12 if proto else 8)
             log = lab.log("receiver.log")
             forwards = re.findall(r"(?:IPv6 firewall|pinhole)[^\n]*", log)
-            published = re.findall(r"Senders use: (sh-\S+)", log)
+            published = re.findall(r"Senders use: (sh4?-\S+)", log)
             address = published[-1] if published else rid.group(1)
             # Only its IPv6 addresses: the sender is not to have another way.
             v6 = [a for a in address.split("@", 1)[1].split(",") if a.startswith("[")] if "@" in address else []
@@ -2113,7 +2113,7 @@ def cmd_samenat(args):
                  "--identity", f"{d}/relay.key", "--log", "info"],
                 "relay.log",
             )
-            rid_m = wait_for(lab, "relay.log", r"Receivers: --relay (sh-\S+?)@", 10)
+            rid_m = wait_for(lab, "relay.log", r"Receivers: --relay (sh4?-\S+?)@", 10)
             data = os.path.join(d, "payload.bin")
             with open(data, "wb") as f:
                 f.write(os.urandom(1 << 20))
@@ -2126,10 +2126,10 @@ def cmd_samenat(args):
                  "--relay", f"{rid_m.group(1)}@{S1}:5560", *extra, "--log-level", "info"],
                 "receiver.log",
             )
-            m = wait_for(lab, "receiver.log", r"Senders use: (sh-\S+@[\d\[]\S*)", 30)
+            m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+@[\d\[]\S*)", 30)
             log = lab.log("receiver.log")
             hairpin = "no hairpinning" if "no hairpinning" in log else ("hairpinning works" if "hairpinning works" in log else "unmeasured")
-            rid = re.search(r"Receiver ID: (sh-\S+)", log).group(1)
+            rid = re.search(r"Receiver ID: (sh4?-\S+)", log).group(1)
             address = m.group(1) if m else f"{rid}@{S1}:9"
             start = time.time()
             sender = lab.spawn(
@@ -2219,10 +2219,10 @@ def cmd_dhtplant(args):
                 lab.spawn("B", [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out",
                                 "--state-dir", f"{d}/rst", "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555",
                                 "--stun", f"{S1}:3478", *dht_args, "--log-level", "info"], "receiver.log")
-                rid = wait_for(lab, "receiver.log", r"Receiver ID: (sh-\S+)", 15).group(1)
+                rid = wait_for(lab, "receiver.log", r"Receiver ID: (sh4?-\S+)", 15).group(1)
             else:
                 shown = lab.x("B", f"{BIN}/sharp-receiver", "--identity", f"{d}/r.key", "--id").stdout
-                rid = re.search(r"(sh-[a-z0-9]+)", shown).group(1)
+                rid = re.search(r"(sh4?-[a-z0-9]+)", shown).group(1)
             start = time.time()
             sender = lab.spawn("A", [f"{BIN}/sharp-sender", data, rid, "--headless", "--stun", f"{S1}:3478",
                                      *dht_args, "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst",
@@ -2276,10 +2276,10 @@ def cmd_early(args):
                  "--identity", f"{d}/relay.key", "--log", "info"],
                 "relay.log",
             )
-            rid = wait_for(lab, "relay.log", r"Receivers: --relay (sh-\S+?)@", 10).group(1)
+            rid = wait_for(lab, "relay.log", r"Receivers: --relay (sh4?-\S+?)@", 10).group(1)
             # The receiver's ID is known before it runs: it is its key's.
             shown = lab.x("B", f"{BIN}/sharp-receiver", "--identity", f"{d}/r.key", "--id").stdout
-            receiver_id = re.search(r"(sh-[a-z0-9]+)", shown).group(1)
+            receiver_id = re.search(r"(sh4?-[a-z0-9]+)", shown).group(1)
             data = os.path.join(d, "payload.bin")
             with open(data, "wb") as f:
                 f.write(os.urandom(1 << 20))
@@ -2348,7 +2348,7 @@ def cmd_timeout(args):
              "--identity", f"{d}/relay.key", "--log", "info"],
             "relay.log",
         )
-        rid_m = wait_for(lab, "relay.log", r"Receivers: --relay (sh-\S+?)@", 10)
+        rid_m = wait_for(lab, "relay.log", r"Receivers: --relay (sh4?-\S+?)@", 10)
         data = os.path.join(d, "payload.bin")
         with open(data, "wb") as f:
             f.write(os.urandom(1 << 20))
@@ -2361,8 +2361,8 @@ def cmd_timeout(args):
              "--relay", f"{rid_m.group(1)}@{S1}:5560", "--log-level", "info"],
             "receiver.log",
         )
-        m = wait_for(lab, "receiver.log", r"Senders use: (sh-\S+@[\d\[]\S*)", 30)
-        rid = re.search(r"Receiver ID: (sh-\S+)", lab.log("receiver.log")).group(1)
+        m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+@[\d\[]\S*)", 30)
+        rid = re.search(r"Receiver ID: (sh4?-\S+)", lab.log("receiver.log")).group(1)
         address = m.group(1) if m else f"{rid}@{S1}:9"
         print(f"the NAT in front of the receiver forgets a UDP flow after {args.memory} s; waiting {args.wait} s idle")
         end = time.time() + args.wait

@@ -169,10 +169,18 @@ impl Reach {
 /// all, and is written as its ID alone; the list of hosts is then empty, and
 /// the sender has to be given the relay.
 pub fn parse_peer(s: &str) -> Result<(SharpId, Vec<String>), String> {
+    parse_peer_versioned(s).map(|(id, _, hosts)| (id, hosts))
+}
+
+/// [`parse_peer`], with the protocol version the ID's form names (`sh4-`:
+/// version 4, and the sender is to speak nothing older).
+pub fn parse_peer_versioned(
+    s: &str,
+) -> Result<(SharpId, crate::crypto::handshake::Version, Vec<String>), String> {
     let s = s.trim();
     let Some((id, hosts)) = s.rsplit_once('@') else {
-        return match s.parse::<SharpId>() {
-            Ok(id) => Ok((id, Vec::new())),
+        return match SharpId::parse_versioned(s) {
+            Ok((id, version)) => Ok((id, version, Vec::new())),
             Err(_) => Err(
                 "a receiver is written as <ID>@<host>:<port>, e.g. sh-…@203.0.113.5:5555 \
                  (or as its ID alone, with --relay)"
@@ -180,7 +188,7 @@ pub fn parse_peer(s: &str) -> Result<(SharpId, Vec<String>), String> {
             ),
         };
     };
-    let id: SharpId = id.parse().map_err(|e| format!("receiver ID: {}", e))?;
+    let (id, version) = SharpId::parse_versioned(id).map_err(|e| format!("receiver ID: {}", e))?;
     let mut out = Vec::new();
     for host in hosts.split(',') {
         let host = host.trim();
@@ -194,7 +202,7 @@ pub fn parse_peer(s: &str) -> Result<(SharpId, Vec<String>), String> {
     if out.is_empty() {
         return Err("no address given after \"@\"".to_string());
     }
-    Ok((id, out))
+    Ok((id, version, out))
 }
 
 /// Most addresses one name contributes. A name that resolves to more than

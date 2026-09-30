@@ -229,9 +229,11 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     } else {
         None
     };
-    let (receiver_id, hosts) = match card_id {
-        Some(id) => (id, Vec::new()),
-        None => sharp256::address::parse_peer(&receiver).map_err(|e| anyhow::anyhow!(e))?,
+    let (receiver_id, version, hosts) = match card_id {
+        Some(id) => (id, sharp256::crypto::handshake::Version::V3, Vec::new()),
+        None => {
+            sharp256::address::parse_peer_versioned(&receiver).map_err(|e| anyhow::anyhow!(e))?
+        }
     };
     // A receiver reached only through a relay publishes no address.
     if card_id.is_none() && hosts.is_empty() && args.relays.is_empty() && !args.lan && !args.dht {
@@ -253,10 +255,18 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     #[cfg(feature = "nat-traversal")]
     let mut cfg = match card {
         Some(card) => SenderConfig::for_card(card, file.clone()),
-        None => SenderConfig::for_hosts(&hosts, receiver_id, file.clone()),
+        None => {
+            let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file.clone());
+            cfg.receiver_version = version;
+            cfg
+        }
     };
     #[cfg(not(feature = "nat-traversal"))]
-    let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file.clone());
+    let mut cfg = {
+        let mut cfg = SenderConfig::for_hosts(&hosts, receiver_id, file.clone());
+        cfg.receiver_version = version;
+        cfg
+    };
     cfg.bind = args.bind;
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
     cfg.find_lan = args.lan && cfg!(feature = "nat-traversal");
@@ -408,10 +418,11 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
             format_bytes(sender.source().size())
         ),
     }
+    let shown = receiver_id.text(sender.receiver_version());
     if hosts.is_empty() {
-        println!("Receiver:  {} (through the relays)", receiver_id);
+        println!("Receiver:  {} (through the relays)", shown);
     } else {
-        println!("Receiver:  {} ({})", hosts.join(", "), receiver_id);
+        println!("Receiver:  {} ({})", hosts.join(", "), shown);
     }
     println!("Local:     {}", sender.local_addr()?);
     println!("Sender ID: {}", sender_id);

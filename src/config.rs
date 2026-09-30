@@ -145,6 +145,10 @@ pub struct SenderConfig {
     /// Identity of the receiver. Only the holder of its private key can
     /// answer the handshake, so this authenticates the receiver.
     pub receiver_id: SharpId,
+    /// The protocol version to speak to it, as its ID or card names it
+    /// (`sh4-`: version 4, and never version 3 — nobody on the way can talk
+    /// the sender down by dropping what it sends).
+    pub receiver_version: crate::crypto::handshake::Version,
     /// The file to send, or a directory to send with everything below it.
     pub file_path: PathBuf,
     pub transport: TransportConfig,
@@ -213,6 +217,7 @@ impl std::fmt::Debug for SenderConfig {
             .field("alternate_peers", &self.alternate_peers)
             .field("peer_names", &self.peer_names)
             .field("receiver_id", &self.receiver_id)
+            .field("receiver_version", &self.receiver_version)
             .field("file_path", &self.file_path)
             .field("transport", &self.transport)
             .field("state_dir", &self.state_dir)
@@ -258,6 +263,7 @@ impl SenderConfig {
             alternate_peers: Vec::new(),
             peer_names: Vec::new(),
             receiver_id,
+            receiver_version: crate::crypto::handshake::Version::V3,
             file_path,
             transport: TransportConfig::default(),
             state_dir: None,
@@ -288,6 +294,7 @@ impl SenderConfig {
             .copied()
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
         let mut cfg = Self::new(peer, card.id, file_path);
+        cfg.receiver_version = card.version;
         cfg.alternate_peers = addrs.get(1..).unwrap_or_default().to_vec();
         cfg.relays = card
             .relays
@@ -363,6 +370,10 @@ pub struct ReceiverConfig {
     /// an address. Off unless asked for: the announcement tells everybody on
     /// the network that this host receives SHARP-256 transfers.
     pub announce_lan: bool,
+    /// Answer version 4 handshakes (the hybrid one, `sh4-` IDs) as well as
+    /// version 3 ones. On; off only to stand in for a receiver that knows
+    /// no version 4 (the tests do).
+    pub speak_v4: bool,
     /// TURN servers this receiver is reached through when nothing direct
     /// works: `USER:PASSWORD@HOST[:PORT]` (see `nat::turn`). The address
     /// each gives is published with the others, and a sender is let in once
@@ -411,6 +422,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("nat_keepalive", &self.nat_keepalive)
             .field("stun_servers", &self.stun_servers)
             .field("announce_lan", &self.announce_lan)
+            .field("speak_v4", &self.speak_v4)
             .field("turn_servers", &self.turn_servers.len())
             .field("dht", &self.dht)
             .field("accept", &self.accept)
@@ -447,10 +459,20 @@ impl ReceiverConfig {
                     format!("--relay {}", host)
                 })
                 .collect();
-            format!("{} {}", id, relays.join(" "))
+            format!("{} {}", self.id_text(id), relays.join(" "))
         } else {
-            format!("{}@<this host>:{}", id, self.bind.port())
+            format!("{}@<this host>:{}", self.id_text(id), self.bind.port())
         }
+    }
+
+    /// The receiver's ID in the form senders are to use: `sh4-` when it
+    /// speaks version 4, so that they speak nothing older to it.
+    pub fn id_text(&self, id: &crate::crypto::SharpId) -> String {
+        id.text(if self.speak_v4 {
+            crate::crypto::handshake::Version::V4
+        } else {
+            crate::crypto::handshake::Version::V3
+        })
     }
 
     pub fn new(bind: SocketAddr, output_dir: PathBuf) -> Self {
@@ -470,6 +492,7 @@ impl ReceiverConfig {
             nat_keepalive: Duration::from_secs(15),
             stun_servers: Vec::new(),
             announce_lan: false,
+            speak_v4: true,
             turn_servers: Vec::new(),
             dht: false,
             dht_bootstrap: Vec::new(),

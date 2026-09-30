@@ -783,6 +783,58 @@ pub fn encode_padded_initiation(p: &Initiation) -> Vec<u8> {
     out
 }
 
+/// Payload of a version 4 initiation: no HELLO — that goes after the
+/// handshake, under its keys (see `crypto::handshake::Version`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitiationV4 {
+    /// Strictly increasing per sender; see `crypto::handshake`.
+    pub timestamp: u64,
+    /// Bit set of [`crate::crypto::Suite`] values the sender supports.
+    pub suites: u8,
+    /// The sender has AES instructions.
+    pub hardware_aes: bool,
+}
+
+pub fn encode_initiation_v4(p: &InitiationV4) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10);
+    out.extend_from_slice(&p.timestamp.to_be_bytes());
+    out.push(p.suites);
+    out.push(p.hardware_aes as u8);
+    out
+}
+
+/// Reads what [`encode_initiation_v4`] wrote; trailing bytes are ignored,
+/// as in every payload.
+pub fn decode_initiation_v4(buf: &[u8]) -> Result<InitiationV4, WireError> {
+    let mut r = Reader::new(buf);
+    Ok(InitiationV4 {
+        timestamp: r.u64()?,
+        suites: r.u8()?,
+        hardware_aes: r.u8()? & 1 == 1,
+    })
+}
+
+/// Payload of a version 4 response: the suite chosen, or 0 and why the
+/// handshake is refused (a `REASON_*`). What the receiver makes of the
+/// transfer comes later, in answer to the HELLO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseV4 {
+    pub suite: u8,
+    pub reason: u8,
+}
+
+pub fn encode_response_v4(p: &ResponseV4) -> Vec<u8> {
+    vec![p.suite, p.reason]
+}
+
+pub fn decode_response_v4(buf: &[u8]) -> Result<ResponseV4, WireError> {
+    let mut r = Reader::new(buf);
+    Ok(ResponseV4 {
+        suite: r.u8()?,
+        reason: r.u8()?,
+    })
+}
+
 pub fn decode_initiation(buf: &[u8]) -> Result<Initiation, WireError> {
     let mut r = Reader::new(buf);
     let timestamp = r.u64()?;
@@ -1134,6 +1186,26 @@ mod tests {
             "{} bytes",
             b.len()
         );
+    }
+
+    #[test]
+    fn version_4_handshake_payloads_roundtrip() {
+        let i = InitiationV4 {
+            timestamp: 1_700_000_000_123_456_789,
+            suites: 3,
+            hardware_aes: true,
+        };
+        assert_eq!(decode_initiation_v4(&encode_initiation_v4(&i)).unwrap(), i);
+        let mut padded = encode_initiation_v4(&i);
+        padded.extend_from_slice(&[0; 7]);
+        assert_eq!(decode_initiation_v4(&padded).unwrap(), i);
+        assert!(decode_initiation_v4(&encode_initiation_v4(&i)[..9]).is_err());
+        let r = ResponseV4 {
+            suite: 0,
+            reason: REASON_BUSY,
+        };
+        assert_eq!(decode_response_v4(&encode_response_v4(&r)).unwrap(), r);
+        assert!(decode_response_v4(&[1]).is_err());
     }
 
     #[test]

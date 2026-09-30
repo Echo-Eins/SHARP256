@@ -210,7 +210,7 @@ impl ReceiverApp {
                         if let Ok(addr) = receiver.local_addr() {
                             s.lock().listen = addr.to_string();
                         }
-                        s.lock().receiver_id = receiver.id().to_string();
+                        s.lock().receiver_id = receiver.id_text();
                         let rt_token = receiver.cancel_token();
                         tokio::spawn(async move {
                             token.cancelled().await;

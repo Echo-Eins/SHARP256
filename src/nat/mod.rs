@@ -961,7 +961,9 @@ impl Reachability {
     /// nothing says it is one, and a sender that punches at the addresses it
     /// was given, as one asked for its own does, would spray somebody else's
     /// server with guessed ports. A card says what each address is.
-    pub fn address_string(&self, id: &crate::crypto::SharpId) -> Option<String> {
+    /// `id` is the receiver's ID in the form senders are to use (`sh4-` for
+    /// one that speaks version 4).
+    pub fn address_string(&self, id: &str) -> Option<String> {
         let candidates = self.candidates();
         let mut list: Vec<String> = candidates
             .iter()
@@ -1745,7 +1747,9 @@ mod tests {
             .candidates()
             .iter()
             .any(|c| c.kind == CandidateKind::Relayed));
-        let text = r.address_string(&id).expect("an address to give");
+        let text = r
+            .address_string(&id.to_string())
+            .expect("an address to give");
         assert!(!text.contains("198.51.100.20"), "{}", text);
         let card = r.card(&id, card::Role::Receiver, &[]);
         assert!(card
@@ -1772,7 +1776,9 @@ mod tests {
             None,
             Some("203.0.113.9:50000"),
         );
-        let text = r.address_string(&id).expect("an address to give");
+        let text = r
+            .address_string(&id.to_string())
+            .expect("an address to give");
         let (_, hosts) = crate::address::parse_peer(&text).expect("parses back");
         assert_eq!(hosts.last().unwrap(), "203.0.113.9:50000", "{}", text);
         assert_eq!(hosts.len(), r.candidates().len() + 1, "{}", text);
@@ -1782,7 +1788,9 @@ mod tests {
             None,
             Some("203.0.113.9:50000"),
         );
-        let text = r.address_string(&id).expect("an address to give");
+        let text = r
+            .address_string(&id.to_string())
+            .expect("an address to give");
         let (_, hosts) = crate::address::parse_peer(&text).expect("parses back");
         assert_eq!(
             hosts.iter().filter(|h| *h == "203.0.113.9:50000").count(),
@@ -1844,7 +1852,9 @@ mod tests {
             Some("198.51.100.4:41000"),
             Some("203.0.113.9:50000"),
         );
-        let text = r.address_string(&id).expect("candidates to publish");
+        let text = r
+            .address_string(&id.to_string())
+            .expect("candidates to publish");
         let (parsed_id, hosts) = crate::address::parse_peer(&text).expect("parses back");
         assert_eq!(parsed_id, id);
         assert_eq!(hosts.len(), r.candidates().len());
@@ -1854,7 +1864,10 @@ mod tests {
         // beats printing something that cannot work.
         let empty = reach(Behaviour::default(), None, None);
         let host_only = empty.candidates().len();
-        assert_eq!(empty.address_string(&id).is_some(), host_only > 0);
+        assert_eq!(
+            empty.address_string(&id.to_string()).is_some(),
+            host_only > 0
+        );
     }
 
     /// Duplicates cost the sender a quarter of a second each for nothing.
