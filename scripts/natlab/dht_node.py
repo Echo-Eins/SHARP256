@@ -68,7 +68,7 @@ class Node:
     peers, and a host with both takes part in both — so each address given
     here is a node of its own, with its own ID and its own store."""
 
-    def __init__(self, bind):
+    def __init__(self, bind, plant=()):
         host, port = bind.rsplit(":", 1)
         host = host.strip("[]")
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
@@ -78,6 +78,9 @@ class Node:
         self.id = os.urandom(20)
         self.secret = os.urandom(16)
         self.peers = {}  # infohash -> {(ip, port): time}
+        # Addresses this node adds to every answer, as a hostile node on a
+        # lookup's path would (natlab.py dhtplant): only those of its family.
+        self.plant = [p for p in plant if (":" in p[0]) == (family == socket.AF_INET6)]
 
     def token(self, ip):
         return hmac.new(self.secret, ip.encode(), hashlib.sha1).digest()[:8]
@@ -108,7 +111,7 @@ class Node:
             reply({"id": self.id, "nodes": b""})
         elif q == b"get_peers" and ih and len(ih) == 20:
             r = {"id": self.id, "token": self.token(ip), "nodes": b""}
-            found = self.peers.get(ih, {})
+            found = list(self.peers.get(ih, {})) + self.plant
             if found:
                 # In this address family's compact form (BEP 5, BEP 32).
                 r["values"] = [
@@ -132,8 +135,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bind", required=True, action="append",
                     help="an address to serve on, IP:PORT or [IPv6]:PORT; repeat it for both families")
+    ap.add_argument("--plant", action="append", default=[],
+                    help="IP:PORT to add to every get_peers answer, as a hostile node would")
     args = ap.parse_args()
-    nodes = [Node(b) for b in args.bind]
+    plant = [(h.strip("[]"), int(p)) for h, p in (x.rsplit(":", 1) for x in args.plant)]
+    nodes = [Node(b, plant) for b in args.bind]
     for n in nodes:
         print(f"dht node {n.id.hex()} on {n.bind}", flush=True)
     sel = selectors.DefaultSelector()

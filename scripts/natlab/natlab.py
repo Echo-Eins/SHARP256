@@ -44,6 +44,7 @@ client.
     scripts/natlab/natlab.py portmap6               # IPv6 pinholes (PCP, UPnP IGD2), with a control
     scripts/natlab/natlab.py lan [--v6]             # multicast DNS on one network (with IPv6 only)
     scripts/natlab/natlab.py samenat                # two hosts behind one NAT, with and without hairpinning
+    scripts/natlab/natlab.py dhtplant               # a DHT node that plants an address: what reaches it
     scripts/natlab/natlab.py early                  # a sender that starts before its receiver has registered
     scripts/natlab/natlab.py fallback               # a direct path that dies: back to the relay or TURN server
     scripts/natlab/natlab.py cgn                    # a carrier-grade NAT in front of the home router: two NATs in a row
@@ -2156,6 +2157,95 @@ def cmd_samenat(args):
     return 0 if ok_all else 1
 
 
+# An address of the server host that nobody has any business sending to:
+# the one a hostile DHT node plants (`dhtplant`).
+PLANTED = "11.9.0.12"
+
+
+def planted_counter(lab):
+    """What the kernel of the server host counted towards PLANTED: (packets,
+    UDP payload bytes)."""
+    out = lab.x("S", "nft", "list", "chain", "inet", "plant", "input").stdout
+    m = re.search(r"counter packets (\d+) bytes (\d+)", out)
+    packets, total = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    return packets, total - 28 * packets
+
+
+def cmd_dhtplant(args):
+    """A DHT node on the lookup's path that answers every question with an
+    address of its choosing beside the real ones — here one of the server
+    host's, where the kernel counts whatever arrives: what one sender that
+    meets its receiver through the DHT sends to an address planted this way
+    (docs/THREAT_MODEL.md, R24). With the receiver there (the meeting has to
+    happen all the same), and with nobody there at all, for as long as
+    `--wait` (the sender looks for five minutes). One pass of prediction is
+    8235 bytes (61 ports), a spray 18 432 (2048)."""
+    failures = 0
+    print(f"{'case':56} {'result':28} planted address got")
+    for case, a_nat, b_nat in (("the receiver is there", "port_restricted", "full_cone"),
+                               ("the receiver is there", "port_restricted", "symmetric_random"),
+                               ("nobody is there", "port_restricted", "full_cone")):
+        lab = Lab()
+        try:
+            topo = Topo(lab, a_nat, b_nat)
+            d = lab.dir
+            lab.x("S", "ip", "addr", "add", f"{PLANTED}/24", "dev", "s0")
+            lab.x("S", "nft", "add", "table", "inet", "plant")
+            lab.x("S", "nft", "add", "chain", "inet", "plant", "input",
+                  "{ type filter hook input priority 0 ; policy accept ; }")
+            lab.x("S", "nft", "add", "rule", "inet", "plant", "input", "ip", "daddr", PLANTED, "counter")
+            lab.spawn("S", [f"{BIN}/sharp-relay", "--bind", "0.0.0.0:5560", "--stun", S1, "--stun", S2,
+                            "--identity", f"{d}/relay.key", "--log", "info"], "relay.log")
+            wait_for(lab, "relay.log", r"Receivers: --relay", 10)
+            lab.spawn("S", ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "dht_node.py"),
+                            "--bind", f"{S1}:6881", "--plant", f"{PLANTED}:7000"], "dht.log")
+            if not wait_for(lab, "dht.log", r"dht node", 10):
+                print("the DHT node did not start:\n" + lab.log("dht.log"))
+                return 1
+            dht_args = ["--dht", "--dht-bootstrap", f"{S1}:6881"]
+            data, want = make_payload(d)
+            os.makedirs(f"{d}/out", exist_ok=True)
+            there = case == "the receiver is there"
+            if there:
+                lab.spawn("B", [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out",
+                                "--state-dir", f"{d}/rst", "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555",
+                                "--stun", f"{S1}:3478", *dht_args, "--log-level", "info"], "receiver.log")
+                rid = wait_for(lab, "receiver.log", r"Receiver ID: (sh-\S+)", 15).group(1)
+            else:
+                shown = lab.x("B", f"{BIN}/sharp-receiver", "--identity", f"{d}/r.key", "--id").stdout
+                rid = re.search(r"(sh-[a-z0-9]+)", shown).group(1)
+            start = time.time()
+            sender = lab.spawn("A", [f"{BIN}/sharp-sender", data, rid, "--headless", "--stun", f"{S1}:3478",
+                                     *dht_args, "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst",
+                                     "--log-level", "info"], "sender.log")
+            limit = args.timeout if there else args.wait
+            try:
+                sender.wait(timeout=limit)
+            except subprocess.TimeoutExpired:
+                sender.kill()
+            took = time.time() - start
+            got = None
+            for name in os.listdir(f"{d}/out"):
+                if not name.endswith(".sharp-part"):
+                    got = hashlib.sha256(open(f"{d}/out/{name}", "rb").read()).hexdigest()
+            packets, payload = planted_counter(lab)
+            planted_asked = "planted" if f"{PLANTED}:7000" in lab.log("sender.log") else "not seen"
+            if there:
+                result = ("delivered" if got == want else "NOT delivered") + f" in {took:.1f}s"
+            else:
+                result = f"searched for {took:.0f}s"
+            bad = there and got != want
+            failures += bad
+            print(f"{case + ', ' + a_nat + '/' + b_nat:56} {result:28} {packets} datagrams, {payload} B"
+                  f"  (sender log: {planted_asked})")
+            if bad and args.verbose:
+                print("--- sender.log\n" + lab.log("sender.log")[-3000:])
+        finally:
+            lab.close()
+    print("(UDP payload counted by the planted host's kernel; a meeting that does not happen fails the run)")
+    return 1 if failures else 0
+
+
 def cmd_early(args):
     """A sender that asks the relay for a receiver before that receiver has
     registered — two people starting at about the same time — keeps asking,
@@ -2529,6 +2619,10 @@ def main():
     lan.add_argument("--timeout", type=int, default=25)
     lan.add_argument("--v6", action="store_true", help="a network with IPv6 only")
     sub.add_parser("samenat")
+    dp = sub.add_parser("dhtplant")
+    dp.add_argument("--wait", type=float, default=45.0, help="how long the sender with nobody to meet runs")
+    dp.add_argument("--timeout", type=float, default=60.0)
+    dp.add_argument("--verbose", action="store_true")
     early = sub.add_parser("early")
     early.add_argument("--delay", type=float, default=2.5, help="seconds the receiver starts after the sender")
     early.add_argument("--timeout", type=int, default=45)
@@ -2566,7 +2660,7 @@ def main():
     matrix.add_argument("-v", "--verbose", action="store_true", help="the logs of every pair that was not as expected")
     args = ap.parse_args()
     sh("ip", "link", "set", "lo", "up")
-    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "timeout": cmd_timeout, "lan": cmd_lan, "early": cmd_early, "fallback": cmd_fallback, "cgn": cmd_cgn}[args.cmd](args))
+    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "dhtplant": cmd_dhtplant, "timeout": cmd_timeout, "lan": cmd_lan, "early": cmd_early, "fallback": cmd_fallback, "cgn": cmd_cgn}[args.cmd](args))
 
 
 if __name__ == "__main__":

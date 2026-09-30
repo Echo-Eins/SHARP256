@@ -1,0 +1,12 @@
+# natlab evidence: dhtplant (a DHT node on the lookup's path plants one address; what one sender and one receiver send there)
+# code:      commit 12b619a (the D2 code); natlab.py and dht_node.py of the commit this log is in
+# binaries:  9bc07cce58c3035c sharp-sender, eeeb33951b7428bd sharp-receiver (debug, --no-default-features --features nat-traversal)
+# date:      2026-09-30T07:30:57Z (the run ended)
+# kernel:    Linux 6.19.2-gentoo-dist
+# command:   scripts/natlab/natlab.py dhtplant --wait 60
+
+case                                                     result                       planted address got
+the receiver is there, port_restricted/full_cone         delivered in 0.1s            4 datagrams, 36 B  (sender log: planted)
+the receiver is there, port_restricted/symmetric_random  delivered in 20.3s           13561 datagrams, 123054 B  (sender log: planted)
+nobody is there, port_restricted/full_cone               searched for 60s             6006 datagrams, 57873 B  (sender log: planted)
+(UDP payload counted by the planted host's kernel; a meeting that does not happen fails the run)
