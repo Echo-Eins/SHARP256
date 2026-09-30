@@ -78,7 +78,7 @@ impl Keepalive {
     pub fn next(&self) -> Duration {
         use rand::Rng;
         let tenth = self.interval.as_millis() as u64 / 10;
-        let jitter = rand::thread_rng().gen_range(0..=2 * tenth);
+        let jitter = rand::rngs::OsRng.gen_range(0..=2 * tenth);
         self.interval - Duration::from_millis(tenth) + Duration::from_millis(jitter)
     }
 

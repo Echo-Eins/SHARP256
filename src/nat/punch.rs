@@ -554,7 +554,7 @@ impl Puncher {
                 let mut random: Vec<u16> = Vec::new();
                 if spray > 0 {
                     let mut all: Vec<u16> = DYNAMIC_PORTS.collect();
-                    all.shuffle(&mut rand::thread_rng());
+                    all.shuffle(&mut rand::rngs::OsRng);
                     all.retain(|p| !plan.ports.contains(p));
                     all.truncate(spray);
                     random = all;

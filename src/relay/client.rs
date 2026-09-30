@@ -16,6 +16,7 @@ use super::{Alt, Hints, Message, Refusal, NONCE_LEN, PROOF_LEN, TOKEN_LEN};
 use crate::crypto::{Identity, SharpId};
 use crate::nat::card::NatHints;
 use crate::nat::punch::Puncher;
+use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -134,7 +135,7 @@ pub async fn connect(
     // What every answer to us has to carry back: without it, anybody who
     // can write the relay's address on a datagram could answer for it —
     // refuse us, or point our punches at whoever they liked.
-    let nonce: [u8; NONCE_LEN] = rand::random();
+    let nonce: [u8; NONCE_LEN] = rand::rngs::OsRng.gen();
     // Set once the relay has refused us as a stranger.
     let mut identify: Option<(SharpId, crate::crypto::SecretKey)> = None;
     // Since when the relay has been saying it does not know the receiver,
@@ -378,7 +379,7 @@ pub async fn serve(
     // is acted on — a datagram's source address is anybody's to write, and
     // a forged introduction would have us push datagrams at whoever it
     // named, a forged refusal take us off the relay (see `relay_tag`).
-    let nonce: [u8; NONCE_LEN] = rand::random();
+    let nonce: [u8; NONCE_LEN] = rand::rngs::OsRng.gen();
     let reach = crate::address::Reach::of(&socket);
     let mut hints_changed = puncher.subscribe();
     let mut watching_hints = true;

@@ -45,6 +45,7 @@ use crate::transport::io::{
 use crate::transport::parallel;
 use crate::transport::path::PathProbe;
 use crate::transport::socket::{is_msgsize_error, Clock};
+use rand::Rng;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
@@ -537,7 +538,7 @@ impl Sender {
             .filter(|st| st.file_mtime == mtime && st.manifest_hash == manifest_hex)
             .and_then(|st| parse_hex16(&st.transfer_id));
         let resuming = saved_id.is_some();
-        let transfer_id = saved_id.unwrap_or_else(rand::random::<[u8; 16]>);
+        let transfer_id = saved_id.unwrap_or_else(|| rand::rngs::OsRng.gen());
 
         // Hash of the whole stream in the background; it is only needed at
         // the end.

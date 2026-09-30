@@ -31,6 +31,7 @@
 //! there too.
 
 use anyhow::{anyhow, bail, Result};
+use rand::Rng;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
@@ -835,7 +836,7 @@ impl UpnpMapping {
             }
         }
         for _ in 0..3 {
-            let port = 20_000 + (rand::random::<u16>() % 40_000);
+            let port = rand::rngs::OsRng.gen_range(20_000..60_000);
             match self.add(port, self.lease).await {
                 Ok(()) => {
                     self.external_port = port;

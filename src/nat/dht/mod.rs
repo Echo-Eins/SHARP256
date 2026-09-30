@@ -158,7 +158,7 @@ impl Dht {
             256 * 1024,
         )?);
         let mut id = [0u8; 20];
-        rand::thread_rng().fill_bytes(&mut id);
+        rand::rngs::OsRng.fill_bytes(&mut id);
         let bootstrap = if bootstrap.is_empty() {
             DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect()
         } else {
@@ -333,7 +333,7 @@ impl Dht {
         let target = to;
         for _ in 0..tries {
             let mut tid = [0u8; 4];
-            rand::thread_rng().fill_bytes(&mut tid);
+            rand::rngs::OsRng.fill_bytes(&mut tid);
             let (tx, rx) = oneshot::channel();
             {
                 let mut pending = self.inner.pending.lock();

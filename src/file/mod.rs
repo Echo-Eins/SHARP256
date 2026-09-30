@@ -7,6 +7,7 @@ pub mod durable;
 pub mod tree;
 
 use crate::protocol::wire::TreeInfo;
+use rand::RngCore;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -789,7 +790,12 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
             return p;
         }
     }
-    dir.join(format!("{}-{:08x}{}", stem, rand::random::<u32>(), ext))
+    dir.join(format!(
+        "{}-{:08x}{}",
+        stem,
+        rand::rngs::OsRng.next_u32(),
+        ext
+    ))
 }
 
 /// Path of the partial file for a given final path.

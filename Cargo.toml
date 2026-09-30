@@ -11,7 +11,8 @@ description = "SHARP-256: Swift Hash Assurance Rust Protocol - encrypted, reliab
 [dependencies]
 # Async runtime
 tokio = { version = "1.37", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+# CancellationToken only, which needs none of its features
+tokio-util = "0.7"
 
 # Integrity: whole-file hashes, MACs and key derivation
 blake3 = { version = "1.5", features = ["mmap", "rayon", "zeroize"] }
@@ -46,10 +47,15 @@ serde_json = "1.0"
 thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Without env-filter, whose regular expressions a level or a list of
+# `target=level` does not need (`init_logging` reads both with `Targets`),
+# and without tracing-log, which nothing but the GUI's libraries log through
+# (the `gui` feature switches it on).
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "ansi", "smallvec", "std"] }
 
 # CLI and paths
-clap = { version = "4.4", features = ["derive", "env"] }
+# Without colour in --help and in error messages, which takes six crates.
+clap = { version = "4.4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "suggestions"] }
 dirs = "5.0"
 # Asking for the identity file's passphrase on the terminal without echo
 rpassword = "7"
@@ -59,7 +65,9 @@ socket2 = { version = "0.5", features = ["all"] }
 # Batched datagram I/O: GSO/GRO and sendmmsg/recvmmsg on Linux, USO/URO on
 # Windows (0.6 needs a newer compiler than our MSRV)
 quinn-udp = { version = "0.5.14", default-features = false, features = ["tracing"] }
-rand = "0.8"
+# The system's random source only (OsRng): without `std_rng`, whose
+# ChaCha generator for thread_rng takes three crates. Tests have it all.
+rand = { version = "0.8.6", default-features = false, features = ["getrandom", "alloc"] }
 parking_lot = "0.12"
 
 # GUI (optional)
@@ -95,6 +103,7 @@ winapi = { version = "0.3.9", features = ["fileapi", "ntdef", "winnt", "winsock2
 
 [dev-dependencies]
 tempfile = "3"
+rand = "0.8.6"
 # The implementations `crypto::noise` and `crypto::blake2s` are checked
 # against (the Noise handshake used to be snow's; no version of snow wipes
 # its keys). Test builds only.
@@ -107,7 +116,7 @@ sha3 = "0.10"
 
 [features]
 default = ["gui", "nat-traversal"]
-gui = ["dep:eframe", "dep:egui", "dep:rfd"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "tracing-subscriber/tracing-log"]
 nat-traversal = ["dep:if-addrs", "dep:md-5", "dep:sha1", "dep:hmac"]
 
 [[bin]]

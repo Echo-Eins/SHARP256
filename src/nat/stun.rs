@@ -96,7 +96,7 @@ pub fn message_transaction_id(pkt: &[u8]) -> Option<[u8; 12]> {
 /// (RFC 8489 section 6).
 pub fn transaction_id() -> [u8; 12] {
     let mut tid = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut tid);
+    rand::rngs::OsRng.fill_bytes(&mut tid);
     tid
 }
 

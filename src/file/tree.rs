@@ -53,6 +53,7 @@ use crate::protocol::constants::{
 };
 use crate::protocol::wire::TreeInfo;
 use parking_lot::Mutex;
+use rand::RngCore;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -1249,7 +1250,7 @@ pub fn unique_dir_path(dir: &Path, name: &str) -> PathBuf {
             return p;
         }
     }
-    dir.join(format!("{}-{:08x}", name, rand::random::<u32>()))
+    dir.join(format!("{}-{:08x}", name, rand::rngs::OsRng.next_u32()))
 }
 
 /// Removes a partial file or staging directory.
@@ -1268,7 +1269,10 @@ pub fn remove_partial(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 pub fn local_umask(dir: &Path) -> u32 {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let probe = dir.join(format!(".sharp-umask-{:016x}", rand::random::<u64>()));
+    let probe = dir.join(format!(
+        ".sharp-umask-{:016x}",
+        rand::rngs::OsRng.next_u64()
+    ));
     let mode = OpenOptions::new()
         .write(true)
         .create_new(true)
