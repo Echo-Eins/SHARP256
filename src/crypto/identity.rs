@@ -6,7 +6,14 @@
 //! addressing somebody else. Knowing a receiver's ID is what allows a sender
 //! to reach it at all (see `handshake`), and the ID authenticates the
 //! receiver to the sender.
+//!
+//! A receiver that speaks protocol version 4 is written `sh4-` and the same
+//! key, with a checksum of its own: a sender given that form speaks
+//! version 4 to it and nothing else, so nobody on the way can talk it down
+//! to version 3 by dropping what it sends — and a `4` lost in copying is a
+//! checksum error, not a quiet step down.
 
+use crate::crypto::handshake::Version;
 use crate::crypto::identity_file::{self, IdentityError, IdentityFile};
 use crate::crypto::SecretKey;
 use std::fmt;
@@ -19,6 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub const KEY_LEN: usize = 32;
 const CHECKSUM_LEN: usize = 3;
 const ID_PREFIX: &str = "sh-";
+const ID_PREFIX_V4: &str = "sh4-";
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 /// Public identity of a peer.
@@ -53,8 +61,60 @@ impl SharpId {
         format!("{}…", &full[..ID_PREFIX.len() + 8])
     }
 
+    /// The ID in the form that names the protocol version to speak: `sh-`
+    /// for version 3 (what [`fmt::Display`] writes), `sh4-` for version 4.
+    pub fn text(&self, version: Version) -> String {
+        match version {
+            Version::V3 => self.to_string(),
+            Version::V4 => {
+                let mut data = [0u8; KEY_LEN + CHECKSUM_LEN];
+                data[..KEY_LEN].copy_from_slice(&self.0);
+                data[KEY_LEN..].copy_from_slice(&Self::checksum_v4(&self.0));
+                format!("{}{}", ID_PREFIX_V4, base32_encode(&data))
+            }
+        }
+    }
+
+    /// Reads an ID in either form, with the version it names.
+    pub fn parse_versioned(s: &str) -> Result<(Self, Version), IdError> {
+        let s = s.trim();
+        let (version, rest) = [(Version::V4, ID_PREFIX_V4), (Version::V3, ID_PREFIX)]
+            .into_iter()
+            .find_map(|(v, prefix)| {
+                s.get(..prefix.len())
+                    .filter(|p| p.eq_ignore_ascii_case(prefix))
+                    .map(|_| (v, &s[prefix.len()..]))
+            })
+            .ok_or(IdError::Prefix)?;
+        // Tolerate grouping characters that people insert when copying.
+        let cleaned: String = rest.chars().filter(|c| !matches!(c, '-' | ' ')).collect();
+        let data = base32_decode(&cleaned).ok_or(IdError::Encoding)?;
+        if data.len() != KEY_LEN + CHECKSUM_LEN {
+            return Err(IdError::Encoding);
+        }
+        let mut key = [0u8; KEY_LEN];
+        key.copy_from_slice(&data[..KEY_LEN]);
+        let checksum = match version {
+            Version::V3 => Self::checksum(&key),
+            Version::V4 => Self::checksum_v4(&key),
+        };
+        if data[KEY_LEN..] != checksum {
+            return Err(IdError::Checksum);
+        }
+        let id = Self(key);
+        if id.is_low_order() {
+            return Err(IdError::Weak);
+        }
+        Ok((id, version))
+    }
+
     fn checksum(key: &[u8; KEY_LEN]) -> [u8; CHECKSUM_LEN] {
         let h = blake3::derive_key("sharp256 id checksum", key);
+        [h[0], h[1], h[2]]
+    }
+
+    fn checksum_v4(key: &[u8; KEY_LEN]) -> [u8; CHECKSUM_LEN] {
+        let h = blake3::derive_key("sharp256 id checksum v4", key);
         [h[0], h[1], h[2]]
     }
 }
@@ -76,9 +136,9 @@ impl fmt::Debug for SharpId {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IdError {
-    #[error("a SHARP ID starts with \"sh-\"")]
+    #[error("a SHARP ID starts with \"sh-\" or \"sh4-\"")]
     Prefix,
-    #[error("a SHARP ID has 56 characters after \"sh-\" (a-z, 2-7)")]
+    #[error("a SHARP ID has 56 characters after \"sh-\" or \"sh4-\" (a-z, 2-7)")]
     Encoding,
     #[error("SHARP ID checksum mismatch (typo?)")]
     Checksum,
@@ -86,32 +146,13 @@ pub enum IdError {
     Weak,
 }
 
+/// Either form: where only the key matters (lists of whom to let in, a
+/// relay's identity), the version it names does not.
 impl FromStr for SharpId {
     type Err = IdError;
 
     fn from_str(s: &str) -> Result<Self, IdError> {
-        let s = s.trim();
-        let rest = s
-            .get(..ID_PREFIX.len())
-            .filter(|p| p.eq_ignore_ascii_case(ID_PREFIX))
-            .map(|_| &s[ID_PREFIX.len()..])
-            .ok_or(IdError::Prefix)?;
-        // Tolerate grouping characters that people insert when copying.
-        let cleaned: String = rest.chars().filter(|c| !matches!(c, '-' | ' ')).collect();
-        let data = base32_decode(&cleaned).ok_or(IdError::Encoding)?;
-        if data.len() != KEY_LEN + CHECKSUM_LEN {
-            return Err(IdError::Encoding);
-        }
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(&data[..KEY_LEN]);
-        if data[KEY_LEN..] != Self::checksum(&key) {
-            return Err(IdError::Checksum);
-        }
-        let id = Self(key);
-        if id.is_low_order() {
-            return Err(IdError::Weak);
-        }
-        Ok(id)
+        Self::parse_versioned(s).map(|(id, _)| id)
     }
 }
 
@@ -422,6 +463,32 @@ pub(crate) mod tests {
         assert!(typo.parse::<SharpId>().is_err());
         assert_eq!("xx-abc".parse::<SharpId>(), Err(IdError::Prefix));
         assert_eq!("sh-abc".parse::<SharpId>(), Err(IdError::Encoding));
+    }
+
+    /// The version 4 form names the version and the same key; the `4` lost
+    /// or put in by a slip is a checksum error, never the other version.
+    #[test]
+    fn the_version_4_form_names_its_version_and_survives_no_slip() {
+        let id = Identity::generate().id();
+        let v4 = id.text(Version::V4);
+        assert!(v4.starts_with("sh4-"));
+        assert_eq!(v4.len(), 4 + 56);
+        assert_eq!(SharpId::parse_versioned(&v4), Ok((id, Version::V4)));
+        assert_eq!(
+            SharpId::parse_versioned(&v4.to_uppercase()),
+            Ok((id, Version::V4))
+        );
+        assert_eq!(
+            SharpId::parse_versioned(&id.to_string()),
+            Ok((id, Version::V3))
+        );
+        assert_eq!(id.text(Version::V3), id.to_string());
+        // Where only the key matters, both forms are the key.
+        assert_eq!(v4.parse::<SharpId>().unwrap(), id);
+        let lost = format!("sh-{}", &v4[4..]);
+        assert_eq!(SharpId::parse_versioned(&lost), Err(IdError::Checksum));
+        let added = format!("sh4-{}", &id.to_string()[3..]);
+        assert_eq!(SharpId::parse_versioned(&added), Err(IdError::Checksum));
     }
 
     /// The branch-free hex is ordinary hex: every byte value is written as

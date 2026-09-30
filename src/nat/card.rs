@@ -23,6 +23,7 @@
 //! checksum. Whitespace and dashes inside are ignored, so a line that got
 //! wrapped on the way still reads.
 
+use crate::crypto::handshake::Version;
 use crate::crypto::identity::{base32_decode, base32_encode};
 use crate::crypto::SharpId;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -315,6 +316,11 @@ pub struct Card {
     /// last, and an old card is worth saying so about.
     pub created: u64,
     pub id: SharpId,
+    /// The protocol version its maker speaks (flag bit 2). A sender given a
+    /// receiver's card that says version 4 speaks version 4 to it and
+    /// nothing else, as for an ID written `sh4-`. A program that knows no
+    /// such flag refuses the card as damaged rather than ignore it.
+    pub version: Version,
     pub candidates: Vec<Candidate>,
     pub v4: Option<NatHints>,
     pub v6: Option<NatHints>,
@@ -341,6 +347,7 @@ impl Card {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             id,
+            version: Version::V4,
             candidates: Vec::new(),
             v4: None,
             v6: None,
@@ -461,7 +468,9 @@ impl Card {
             });
             put_addr(&mut out, c.addr);
         }
-        let flags = self.v4.is_some() as u8 | (self.v6.is_some() as u8) << 1;
+        let flags = self.v4.is_some() as u8
+            | (self.v6.is_some() as u8) << 1
+            | ((self.version == Version::V4) as u8) << 2;
         out.push(flags);
         for h in [&self.v4, &self.v6].into_iter().flatten() {
             out.extend_from_slice(&h.to_bytes());
@@ -512,9 +521,14 @@ impl Card {
             });
         }
         let flags = r.u8()?;
-        if flags & !0b11 != 0 {
+        if flags & !0b111 != 0 {
             return Err(CardError::Damaged("unknown flags"));
         }
+        let version = if flags & 0b100 != 0 {
+            Version::V4
+        } else {
+            Version::V3
+        };
         let mut hints = |present: bool| -> Result<Option<NatHints>, CardError> {
             if !present {
                 return Ok(None);
@@ -548,6 +562,7 @@ impl Card {
             role,
             created,
             id,
+            version,
             candidates,
             v4,
             v6,
@@ -760,6 +775,43 @@ mod tests {
         ] {
             assert!(parse_peer_addr(bad).is_err(), "{:?} was accepted", bad);
         }
+    }
+
+    /// The version a card's maker speaks goes and comes back; a flag this
+    /// program does not know makes the card damaged, not something to
+    /// ignore.
+    #[test]
+    fn a_card_says_which_version_its_maker_speaks() {
+        for version in [Version::V3, Version::V4] {
+            let c = Card {
+                version,
+                ..sample()
+            };
+            let back = Card::from_text(&c.to_text()).unwrap();
+            assert_eq!(back.version, version);
+            assert_eq!(back, c);
+        }
+        let mut bytes = sample().encode();
+        // The flags byte follows the candidates.
+        let flags_at = 1
+            + 1
+            + 4
+            + 32
+            + 1
+            + sample()
+                .candidates
+                .iter()
+                .map(|c| {
+                    1 + if c.addr.is_ipv4() {
+                        1 + 4 + 2
+                    } else {
+                        1 + 16 + 2
+                    }
+                })
+                .sum::<usize>();
+        assert_eq!(bytes[flags_at] & 0b100, 0b100);
+        bytes[flags_at] |= 0b1000;
+        assert!(matches!(Card::decode(&bytes), Err(CardError::Damaged(_))));
     }
 
     fn sample() -> Card {
