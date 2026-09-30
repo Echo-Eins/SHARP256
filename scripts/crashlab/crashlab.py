@@ -281,14 +281,36 @@ class Receiver:
         return [(int(a), int(b)) for a, b in
                 re.findall(r"resuming [^\n]*?: (\d+) of (\d+) bytes already on disk", self.text())]
 
+    def pids(self):
+        """The receiver's own process: under strace, strace's child — a
+        signal to strace only makes it let go, and the receiver ran on."""
+        if not self.prefix:
+            return [self.proc.pid]
+        kids = []
+        try:
+            for task in os.listdir("/proc/%d/task" % self.proc.pid):
+                with open("/proc/%d/task/%s/children" % (self.proc.pid, task)) as f:
+                    kids += [int(x) for x in f.read().split()]
+        except OSError:
+            pass
+        return kids or [self.proc.pid]
+
+    def signal(self, sig):
+        for pid in self.pids():
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+
     def kill(self):
         if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGKILL)
+            self.signal(signal.SIGKILL)
+            self.proc.kill()
             self.proc.wait()
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGINT)
+            self.signal(signal.SIGINT)
             try:
                 self.proc.wait(10)
             except subprocess.TimeoutExpired:
@@ -692,7 +714,7 @@ def cmd_audit(args):
         src = sources(work, kind)
         port = free_port()
         trace = os.path.join(work, "receiver.strace")
-        prefix = [STRACE, "-f", "-ttt", "-y", "-qq", "-o", trace, "-e",
+        prefix = [STRACE, "-f", "--kill-on-exit", "-ttt", "-y", "-qq", "-o", trace, "-e",
                   "trace=openat,creat,write,pwrite64,pwritev,writev,ftruncate,fallocate,fsync,fdatasync,"
                   "rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,fchmod,fchmodat,utimensat"]
         r = Receiver(work, out, state, port, prefix=prefix)
