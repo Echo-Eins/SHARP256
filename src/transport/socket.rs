@@ -96,6 +96,7 @@ fn v6_only(socket: &UdpSocket) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // getsockopt (docs/UNSAFE.md)
 fn v6_only(socket: &UdpSocket) -> io::Result<bool> {
     use std::os::windows::io::AsRawSocket;
     use winapi::shared::ws2def::IPPROTO_IPV6;
@@ -105,7 +106,8 @@ fn v6_only(socket: &UdpSocket) -> io::Result<bool> {
     // read as zero.
     let mut value: u32 = 0;
     let mut len = std::mem::size_of::<u32>() as i32;
-    // SAFETY: getsockopt on a socket we own, into a buffer of `len` bytes.
+    // SAFETY: getsockopt on a socket borrowed for the call, into a buffer
+    // of `len` bytes.
     let r = unsafe {
         getsockopt(
             socket.as_raw_socket() as SOCKET,
@@ -154,20 +156,10 @@ fn ipv6_unavailable(e: &io::Error) -> bool {
 fn set_buffer_sizes(socket: &socket2::Socket, bytes: usize) {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
+        // Refused without the privilege, which is what the rest is for.
         let val = bytes.min(i32::MAX as usize) as libc::c_int;
         for opt in [libc::SO_RCVBUFFORCE, libc::SO_SNDBUFFORCE] {
-            // SAFETY: plain setsockopt with an integer value on a socket we
-            // own; failure (no privilege) is handled below.
-            unsafe {
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    opt,
-                    &val as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+            set_int_option(socket, libc::SOL_SOCKET, opt, val);
         }
     }
     // Best effort: the kernel clamps to its configured maximum. (Linux
@@ -241,6 +233,7 @@ pub struct DontFragment {
 /// IPv6 socket. macOS and FreeBSD may not; those datagrams can then be
 /// fragmented by routers on the way, which costs efficiency, not
 /// correctness. The result says what took.
+#[cfg_attr(windows, allow(unsafe_code))] // setsockopt (docs/UNSAFE.md)
 pub fn set_dont_fragment(socket: &UdpSocket) -> DontFragment {
     let local = socket.local_addr().ok();
     let is_v6 = local.is_some_and(|a| a.is_ipv6());
@@ -301,7 +294,8 @@ pub fn set_dont_fragment(socket: &UdpSocket) -> DontFragment {
         use winapi::um::winsock2::setsockopt;
         let s = socket.as_raw_socket() as winapi::um::winsock2::SOCKET;
         let set = |level: i32, name: i32, value: u32| -> bool {
-            // SAFETY: setsockopt on a socket we own with a DWORD value.
+            // SAFETY: setsockopt on a socket borrowed for the call, with a
+            // DWORD value of the size given.
             unsafe {
                 setsockopt(
                     s,
@@ -331,23 +325,24 @@ pub fn set_dont_fragment(socket: &UdpSocket) -> DontFragment {
     out
 }
 
+/// Sets an integer socket option; whether the system took it.
 #[cfg(unix)]
 #[allow(dead_code)]
+#[allow(unsafe_code)] // setsockopt(2) (docs/UNSAFE.md)
 fn set_int_option(
-    socket: &UdpSocket,
+    socket: &impl std::os::unix::io::AsRawFd,
     level: libc::c_int,
     name: libc::c_int,
     value: libc::c_int,
 ) -> bool {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: plain setsockopt on a socket we own, with a correctly sized
-    // integer option value.
+    // SAFETY: setsockopt on a socket borrowed for the call, with an integer
+    // value of the size given.
     unsafe {
         libc::setsockopt(
             socket.as_raw_fd(),
             level,
             name,
-            &value as *const _ as *const libc::c_void,
+            &value as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         ) == 0
     }
@@ -357,6 +352,7 @@ fn set_int_option(
 /// next `recv_from` on a UDP socket fail with WSAECONNRESET. A receiver that
 /// serves many peers must not be disturbed by one peer going away, so the
 /// behaviour is switched off (SIO_UDP_CONNRESET = FALSE). No-op elsewhere.
+#[cfg_attr(windows, allow(unsafe_code))] // WSAIoctl (docs/UNSAFE.md)
 pub fn disable_udp_connreset(socket: &UdpSocket) {
     #[cfg(windows)]
     {
@@ -366,8 +362,8 @@ pub fn disable_udp_connreset(socket: &UdpSocket) {
         const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
         let mut enable: u32 = 0;
         let mut returned: u32 = 0;
-        // SAFETY: documented ioctl on a socket we own; input is a 4-byte BOOL,
-        // no output buffer, synchronous call.
+        // SAFETY: a documented ioctl on a socket borrowed for the call: a
+        // 4-byte BOOL in, no output buffer, a synchronous call.
         unsafe {
             WSAIoctl(
                 socket.as_raw_socket() as winapi::um::winsock2::SOCKET,

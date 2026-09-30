@@ -3272,27 +3272,32 @@ async fn a_receiver_can_be_reached_by_its_id_and_a_relay_alone() {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // interface ioctls (docs/UNSAFE.md)
 mod netns {
     use std::ffi::CString;
 
     fn ioctl_ifreq(name: &str, request: libc::c_ulong, fill: impl FnOnce(&mut libc::ifreq)) {
         let name = CString::new(name).unwrap();
-        // SAFETY: an ifreq is plain data; zeroed is a valid value for it,
-        // and the name fits (interface names are short and NUL-terminated).
+        // SAFETY: an ifreq is plain data; all zeroes is a value of it.
         let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+        assert!(
+            name.as_bytes_with_nul().len() <= req.ifr_name.len(),
+            "interface name too long: {:?}",
+            name
+        );
         for (d, s) in req.ifr_name.iter_mut().zip(name.as_bytes_with_nul()) {
             *d = *s as libc::c_char;
         }
         fill(&mut req);
-        // SAFETY: a datagram socket used only for interface ioctls, with a
-        // fully initialised ifreq.
-        unsafe {
-            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-            assert!(fd >= 0, "socket");
-            let rc = libc::ioctl(fd, request as _, &mut req);
-            libc::close(fd);
-            assert_eq!(rc, 0, "ioctl {:#x} on {}", request, name.to_str().unwrap());
-        }
+        // SAFETY: a datagram socket, used only for interface ioctls.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        assert!(fd >= 0, "socket");
+        // SAFETY: an interface ioctl on that socket, with an ifreq that
+        // names the interface and holds what the request reads or writes.
+        let rc = unsafe { libc::ioctl(fd, request as _, &mut req) };
+        // SAFETY: the socket opened above, closed once.
+        unsafe { libc::close(fd) };
+        assert_eq!(rc, 0, "ioctl {:#x} on {}", request, name.to_str().unwrap());
     }
 
     /// Whether the test runs inside the namespace `scripts/netns-tests.sh`
@@ -3318,12 +3323,21 @@ mod netns {
 
     pub fn set_addr(name: &str, ip: std::net::Ipv4Addr) {
         ioctl_ifreq(name, libc::SIOCSIFADDR as _, |r| {
-            // SAFETY: sockaddr_in fits in the sockaddr of the union.
-            let sin = unsafe {
-                &mut *(&mut r.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in)
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(ip).to_be(),
+                },
+                sin_zero: [0; 8],
             };
-            sin.sin_family = libc::AF_INET as libc::sa_family_t;
-            sin.sin_addr.s_addr = u32::from(ip).to_be();
+            // The union itself, where every member starts (its address is
+            // taken without touching a member, which Rust 1.82 would call
+            // unsafe and later versions not).
+            let at = std::ptr::addr_of_mut!(r.ifr_ifru).cast::<libc::sockaddr_in>();
+            // SAFETY: the union holds a sockaddr, as long as a sockaddr_in,
+            // and is aligned for its pointers, so for a sockaddr_in.
+            unsafe { at.write(sin) };
         });
     }
 }

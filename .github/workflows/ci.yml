@@ -50,6 +50,11 @@ jobs:
         run: |
           rustup target add x86_64-unknown-freebsd
           cargo clippy --target x86_64-unknown-freebsd --no-default-features --features nat-traversal,blake3/pure --all-targets -- -D warnings
+      - name: Clippy for Windows and macOS (their system calls' unsafe blocks; the tests run there below)
+        run: |
+          rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin
+          cargo clippy --target x86_64-pc-windows-gnu --all-features --features blake3/pure --all-targets -- -D warnings
+          cargo clippy --target x86_64-apple-darwin --all-features --features blake3/pure --all-targets -- -D warnings
 
   test:
     name: Tests (${{ matrix.os }})
@@ -229,6 +234,23 @@ jobs:
         env:
           SHARP_BIN_DIR: ${{ github.workspace }}/target/release
         run: ${{ matrix.run }}
+
+  miri:
+    name: Miri (the unsafe code it can run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/miri
+            target/miri
+          key: miri-${{ hashFiles('Cargo.lock') }}
+      - run: sh scripts/miri.sh
 
   fuzz:
     name: Fuzzing (short run of every target)

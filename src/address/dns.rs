@@ -53,11 +53,13 @@ pub async fn lookup(host: &str, port: u16, family: Family) -> io::Result<Vec<Soc
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // getaddrinfo(3) and its list (docs/UNSAFE.md)
 fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
     use std::ffi::{CStr, CString};
     let name = CString::new(host)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name cannot contain NUL"))?;
-    // SAFETY: an all-zero addrinfo is the documented way to start hints.
+    // SAFETY: addrinfo is plain data, integers and pointers; all zeroes,
+    // null pointers included, is the documented way to start hints.
     let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
     hints.ai_family = match family {
         Family::V4 => libc::AF_INET,
@@ -65,17 +67,24 @@ fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
     };
     hints.ai_socktype = libc::SOCK_DGRAM;
     let mut res: *mut libc::addrinfo = std::ptr::null_mut();
-    // SAFETY: a NUL-terminated name, no service, initialised hints, and a
-    // valid place for the result.
+    // SAFETY: a NUL-terminated name, no service, initialised hints and a
+    // place for the result, all alive for the call.
     let rc = unsafe { libc::getaddrinfo(name.as_ptr(), std::ptr::null(), &hints, &mut res) };
     if rc != 0 {
         if rc == libc::EAI_SYSTEM {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: gai_strerror returns a pointer to a static string.
-        let what = unsafe { CStr::from_ptr(libc::gai_strerror(rc)) }
-            .to_string_lossy()
-            .into_owned();
+        // SAFETY: gai_strerror takes any code.
+        let text = unsafe { libc::gai_strerror(rc) };
+        let what = if text.is_null() {
+            format!("resolver error {}", rc)
+        } else {
+            // SAFETY: what gai_strerror returns is a NUL-terminated string
+            // that lives as long as the program.
+            unsafe { CStr::from_ptr(text) }
+                .to_string_lossy()
+                .into_owned()
+        };
         let kind = if rc == libc::EAI_AGAIN {
             io::ErrorKind::TimedOut
         } else {
@@ -83,43 +92,66 @@ fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
         };
         return Err(io::Error::new(kind, what));
     }
-    let mut out = Vec::new();
-    let mut p = res;
-    while !p.is_null() {
-        // SAFETY: `p` walks the list getaddrinfo returned, which stays
-        // valid until freeaddrinfo below; each address is read only after
-        // its family and length say what it is.
-        unsafe {
-            let ai = &*p;
-            if !ai.ai_addr.is_null() {
-                let len = ai.ai_addrlen as usize;
-                if ai.ai_family == libc::AF_INET && len >= std::mem::size_of::<libc::sockaddr_in>()
-                {
-                    let sin = &*(ai.ai_addr as *const libc::sockaddr_in);
-                    out.push((
-                        IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
-                        0,
-                    ));
-                } else if ai.ai_family == libc::AF_INET6
-                    && len >= std::mem::size_of::<libc::sockaddr_in6>()
-                {
-                    let sin6 = &*(ai.ai_addr as *const libc::sockaddr_in6);
-                    out.push((
-                        IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
-                        sin6.sin6_scope_id,
-                    ));
-                }
-            }
-            p = ai.ai_next;
-        }
-    }
-    // SAFETY: `res` came from a successful getaddrinfo and is freed once.
+    // SAFETY: the list a successful getaddrinfo returned, not yet freed.
+    let out = unsafe { addresses_in(res) };
+    // SAFETY: `res` came from a successful getaddrinfo, nothing refers to
+    // it any more, and it is freed once.
     unsafe { libc::freeaddrinfo(res) };
-    out.dedup();
     Ok(out)
 }
 
+/// The addresses in a list of `addrinfo`, in its order and without
+/// repeats, each read as what its family and length say it is; entries of
+/// another family, or too short, are passed over.
+///
+/// # Safety
+///
+/// `list` is null or the first of a list linked by `ai_next`, each entry's
+/// `ai_addr` null or pointing to `ai_addrlen` readable bytes, all of it
+/// valid for the call. Nothing more is promised of the addresses: they are
+/// read wherever they lie, aligned or not.
+#[cfg(unix)]
+#[allow(unsafe_code)] // reading getaddrinfo's list (docs/UNSAFE.md)
+unsafe fn addresses_in(list: *const libc::addrinfo) -> Vec<(IpAddr, u32)> {
+    let mut out = Vec::new();
+    let mut p = list;
+    while !p.is_null() {
+        // SAFETY: the caller's promise: `p` is an entry of the list. `ai` is
+        // not kept past this turn of the loop.
+        let ai = unsafe { &*p };
+        let len = ai.ai_addrlen as usize;
+        if !ai.ai_addr.is_null() {
+            if ai.ai_family == libc::AF_INET && len >= std::mem::size_of::<libc::sockaddr_in>() {
+                // SAFETY: the entry says its address is a sockaddr_in and has
+                // that many bytes. Read without a reference: nothing promises
+                // a `*mut sockaddr`, aligned for two bytes, the four a
+                // sockaddr_in wants.
+                let sin =
+                    unsafe { std::ptr::read_unaligned(ai.ai_addr as *const libc::sockaddr_in) };
+                out.push((
+                    IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
+                    0,
+                ));
+            } else if ai.ai_family == libc::AF_INET6
+                && len >= std::mem::size_of::<libc::sockaddr_in6>()
+            {
+                // SAFETY: as for sockaddr_in, a sockaddr_in6 of that many bytes.
+                let sin6 =
+                    unsafe { std::ptr::read_unaligned(ai.ai_addr as *const libc::sockaddr_in6) };
+                out.push((
+                    IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
+                    sin6.sin6_scope_id,
+                ));
+            }
+        }
+        p = ai.ai_next;
+    }
+    out.dedup();
+    out
+}
+
 #[cfg(windows)]
+#[allow(unsafe_code)] // getaddrinfo and its list (docs/UNSAFE.md)
 fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
     use std::ffi::CString;
     use winapi::shared::ws2def::{ADDRINFOA, AF_INET, AF_INET6, SOCKADDR_IN, SOCK_DGRAM};
@@ -128,7 +160,8 @@ fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
     winsock_ready();
     let name = CString::new(host)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name cannot contain NUL"))?;
-    // SAFETY: an all-zero ADDRINFOA is the documented way to start hints.
+    // SAFETY: ADDRINFOA is plain data, integers and pointers; all zeroes,
+    // null pointers included, is the documented way to start hints.
     let mut hints: ADDRINFOA = unsafe { std::mem::zeroed() };
     hints.ai_family = match family {
         Family::V4 => AF_INET,
@@ -136,8 +169,8 @@ fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
     };
     hints.ai_socktype = SOCK_DGRAM;
     let mut res: *mut ADDRINFOA = std::ptr::null_mut();
-    // SAFETY: a NUL-terminated name, no service, initialised hints, and a
-    // valid place for the result.
+    // SAFETY: a NUL-terminated name, no service, initialised hints and a
+    // place for the result, all alive for the call.
     let rc = unsafe { getaddrinfo(name.as_ptr(), std::ptr::null(), &hints, &mut res) };
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc));
@@ -145,29 +178,38 @@ fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
     let mut out = Vec::new();
     let mut p = res;
     while !p.is_null() {
-        // SAFETY: as for the Unix version: the list stays valid until
-        // freeaddrinfo, and each address is read as what its family and
-        // length say it is.
-        unsafe {
-            let ai = &*p;
-            if !ai.ai_addr.is_null() {
-                if ai.ai_family == AF_INET && ai.ai_addrlen >= std::mem::size_of::<SOCKADDR_IN>() {
-                    let sin = &*(ai.ai_addr as *const SOCKADDR_IN);
-                    let raw = *sin.sin_addr.S_un.S_addr();
-                    out.push((IpAddr::V4(Ipv4Addr::from(u32::from_be(raw))), 0));
-                } else if ai.ai_family == AF_INET6
-                    && ai.ai_addrlen >= std::mem::size_of::<SOCKADDR_IN6_LH>()
-                {
-                    let sin6 = &*(ai.ai_addr as *const SOCKADDR_IN6_LH);
-                    let bytes = *sin6.sin6_addr.u.Byte();
-                    let scope = *sin6.u.sin6_scope_id();
-                    out.push((IpAddr::V6(Ipv6Addr::from(bytes)), scope));
-                }
+        // SAFETY: as for the Unix version: `p` is an entry of the list,
+        // valid until freeaddrinfo, and `ai` is not kept past this turn.
+        let ai = unsafe { &*p };
+        if !ai.ai_addr.is_null() {
+            if ai.ai_family == AF_INET && ai.ai_addrlen >= std::mem::size_of::<SOCKADDR_IN>() {
+                // SAFETY: a SOCKADDR_IN of that many bytes, read without a
+                // reference (see the Unix version).
+                let sin = unsafe { std::ptr::read_unaligned(ai.ai_addr as *const SOCKADDR_IN) };
+                // SAFETY: IN_ADDR's union is the same four bytes whichever way
+                // it is read.
+                let raw = unsafe { *sin.sin_addr.S_un.S_addr() };
+                out.push((IpAddr::V4(Ipv4Addr::from(u32::from_be(raw))), 0));
+            } else if ai.ai_family == AF_INET6
+                && ai.ai_addrlen >= std::mem::size_of::<SOCKADDR_IN6_LH>()
+            {
+                // SAFETY: as for SOCKADDR_IN, a SOCKADDR_IN6_LH of that many
+                // bytes.
+                let sin6 =
+                    unsafe { std::ptr::read_unaligned(ai.ai_addr as *const SOCKADDR_IN6_LH) };
+                // SAFETY: IN6_ADDR's union is the same sixteen bytes whichever
+                // way it is read.
+                let bytes = unsafe { *sin6.sin6_addr.u.Byte() };
+                // SAFETY: the scope id and the scope structure are the same
+                // four bytes.
+                let scope = unsafe { *sin6.u.sin6_scope_id() };
+                out.push((IpAddr::V6(Ipv6Addr::from(bytes)), scope));
             }
-            p = ai.ai_next;
         }
+        p = ai.ai_next;
     }
-    // SAFETY: `res` came from a successful getaddrinfo and is freed once.
+    // SAFETY: `res` came from a successful getaddrinfo, nothing refers to
+    // it any more, and it is freed once.
     unsafe { freeaddrinfo(res) };
     out.dedup();
     Ok(out)
@@ -177,14 +219,15 @@ fn getaddrinfo(host: &str, family: Family) -> io::Result<Vec<(IpAddr, u32)>> {
 /// library does it on first use of its own networking, which may not have
 /// happened yet. Starting it again is harmless: it counts.
 #[cfg(windows)]
+#[allow(unsafe_code)] // WSAStartup (docs/UNSAFE.md)
 fn winsock_ready() {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
-        // SAFETY: WSAStartup with a zeroed WSADATA to fill in; version 2.2.
-        unsafe {
-            let mut data: winapi::um::winsock2::WSADATA = std::mem::zeroed();
-            winapi::um::winsock2::WSAStartup(0x0202, &mut data);
-        }
+        // SAFETY: WSADATA is plain data for WSAStartup to fill in.
+        let mut data: winapi::um::winsock2::WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: version 2.2 and a WSADATA to fill; a failure shows as
+        // getaddrinfo's error.
+        unsafe { winapi::um::winsock2::WSAStartup(0x0202, &mut data) };
     });
 }
 
@@ -446,6 +489,7 @@ pub fn interface_index_of(name: &str) -> Option<u32> {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // if_nametoindex(3) (docs/UNSAFE.md)
 fn interface_index(name: &str) -> Option<u32> {
     let name = std::ffi::CString::new(name).ok()?;
     // SAFETY: a NUL-terminated interface name; 0 means "no such interface".
@@ -454,6 +498,7 @@ fn interface_index(name: &str) -> Option<u32> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // if_nametoindex (docs/UNSAFE.md)
 fn interface_index(name: &str) -> Option<u32> {
     let name = std::ffi::CString::new(name).ok()?;
     // SAFETY: a NUL-terminated interface name; 0 means "no such interface".
@@ -472,6 +517,80 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// A list as getaddrinfo gives it, read whatever the alignment of the
+    /// addresses in it (here: at odd places): an IPv4 and an IPv6 address
+    /// with its scope, in order; an entry with no address, one too short
+    /// for its family and one of another family passed over; a repeat
+    /// dropped. Taking the addresses by reference, as this once did, fails
+    /// here in a debug build (and under Miri: `scripts/miri.sh`).
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)] // building the list
+    fn addresses_are_read_from_the_list_wherever_they_lie() {
+        use std::mem::size_of;
+        use std::ptr::{null_mut, write_unaligned};
+        let (n4, n6) = (
+            size_of::<libc::sockaddr_in>(),
+            size_of::<libc::sockaddr_in6>(),
+        );
+        // SAFETY: plain data; all zeroes is a value of it.
+        let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sin.sin_family = libc::AF_INET as libc::sa_family_t;
+        sin.sin_addr.s_addr = u32::from(Ipv4Addr::new(192, 0, 2, 7)).to_be();
+        sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sin6.sin6_addr.s6_addr = "fe80::1".parse::<Ipv6Addr>().unwrap().octets();
+        sin6.sin6_scope_id = 3;
+        let mut buf = vec![0u8; 4 + 1 + n4 + n6];
+        let start = buf.as_mut_ptr();
+        // One past a multiple of four: misaligned for both, wherever the
+        // buffer lies.
+        let at4 = start.wrapping_add(start.align_offset(4) + 1);
+        let at6 = at4.wrapping_add(n4);
+        // SAFETY: both fit in `buf`, at the odd places chosen.
+        unsafe { write_unaligned(at4.cast::<libc::sockaddr_in>(), sin) };
+        // SAFETY: as above.
+        unsafe { write_unaligned(at6.cast::<libc::sockaddr_in6>(), sin6) };
+        let entry = |family: libc::c_int, addr: *mut u8, len: usize| {
+            // SAFETY: plain data; all zeroes is a value of it.
+            let mut ai: libc::addrinfo = unsafe { std::mem::zeroed() };
+            ai.ai_family = family;
+            ai.ai_addr = addr.cast();
+            ai.ai_addrlen = len as libc::socklen_t;
+            ai
+        };
+        let mut list = [
+            entry(libc::AF_INET, at4, n4),
+            entry(libc::AF_INET, null_mut(), n4),
+            entry(libc::AF_INET6, at6, n6 - 1),
+            entry(libc::AF_UNIX, at4, n4),
+            entry(libc::AF_INET6, at6, n6),
+            entry(libc::AF_INET6, at6, n6),
+        ];
+        // Every link from one pointer to the array, which nothing else
+        // touches until the list has been read (a reference taken to link
+        // one entry would be undone by the next: Miri says so).
+        let base = list.as_mut_ptr();
+        for k in 1..list.len() {
+            let (prev, next) = (base.wrapping_add(k - 1), base.wrapping_add(k));
+            // SAFETY: `prev` is an entry of the array.
+            unsafe { (*prev).ai_next = next };
+        }
+        // SAFETY: a list linked by `ai_next`, each address null or of the
+        // bytes it states, all alive for the call.
+        let got = unsafe { addresses_in(base) };
+        assert_eq!(
+            got,
+            vec![
+                (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 0),
+                (IpAddr::V6("fe80::1".parse().unwrap()), 3),
+            ]
+        );
+        // SAFETY: an empty list.
+        assert!(unsafe { addresses_in(std::ptr::null()) }.is_empty());
     }
 
     const PACE: Duration = Duration::from_millis(250);

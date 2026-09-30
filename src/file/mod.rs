@@ -693,6 +693,7 @@ pub fn hash_to_hex(hash: &[u8; 32]) -> String {
 /// `None` when the file system does not say. (A FUSE file system without a
 /// `statfs` of its own reports a size of zero, and a receiver writing to
 /// one refused every transfer for want of space.)
+#[allow(unsafe_code)] // statvfs(3), GetDiskFreeSpaceExW (docs/UNSAFE.md)
 pub fn available_space(dir: &Path) -> io::Result<Option<u64>> {
     #[cfg(unix)]
     {
@@ -700,9 +701,10 @@ pub fn available_space(dir: &Path) -> io::Result<Option<u64>> {
         use std::os::unix::ffi::OsStrExt;
         let c = CString::new(dir.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-        // SAFETY: statvfs fills a zero-initialised POD struct for a valid
-        // NUL-terminated path.
+        // SAFETY: statvfs is plain data; all zeroes is a value of it.
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a structure to fill, both alive
+        // for the call.
         let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -721,9 +723,10 @@ pub fn available_space(dir: &Path) -> io::Result<Option<u64>> {
         use winapi::shared::ntdef::ULARGE_INTEGER;
         use winapi::um::fileapi::GetDiskFreeSpaceExW;
         let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: GetDiskFreeSpaceExW writes into a zero-initialised
-        // ULARGE_INTEGER for a valid NUL-terminated wide path.
+        // SAFETY: ULARGE_INTEGER is plain data; all zeroes is a value of it.
         let mut free: ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated wide path and one place to fill, the
+        // other two not asked for; all alive for the call.
         let ok = unsafe {
             GetDiskFreeSpaceExW(
                 wide.as_ptr(),
@@ -735,6 +738,7 @@ pub fn available_space(dir: &Path) -> io::Result<Option<u64>> {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: the union's eight bytes, read as the one 64-bit number.
         Ok(Some(unsafe { *free.QuadPart() }))
     }
     #[cfg(not(any(unix, windows)))]
@@ -884,21 +888,24 @@ fn c_path(p: &Path) -> io::Result<std::ffi::CString> {
 
 /// `None` where the system, or the file system, has no such call.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)] // renameat2(2) (docs/UNSAFE.md)
 fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
     let (f, t) = match (c_path(from), c_path(to)) {
         (Ok(f), Ok(t)) => (f, t),
         (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
     };
     // The system call itself: glibc before 2.28 has no wrapper for it.
-    // SAFETY: two NUL-terminated paths, relative to the working directory.
+    // syscall(2) takes its arguments as longs, so they are passed as such.
+    // SAFETY: two NUL-terminated paths, alive for the call, relative to
+    // the working directory.
     let r = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
+            libc::AT_FDCWD as libc::c_long,
             f.as_ptr(),
-            libc::AT_FDCWD,
+            libc::AT_FDCWD as libc::c_long,
             t.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            libc::RENAME_NOREPLACE as libc::c_long,
         )
     };
     if r == 0 {
@@ -913,12 +920,13 @@ fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+#[allow(unsafe_code)] // renamex_np(2) (docs/UNSAFE.md)
 fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
     let (f, t) = match (c_path(from), c_path(to)) {
         (Ok(f), Ok(t)) => (f, t),
         (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
     };
-    // SAFETY: two NUL-terminated paths.
+    // SAFETY: two NUL-terminated paths, alive for the call.
     if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
         return Some(Ok(()));
     }
@@ -931,6 +939,7 @@ fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // MoveFileExW (docs/UNSAFE.md)
 fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
     use std::os::windows::ffi::OsStrExt;
     let wide = |p: &Path| -> Vec<u16> {
@@ -940,8 +949,8 @@ fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
             .collect()
     };
     let (f, t) = (wide(from), wide(to));
-    // SAFETY: two NUL-terminated wide paths. Without
-    // MOVEFILE_REPLACE_EXISTING an existing target is refused.
+    // SAFETY: two NUL-terminated wide paths, alive for the call. (Without
+    // MOVEFILE_REPLACE_EXISTING an existing target is refused.)
     let ok = unsafe { winapi::um::winbase::MoveFileExW(f.as_ptr(), t.as_ptr(), 0) };
     if ok != 0 {
         return Some(Ok(()));

@@ -363,7 +363,10 @@ mod pages {
     }
 }
 
-#[cfg(unix)]
+// Miri runs none of these system calls; under it keys are kept as on a
+// system that cannot lock them, and everything else is checked.
+#[cfg(all(unix, not(miri)))]
+#[allow(unsafe_code)] // sysconf(3), mlock(2), munlock(2), madvise(2) (docs/UNSAFE.md)
 mod os {
     pub enum Error {
         Unsupported,
@@ -425,7 +428,8 @@ mod os {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(miri)))]
+#[allow(unsafe_code)] // GetSystemInfo, VirtualLock and the working set (docs/UNSAFE.md)
 mod os {
     use winapi::shared::winerror::ERROR_WORKING_SET_QUOTA;
     use winapi::um::memoryapi::{VirtualLock, VirtualUnlock};
@@ -440,9 +444,10 @@ mod os {
         "The process's minimum working set could not be raised to make room.";
 
     pub fn page_size() -> Option<usize> {
-        // SAFETY: GetSystemInfo fills the structure it is given and has no
-        // other effect; a zeroed SYSTEM_INFO is a valid one to fill.
+        // SAFETY: SYSTEM_INFO is plain data; all zeroes is a value of it.
         let mut info: winapi::um::sysinfoapi::SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: GetSystemInfo fills the structure it is given and has no
+        // other effect.
         unsafe { winapi::um::sysinfoapi::GetSystemInfo(&mut info) };
         Some(info.dwPageSize as usize)
     }
@@ -479,14 +484,16 @@ mod os {
         use winapi::um::winbase::{GetProcessWorkingSetSize, SetProcessWorkingSetSize};
         const MORE: usize = 4 << 20;
         let (mut min, mut max) = (0usize, 0usize);
-        // SAFETY: both calls act on this process's own working set limits
-        // through its pseudo-handle, which needs no closing; the out
-        // parameters are ours.
-        unsafe {
-            let me = GetCurrentProcess();
-            if GetProcessWorkingSetSize(me, &mut min, &mut max) != 0 {
-                SetProcessWorkingSetSize(me, min + MORE, max.max(min + MORE) + MORE);
-            }
+        // SAFETY: the process's pseudo-handle for itself, which needs no
+        // closing.
+        let me = unsafe { GetCurrentProcess() };
+        // SAFETY: this process's own working set limits, into two places of
+        // ours.
+        if unsafe { GetProcessWorkingSetSize(me, &mut min, &mut max) } != 0 {
+            // SAFETY: new limits for this process's own working set; the
+            // system refuses what it will not allow, and a refusal shows
+            // as VirtualLock's.
+            unsafe { SetProcessWorkingSetSize(me, min + MORE, max.max(min + MORE) + MORE) };
         }
     }
 
@@ -499,7 +506,7 @@ mod os {
     pub fn keep_out_of_dumps(_page: usize, _len: usize, _out: bool) {}
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(any(miri, not(any(unix, windows))))]
 mod os {
     pub enum Error {
         Unsupported,
@@ -573,7 +580,7 @@ mod tests {
 
     /// On this machine keys are locked: the test environment has room for
     /// a few pages (RLIMIT_MEMLOCK is 64 KiB even on old systems).
-    #[cfg(unix)]
+    #[cfg(all(unix, not(miri)))]
     #[test]
     fn keys_are_locked_here() {
         let _k = SecretKey::random();

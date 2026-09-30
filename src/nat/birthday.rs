@@ -73,12 +73,14 @@ fn allowance() -> &'static Arc<tokio::sync::Semaphore> {
 
 /// How many descriptors the system lets this process have open, if it says.
 #[cfg(unix)]
+#[allow(unsafe_code)] // getrlimit(2) (docs/UNSAFE.md)
 fn descriptor_limit() -> Option<usize> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: getrlimit only writes the struct it is given.
+    // SAFETY: getrlimit only writes the structure it is given, which is
+    // alive for the call.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         return None;
     }

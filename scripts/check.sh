@@ -13,4 +13,11 @@ if rustup target list --installed 2>/dev/null | grep -q x86_64-unknown-freebsd; 
 else
   echo "(the FreeBSD target is not installed, so its lint is skipped: rustup target add x86_64-unknown-freebsd)"
 fi
+for t in x86_64-pc-windows-gnu x86_64-apple-darwin; do
+  if rustup target list --installed 2>/dev/null | grep -q "$t"; then
+    cargo clippy --target "$t" --all-features --features blake3/pure --all-targets -- -D warnings
+  else
+    echo "(the $t target is not installed, so its lint is skipped: rustup target add $t)"
+  fi
+done
 cargo test --no-default-features --features nat-traversal

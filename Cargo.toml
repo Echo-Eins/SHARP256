@@ -149,5 +149,15 @@ codegen-units = 1
 strip = true
 
 # `cargo fuzz` builds with --cfg fuzzing (see fuzz/).
+#
+# Unsafe code only where it is allowed by name (`#[allow(unsafe_code)]`, all
+# of it calls into the system; docs/UNSAFE.md lists each), every block with
+# the reason it is sound, and one operation to a block.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"

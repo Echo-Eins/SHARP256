@@ -298,6 +298,7 @@ mod keychain {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // CryptProtectData, CryptUnprotectData (docs/UNSAFE.md)
 mod dpapi {
     //! DPAPI seals data to the Windows account: only the same user on the
     //! same machine (or domain) can unseal it. The identity's public key is
@@ -323,13 +324,24 @@ mod dpapi {
 
     /// Copies what DPAPI allocated, wipes it and gives it back to it.
     ///
-    /// SAFETY (for the callers): `out` must be a blob DPAPI filled in, whose
-    /// `pbData` points to `cbData` bytes it allocated with LocalAlloc.
+    /// # Safety
+    ///
+    /// `out` must be a blob a successful DPAPI call filled in: `pbData`
+    /// null, or `cbData` bytes it allocated with LocalAlloc.
     unsafe fn take(out: &mut DATA_BLOB) -> Vec<u8> {
-        let bytes = std::slice::from_raw_parts_mut(out.pbData, out.cbData as usize);
+        // Nothing promises a non-null pointer for nothing, and a slice may
+        // not be made from a null one, whatever its length.
+        if out.pbData.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: the caller's promise: `cbData` bytes of DPAPI's, which
+        // nothing else refers to.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(out.pbData, out.cbData as usize) };
         let copy = bytes.to_vec();
         bytes.zeroize();
-        LocalFree(out.pbData as _);
+        // SAFETY: DPAPI's LocalAlloc allocation, given back once; `bytes`
+        // is not used after.
+        unsafe { LocalFree(out.pbData as _) };
         copy
     }
 
@@ -396,6 +408,25 @@ mod dpapi {
         let key = (bytes.len() == 32).then(|| SecretKey::with(|k| k.copy_from_slice(&bytes)));
         bytes.zeroize();
         key.ok_or_else(|| Error("what Windows unsealed is not a key".to_string()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A blob with nothing in it and no pointer is nothing, not a
+        /// slice made from a null pointer (which taking it once made: a
+        /// panic in a debug build, undefined behaviour otherwise; Miri
+        /// sees it too, `scripts/miri.sh`).
+        #[test]
+        fn an_empty_blob_is_nothing() {
+            let mut out = DATA_BLOB {
+                cbData: 0,
+                pbData: std::ptr::null_mut(),
+            };
+            // SAFETY: a blob as a successful call may leave it, empty.
+            assert!(unsafe { take(&mut out) }.is_empty());
+        }
     }
 }
 
