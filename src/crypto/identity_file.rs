@@ -42,8 +42,8 @@ use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
 const TAG: &str = "sharp256-identity-2";
@@ -524,7 +524,7 @@ fn save_with_cost(
 ) -> Result<(), IdentityError> {
     let before = IdentityFile::read(path).ok().map(|f| f.protection());
     let text = render(identity, protection, cost)?;
-    if let Err(e) = replace(path, &text) {
+    if let Err(e) = crate::file::durable::replace(path, &text) {
         // The store took a key for a file that was never written.
         if let NewProtection::Keystore(backend) = protection {
             if before != Some(Protection::Keystore(*backend)) {
@@ -546,62 +546,6 @@ fn save_with_cost(
         }
     }
     Ok(())
-}
-
-/// Creates a new file at `path` with `text`, or replaces the one there,
-/// without a moment in which half a file is there: written beside it,
-/// flushed, renamed over it, and the directory flushed so that the rename
-/// itself is on disk.
-pub(crate) fn replace(path: &Path, text: &[u8]) -> io::Result<()> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    fs::create_dir_all(&dir)?;
-    let mut name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?
-        .to_os_string();
-    name.push(format!(".{:016x}.tmp", rand::rngs::OsRng.next_u64()));
-    let tmp = dir.join(name);
-    let result = (|| {
-        write_private(&tmp, text)?;
-        fs::rename(&tmp, path)?;
-        sync_dir(&dir)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
-/// Creates `path` readable by its owner only, writes `text` and flushes it
-/// to disk; refuses if something is there.
-pub(crate) fn write_private(path: &Path, text: &[u8]) -> io::Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(text)?;
-    f.sync_all()
-}
-
-/// Flushes a directory's entries, so that a file created or renamed in it
-/// survives a crash. (Windows has no such call; its renames are journaled.)
-pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        fs::File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
 }
 
 fn warn_if_exposed(path: &Path) {

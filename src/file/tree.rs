@@ -1190,6 +1190,38 @@ fn parallel_try<T: Sync>(items: &[T], f: impl Fn(&T) -> io::Result<()> + Sync) -
     })
 }
 
+/// Gives the owner back the right to write every entry of a staging tree
+/// that exists — directories before what is in them, since a directory's
+/// own permissions may shut out its contents. A resumed transfer may have
+/// to write into a tree that was already given the sender's permissions
+/// (see the receiver's `open_tree_writer`); the staging directory is the
+/// owner's alone, and the permissions are applied again at the end.
+pub fn make_writable(root: &Path, plan: &Manifest) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (i, e) in plan.entries().iter().enumerate() {
+            let path = plan.local_path(root, i);
+            let Ok(md) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let owner = if e.kind == EntryKind::Dir {
+                0o700
+            } else {
+                0o600
+            };
+            let mode = md.permissions().mode() & 0o7777;
+            if md.file_type().is_symlink() || mode & owner == owner {
+                continue;
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode | owner))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (root, plan);
+    Ok(())
+}
+
 /// Creates a directory only its owner can enter (Unix), for staging.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -1258,54 +1290,93 @@ pub fn local_umask(_dir: &Path) -> u32 {
 /// directory is done after everything in it. Permission bits are masked
 /// with `umask` and never include set-id bits. Failures are logged and
 /// counted, not fatal: the data itself is complete and verified.
-pub fn apply_metadata(root: &Path, m: &Manifest, umask: u32) -> usize {
-    let mut failures = 0;
-    for i in (0..m.entries().len()).rev() {
+///
+/// Each entry is then flushed, since times and permissions are on disk only
+/// once their entry is: files several at a time, then directories from the
+/// deepest up (a directory's permissions may shut out what is below it).
+/// An entry is opened once and everything is done through that handle, so
+/// that permissions that forbid reading do not stop its flush. Returns how
+/// many entries keep default metadata; a flush that fails is an error,
+/// since the tree would then not be on disk as it is about to be reported.
+pub fn apply_metadata(root: &Path, m: &Manifest, umask: u32) -> io::Result<usize> {
+    let failures = std::sync::atomic::AtomicUsize::new(0);
+    let each = |i: usize| -> io::Result<()> {
         let e = &m.entries()[i];
         let path = m.local_path(root, i);
-        if let Err(err) = set_meta(&path, e.kind == EntryKind::Dir, &e.meta, umask) {
-            failures += 1;
-            if failures <= 5 {
+        let dir = e.kind == EntryKind::Dir;
+        let f = open_for_meta(&path, dir)
+            .map_err(|err| io::Error::new(err.kind(), format!("{}: {}", path.display(), err)))?;
+        if let Err(err) = set_meta(&f, &e.meta, umask) {
+            if failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
                 tracing::warn!("cannot set metadata of {}: {}", path.display(), err);
             }
         }
+        flush_entry(&f, dir)
+            .map_err(|err| io::Error::new(err.kind(), format!("{}: {}", path.display(), err)))
+    };
+    let (dirs, files): (Vec<usize>, Vec<usize>) =
+        (0..m.entries().len()).partition(|&i| m.entries()[i].kind == EntryKind::Dir);
+    parallel_try(&files, |&i| each(i))?;
+    // Parents come before their children in a manifest: backwards is
+    // deepest first.
+    for &i in dirs.iter().rev() {
+        each(i)?;
     }
-    failures
+    Ok(failures.into_inner())
 }
 
 /// Applies the root's metadata to the finished tree at `root`. Without a
 /// mode from the sender the (private) staging mode is replaced by the
 /// default for new directories.
+/// It is flushed too; flushing the directory that holds it is the caller's.
 pub fn apply_root_metadata(root: &Path, m: &Manifest, umask: u32) -> io::Result<()> {
     let meta = Meta {
         mode: m.root_meta().mode.or(Some(0o777)),
         ..m.root_meta()
     };
-    set_meta(root, true, &meta, umask)
+    let f = open_for_meta(root, true)?;
+    set_meta(&f, &meta, umask)?;
+    flush_entry(&f, true)
 }
 
-fn set_meta(path: &Path, dir: bool, meta: &Meta, umask: u32) -> io::Result<()> {
+fn set_meta(f: &File, meta: &Meta, umask: u32) -> io::Result<()> {
     if let Some(t) = meta.mtime.and_then(system_time) {
-        open_for_times(path, dir)?.set_modified(t)?;
+        f.set_modified(t)?;
     }
     #[cfg(unix)]
     if let Some(mode) = meta.mode {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777 & !umask))?;
+        f.set_permissions(fs::Permissions::from_mode(mode & 0o777 & !umask))?;
     }
     #[cfg(not(unix))]
     let _ = umask;
     Ok(())
 }
 
+/// Flushes an entry's data and metadata. On Windows a handle opened for
+/// its attributes cannot be flushed, and NTFS journals metadata changes;
+/// there this does nothing.
+fn flush_entry(f: &File, _dir: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
-fn open_for_times(path: &Path, _dir: bool) -> io::Result<File> {
-    // The owner may set times through any descriptor.
+fn open_for_meta(path: &Path, _dir: bool) -> io::Result<File> {
+    // The owner may set times and permissions, and flush, through any
+    // descriptor — one for reading will do, and a directory opens so too.
     File::open(path)
 }
 
 #[cfg(windows)]
-fn open_for_times(path: &Path, dir: bool) -> io::Result<File> {
+fn open_for_meta(path: &Path, dir: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -1318,7 +1389,7 @@ fn open_for_times(path: &Path, dir: bool) -> io::Result<File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_for_times(path: &Path, _dir: bool) -> io::Result<File> {
+fn open_for_meta(path: &Path, _dir: bool) -> io::Result<File> {
     OpenOptions::new().write(true).open(path)
 }
 
@@ -1616,6 +1687,74 @@ mod tests {
         );
     }
 
+    /// Permissions that forbid the owner to read a file, or to enter a
+    /// directory, do not stop its times and permissions being applied and
+    /// flushed: everything is done through a handle opened before.
+    #[cfg(unix)]
+    #[test]
+    fn metadata_that_locks_the_owner_out_is_applied_and_flushed() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut b = Builder::new(meta(0o755, 1_700_000_000), 8);
+        let d = b.push(0, "d", EntryKind::Dir, 0, meta(0o300, 5)).unwrap();
+        b.push(d, "sealed", EntryKind::File, 4, meta(0o000, 6))
+            .unwrap();
+        b.push(d, "wo", EntryKind::File, 4, meta(0o200, 7)).unwrap();
+        let bytes = b.m.encode();
+        let plan = b.finish(bytes.len() as u64).unwrap();
+        // The tree as the receiver's sink leaves it.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("out.sharp-part");
+        create_private_dir(&staging).unwrap();
+        write(&staging.join("d/sealed"), b"1234");
+        write(&staging.join("d/wo"), b"5678");
+        assert_eq!(apply_metadata(&staging, &plan, 0o022).unwrap(), 0);
+        let mode = |p: &str| fs::metadata(staging.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("d"), 0o300);
+        assert_eq!(mode("d/sealed"), 0o000);
+        assert_eq!(mode("d/wo"), 0o200);
+        let mtime = fs::metadata(staging.join("d/wo"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(mtime, system_time((7, 123)).unwrap());
+        // So that the temporary directory can be removed.
+        fs::set_permissions(staging.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A tree already given the sender's permissions — read-only files, a
+    /// directory the owner may not list or write — is made writable again
+    /// for a resume, and then written into.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_given_its_permissions_can_be_written_into_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut b = Builder::new(meta(0o755, 1_700_000_000), 8);
+        let d = b.push(0, "d", EntryKind::Dir, 0, meta(0o100, 5)).unwrap();
+        b.push(d, "ro", EntryKind::File, 4, meta(0o400, 6)).unwrap();
+        let bytes = b.m.encode();
+        let plan = b.finish(bytes.len() as u64).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("out.sharp-part");
+        create_private_dir(&staging).unwrap();
+        write(&staging.join("d/ro"), b"12");
+        assert_eq!(apply_metadata(&staging, &plan, 0o022).unwrap(), 0);
+        assert!(fs::OpenOptions::new()
+            .write(true)
+            .open(staging.join("d/ro"))
+            .is_err());
+        make_writable(&staging, &plan).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(staging.join("d/ro"))
+            .expect("writable again");
+        let mode = |p: &str| fs::metadata(staging.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode("d"), mode("d/ro")), (0o700, 0o600));
+        // And the sender's permissions go back on at the end.
+        assert_eq!(apply_metadata(&staging, &plan, 0o022).unwrap(), 0);
+        assert_eq!((mode("d/ro"), mode("d")), (0o400, 0o100));
+        fs::set_permissions(staging.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[test]
     fn sink_builds_the_tree_and_detects_collisions() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1652,7 +1791,7 @@ mod tests {
             src.hash().unwrap()
         );
         let umask = local_umask(&staging);
-        assert_eq!(apply_metadata(&staging, &plan, umask), 0);
+        assert_eq!(apply_metadata(&staging, &plan, umask).unwrap(), 0);
         apply_root_metadata(&staging, &plan, umask).unwrap();
         assert!(staging.join("e/empty").is_file());
         assert!(staging.join("f/g").is_dir());

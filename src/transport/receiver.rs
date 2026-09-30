@@ -59,7 +59,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1547,33 +1547,39 @@ async fn finish_file(
     part: PathBuf,
     final_path: PathBuf,
     overwrite: bool,
+    all_on_disk: impl FnOnce() + Send + 'static,
 ) -> Result<([u8; 32], PathBuf), String> {
     writer
         .close()
         .await
         .map_err(|e| format!("cannot finish writing file: {}", e))?;
+    all_on_disk();
     let p = part.clone();
     let hash = tokio::task::spawn_blocking(move || hash_file(&p))
         .await
         .map_err(|e| format!("hash task failed: {}", e))?
         .map_err(|e| format!("cannot hash file: {}", e))?;
     let target = tokio::task::spawn_blocking(move || -> io::Result<PathBuf> {
+        let dir = crate::file::durable::parent_of(&final_path);
         if overwrite {
-            let _ = std::fs::remove_file(&final_path);
+            // A rename replaces what is there in one step (on Windows as
+            // well: MoveFileEx with MOVEFILE_REPLACE_EXISTING); removing it
+            // first left a moment with neither file under the name.
             rename_with_retry(&part, &final_path)?;
+            // The rename is on disk before the sender is told the file is
+            // stored (FIN follows this).
+            crate::file::durable::sync_dir(&dir)?;
             return Ok(final_path);
         }
         let name = final_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let dir = final_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
         // Never over anything, even a file that appears after the free
         // name was chosen.
-        crate::file::move_into_free_name(&part, &dir, &name, unique_path)
+        let target = crate::file::move_into_free_name(&part, &dir, &name, unique_path)?;
+        crate::file::durable::sync_dir(&dir)?;
+        Ok(target)
     })
     .await
     .map_err(|e| format!("rename task failed: {}", e))?
@@ -1590,16 +1596,22 @@ async fn finish_tree(
     final_path: PathBuf,
     plan: Arc<Manifest>,
     manifest: Arc<Vec<u8>>,
+    all_on_disk: impl FnOnce() + Send + 'static,
 ) -> Result<([u8; 32], PathBuf), String> {
     writer
         .finish()
         .await
         .map_err(|e| format!("cannot finish writing the directory: {}", e))?;
+    all_on_disk();
     tokio::task::spawn_blocking(move || {
         let hash = tree::hash_tree(&staging, &plan, &manifest)
             .map_err(|e| format!("cannot hash the directory: {}", e))?;
         let umask = tree::local_umask(&staging);
-        let failures = tree::apply_metadata(&staging, &plan, umask);
+        // Applies times and permissions and flushes every entry, before the
+        // tree is moved into place: what appears under the final name is
+        // then what the manifest says, on disk.
+        let failures = tree::apply_metadata(&staging, &plan, umask)
+            .map_err(|e| format!("cannot flush {}: {}", staging.display(), e))?;
         if failures > 0 {
             tracing::warn!(
                 "{} entries of {} keep default times or permissions",
@@ -1607,10 +1619,9 @@ async fn finish_tree(
                 staging.display()
             );
         }
-        let dir = final_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+        crate::file::durable::sync_dir(&staging)
+            .map_err(|e| format!("cannot flush {}: {}", staging.display(), e))?;
+        let dir = crate::file::durable::parent_of(&final_path);
         let name = final_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1620,6 +1631,11 @@ async fn finish_tree(
         if let Err(e) = tree::apply_root_metadata(&target, &plan, umask) {
             tracing::warn!("cannot set metadata of {}: {}", target.display(), e);
         }
+        // The move on disk before the sender is told the directory is
+        // stored (the root's own times and permissions went with
+        // `apply_root_metadata`).
+        crate::file::durable::sync_dir(&dir)
+            .map_err(|e| format!("cannot flush {}: {}", dir.display(), e))?;
         Ok((hash, target))
     })
     .await
@@ -2364,13 +2380,17 @@ impl Session {
 
         let needed = hello.file_size.saturating_sub(durable.total());
         match available_space(&out_dir) {
-            Ok(avail) if avail < needed.saturating_add(1 << 20) => {
+            Ok(Some(avail)) if avail < needed.saturating_add(1 << 20) => {
                 return Err((
                     REASON_DISK_SPACE,
                     format!("need {} bytes, {} available", needed, avail),
                 ));
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::debug!(
+                "{} does not say how much space it has; not checked",
+                out_dir.display()
+            ),
             Err(e) => tracing::warn!("cannot query free space: {}", e),
         }
         self.received = durable;
@@ -2384,7 +2404,14 @@ impl Session {
     fn create_file(&mut self) -> Result<(), String> {
         if let Some(tree) = &self.tree {
             if !tree.resume {
+                // Its name flushed with the output directory's, before any
+                // state that describes what is inside it is kept.
                 tree::create_private_dir(&self.part_path)
+                    .and_then(|()| {
+                        crate::file::durable::sync_dir(&crate::file::durable::parent_of(
+                            &self.part_path,
+                        ))
+                    })
                     .map_err(|e| format!("cannot create {}: {}", self.part_path.display(), e))?;
             }
             if tree.plan.is_some() {
@@ -2409,6 +2436,15 @@ impl Session {
     fn open_tree_writer(&mut self) -> Result<(), String> {
         let tree = self.tree.as_ref().expect("directory transfer");
         let (plan, bytes) = tree.plan.clone().expect("verified manifest");
+        if tree.resume {
+            // A tree whose finishing was cut short — a crash between giving
+            // its entries the sender's permissions and moving it into place —
+            // may hold read-only files and closed directories, and every
+            // resume of it failed writing into them. The permissions are
+            // applied again when it is complete.
+            tree::make_writable(&self.part_path, &plan)
+                .map_err(|e| format!("cannot reopen {}: {}", self.part_path.display(), e))?;
+        }
         let keep = self
             .shared
             .store
@@ -3462,10 +3498,24 @@ impl Session {
         let overwrite = self.shared.cfg.overwrite;
         let plan = self.tree.as_ref().and_then(|t| t.plan.clone());
         let tx = self.self_tx.clone();
+        // Once the writer has flushed everything, the resume state says so:
+        // a crash while the result is verified and moved into place then
+        // resumes with every byte already there, instead of from the last
+        // state kept during the transfer.
+        let (shared, state) = (self.shared.clone(), self.state(&self.received));
+        let all_on_disk = move || {
+            if let Some(store) = &shared.store {
+                if let Err(e) = store.save_receiver(&state) {
+                    tracing::warn!("cannot save resume state: {}", e);
+                }
+            }
+        };
         tokio::spawn(async move {
             let result = match plan {
-                Some((plan, bytes)) => finish_tree(writer, part, final_path, plan, bytes).await,
-                None => finish_file(writer, part, final_path, overwrite).await,
+                Some((plan, bytes)) => {
+                    finish_tree(writer, part, final_path, plan, bytes, all_on_disk).await
+                }
+                None => finish_file(writer, part, final_path, overwrite, all_on_disk).await,
             };
             let _ = tx.send(Incoming::Verified(result)).await;
         });

@@ -196,11 +196,9 @@ impl Identity {
                 if let Some(dir) = path.parent() {
                     fs::create_dir_all(dir)?;
                 }
-                match identity_file::write_private(path, &text) {
+                match crate::file::durable::create_private(path, &text) {
                     Ok(()) => {
-                        if let Some(dir) = path.parent() {
-                            identity_file::sync_dir(dir)?;
-                        }
+                        crate::file::durable::sync_dir(&crate::file::durable::parent_of(path))?;
                         Ok(id)
                     }
                     // Another process created it first: use theirs.

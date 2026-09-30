@@ -3,11 +3,12 @@
 //! coalescing writer thread for the receiver, whole-file hashing, disk-space
 //! queries and file-name hygiene.
 
+pub mod durable;
 pub mod tree;
 
 use crate::protocol::wire::TreeInfo;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
@@ -292,6 +293,7 @@ impl FileWriter {
     /// writer thread. `capacity_bytes` bounds the amount of queued,
     /// not-yet-written data.
     pub fn open(path: &Path, size: u64, capacity_bytes: u64) -> io::Result<Self> {
+        let existed = path.exists();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -300,6 +302,12 @@ impl FileWriter {
             .open(path)?;
         if file.metadata()?.len() != size {
             file.set_len(size)?;
+        }
+        // The resume state will say which bytes of this file are on disk;
+        // the file's own name in its directory has to be, too, or after a
+        // crash the state would describe a file that is not there.
+        if !existed {
+            durable::sync_dir(&durable::parent_of(path))?;
         }
         Self::start(Target::File(file), capacity_bytes, || {})
     }
@@ -652,17 +660,9 @@ fn writer_loop(target: Target, rx: MpscReceiver<WriteCmd>, shared: Arc<WriterSha
     let _ = st.close(false);
 }
 
-/// Replaces `path` with `bytes` durably (temporary file, fsync, rename).
+/// Replaces `path` with `bytes` durably (see `durable::replace`).
 pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+    durable::replace(path, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -688,8 +688,11 @@ pub fn hash_to_hex(hash: &[u8; 32]) -> String {
 // Disk space
 // ---------------------------------------------------------------------------
 
-/// Free space available to this process on the file system holding `dir`.
-pub fn available_space(dir: &Path) -> io::Result<u64> {
+/// Free space available to this process on the file system holding `dir`;
+/// `None` when the file system does not say. (A FUSE file system without a
+/// `statfs` of its own reports a size of zero, and a receiver writing to
+/// one refused every transfer for want of space.)
+pub fn available_space(dir: &Path) -> io::Result<Option<u64>> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -703,10 +706,13 @@ pub fn available_space(dir: &Path) -> io::Result<u64> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
+        if st.f_blocks == 0 {
+            return Ok(None);
+        }
         // The field types differ between platforms (u32 on some, u64 on others).
         #[allow(clippy::unnecessary_cast)]
         let free = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
-        Ok(free)
+        Ok(Some(free))
     }
     #[cfg(windows)]
     {
@@ -728,12 +734,12 @@ pub fn available_space(dir: &Path) -> io::Result<u64> {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(unsafe { *free.QuadPart() })
+        Ok(Some(unsafe { *free.QuadPart() }))
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = dir;
-        Ok(u64::MAX)
+        Ok(None)
     }
 }
 
@@ -1147,7 +1153,7 @@ mod tests {
         r.read_at(4900, &mut buf).unwrap();
         assert_eq!(&buf[..], &data[4900..]);
         assert!(r.read_at(4950, &mut buf).is_err());
-        assert!(available_space(dir.path()).unwrap() > 0);
+        assert!(available_space(dir.path()).unwrap().unwrap() > 0);
         assert_eq!(hash_file(&path).unwrap(), *blake3::hash(&data).as_bytes());
         // Empty file hashes like empty input.
         let empty = dir.path().join("empty");

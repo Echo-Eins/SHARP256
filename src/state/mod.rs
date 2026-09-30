@@ -4,8 +4,10 @@
 //! stream of a partial directory) are durable (written and fsynced), and for
 //! a directory also its manifest. The sender stores the transfer id it used
 //! for a given (file or directory, peer) so that a restarted sender can
-//! present the same id. Files are written atomically (temp file + rename).
+//! present the same id. Files are replaced whole and flushed with their
+//! directory (`file::durable`).
 
+use crate::file::durable;
 use crate::protocol::RangeSet;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -147,16 +149,15 @@ impl StateStore {
     }
 
     pub fn save_stamp(&self, stamp: u64) -> io::Result<()> {
-        let path = self.stamp_path();
-        let tmp = path.with_extension("stamp.tmp");
-        fs::write(&tmp, stamp.to_string())?;
-        fs::rename(&tmp, path)
+        durable::replace(&self.stamp_path(), stamp.to_string().as_bytes())
     }
 
+    /// Every state file is replaced whole and flushed with its directory
+    /// (`file::durable`): after a crash it is the old one or the new one.
+    /// It used to be written and renamed without a flush, which could leave
+    /// an empty or cut-off file under the name after a power cut.
     fn write_atomic(path: &Path, json: &str) -> io::Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)
+        durable::replace(path, json.as_bytes())
     }
 
     pub fn save_receiver(&self, state: &ReceiverState) -> io::Result<()> {
@@ -174,8 +175,8 @@ impl StateStore {
     }
 
     pub fn remove_receiver(&self, transfer_id: &str) {
-        let _ = fs::remove_file(self.receiver_path(transfer_id));
-        let _ = fs::remove_file(self.manifest_path(transfer_id));
+        let _ = durable::remove(&self.receiver_path(transfer_id));
+        let _ = durable::remove(&self.manifest_path(transfer_id));
     }
 
     /// Finds the most recent receiver state of `sender` for a file (or
@@ -248,7 +249,7 @@ impl StateStore {
 
     pub fn remove_sender(&self, file_path: &Path, file_size: u64, peer: &str) {
         let key = Self::sender_key(file_path, file_size, peer);
-        let _ = fs::remove_file(self.sender_path(&key));
+        let _ = durable::remove(&self.sender_path(&key));
     }
 
     /// Deletes state files older than `max_age`, together with the partial
@@ -259,6 +260,20 @@ impl StateStore {
         let mut removed = 0;
         for entry in fs::read_dir(&self.dir)?.flatten() {
             let path = entry.path();
+            // What a replacement left when the process died in the middle
+            // of it; an hour is long past any replacement in progress.
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(3600));
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            }
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
