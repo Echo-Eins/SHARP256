@@ -23,9 +23,9 @@
 
 use crate::crypto::secret::Locked;
 use crate::crypto::{derive_secret, CryptoError};
+use crate::sync::{AtomicU64, Ordering, RwLock};
 use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
-use std::sync::atomic::{AtomicU64, Ordering};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
 use zeroize::Zeroize;
 
@@ -271,7 +271,7 @@ struct Secrets {
     secret: [u8; 32],
     iv: [u8; 12],
     hp: HeaderKey,
-    slots: parking_lot::RwLock<[Slot; SLOTS]>,
+    slots: RwLock<[Slot; SLOTS]>,
 }
 
 impl Zeroize for Secrets {
@@ -825,5 +825,47 @@ mod tests {
         if Suite::hardware_aes() {
             assert_eq!(Suite::choose(Suite::ALL_BITS, true), Some(Suite::Aes256Gcm));
         }
+    }
+
+    /// The crypto pool seals and opens a session's packets on several
+    /// threads at once while the epochs kept move on. In every
+    /// interleaving loom makes of two packets sealed across an epoch
+    /// boundary at once, then opened at once with a forgery among them:
+    /// both seal and open, the forgery opens nothing, and the epochs kept
+    /// end as those around the newest (`scripts/loom.sh`).
+    #[cfg(sharp_loom)]
+    #[test]
+    fn loom_epochs_move_on_under_threads() {
+        use loom::sync::Arc;
+        loom::model(|| {
+            let a = Arc::new(SessionKeys::derive(&split(), true, Suite::Aes256Gcm));
+            let b = Arc::new(SessionKeys::derive(&split(), false, Suite::Aes256Gcm));
+            let (p1, p2) = (1u64 << EPOCH_BITS, (2u64 << EPOCH_BITS) + 1);
+            let sealer = {
+                let a = a.clone();
+                loom::thread::spawn(move || sealed(&a.send, p2))
+            };
+            let mut one = sealed(&a.send, p1);
+            let two = sealer.join().unwrap();
+            let mut forged = two.clone();
+            *forged.last_mut().unwrap() ^= 1;
+            let open = |mut pkt: Vec<u8>| {
+                let b = b.clone();
+                loom::thread::spawn(move || b.recv.open(&mut pkt).map(|(_, pn, _)| pn).ok())
+            };
+            let (two, forged) = (open(two), open(forged));
+            assert_eq!(b.recv.open(&mut one).map(|(_, pn, _)| pn).ok(), Some(p1));
+            assert_eq!(two.join().unwrap(), Some(p2));
+            assert_eq!(forged.join().unwrap(), None);
+            assert_eq!(b.recv.top.load(Ordering::Relaxed), 2);
+            let slots = b.recv.keys.slots.read();
+            let mut kept: Vec<u64> = slots
+                .iter()
+                .filter(|s| !matches!(s.aead, Aead::None))
+                .map(|s| s.epoch)
+                .collect();
+            kept.sort_unstable();
+            assert_eq!(kept, [1, 2, 3]);
+        });
     }
 }

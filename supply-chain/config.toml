@@ -414,6 +414,11 @@ criteria = "safe-to-deploy"
 version = "0.18.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.generator]]
+version = "0.8.10"
+criteria = "safe-to-run"
+notes = "loom's, for the models in scripts/loom.sh (builds with --cfg sharp_loom); not in any build shipped"
+
 [[exemptions.generic-array]]
 version = "0.14.7"
 criteria = "safe-to-deploy"
@@ -557,6 +562,16 @@ criteria = "safe-to-deploy"
 [[exemptions.lock_api]]
 version = "0.4.13"
 criteria = "safe-to-deploy"
+
+[[exemptions.loom]]
+version = "0.7.2"
+criteria = "safe-to-run"
+notes = "loom's, for the models in scripts/loom.sh (builds with --cfg sharp_loom); not in any build shipped"
+
+[[exemptions.matchers]]
+version = "0.2.0"
+criteria = "safe-to-deploy"
+notes = "tracing-subscriber's env-filter, which only loom asks for (builds with --cfg sharp_loom, scripts/loom.sh); not in any build shipped"
 
 [[exemptions.md-5]]
 version = "0.10.6"
@@ -1041,6 +1056,11 @@ criteria = "safe-to-deploy"
 [[exemptions.windows-interface]]
 version = "0.48.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.windows-result]]
+version = "0.4.1"
+criteria = "safe-to-run"
+notes = "loom's, for the models in scripts/loom.sh (builds with --cfg sharp_loom); not in any build shipped"
 
 [[exemptions.windows-sys]]
 version = "0.45.0"

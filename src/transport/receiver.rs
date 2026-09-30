@@ -51,6 +51,7 @@ use crate::protocol::wire::{
 };
 use crate::protocol::RangeSet;
 use crate::state::{hex16, ReceiverState, StateStore};
+use crate::sync;
 use crate::transport::io::{recv_buffers, BatchSocket, Received, RECV_BATCH, RECV_BUF_LEN};
 use crate::transport::parallel;
 use crate::transport::path::PathProbe;
@@ -208,13 +209,13 @@ struct Shared {
     declined: parking_lot::Mutex<HashMap<TransferKey, Instant>>,
     /// Bytes of datagrams queued to sessions, all of them together; held to
     /// a quarter of the memory budget.
-    queued_total: AtomicU64,
+    queued_total: Budget,
     /// Sessions receiving file data now, which share the rest of it.
     receiving: std::sync::atomic::AtomicUsize,
     /// File data not yet on disk, all sessions together, as each last
-    /// published it (see [`Unwritten`]); held to three quarters of the
-    /// budget.
-    unwritten_total: AtomicU64,
+    /// claimed or published it (see [`Unwritten`]); held to three quarters
+    /// of the budget.
+    unwritten_total: Budget,
     /// Sockets particular peers are answered from.
     #[cfg(feature = "nat-traversal")]
     routes: Arc<crate::nat::birthday::Routes>,
@@ -324,19 +325,55 @@ impl Meetings {
     }
 }
 
-/// Replaces the value of `a` with `f` of it, unless `f` says `None`;
-/// whether it did. What `AtomicU64::fetch_update` does — spelled out,
-/// because newer compilers deprecate that name for one that does not exist
-/// yet at the oldest compiler this crate supports.
-fn update_atomic(a: &AtomicU64, mut f: impl FnMut(u64) -> Option<u64>) -> bool {
-    let mut current = a.load(Ordering::Acquire);
-    while let Some(new) = f(current) {
-        match a.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return true,
-            Err(seen) => current = seen,
+/// Bytes that all sessions together may hold, taken and given back from
+/// any of their threads. What is taken never passes the limit, at any
+/// moment: every change that makes it grow is checked and made in one step
+/// (a check first and a change after would let two sessions pass at once,
+/// each on what the other had not added yet).
+struct Budget {
+    used: sync::AtomicU64,
+    limit: u64,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Self {
+            used: sync::AtomicU64::new(0),
+            limit,
         }
     }
-    false
+
+    /// Takes `bytes`; false, with nothing taken, when that would pass the
+    /// limit.
+    fn take(&self, bytes: u64) -> bool {
+        let limit = self.limit;
+        sync::update_atomic(&self.used, |used| {
+            (used + bytes <= limit).then_some(used + bytes)
+        })
+    }
+
+    fn give(&self, bytes: u64) {
+        sync::update_atomic(&self.used, |used| Some(used.saturating_sub(bytes)));
+    }
+
+    /// One holder's part, `held` until now, made `now`: always when it
+    /// shrinks; when it grows, only if all parts together stay within the
+    /// limit. Whether it was made.
+    fn resize(&self, held: u64, now: u64) -> bool {
+        let limit = self.limit;
+        sync::update_atomic(&self.used, |used| {
+            let others = used.saturating_sub(held);
+            (now <= held || others + now <= limit).then_some(others + now)
+        })
+    }
+
+    fn used(&self) -> u64 {
+        self.used.load(sync::Ordering::Acquire)
+    }
+
+    fn room(&self) -> u64 {
+        self.limit.saturating_sub(self.used())
+    }
 }
 
 impl Shared {
@@ -413,24 +450,13 @@ impl Shared {
         self.socket.try_send(to, datagram)
     }
 
-    fn queue_budget(&self) -> u64 {
-        self.cfg.memory_budget / 4
-    }
-
     /// Takes `bytes` of the queue budget; false when it is spent.
     fn take_queued(&self, bytes: u64) -> bool {
-        let limit = self.queue_budget();
-        update_atomic(&self.queued_total, |used| {
-            (used + bytes <= limit).then_some(used + bytes)
-        })
+        self.queued_total.take(bytes)
     }
 
     fn give_queued(&self, bytes: u64) {
-        update_atomic(&self.queued_total, |used| Some(used.saturating_sub(bytes)));
-    }
-
-    fn unwritten_budget(&self) -> u64 {
-        self.cfg.memory_budget / 4 * 3
+        self.queued_total.give(bytes);
     }
 
     /// What one receiving session may hold of file data not yet written:
@@ -442,13 +468,16 @@ impl Shared {
     }
 }
 
-/// One session's part of [`Shared::unwritten_total`]: what it last said it
-/// holds, taken back out when it ends.
+/// One session's part of [`Shared::unwritten_total`]: what it last claimed
+/// or said it holds, taken back out when it ends.
 ///
 /// Shares alone bound each session to its part of the budget at the moment
 /// it takes data; sessions that start while others are still full would
 /// otherwise add their shares on top. The total is what makes the bound
-/// hold for all of them at every moment.
+/// hold for all of them at every moment — which it does only because data
+/// is taken by claiming room for it in the total, in one step with the
+/// check (it used to be checked, and added when published: two sessions
+/// could each pass on what the other had not published yet).
 struct Unwritten {
     shared: Arc<Shared>,
     published: u64,
@@ -462,16 +491,19 @@ impl Unwritten {
         }
     }
 
-    /// Records that this session now holds `now` bytes not yet on disk.
+    /// Records that this session now holds `now` bytes not yet on disk:
+    /// what it claimed, less what its writer has written since.
     fn publish(&mut self, now: u64) {
         if now >= self.published {
             self.shared
                 .unwritten_total
-                .fetch_add(now - self.published, Ordering::AcqRel);
+                .used
+                .fetch_add(now - self.published, sync::Ordering::AcqRel);
         } else {
             self.shared
                 .unwritten_total
-                .fetch_sub(self.published - now, Ordering::AcqRel);
+                .used
+                .fetch_sub(self.published - now, sync::Ordering::AcqRel);
         }
         self.published = now;
     }
@@ -479,20 +511,17 @@ impl Unwritten {
     /// How much more this session could take before all sessions together
     /// reach the budget.
     fn room(&self) -> u64 {
-        self.shared
-            .unwritten_budget()
-            .saturating_sub(self.shared.unwritten_total.load(Ordering::Acquire))
+        self.shared.unwritten_total.room()
     }
 
-    /// Whether this session may hold `now` bytes, with what everybody else
-    /// holds.
-    fn fits(&self, now: u64) -> bool {
-        let others = self
-            .shared
-            .unwritten_total
-            .load(Ordering::Acquire)
-            .saturating_sub(self.published);
-        others + now <= self.shared.unwritten_budget()
+    /// Makes this session's part `now` bytes, if that fits with what every
+    /// other holds; whether it did.
+    fn claim(&mut self, now: u64) -> bool {
+        let made = self.shared.unwritten_total.resize(self.published, now);
+        if made {
+            self.published = now;
+        }
+        made
     }
 }
 
@@ -594,6 +623,7 @@ impl Receiver {
         let (_aux_tx, aux_rx) = mpsc::channel(1);
         let (cards_tx, cards_rx) = mpsc::unbounded_channel();
         let (addrs_tx, addrs_rx) = mpsc::unbounded_channel();
+        let memory_budget = cfg.memory_budget;
         Ok(Self {
             aux_rx,
             cards_tx,
@@ -609,9 +639,9 @@ impl Receiver {
                 cancel: CancellationToken::new(),
                 identity,
                 declined: parking_lot::Mutex::new(HashMap::new()),
-                queued_total: AtomicU64::new(0),
+                queued_total: Budget::new(memory_budget / 4),
                 receiving: std::sync::atomic::AtomicUsize::new(0),
-                unwritten_total: AtomicU64::new(0),
+                unwritten_total: Budget::new(memory_budget / 4 * 3),
                 #[cfg(feature = "nat-traversal")]
                 routes,
                 #[cfg(feature = "nat-traversal")]
@@ -3705,7 +3735,7 @@ impl Session {
             let holding = writer.queued_bytes() + pieces.bytes + need;
             if writer.available() < pieces.bytes + need
                 || holding > self.shared.write_share()
-                || !self.unwritten.fits(holding)
+                || !self.unwritten.claim(holding)
             {
                 self.writer_full_drops += 1;
                 return false;
@@ -3729,7 +3759,7 @@ impl Session {
                 .min(self.shared.write_share());
             if tree.early_bytes + need > cap
                 || tree.early.len() + missing.len() > EARLY_MAX_ITEMS
-                || !self.unwritten.fits(tree.early_bytes + need)
+                || !self.unwritten.claim(tree.early_bytes + need)
             {
                 self.writer_full_drops += 1;
                 return false;
@@ -4305,5 +4335,75 @@ mod tests {
         assert!(elsewhere.is_cancelled());
         let _ = m.add(sa("192.0.2.1:1"), None, &CancellationToken::new());
         assert_eq!(m.0.lock().len(), 1);
+    }
+}
+
+/// The receiver's memory budget, taken and given back by sessions on
+/// several threads at once (`scripts/loom.sh`).
+#[cfg(all(test, sharp_loom))]
+mod loom_models {
+    use super::Budget;
+    use loom::sync::Arc;
+
+    /// Two sessions each wanting 60 of 100 at once: in no interleaving do
+    /// both get it (checking first and adding after, as the unwritten data
+    /// once was, lets both).
+    #[test]
+    fn loom_two_sessions_never_claim_past_the_budget() {
+        loom::model(|| {
+            let budget = Arc::new(Budget::new(100));
+            let other = {
+                let budget = budget.clone();
+                loom::thread::spawn(move || budget.resize(0, 60))
+            };
+            let mine = budget.resize(0, 60);
+            let theirs = other.join().unwrap();
+            assert!(!(mine && theirs), "both took 60 of 100");
+            assert_eq!(budget.used(), 60 * (u64::from(mine) + u64::from(theirs)));
+        });
+    }
+
+    /// One session shrinks its part while another grows into the room:
+    /// the growth is made only if it fits with what is held at that
+    /// moment, and the total is always what the parts are.
+    #[test]
+    fn loom_a_part_that_shrinks_makes_room() {
+        loom::model(|| {
+            let budget = Arc::new(Budget::new(100));
+            assert!(budget.resize(0, 80));
+            let shrink = {
+                let budget = budget.clone();
+                loom::thread::spawn(move || budget.resize(80, 10))
+            };
+            let grown = budget.resize(0, 50);
+            assert!(shrink.join().unwrap());
+            assert_eq!(budget.used(), 10 + if grown { 50 } else { 0 });
+        });
+    }
+
+    /// The queue budget taken and given back on two threads: never more
+    /// than the limit taken, and all of it back at the end.
+    #[test]
+    fn loom_the_queue_budget_is_taken_and_given_back() {
+        loom::model(|| {
+            let budget = Arc::new(Budget::new(100));
+            let other = {
+                let budget = budget.clone();
+                loom::thread::spawn(move || {
+                    let took = budget.take(70);
+                    if took {
+                        budget.give(70);
+                    }
+                    took
+                })
+            };
+            let took = budget.take(70);
+            assert!(budget.used() <= 100);
+            if took {
+                budget.give(70);
+            }
+            other.join().unwrap();
+            assert_eq!(budget.used(), 0);
+        });
     }
 }

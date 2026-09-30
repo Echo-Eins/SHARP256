@@ -26,12 +26,12 @@ use crate::crypto::identity::{Identity, SharpId, KEY_LEN};
 use crate::crypto::noise;
 use crate::crypto::transport::CID_LEN;
 use crate::crypto::{derive_secret, keyed_mac, CryptoError, SecretKey};
+use crate::sync::{AtomicU64, Ordering};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -127,8 +127,52 @@ fn random_cid() -> u64 {
     }
 }
 
+/// Initiation timestamps: each above every one handed out before by this
+/// process, whichever threads ask at once and whatever floor is raised
+/// meanwhile (the order of changes to one atomic is total, so no ordering
+/// stronger than Relaxed is needed; the loom model checks it).
+struct Clock {
+    last: AtomicU64,
+}
+
+impl Clock {
+    /// `now`, or just above the newest handed out if that is not below it.
+    fn next(&self, now: u64) -> u64 {
+        use Ordering::Relaxed;
+        let mut prev = self.last.load(Relaxed);
+        loop {
+            let next = now.max(prev + 1);
+            match self
+                .last
+                .compare_exchange_weak(prev, next, Relaxed, Relaxed)
+            {
+                Ok(_) => return next,
+                Err(p) => prev = p,
+            }
+        }
+    }
+
+    fn last(&self) -> u64 {
+        self.last.load(Ordering::Relaxed)
+    }
+
+    fn raise(&self, floor: u64) {
+        self.last.fetch_max(floor, Ordering::Relaxed);
+    }
+}
+
 /// The newest initiation timestamp handed out by this process.
-static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(all(test, sharp_loom)))]
+static CLOCK: Clock = Clock {
+    last: AtomicU64::new(0),
+};
+
+// loom's atomics cannot be made in a constant; this one is made afresh in
+// each run of a model.
+#[cfg(all(test, sharp_loom))]
+loom::lazy_static! {
+    static ref CLOCK: Clock = Clock { last: AtomicU64::new(0) };
+}
 
 /// Strictly increasing wall-clock timestamp (nanoseconds since the Unix
 /// epoch) carried in initiations: a receiver accepts an initiation from a
@@ -139,21 +183,13 @@ pub fn initiation_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut prev = LAST_TIMESTAMP.load(Ordering::Relaxed);
-    loop {
-        let next = now.max(prev + 1);
-        match LAST_TIMESTAMP.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
-        {
-            Ok(_) => return next,
-            Err(p) => prev = p,
-        }
-    }
+    CLOCK.next(now)
 }
 
 /// The newest timestamp [`initiation_timestamp`] has handed out, for saving
 /// across restarts.
 pub fn last_initiation_timestamp() -> u64 {
-    LAST_TIMESTAMP.load(Ordering::Relaxed)
+    CLOCK.last()
 }
 
 /// Never hand out a timestamp at or below `floor` — the newest one a
@@ -162,7 +198,7 @@ pub fn last_initiation_timestamp() -> u64 {
 /// sender whose clock was set back since then would otherwise be refused
 /// without a word until the clock caught up again.
 pub fn raise_initiation_timestamp_floor(floor: u64) {
-    LAST_TIMESTAMP.fetch_max(floor, Ordering::Relaxed);
+    CLOCK.raise(floor);
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,5 +1414,40 @@ mod tests {
             .iter()
             .all(|f| !jar.mac2_ok(f, addr("203.0.113.9:5001"), now)));
         assert!(frags.iter().all(|f| responder.fragment(f).is_some()));
+    }
+}
+
+/// Initiation timestamps asked for on two threads at once, with the floor
+/// raised on a third: in every interleaving loom makes, each is new, each
+/// thread's rise, and the newest is above all of them and the floor
+/// (`scripts/loom.sh`).
+#[cfg(all(test, sharp_loom))]
+mod loom_models {
+    use super::{AtomicU64, Clock};
+    use loom::sync::Arc;
+
+    #[test]
+    fn loom_timestamps_are_unique_and_rise() {
+        loom::model(|| {
+            let clock = Arc::new(Clock {
+                last: AtomicU64::new(0),
+            });
+            let other = {
+                let clock = clock.clone();
+                loom::thread::spawn(move || [clock.next(100), clock.next(100)])
+            };
+            let floor = {
+                let clock = clock.clone();
+                loom::thread::spawn(move || clock.raise(500))
+            };
+            let mine = [clock.next(50), clock.next(1000)];
+            let theirs = other.join().unwrap();
+            floor.join().unwrap();
+            assert!(mine[0] < mine[1] && theirs[0] < theirs[1]);
+            let mut all = [mine[0], mine[1], theirs[0], theirs[1]];
+            all.sort_unstable();
+            assert!(all.windows(2).all(|w| w[0] < w[1]), "{:?}", all);
+            assert_eq!(clock.last(), all[3].max(500));
+        });
     }
 }

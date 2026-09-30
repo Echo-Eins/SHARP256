@@ -10,6 +10,7 @@ pub mod file;
 pub mod progress;
 pub mod protocol;
 pub mod state;
+mod sync;
 pub mod transport;
 
 #[cfg(feature = "nat-traversal")]

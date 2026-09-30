@@ -114,6 +114,11 @@ blake2 = "0.10"
 ml-kem = { version = "0.2.1", default-features = false, features = ["zeroize", "deterministic"] }
 sha3 = "0.10"
 
+# Model checking of the synchronisations that hold invariants (scripts/loom.sh):
+# only in builds with --cfg sharp_loom.
+[target.'cfg(sharp_loom)'.dev-dependencies]
+loom = "0.7"
+
 [features]
 default = ["gui", "nat-traversal"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "tracing-subscriber/tracing-log"]
@@ -148,13 +153,14 @@ lto = true
 codegen-units = 1
 strip = true
 
-# `cargo fuzz` builds with --cfg fuzzing (see fuzz/).
+# `cargo fuzz` builds with --cfg fuzzing (see fuzz/), scripts/loom.sh with
+# --cfg sharp_loom.
 #
 # Unsafe code only where it is allowed by name (`#[allow(unsafe_code)]`, all
 # of it calls into the system; docs/UNSAFE.md lists each), every block with
 # the reason it is sound, and one operation to a block.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(sharp_loom)'] }
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
