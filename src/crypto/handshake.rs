@@ -41,6 +41,41 @@ pub use crate::crypto::noise::{Split, PROTOCOL_NAME as NOISE_PARAMS};
 /// Bound into the handshake transcript: a peer speaking another version of
 /// the protocol cannot complete a handshake by accident.
 pub const PROLOGUE: &[u8] = b"SHARP-256 v3";
+/// The same for version 4.
+pub const PROLOGUE_V4: &[u8] = b"SHARP-256 v4";
+
+/// The handshake a peer speaks.
+///
+/// * Version 3: `Noise_IKpsk2`, the HELLO inside message 1.
+/// * Version 4: `Noise_IKpsk2+hfs` with ML-KEM-768 (the session keys depend
+///   on X25519 and ML-KEM alike). Message 1 is too long for one datagram
+///   and travels in fragments, each with its own `mac1` and `mac2`; message
+///   2 carries no HELLO_ACK and no clear copy of the receiver's connection
+///   id, and fits one. The HELLO goes after the handshake, under its keys:
+///   it has forward secrecy, and a thief of the receiver's key can no
+///   longer write one in anybody's name (see the receiver).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Version {
+    V3,
+    V4,
+}
+
+/// A version 4 fragment's own bytes: the sender's connection id, the
+/// fragment byte (index in the high nibble, count in the low one), `mac1`
+/// and `mac2`.
+pub const FRAGMENT_OVERHEAD: usize = CID_LEN + 1 + 2 * MAC_LEN;
+/// Most fragments one initiation is cut into.
+pub const MAX_FRAGMENTS: usize = 4;
+/// The most of the Noise message one fragment carries: every fragment fits
+/// a control datagram.
+pub const FRAGMENT_CHUNK: usize =
+    crate::protocol::constants::MAX_CONTROL_DATAGRAM - FRAGMENT_OVERHEAD;
+/// A version 4 initiation's bytes without payload: the Noise message (with
+/// the sealed connection id), and each fragment's own.
+pub const INITIATION_OVERHEAD_V4: usize = CID_LEN + noise::HFS_INITIATION_LEN;
+/// A version 4 response without payload: the sender's connection id in the
+/// clear, the Noise message with the receiver's sealed inside, `mac1`.
+pub const RESPONSE_OVERHEAD_V4: usize = 2 * CID_LEN + noise::HFS_RESPONSE_LEN + MAC_LEN;
 pub const MAC_LEN: usize = 16;
 const AEAD_TAG: usize = 16;
 /// Initiation size without payload. The sender's connection id is in it
@@ -56,6 +91,12 @@ pub const COOKIE_LIFETIME: Duration = Duration::from_secs(120);
 
 fn mac1_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v3 mac1", public)
+}
+
+/// Version 4's `mac1` key: a receiver of either version tells the two apart
+/// by it, and one of version 3 hears nothing it knows in a fragment.
+fn mac1_key_v4(public: &[u8; KEY_LEN]) -> [u8; 32] {
+    blake3::derive_key("sharp256 v4 mac1", public)
 }
 
 fn cookie_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
@@ -132,11 +173,14 @@ pub fn raise_initiation_timestamp_floor(floor: u64) {
 /// new ephemeral key and connection id.
 pub struct Initiator {
     noise: noise::Initiator,
+    version: Version,
     cid: u64,
     receiver_mac1_key: [u8; 32],
     receiver_cookie_key: [u8; 32],
     own_mac1_key: [u8; 32],
-    last_mac1: [u8; MAC_LEN],
+    /// The mac1 of each datagram of the latest initiation: a cookie reply
+    /// is sealed to one of them.
+    last_mac1: Vec<[u8; MAC_LEN]>,
 }
 
 impl Initiator {
@@ -153,12 +197,33 @@ impl Initiator {
         }
         Ok(Self {
             noise: noise::Initiator::new(identity, receiver.as_bytes(), psk, PROLOGUE),
+            version: Version::V3,
             cid: random_cid(),
             receiver_mac1_key: mac1_key(receiver.as_bytes()),
             receiver_cookie_key: cookie_key(receiver.as_bytes()),
             own_mac1_key: mac1_key(identity.public()),
-            last_mac1: [0; MAC_LEN],
+            last_mac1: Vec::new(),
         })
+    }
+
+    /// An attempt at a version 4 handshake.
+    pub fn new_v4(
+        identity: &Identity,
+        receiver: &SharpId,
+        psk: &SecretKey,
+    ) -> Result<Self, CryptoError> {
+        let v3 = Self::new(identity, receiver, psk)?;
+        Ok(Self {
+            noise: noise::Initiator::new_hybrid(identity, receiver.as_bytes(), psk, PROLOGUE_V4),
+            version: Version::V4,
+            receiver_mac1_key: mac1_key_v4(receiver.as_bytes()),
+            own_mac1_key: mac1_key_v4(identity.public()),
+            ..v3
+        })
+    }
+
+    pub fn version(&self) -> Version {
+        self.version
     }
 
     /// The sender's connection id for this attempt: responses and transport
@@ -173,13 +238,67 @@ impl Initiator {
         self.noise.is_finished()
     }
 
-    /// Builds the initiation datagram. `cookie` is the latest cookie received
-    /// from this receiver, if any.
+    /// The datagrams of the initiation: one in version 3, the fragments of
+    /// it in version 4. `cookie` is the latest cookie received from this
+    /// receiver, if any.
+    pub fn initiation_datagrams(
+        &mut self,
+        payload: &[u8],
+        cookie: Option<&[u8; MAC_LEN]>,
+    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+        match self.version {
+            Version::V3 => Ok(vec![self.initiation(payload, cookie)?]),
+            Version::V4 => self.fragments(payload, cookie),
+        }
+    }
+
+    /// Version 4: the Noise message, cut into fragments of about equal
+    /// size, each of them `cid | index·count | chunk | mac1 | mac2`.
+    fn fragments(
+        &mut self,
+        payload: &[u8],
+        cookie: Option<&[u8; MAC_LEN]>,
+    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+        let sealed = [&self.cid.to_be_bytes()[..], payload].concat();
+        let msg = self.noise.write_initiation(&sealed)?;
+        let count = msg.len().div_ceil(FRAGMENT_CHUNK);
+        if count > MAX_FRAGMENTS {
+            return Err(CryptoError::Handshake("initiation too long".into()));
+        }
+        let per = msg.len().div_ceil(count);
+        self.last_mac1.clear();
+        let mut out = Vec::with_capacity(count);
+        for (i, chunk) in msg.chunks(per).enumerate() {
+            let mut d = Vec::with_capacity(FRAGMENT_OVERHEAD + chunk.len());
+            d.extend_from_slice(&self.cid.to_be_bytes());
+            d.push(((i as u8) << 4) | count as u8);
+            d.extend_from_slice(chunk);
+            let end = d.len();
+            d.resize(end + 2 * MAC_LEN, 0);
+            let m1 = mac(&self.receiver_mac1_key, &d[..end]);
+            d[end..end + MAC_LEN].copy_from_slice(&m1);
+            self.last_mac1.push(m1);
+            if let Some(cookie) = cookie {
+                let m2: [u8; MAC_LEN] = keyed_mac(&mac2_key(cookie), &[&d[..end + MAC_LEN]]);
+                d[end + MAC_LEN..].copy_from_slice(&m2);
+            }
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    /// Builds the initiation datagram (version 3). `cookie` is the latest
+    /// cookie received from this receiver, if any.
     pub fn initiation(
         &mut self,
         payload: &[u8],
         cookie: Option<&[u8; MAC_LEN]>,
     ) -> Result<Vec<u8>, CryptoError> {
+        if self.version != Version::V3 {
+            return Err(CryptoError::Handshake(
+                "a version 4 initiation is fragments".into(),
+            ));
+        }
         let sealed = [&self.cid.to_be_bytes()[..], payload].concat();
         let msg = self.noise.write_initiation(&sealed)?;
         let mut out = Vec::with_capacity(INITIATION_OVERHEAD + payload.len());
@@ -187,8 +306,9 @@ impl Initiator {
         out.extend_from_slice(&msg);
         let end = out.len();
         out.resize(end + 2 * MAC_LEN, 0);
-        self.last_mac1 = mac(&self.receiver_mac1_key, &out[..end]);
-        out[end..end + MAC_LEN].copy_from_slice(&self.last_mac1);
+        let m1 = mac(&self.receiver_mac1_key, &out[..end]);
+        self.last_mac1 = vec![m1];
+        out[end..end + MAC_LEN].copy_from_slice(&m1);
         if let Some(cookie) = cookie {
             let m2: [u8; MAC_LEN] = keyed_mac(&mac2_key(cookie), &[&out[..end + MAC_LEN]]);
             out[end + MAC_LEN..].copy_from_slice(&m2);
@@ -202,13 +322,16 @@ impl Initiator {
             return None;
         }
         let nonce = &pkt[CID_LEN..CID_LEN + 24];
-        let mut cookie = [0u8; MAC_LEN];
-        cookie.copy_from_slice(&pkt[CID_LEN + 24..CID_LEN + 40]);
         let tag = &pkt[CID_LEN + 40..];
-        XChaCha20Poly1305::new((&self.receiver_cookie_key).into())
-            .decrypt_in_place_detached(nonce.into(), &self.last_mac1, &mut cookie, tag.into())
-            .ok()?;
-        Some(cookie)
+        // Sealed to the mac1 of the datagram it answers: any of ours.
+        self.last_mac1.iter().find_map(|m1| {
+            let mut cookie = [0u8; MAC_LEN];
+            cookie.copy_from_slice(&pkt[CID_LEN + 24..CID_LEN + 40]);
+            XChaCha20Poly1305::new((&self.receiver_cookie_key).into())
+                .decrypt_in_place_detached(nonce.into(), m1, &mut cookie, tag.into())
+                .ok()
+                .map(|()| cookie)
+        })
     }
 
     /// Completes the handshake with the receiver's response. Returns the
@@ -227,17 +350,26 @@ impl Initiator {
             return Err(CryptoError::Malformed);
         }
         let n = pkt.len();
-        if n < RESPONSE_OVERHEAD || pkt[..CID_LEN] != self.cid.to_be_bytes() {
+        // Version 3: sender cid | receiver cid | Noise | mac1 | mac2 (zero);
+        // version 4: sender cid | Noise | mac1.
+        let (least, noise_at, body_end) = match self.version {
+            Version::V3 => (
+                RESPONSE_OVERHEAD,
+                2 * CID_LEN,
+                n.saturating_sub(2 * MAC_LEN),
+            ),
+            Version::V4 => (RESPONSE_OVERHEAD_V4, CID_LEN, n.saturating_sub(MAC_LEN)),
+        };
+        if n < least || pkt[..CID_LEN] != self.cid.to_be_bytes() {
             return Err(CryptoError::Malformed);
         }
-        let body_end = n - 2 * MAC_LEN;
         if !ct_eq(
             &mac(&self.own_mac1_key, &pkt[..body_end]),
             &pkt[body_end..body_end + MAC_LEN],
         ) {
             return Err(CryptoError::Mac);
         }
-        let mut payload = self.noise.read_response(&pkt[2 * CID_LEN..body_end])?;
+        let mut payload = self.noise.read_response(&pkt[noise_at..body_end])?;
         // The receiver's connection id is taken from inside, where it is
         // sealed, never from the clear copy: that one is covered only by a
         // mac1 anyone who knows our public key can make, so a copy of the
@@ -268,24 +400,73 @@ pub struct Responder {
     identity: Identity,
     psk: SecretKey,
     mac1_key: [u8; 32],
+    mac1_key_v4: [u8; 32],
 }
 
 /// An authenticated initiation waiting for the receiver's answer.
 pub struct Incoming {
     noise: noise::Responder,
+    pub version: Version,
     pub sender_cid: u64,
     pub sender: SharpId,
     pub payload: Vec<u8>,
 }
 
+/// A version 4 fragment whose `mac1` is ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fragment {
+    pub sender_cid: u64,
+    pub index: usize,
+    pub count: usize,
+}
+
 impl Responder {
     pub fn new(identity: Identity, psk: SecretKey) -> Self {
         let mac1_key = mac1_key(identity.public());
+        let mac1_key_v4 = mac1_key_v4(identity.public());
         Self {
             identity,
             psk,
             mac1_key,
+            mac1_key_v4,
         }
+    }
+
+    /// The same check for a version 4 fragment: whether it is one, made by
+    /// someone who knows our ID, and where it goes.
+    pub fn fragment(&self, pkt: &[u8]) -> Option<Fragment> {
+        let n = pkt.len();
+        if n <= FRAGMENT_OVERHEAD {
+            return None;
+        }
+        let body_end = n - 2 * MAC_LEN;
+        if !ct_eq(
+            &mac(&self.mac1_key_v4, &pkt[..body_end]),
+            &pkt[body_end..body_end + MAC_LEN],
+        ) {
+            return None;
+        }
+        let byte = pkt[CID_LEN];
+        let (index, count) = ((byte >> 4) as usize, (byte & 0x0f) as usize);
+        if count == 0 || count > MAX_FRAGMENTS || index >= count {
+            return None;
+        }
+        Some(Fragment {
+            sender_cid: u64::from_be_bytes(pkt[..CID_LEN].try_into().unwrap()),
+            index,
+            count,
+        })
+    }
+
+    /// Reads a version 4 initiation put together from its fragments: the
+    /// sender's connection id and the Noise message.
+    pub fn read_initiation_v4(&self, sender_cid: u64, msg: &[u8]) -> Result<Incoming, CryptoError> {
+        if sender_cid == 0 {
+            return Err(CryptoError::Malformed);
+        }
+        let read =
+            noise::Responder::read_hybrid_initiation(&self.identity, &self.psk, PROLOGUE_V4, msg)?;
+        self.incoming(Version::V4, sender_cid, read)
     }
 
     pub fn id(&self) -> SharpId {
@@ -325,6 +506,15 @@ impl Responder {
             PROLOGUE,
             &pkt[CID_LEN..n - 2 * MAC_LEN],
         )?;
+        self.incoming(Version::V3, sender_cid, read)
+    }
+
+    fn incoming(
+        &self,
+        version: Version,
+        sender_cid: u64,
+        read: noise::Initiation,
+    ) -> Result<Incoming, CryptoError> {
         let mut payload = read.payload;
         // The connection id in the clear is covered by nothing but mac1,
         // whose key anyone can work out from our public key, so a copy of
@@ -332,7 +522,7 @@ impl Responder {
         // then go to a connection the sender does not have. The sealed copy
         // is the sender's; a packet where the two differ was altered on the
         // way, and is refused before it counts for anything.
-        if payload.len() < CID_LEN || payload[..CID_LEN] != pkt[..CID_LEN] {
+        if payload.len() < CID_LEN || payload[..CID_LEN] != sender_cid.to_be_bytes() {
             return Err(CryptoError::Malformed);
         }
         payload.drain(..CID_LEN);
@@ -345,6 +535,7 @@ impl Responder {
         }
         Ok(Incoming {
             noise: read.responder,
+            version,
             sender_cid,
             sender,
             payload: payload.to_vec(),
@@ -361,15 +552,157 @@ impl Incoming {
     ) -> Result<(Vec<u8>, Split), CryptoError> {
         let sealed = [&receiver_cid.to_be_bytes()[..], payload].concat();
         let (msg, split) = self.noise.write_response(&sealed)?;
-        let mut out = Vec::with_capacity(RESPONSE_OVERHEAD + payload.len());
+        let mut out = Vec::with_capacity(RESPONSE_OVERHEAD_V4 + payload.len());
         out.extend_from_slice(&self.sender_cid.to_be_bytes());
-        out.extend_from_slice(&receiver_cid.to_be_bytes());
-        out.extend_from_slice(&msg);
-        let end = out.len();
-        out.resize(end + 2 * MAC_LEN, 0);
-        let m1 = mac(&mac1_key(self.sender.as_bytes()), &out[..end]);
-        out[end..end + MAC_LEN].copy_from_slice(&m1);
+        match self.version {
+            Version::V3 => {
+                out.extend_from_slice(&receiver_cid.to_be_bytes());
+                out.extend_from_slice(&msg);
+                let end = out.len();
+                out.resize(end + 2 * MAC_LEN, 0);
+                let m1 = mac(&mac1_key(self.sender.as_bytes()), &out[..end]);
+                out[end..end + MAC_LEN].copy_from_slice(&m1);
+            }
+            // No clear copy of the receiver's id (only the sealed one ever
+            // counted) and no mac2 (always zero in an answer): what keeps
+            // the answer within one control datagram.
+            Version::V4 => {
+                out.extend_from_slice(&msg);
+                let m1 = mac(&mac1_key_v4(self.sender.as_bytes()), &out);
+                out.extend_from_slice(&m1);
+            }
+        }
         Ok((out, split))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fragments (version 4)
+// ---------------------------------------------------------------------------
+
+/// Version 4 initiations being put together from their fragments.
+///
+/// Only a fragment whose `mac1` is ours comes here — made by someone who
+/// knows our ID — and what it may make us hold is bounded: a few initiations
+/// per client (an IPv4 address or an IPv6 /64, as the handshake limiter
+/// counts), a table of [`Fragments::CAPACITY`], each for
+/// [`Fragments::PATIENCE`], the oldest going first when the table is full.
+/// Nothing is answered until every fragment is in.
+#[derive(Default)]
+pub struct Fragments {
+    partial: HashMap<(SocketAddr, u64), Partial>,
+}
+
+struct Partial {
+    chunks: [Option<Vec<u8>>; MAX_FRAGMENTS],
+    count: usize,
+    /// Bytes of the datagrams taken, fragments' own included: what the
+    /// address has sent, and what may be sent back to it.
+    bytes: usize,
+    first: Instant,
+}
+
+/// An initiation put together: the sender's connection id, the Noise
+/// message, and the bytes of all its datagrams.
+pub struct Assembled {
+    pub sender_cid: u64,
+    pub msg: Vec<u8>,
+    pub len: usize,
+}
+
+impl Fragments {
+    /// Initiations being put together at once.
+    pub const CAPACITY: usize = 1024;
+    /// Of them, from one client.
+    pub const PER_CLIENT: usize = 8;
+    /// How long the fragments of one are waited for.
+    pub const PATIENCE: Duration = Duration::from_secs(2);
+
+    /// Takes the fragment `f` (checked by [`Responder::fragment`]) of the
+    /// datagram `pkt` from `from`; the whole initiation when it was the
+    /// last one missing.
+    pub fn add(
+        &mut self,
+        pkt: &[u8],
+        f: Fragment,
+        from: SocketAddr,
+        now: Instant,
+    ) -> Option<Assembled> {
+        self.partial
+            .retain(|_, p| now.saturating_duration_since(p.first) < Self::PATIENCE);
+        let key = (from, f.sender_cid);
+        if !self.partial.contains_key(&key) {
+            let client = client_key(from);
+            let mine = self
+                .partial
+                .keys()
+                .filter(|(a, _)| client_key(*a) == client)
+                .count();
+            if mine >= Self::PER_CLIENT {
+                return None;
+            }
+            if self.partial.len() >= Self::CAPACITY {
+                let oldest = self
+                    .partial
+                    .iter()
+                    .min_by_key(|(_, p)| p.first)
+                    .map(|(k, _)| *k)?;
+                self.partial.remove(&oldest);
+            }
+            self.partial.insert(
+                key,
+                Partial {
+                    chunks: Default::default(),
+                    count: f.count,
+                    bytes: 0,
+                    first: now,
+                },
+            );
+        }
+        let p = self.partial.get_mut(&key).expect("just made");
+        // A fragment that disagrees on how many there are is not one of
+        // these; one already here is not taken twice.
+        if p.count != f.count || p.chunks[f.index].is_some() {
+            return None;
+        }
+        p.chunks[f.index] = Some(pkt[CID_LEN + 1..pkt.len() - 2 * MAC_LEN].to_vec());
+        p.bytes += pkt.len();
+        if p.chunks[..p.count].iter().any(Option::is_none) {
+            return None;
+        }
+        let p = self.partial.remove(&key).expect("present");
+        let msg = p.chunks[..p.count]
+            .iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .collect();
+        Some(Assembled {
+            sender_cid: f.sender_cid,
+            msg,
+            len: p.bytes,
+        })
+    }
+
+    /// Initiations being put together.
+    pub fn len(&self) -> usize {
+        self.partial.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.partial.is_empty()
+    }
+}
+
+/// An IPv4 address or an IPv6 /64: one subscriber, as far as limits go.
+fn client_key(addr: SocketAddr) -> IpAddr {
+    match crate::address::canonical(addr).ip() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[8..].fill(0);
+            IpAddr::V6(o.into())
+        }
     }
 }
 
@@ -873,5 +1206,189 @@ mod tests {
             l.allow(SocketAddr::new(ip.into(), 9), now);
         }
         assert!(l.per_ip.len() <= MAX_LIMITED_CLIENTS);
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// A version 4 handshake: the initiation in fragments that each fit a
+    /// control datagram, put together in any order; the answer in one
+    /// datagram, no longer than the fragments together; the same keys on
+    /// both sides.
+    #[test]
+    fn a_version_4_handshake_goes_in_fragments_and_agrees() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), psk());
+        let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+        assert_eq!(init.version(), Version::V4);
+        let frags = init.initiation_datagrams(b"hello", None).unwrap();
+        assert_eq!(frags.len(), 2);
+        for f in &frags {
+            assert!(
+                f.len() <= crate::protocol::constants::MAX_CONTROL_DATAGRAM,
+                "{}",
+                f.len()
+            );
+            assert!(
+                !responder.is_initiation(f),
+                "a version 3 receiver hears nothing it knows"
+            );
+        }
+        let total: usize = frags.iter().map(Vec::len).sum();
+        assert_eq!(total, INITIATION_OVERHEAD_V4 + 5 + 2 * FRAGMENT_OVERHEAD);
+        let (from, now) = (addr("198.51.100.7:4000"), Instant::now());
+        let mut table = Fragments::default();
+        let second = responder.fragment(&frags[1]).unwrap();
+        assert!(table.add(&frags[1], second, from, now).is_none());
+        // The same fragment again changes nothing.
+        assert!(table.add(&frags[1], second, from, now).is_none());
+        let first = responder.fragment(&frags[0]).unwrap();
+        let whole = table.add(&frags[0], first, from, now).expect("complete");
+        assert!(table.is_empty());
+        assert_eq!(whole.len, total);
+        assert_eq!(whole.sender_cid, init.cid());
+        let incoming = responder
+            .read_initiation_v4(whole.sender_cid, &whole.msg)
+            .unwrap();
+        assert_eq!((incoming.version, incoming.sender), (Version::V4, s.id()));
+        assert_eq!(incoming.payload, b"hello");
+        let (resp, rsplit) = incoming.respond(77, b"ok").unwrap();
+        assert_eq!(resp.len(), RESPONSE_OVERHEAD_V4 + 2);
+        assert!(resp.len() <= crate::protocol::constants::MAX_CONTROL_DATAGRAM);
+        assert!(resp.len() <= whole.len, "no more back than came in");
+        let (rcid, payload, isplit) = init.read_response(&resp).unwrap();
+        assert_eq!((rcid, payload.as_slice()), (77, &b"ok"[..]));
+        assert_eq!(
+            *isplit.initiator_to_responder,
+            *rsplit.initiator_to_responder
+        );
+        assert_eq!(
+            *isplit.responder_to_initiator,
+            *rsplit.responder_to_initiator
+        );
+
+        // A version 3 initiation is not a fragment.
+        let mut old = Initiator::new(&s, &r.id(), &psk()).unwrap();
+        let v3 = old.initiation(b"hello", None).unwrap();
+        assert!(responder.fragment(&v3).is_none());
+        let mut fresh = Initiator::new(&s, &r.id(), &psk()).unwrap();
+        assert_eq!(fresh.initiation_datagrams(b"x", None).unwrap().len(), 1);
+    }
+
+    /// A fragment altered anywhere is not ours (its mac1 fails); one whose
+    /// mac1 the alterer made anew — anyone who knows our ID can — is put
+    /// together and then fails in Noise. Fragments that disagree on their
+    /// count are not put together.
+    #[test]
+    fn altered_fragments_come_to_nothing() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), psk());
+        let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+        let frags = init.initiation_datagrams(b"hello", None).unwrap();
+        for i in (0..frags[0].len()).step_by(41) {
+            let mut bad = frags[0].clone();
+            bad[i] ^= 0x04;
+            assert!(responder.fragment(&bad).is_none(), "byte {}", i);
+        }
+        let (from, now) = (addr("198.51.100.7:4000"), Instant::now());
+        let mut rewritten = frags[0].clone();
+        rewritten[40] ^= 0x04;
+        let end = rewritten.len() - 2 * MAC_LEN;
+        let m1 = mac(&mac1_key_v4(r.public()), &rewritten[..end]);
+        rewritten[end..end + MAC_LEN].copy_from_slice(&m1);
+        let mut table = Fragments::default();
+        let f = responder.fragment(&rewritten).unwrap();
+        assert!(table.add(&rewritten, f, from, now).is_none());
+        let f = responder.fragment(&frags[1]).unwrap();
+        let whole = table.add(&frags[1], f, from, now).unwrap();
+        assert!(responder
+            .read_initiation_v4(whole.sender_cid, &whole.msg)
+            .is_err());
+
+        // A count that is not the other fragment's.
+        let mut table = Fragments::default();
+        let f = responder.fragment(&frags[0]).unwrap();
+        assert!(table.add(&frags[0], f, from, now).is_none());
+        let odd = Fragment {
+            count: 3,
+            ..responder.fragment(&frags[1]).unwrap()
+        };
+        assert!(table.add(&frags[1], odd, from, now).is_none());
+    }
+
+    /// What fragments may make a receiver hold is bounded: a few
+    /// initiations per client, the table as a whole, and a while each.
+    #[test]
+    fn fragments_waiting_are_bounded() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), psk());
+        let now = Instant::now();
+        let mut table = Fragments::default();
+        let first_of = |init: &mut Initiator| {
+            let frags = init.initiation_datagrams(b"x", None).unwrap();
+            let f = responder.fragment(&frags[0]).unwrap();
+            (frags[0].clone(), f)
+        };
+        // One client, from ports of its own: no more than its share.
+        for port in 0..20u16 {
+            let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+            let (pkt, f) = first_of(&mut init);
+            table.add(&pkt, f, addr(&format!("198.51.100.7:{}", 4000 + port)), now);
+        }
+        assert_eq!(table.len(), Fragments::PER_CLIENT);
+        // An IPv6 /64 is one client too.
+        for host in 1..20u16 {
+            let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+            let (pkt, f) = first_of(&mut init);
+            table.add(
+                &pkt,
+                f,
+                addr(&format!("[2001:db8:1:2::{:x}]:4000", host)),
+                now,
+            );
+        }
+        assert_eq!(table.len(), 2 * Fragments::PER_CLIENT);
+        // Many clients: the table stays at its size.
+        for i in 0..(Fragments::CAPACITY + 100) {
+            let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+            let (pkt, f) = first_of(&mut init);
+            let a = addr(&format!("10.{}.{}.1:4000", i / 256, i % 256));
+            table.add(&pkt, f, a, now);
+        }
+        assert_eq!(table.len(), Fragments::CAPACITY);
+        // And nothing waits longer than it may.
+        let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+        let (pkt, f) = first_of(&mut init);
+        table.add(&pkt, f, addr("192.0.2.1:1"), now + Fragments::PATIENCE);
+        assert_eq!(table.len(), 1);
+    }
+
+    /// Under load every fragment needs a mac2, and a cookie reply to any
+    /// fragment gives the cookie that makes them.
+    #[test]
+    fn a_cookie_proves_the_address_of_every_fragment() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), psk());
+        let mut jar = CookieJar::new(&r.id());
+        let (from, now) = (addr("203.0.113.9:5000"), Instant::now());
+        let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+        let frags = init.initiation_datagrams(b"x", None).unwrap();
+        assert!(frags.iter().all(|f| !jar.mac2_ok(f, from, now)));
+        let reply = jar.reply(&frags[1], from, now).unwrap();
+        assert!(reply.len() <= frags[1].len());
+        let cookie = init
+            .read_cookie_reply(&reply)
+            .expect("a reply to one of ours");
+        let again = init.initiation_datagrams(b"x", Some(&cookie));
+        // One message 1 per attempt: the retry is a new attempt.
+        assert!(again.is_err());
+        let mut retry = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+        let frags = retry.initiation_datagrams(b"x", Some(&cookie)).unwrap();
+        assert!(frags.iter().all(|f| jar.mac2_ok(f, from, now)));
+        assert!(frags
+            .iter()
+            .all(|f| !jar.mac2_ok(f, addr("203.0.113.9:5001"), now)));
+        assert!(frags.iter().all(|f| responder.fragment(f).is_some()));
     }
 }
