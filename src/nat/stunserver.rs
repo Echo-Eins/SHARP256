@@ -21,7 +21,11 @@
 //! an address it does not own; send the answer anywhere but to the source
 //! IP of the request (RESPONSE-PORT only changes the port, so a forged
 //! source cannot aim it at a third party any more than the request could);
-//! answer one client faster than a token bucket allows.
+//! send an answer longer than the request (a forged source gets back no
+//! more than it sent: SHARP-256's clients pad their requests to
+//! [`stun::REQUEST_LEN`], and a bare 20-byte request, which would draw
+//! 56 or 92 bytes, gets nothing); answer one client faster than a token
+//! bucket allows.
 
 use super::stun;
 use crate::relay::server::RateLimiter;
@@ -197,6 +201,10 @@ impl Group {
         // from the one the request arrived on.
         let other = self.origins[on ^ if self.has_alt_ip { 0b11 } else { 0b01 }];
         let reply = stun::binding_success(&tid, from, Some(self.origins[via]), Some(other));
+        // No more back than came in: the source is not proven.
+        if reply.len() > pkt.len() {
+            return None;
+        }
         Some((reply, to, via))
     }
 }
@@ -419,5 +427,61 @@ mod tests {
             "the limiter never engaged, or engaged too soon"
         );
         cancel.cancel();
+    }
+
+    /// Nothing goes back longer than what came in, in either family and
+    /// whatever the request asks for; a bare request, whose answer would be
+    /// several times its size, is not answered at all.
+    #[tokio::test]
+    async fn no_answer_is_longer_than_its_request() {
+        let families = [
+            ("127.0.0.1", Some("127.0.0.2"), "203.0.113.9:40000"),
+            ("::1", None, "[2001:db8::9]:40000"),
+        ];
+        let mut checked = 0;
+        for (primary, alternate, client) in families {
+            let fam = FamilyConfig {
+                primary: primary.parse().unwrap(),
+                alternate: alternate.map(|a| a.parse().unwrap()),
+            };
+            // Without the second loopback address (macOS) or IPv6, the
+            // family is checked where it can be.
+            let Ok(group) = Group::bind(&fam, 0, 0).await else {
+                continue;
+            };
+            let from: SocketAddr = client.parse().unwrap();
+            let tid = stun::transaction_id();
+            let mut bare = stun::binding_request(&tid);
+            bare.truncate(20);
+            bare[2..4].copy_from_slice(&0u16.to_be_bytes());
+            assert!(stun::is_stun_request(&bare));
+            assert!(group.answer(0, &bare, from).is_none(), "{}", primary);
+            let mut requests = vec![
+                stun::binding_request(&tid),
+                stun::binding_request_with_response_port(&tid, 50000),
+            ];
+            for (ip, port) in [(false, true), (true, false), (true, true)] {
+                requests.push(stun::binding_request_with_change(&tid, ip, port));
+            }
+            for on in 0..group.socks.len() {
+                for req in &requests {
+                    let Some((reply, to, _)) = group.answer(on, req, from) else {
+                        // Only "change IP" without a second address.
+                        assert!(stun::requested_change(req).0 && !group.has_alt_ip);
+                        continue;
+                    };
+                    assert!(
+                        reply.len() <= req.len(),
+                        "{} bytes for {} ({})",
+                        reply.len(),
+                        req.len(),
+                        primary
+                    );
+                    assert_eq!(to.ip(), from.ip());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
     }
 }

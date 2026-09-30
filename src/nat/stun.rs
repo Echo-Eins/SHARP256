@@ -34,6 +34,23 @@ const ATTR_RESPONSE_ORIGIN: u16 = 0x802b;
 /// RFC 5780: the server's second address and port.
 const ATTR_OTHER_ADDRESS: u16 = 0x802c;
 const STUN_HEADER_LEN: usize = 20;
+/// RFC 8489: a textual description of the software; comprehension-optional,
+/// so every server ignores what it does not need of it.
+const ATTR_SOFTWARE: u16 = 0x8022;
+/// The length every Binding request of ours is padded to.
+///
+/// A STUN server answers the address a request came from, which nobody has
+/// proven, and the answer is longer than a bare request: a server that
+/// answered every 20-byte request with 56 bytes (IPv4) or 92 (IPv6) would
+/// hand anyone who forged a source address almost five times what they
+/// sent. `sharp-relay`'s server answers only a request at least as long as
+/// its answer; this is longer than its longest (three IPv6 addresses, 92
+/// bytes), with room for more. The padding is a SOFTWARE attribute:
+/// RFC 5780's PADDING would be the attribute made for it, but it is one a
+/// server has to understand, and one that does not must refuse the request
+/// (RFC 8489 section 7.3.1, error 420), where SOFTWARE is one every server
+/// may ignore. (Google's and Cloudflare's public servers answer both.)
+pub const REQUEST_LEN: usize = 128;
 
 /// CHANGE-REQUEST flag: answer from the other IP address.
 const CHANGE_IP: u32 = 0x04;
@@ -93,13 +110,8 @@ pub fn binding_request(tid: &[u8; 12]) -> Vec<u8> {
 /// port. Whether such an answer gets back to us is what reveals the NAT's
 /// filtering behaviour.
 pub fn binding_request_with_change(tid: &[u8; 12], change_ip: bool, change_port: bool) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(STUN_HEADER_LEN + 8);
-    msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-    let body_len: u16 = if change_ip || change_port { 8 } else { 0 };
-    msg.extend_from_slice(&body_len.to_be_bytes());
-    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    msg.extend_from_slice(tid);
-    if body_len > 0 {
+    let mut msg = request_head(tid);
+    if change_ip || change_port {
         let mut flags = 0u32;
         if change_ip {
             flags |= CHANGE_IP;
@@ -111,6 +123,31 @@ pub fn binding_request_with_change(tid: &[u8; 12], change_ip: bool, change_port:
         msg.extend_from_slice(&4u16.to_be_bytes());
         msg.extend_from_slice(&flags.to_be_bytes());
     }
+    padded(msg)
+}
+
+/// A Binding request's header; the length is [`padded`]'s to set.
+fn request_head(tid: &[u8; 12]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(REQUEST_LEN);
+    msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(tid);
+    msg
+}
+
+/// Pads a request to [`REQUEST_LEN`] with a SOFTWARE attribute and writes
+/// its length.
+fn padded(mut msg: Vec<u8>) -> Vec<u8> {
+    const NAME: &[u8] = b"SHARP-256";
+    let value = REQUEST_LEN.saturating_sub(msg.len() + 4).max(NAME.len());
+    msg.extend_from_slice(&ATTR_SOFTWARE.to_be_bytes());
+    msg.extend_from_slice(&(value as u16).to_be_bytes());
+    msg.extend_from_slice(NAME);
+    msg.resize(msg.len() + value - NAME.len(), b' ');
+    msg.resize(msg.len() + (4 - value % 4) % 4, 0);
+    let body = (msg.len() - STUN_HEADER_LEN) as u16;
+    msg[2..4].copy_from_slice(&body.to_be_bytes());
     msg
 }
 
@@ -121,16 +158,12 @@ pub fn binding_request_with_change(tid: &[u8; 12], change_ip: bool, change_port:
 /// sent to another socket's mapping, and whether it arrives says whether
 /// that mapping still exists.
 pub fn binding_request_with_response_port(tid: &[u8; 12], port: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(STUN_HEADER_LEN + 8);
-    msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-    msg.extend_from_slice(&8u16.to_be_bytes());
-    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    msg.extend_from_slice(tid);
+    let mut msg = request_head(tid);
     msg.extend_from_slice(&ATTR_RESPONSE_PORT.to_be_bytes());
     msg.extend_from_slice(&4u16.to_be_bytes());
     msg.extend_from_slice(&port.to_be_bytes());
     msg.extend_from_slice(&[0, 0]);
-    msg
+    padded(msg)
 }
 
 /// A Binding indication (RFC 8489 section 6.3.2): a message a server
@@ -713,22 +746,59 @@ mod tests {
     #[test]
     fn change_request_carries_the_asked_for_flags() {
         let tid = transaction_id();
-        assert_eq!(binding_request(&tid).len(), STUN_HEADER_LEN);
         for (ip, port, want) in [
             (false, true, CHANGE_PORT),
             (true, false, CHANGE_IP),
             (true, true, CHANGE_IP | CHANGE_PORT),
         ] {
             let req = binding_request_with_change(&tid, ip, port);
-            assert_eq!(req.len(), STUN_HEADER_LEN + 8);
             assert!(is_stun_request(&req) && !is_stun_response(&req));
             assert_eq!(message_transaction_id(&req), Some(tid));
-            assert_eq!(u16::from_be_bytes([req[2], req[3]]), 8);
             let attr = u16::from_be_bytes([req[20], req[21]]);
             assert_eq!(attr, ATTR_CHANGE_REQUEST);
             let flags = u32::from_be_bytes(req[24..28].try_into().unwrap());
             assert_eq!(flags, want);
+            assert_eq!(requested_change(&req), (ip, port));
         }
+    }
+
+    /// Every request is padded to the same length, which is what a server
+    /// that answers no more than it was sent needs; the padding is a
+    /// well-formed SOFTWARE attribute that closes the message.
+    #[test]
+    fn every_request_is_padded_with_software() {
+        let tid = transaction_id();
+        for req in [
+            binding_request(&tid),
+            binding_request_with_change(&tid, true, true),
+            binding_request_with_response_port(&tid, 40000),
+        ] {
+            assert_eq!(req.len(), REQUEST_LEN);
+            assert!(is_stun_request(&req));
+            assert_eq!(
+                u16::from_be_bytes([req[2], req[3]]) as usize,
+                REQUEST_LEN - STUN_HEADER_LEN
+            );
+            // Walk the attributes: they end exactly at the end, the last
+            // is SOFTWARE, and it names us.
+            let (mut pos, mut last) = (STUN_HEADER_LEN, None);
+            while pos < req.len() {
+                let t = u16::from_be_bytes([req[pos], req[pos + 1]]);
+                let l = u16::from_be_bytes([req[pos + 2], req[pos + 3]]) as usize;
+                last = Some((t, pos + 4, l));
+                pos += 4 + l + (4 - l % 4) % 4;
+            }
+            assert_eq!(pos, req.len());
+            let (t, at, l) = last.unwrap();
+            assert_eq!(t, ATTR_SOFTWARE);
+            assert!(l < 128);
+            assert!(req[at..at + l].starts_with(b"SHARP-256"));
+            assert!(std::str::from_utf8(&req[at..at + l]).is_ok());
+        }
+        assert_eq!(
+            requested_response_port(&binding_request_with_response_port(&tid, 40000)),
+            Some(40000)
+        );
     }
 
     /// A plain request is answered by the server it went to. The

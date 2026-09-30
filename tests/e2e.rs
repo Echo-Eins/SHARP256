@@ -209,10 +209,11 @@ impl Impairment {
 }
 
 /// Packet types are masked on the wire (header protection), so the proxy can
-/// only tell packets apart by size: full-sized ones towards the receiver are
-/// DATA (or path probes).
+/// only tell packets apart by size: ones towards the receiver that are longer
+/// than a control datagram are DATA (or path probes). A handshake initiation
+/// is at most a control datagram, 1200 bytes (padded to it when resuming).
 fn is_data(pkt: &[u8]) -> bool {
-    pkt.len() >= 1000
+    pkt.len() > sharp256::protocol::constants::MAX_CONTROL_DATAGRAM
 }
 
 /// Sizes of some encrypted packets: 33 bytes of packet overhead plus the
@@ -1056,6 +1057,9 @@ impl FakeSender {
             .await
             .expect("handshake response")
             .unwrap();
+        // These initiations are not padded, and the answer is still no
+        // longer than what it answers.
+        assert!(n <= pkt.len(), "{} bytes answered with {}", pkt.len(), n);
         let (peer_cid, payload, split) = init.read_response(&buf[..n]).expect("valid response");
         let resp = wire::decode_response(&payload).unwrap();
         let suite = Suite::from_u8(resp.suite).expect("suite");
@@ -2123,6 +2127,243 @@ async fn a_forged_source_address_never_redirects_the_session() {
     assert!(
         !lens.is_empty(),
         "the receiver never challenged the forged address, so this test proved nothing"
+    );
+    stop_receiver(r).await;
+}
+
+/// No address that has not shown it receives gets back more bytes than it
+/// sent (docs/THREAT_MODEL.md, "Об усилении"), measured on the wire. A
+/// copier on the path re-sends packets of both ends from addresses of its
+/// own, each ahead of its original: the first initiation, the first
+/// handshake answer, data, acknowledgements, and every packet shorter than
+/// an address challenge (41 bytes: FIN_DONE is one), which may draw nothing
+/// at all. (Not every small one: a copy of an answer to a challenge, arriving
+/// from the wrong address ahead of the real one, stalls the validation until
+/// the copying stops — what dropping packets does too, and what RFC 9000
+/// section 21.1.3.3 says of QUIC.) Every one of those addresses
+/// is then an address nobody proved, and whatever each is sent back — a
+/// handshake answer, address challenges — is counted against what it sent.
+/// The transfer completes all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unproven_address_gets_back_no_more_than_it_sent() {
+    init_test_logging();
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 3 << 20;
+    let file = make_file(&src, "copied.bin", size, 0xC0B1);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+
+    let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_addr = relay_in.local_addr().unwrap();
+    let target = r.addr;
+
+    /// One copier address: what it sent, and what came back to it.
+    struct Forger {
+        towards: &'static str,
+        first: bool,
+        sent: usize,
+        back: Arc<AtomicU64>,
+    }
+    let forgers: Arc<parking_lot::Mutex<Vec<Forger>>> = Arc::default();
+    let listeners: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+    async fn copy(
+        pkt: &[u8],
+        to: SocketAddr,
+        towards: &'static str,
+        first: bool,
+        forgers: &parking_lot::Mutex<Vec<Forger>>,
+        listeners: &parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    ) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let _ = sock.send_to(pkt, to).await;
+        let back = Arc::new(AtomicU64::new(0));
+        let counted = back.clone();
+        listeners.lock().push(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, _)) = sock.recv_from(&mut buf).await {
+                counted.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }));
+        forgers.lock().push(Forger {
+            towards,
+            first,
+            sent: pkt.len(),
+            back,
+        });
+    }
+
+    let (f, l) = (forgers.clone(), listeners.clone());
+    let relay = tokio::spawn(async move {
+        let mut client: Option<SocketAddr> = None;
+        let mut from_sender = vec![0u8; 65536];
+        let mut from_receiver = vec![0u8; 65536];
+        let (mut up, mut down) = (0usize, 0usize);
+        let (mut up_copies, mut down_copies) = (0usize, 0usize);
+        loop {
+            tokio::select! {
+                res = relay_in.recv_from(&mut from_sender) => {
+                    let Ok((n, from)) = res else { continue };
+                    client = Some(from);
+                    let pkt = &from_sender[..n];
+                    if (up == 0 || up % 37 == 5 || n < 41) && up_copies < 40 {
+                        up_copies += 1;
+                        copy(pkt, target, "receiver", up == 0, &f, &l).await;
+                    }
+                    up += 1;
+                    let _ = relay_out.send_to(pkt, target).await;
+                }
+                res = relay_out.recv_from(&mut from_receiver) => {
+                    let Ok((n, _)) = res else { continue };
+                    let Some(c) = client else { continue };
+                    let pkt = &from_receiver[..n];
+                    if (down == 0 || down % 23 == 3 || n < 41) && down_copies < 40 {
+                        down_copies += 1;
+                        copy(pkt, c, "sender", down == 0, &f, &l).await;
+                    }
+                    down += 1;
+                    let _ = relay_in.send_to(pkt, c).await;
+                }
+            }
+        }
+    });
+
+    let summary = run_sender(sender_cfg(&file, relay_addr, r.id, &state))
+        .await
+        .expect("the transfer completes despite the copies");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&file, &out.join("copied.bin"));
+    // Late challenges, repeated with backoff, still count.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    relay.abort();
+    for t in listeners.lock().drain(..) {
+        t.abort();
+    }
+
+    let forgers = std::mem::take(&mut *forgers.lock());
+    assert!(
+        forgers.iter().any(|f| f.sent < 41),
+        "no packet shorter than a challenge was copied"
+    );
+    let mut answered = [0usize; 2];
+    for f in forgers.iter() {
+        let back = f.back.load(Ordering::Relaxed) as usize;
+        assert!(
+            back <= f.sent,
+            "a copy of {} bytes towards the {} drew {} bytes back to where it came from",
+            f.sent,
+            f.towards,
+            back
+        );
+        if back > 0 {
+            answered[(f.towards == "sender") as usize] += 1;
+        }
+    }
+    // The first copy towards the receiver is the initiation, and it drew
+    // the handshake's answer; each end challenged some of the copies.
+    // Otherwise nothing above was tested.
+    let first = forgers
+        .iter()
+        .find(|f| f.first && f.towards == "receiver")
+        .expect("the initiation was copied");
+    assert!(
+        first.back.load(Ordering::Relaxed) > 0,
+        "the copied initiation was not answered"
+    );
+    assert!(
+        answered[0] > 1 && answered[1] > 0,
+        "copies answered: {} towards the receiver, {} towards the sender",
+        answered[0],
+        answered[1]
+    );
+    stop_receiver(r).await;
+}
+
+/// A session begun by a copy of the initiation from somebody else's address
+/// sends nothing there but what that copy paid for, however long the real
+/// address takes to prove itself. The copy arrives first, so the session
+/// starts at the copier's address; the sender's data then comes from its
+/// own, whose answers to the receiver's challenges are held back for a
+/// while — and until one gets through, every acknowledgement of that data
+/// has no proven address to go to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_begun_by_a_copied_initiation_sends_nothing_more_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 2 << 20;
+    let file = make_file(&src, "begun.bin", size, 0xB3C0);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+
+    let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let forger = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_addr = relay_in.local_addr().unwrap();
+    let target = r.addr;
+    let sent = Arc::new(AtomicU64::new(0));
+    let back = Arc::new(AtomicU64::new(0));
+
+    let (attacker, copied) = (forger.clone(), sent.clone());
+    let relay = tokio::spawn(async move {
+        let start = Instant::now();
+        let mut client: Option<SocketAddr> = None;
+        let mut from_sender = vec![0u8; 65536];
+        let mut from_receiver = vec![0u8; 65536];
+        let mut first = true;
+        loop {
+            tokio::select! {
+                res = relay_in.recv_from(&mut from_sender) => {
+                    let Ok((n, from)) = res else { continue };
+                    client = Some(from);
+                    let pkt = &from_sender[..n];
+                    if first {
+                        first = false;
+                        copied.fetch_add(n as u64, Ordering::Relaxed);
+                        let _ = attacker.send_to(pkt, target).await;
+                    }
+                    // Answers to challenges (41 bytes) held back for a while:
+                    // long enough for the sender's probes and retransmissions,
+                    // each acknowledged, to add up to more than the copy.
+                    if n == PATH_CHALLENGE_LEN && start.elapsed() < Duration::from_secs(4) {
+                        continue;
+                    }
+                    let _ = relay_out.send_to(pkt, target).await;
+                }
+                res = relay_out.recv_from(&mut from_receiver) => {
+                    let Ok((n, _)) = res else { continue };
+                    if let Some(c) = client {
+                        let _ = relay_in.send_to(&from_receiver[..n], c).await;
+                    }
+                }
+            }
+        }
+    });
+    let counted = back.clone();
+    let listener = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, _)) = forger.recv_from(&mut buf).await {
+            counted.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    });
+
+    let summary = run_sender(sender_cfg(&file, relay_addr, r.id, &state))
+        .await
+        .expect("the transfer completes once the real address is proven");
+    assert_eq!(summary.file_size, size as u64);
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&file, &out.join("begun.bin"));
+    relay.abort();
+    listener.abort();
+    let (sent, back) = (sent.load(Ordering::Relaxed), back.load(Ordering::Relaxed));
+    assert!(
+        back > 0,
+        "the copied initiation was not answered: nothing was tested"
+    );
+    assert!(
+        back <= sent,
+        "the copier's address sent {} bytes and got {}",
+        sent,
+        back
     );
     stop_receiver(r).await;
 }

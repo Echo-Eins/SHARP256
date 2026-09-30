@@ -97,9 +97,6 @@ const EARLY_MAX_ITEMS: usize = 16_384;
 /// How long an unanswered address challenge first waits before it is
 /// repeated; each repeat waits twice as long as the last.
 const PATH_RETRY: Duration = Duration::from_millis(250);
-/// Bytes sent to an address nobody has proven, per byte it sent (RFC 9000
-/// section 8).
-const AMPLIFICATION_FACTOR: usize = 3;
 /// Everything in a handshake answer but its hole list: the packet overhead
 /// and the fixed fields of the response and its HELLO_ACK, with room over.
 const RESPONSE_FIXED: usize = hs::RESPONSE_OVERHEAD + 64;
@@ -1065,7 +1062,7 @@ impl Dispatcher {
                 self.reject(
                     incoming,
                     &init,
-                    from,
+                    (from, pkt.len()),
                     REASON_UNAUTHORIZED,
                     "sender not authorized",
                 );
@@ -1087,7 +1084,13 @@ impl Dispatcher {
             declined.retain(|_, at| now.saturating_duration_since(*at) < DECLINE_MEMORY);
             if declined.contains_key(&key) {
                 drop(declined);
-                self.reject(incoming, &init, from, REASON_DECLINED, "declined by user");
+                self.reject(
+                    incoming,
+                    &init,
+                    (from, pkt.len()),
+                    REASON_DECLINED,
+                    "declined by user",
+                );
                 return;
             }
         }
@@ -1095,7 +1098,7 @@ impl Dispatcher {
             self.reject(
                 incoming,
                 &init,
-                from,
+                (from, pkt.len()),
                 REASON_NO_SUITE,
                 "no cipher in common",
             );
@@ -1136,7 +1139,7 @@ impl Dispatcher {
             self.reject(
                 incoming,
                 &init,
-                from,
+                (from, pkt.len()),
                 REASON_BUSY,
                 "too many concurrent transfers",
             );
@@ -1162,7 +1165,7 @@ impl Dispatcher {
             self.reject(
                 incoming,
                 &init,
-                from,
+                (from, pkt.len()),
                 REASON_BUSY,
                 "too many concurrent transfers from this sender",
             );
@@ -1192,21 +1195,19 @@ impl Dispatcher {
         );
     }
 
-    /// Answers an authenticated initiation with a rejection; no session is
-    /// created.
+    /// Answers an authenticated initiation of `len` bytes with a rejection;
+    /// no session is created.
     fn reject(
         &self,
         incoming: hs::Incoming,
         init: &wire::Initiation,
-        to: SocketAddr,
+        (to, len): (SocketAddr, usize),
         reason: u8,
         message: &str,
     ) {
-        let payload = wire::encode_response(&wire::Response {
-            suite: 0,
-            ack_flags: 0,
-            ack: rejection(init.hello.timestamp, reason, message),
-        });
+        let Some(payload) = rejection_within(init.hello.timestamp, reason, message, len) else {
+            return;
+        };
         if let Ok((pkt, _)) = incoming.respond(self.new_cid(), &payload) {
             let _ = self.shared.send(to, &pkt);
         }
@@ -1524,6 +1525,31 @@ fn side_channel(
     false
 }
 
+/// The payload of a handshake response that rejects a transfer, held to an
+/// answer of at most `limit` bytes — the initiation's, since the address it
+/// came from is not proven. The message is shortened to fit, and dropped if
+/// need be; `None` if even the bare rejection would be longer.
+fn rejection_within(echo_ts: u32, reason: u8, message: &str, limit: usize) -> Option<Vec<u8>> {
+    let room = limit.checked_sub(hs::RESPONSE_OVERHEAD)?;
+    let encode = |message: &str| {
+        wire::encode_response(&wire::Response {
+            suite: 0,
+            ack_flags: 0,
+            ack: rejection(echo_ts, reason, message),
+        })
+    };
+    let bare = encode("");
+    if bare.len() > room {
+        return None;
+    }
+    let mut cut = message.len().min(room - bare.len());
+    while !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let payload = encode(&message[..cut]);
+    (payload.len() <= room).then_some(payload).or(Some(bare))
+}
+
 fn rejection(echo_ts: u32, reason: u8, message: &str) -> HelloAck {
     HelloAck {
         status: HELLO_REJECTED,
@@ -1684,7 +1710,21 @@ enum Phase {
         fin_delay: Duration,
         started_at: Instant,
     },
+    /// Refused, but the refusal could not go yet: the sender had not shown
+    /// that it receives where the session is, and the refusal was longer
+    /// than what may be sent there before it has (see `peer_allowance`). It
+    /// goes with the answer to the sender's next question — its decision
+    /// poll, a second at most — or, by `until`, not at all.
+    Refusing {
+        reason: u8,
+        message: String,
+        until: Instant,
+    },
 }
+
+/// How long a refusal waits for the sender's address to prove itself (the
+/// sender asks for the decision every second).
+const REFUSAL_WAIT: Duration = Duration::from_secs(5);
 
 /// A directory transfer's manifest, while it arrives and once verified.
 struct TreeRecv {
@@ -1825,8 +1865,18 @@ struct Session {
 
     transfer_id: [u8; 16],
     sender: SharpId,
-    /// The sender's proven address: everything we send goes there.
+    /// The sender's address: everything we send goes there (before it is
+    /// proven, within `peer_allowance`).
     peer: SocketAddr,
+    /// Whether `peer` has shown that it receives there: a transport packet
+    /// from it, under keys our answer to the handshake made (see
+    /// `note_alive`), or an answer to a challenge. A session starts at the
+    /// address its first initiation came from, which proves nothing — a
+    /// copy of it may have had its source forged — and until then nothing
+    /// may be sent there but what the initiation left over of its own
+    /// length after the answer (`peer_allowance`): no more back than came in.
+    peer_proven: bool,
+    peer_allowance: usize,
     /// An address the sender claims but has not proven yet.
     path: PathProbe,
     /// The proven address the meetings at its host were last ended for (see
@@ -1901,6 +1951,8 @@ impl Session {
             transfer_id: key.1,
             sender: key.0,
             peer,
+            peer_proven: false,
+            peer_allowance: 0,
             path: PathProbe::new(),
             #[cfg(feature = "nat-traversal")]
             met_at: None,
@@ -1949,16 +2001,17 @@ impl Session {
     }
 
     /// Encrypts `msg` as a transport packet to the sender's proven address.
-    fn send(&mut self, flags: u8, msg: &Message<'_>) {
-        self.send_to(self.peer, flags, msg);
+    fn send(&mut self, flags: u8, msg: &Message<'_>) -> bool {
+        self.send_to(self.peer, flags, msg)
     }
 
     /// Encrypts `msg` as a transport packet and sends it to `to`. Only
     /// address validation sends anywhere but the proven address, and only
     /// the small PATH_CHALLENGE / PATH_RESPONSE frames.
-    fn send_to(&mut self, to: SocketAddr, flags: u8, msg: &Message<'_>) {
+    /// Whether it went (not whether it arrives).
+    fn send_to(&mut self, to: SocketAddr, flags: u8, msg: &Message<'_>) -> bool {
         let Some(sec) = self.secure.as_mut() else {
-            return;
+            return false;
         };
         let pn = sec.next_pn;
         sec.next_pn += 1;
@@ -1970,13 +2023,24 @@ impl Session {
         );
         wire::encode_body(msg, &mut self.tx_buf, MAX_CONTROL_BODY);
         if sec.keys.send.seal(&mut self.tx_buf).is_err() {
-            return;
+            return false;
+        }
+        // To an address that has not shown it receives, only what is left
+        // of what came from it: an ACK for data that came from elsewhere
+        // would otherwise go to wherever a copied initiation said it came
+        // from. (A skipped packet number is only a gap.)
+        if to == self.peer && !self.peer_proven {
+            let Some(left) = self.peer_allowance.checked_sub(self.tx_buf.len()) else {
+                return false;
+            };
+            self.peer_allowance = left;
         }
         if let Err(e) = self.shared.send(to, &self.tx_buf) {
             if e.kind() != io::ErrorKind::WouldBlock {
                 tracing::debug!("send {:?} failed: {}", msg.msg_type(), e);
             }
         }
+        true
     }
 
     // ----- lifecycle -------------------------------------------------------
@@ -2080,6 +2144,8 @@ impl Session {
                 self.complete(hash, false);
             }
             Phase::Pending { .. } => self.emit_failed(why.to_string(), false),
+            // Already reported when it was refused.
+            Phase::Refusing { .. } => {}
             Phase::Receiving => self.suspend(why).await,
         }
     }
@@ -2107,6 +2173,8 @@ impl Session {
     /// the transfer was rejected.
     fn start(&mut self, h: Handshake) -> Option<Option<oneshot::Receiver<bool>>> {
         self.peer = h.from;
+        self.peer_proven = false;
+        self.peer_allowance = 0;
         self.last_rx = h.at;
         self.heard_peer_at = h.at;
         let hello = h.init.hello.clone();
@@ -2177,14 +2245,12 @@ impl Session {
                 }
                 declined.insert(self.key(), Instant::now());
             }
-            self.send_rejection(REASON_DECLINED, "declined by user");
             self.emit_failed("declined by user".into(), false);
-            return ControlFlow::Break(());
+            return self.refuse(REASON_DECLINED, "declined by user");
         }
         if let Err(message) = self.create_file() {
-            self.send_rejection(REASON_INTERNAL, &message);
-            self.report_failure(message, false);
-            return ControlFlow::Break(());
+            self.report_failure(message.clone(), false);
+            return self.refuse(REASON_INTERNAL, &message);
         }
         self.phase = Phase::Receiving;
         // Tell the sender right away instead of at its next poll.
@@ -2545,15 +2611,24 @@ impl Session {
         // The answer goes to wherever the initiation came from, which
         // nobody has proven: a copy of an initiation sent from a forged
         // address would otherwise draw an answer five times its size at
-        // whoever owns that address. Held to three times the initiation,
-        // as for everything else sent to an unproven address.
-        let budget = (AMPLIFICATION_FACTOR * h.len).saturating_sub(RESPONSE_FIXED);
+        // whoever owns that address. So no more goes back than came in — a
+        // resuming sender pads its initiation to 1200 bytes, which leaves
+        // the answer room for the holes of what we hold.
+        let budget = h.len.saturating_sub(RESPONSE_FIXED);
         let (ack, ack_flags) = self.current_ack(hello.timestamp, hello.capabilities, budget);
         let payload = wire::encode_response(&wire::Response {
             suite: h.suite as u8,
             ack_flags,
             ack,
         });
+        if hs::RESPONSE_OVERHEAD + payload.len() > h.len {
+            tracing::debug!(
+                "initiation of {} bytes from {} not answered: the answer would be longer",
+                h.len,
+                h.from
+            );
+            return;
+        }
         let sender_cid = h.incoming.sender_cid;
         match h.incoming.respond(h.cid, &payload) {
             Ok((pkt, split)) => {
@@ -2571,6 +2646,13 @@ impl Session {
                 if let Err(e) = self.shared.send(h.from, &pkt) {
                     tracing::debug!("sending handshake response failed: {}", e);
                 }
+                // What the initiation left over is what may follow the
+                // answer there before the address is proven.
+                if h.from == self.peer && !self.peer_proven {
+                    self.peer_allowance = self
+                        .peer_allowance
+                        .saturating_add(h.len.saturating_sub(pkt.len()));
+                }
                 // A handshake from an address we have not proven does not
                 // move the session there on its own: an on-path attacker
                 // able to race our sender could otherwise re-send a captured
@@ -2581,10 +2663,8 @@ impl Session {
                 if h.from != self.peer {
                     // What the answer used of the address's allowance is
                     // not there to spend again on challenges.
-                    let credit = h
-                        .len
-                        .saturating_sub(pkt.len().div_ceil(AMPLIFICATION_FACTOR));
-                    if let Some(c) = self.path.on_authentic(h.from, self.peer, h.at, credit) {
+                    let credit = h.len.saturating_sub(pkt.len());
+                    if let Some(c) = self.path.on_authentic(h.from, self.peer, h.at, credit, 0) {
                         tracing::info!(
                             "handshake from {} while the session is at {}; validating it",
                             c.to,
@@ -2605,23 +2685,38 @@ impl Session {
     /// Rejects the transfer in the handshake response (no session keys).
     fn reject_handshake(&mut self, h: Handshake, reason: u8, message: &str) {
         tracing::info!("rejected transfer from {}: {}", h.from, message);
-        let payload = wire::encode_response(&wire::Response {
-            suite: 0,
-            ack_flags: 0,
-            ack: rejection(h.init.hello.timestamp, reason, message),
-        });
+        let Some(payload) = rejection_within(h.init.hello.timestamp, reason, message, h.len) else {
+            return;
+        };
         if let Ok((pkt, _)) = h.incoming.respond(h.cid, &payload) {
             let _ = self.shared.send(h.from, &pkt);
         }
     }
 
     /// Rejects the transfer over the established session.
-    fn send_rejection(&mut self, reason: u8, message: &str) {
+    fn send_rejection(&mut self, reason: u8, message: &str) -> bool {
         tracing::info!("rejected transfer {}: {}", self.tid_hex(), message);
         let ack = rejection(0, reason, message);
+        let mut went = false;
         for _ in 0..2 {
-            self.send(0, &Message::HelloAck(ack.clone()));
+            went |= self.send(0, &Message::HelloAck(ack.clone()));
         }
+        went
+    }
+
+    /// Refuses the transfer over the session, and ends the session once the
+    /// refusal has gone — at once, or when the sender's address has proven
+    /// itself (see [`Phase::Refusing`]).
+    fn refuse(&mut self, reason: u8, message: &str) -> ControlFlow<()> {
+        if self.send_rejection(reason, message) {
+            return ControlFlow::Break(());
+        }
+        self.phase = Phase::Refusing {
+            reason,
+            message: message.to_string(),
+            until: Instant::now() + REFUSAL_WAIT,
+        };
+        ControlFlow::Continue(())
     }
 
     /// Holes in `[from, to)`, complete for the (possibly shortened)
@@ -2834,7 +2929,14 @@ impl Session {
         let Ok((msg_type, flags)) = parse_type_byte(tb) else {
             return Ok(());
         };
-        self.note_alive(from, at, range.len());
+        // A challenge is answered where it came from, and that answer is
+        // part of what the address may be sent (see `PathProbe::on_authentic`).
+        let answer = if msg_type == MsgType::PathChallenge {
+            crate::transport::path::CHALLENGE_BYTES
+        } else {
+            0
+        };
+        self.note_alive(from, at, range.len(), answer);
         let body = range.start + HEADER_LEN..range.end - TAG_LEN;
         if msg_type != MsgType::Data {
             controls.push(Control {
@@ -2886,7 +2988,7 @@ impl Session {
     /// [`crate::transport::path`] — an attacker that repeats a captured
     /// packet with a forged source address must not be able to point our
     /// ACKs (and, on the sending side, the data stream) at a third party.
-    fn note_alive(&mut self, from: SocketAddr, at: Instant, len: usize) {
+    fn note_alive(&mut self, from: SocketAddr, at: Instant, len: usize, answer: usize) {
         self.last_rx = at;
         if from == self.peer {
             self.heard_peer_at = at;
@@ -2895,8 +2997,9 @@ impl Session {
         // that address: it takes the keys our answer to the handshake made,
         // and the answer went there. (The handshake alone proves nothing
         // of where it came from: a copy may have had its source forged.)
-        #[cfg(feature = "nat-traversal")]
         if from == self.peer {
+            self.peer_proven = true;
+            #[cfg(feature = "nat-traversal")]
             self.met_directly();
         }
         if self.stalled {
@@ -2912,7 +3015,7 @@ impl Session {
         // catching up, not moving (see `path::DIRECT_GRACE`).
         let held = from != self.peer && self.keeps_direct(from, at);
         if let Some(c) = (!held)
-            .then(|| self.path.on_authentic(from, self.peer, at, len))
+            .then(|| self.path.on_authentic(from, self.peer, at, len, answer))
             .flatten()
         {
             tracing::info!(
@@ -2989,6 +3092,18 @@ impl Session {
         match decoded {
             Message::Hello(h) => {
                 if h.transfer_id == self.transfer_id {
+                    // The sender asking again is the sender proving its
+                    // address: a refusal that had to wait goes now.
+                    if let Phase::Refusing {
+                        reason, message, ..
+                    } = &self.phase
+                    {
+                        let (reason, message) = (*reason, message.clone());
+                        if self.send_rejection(reason, &message) {
+                            return ControlFlow::Break(());
+                        }
+                        return ControlFlow::Continue(());
+                    }
                     self.answer_hello(&h);
                 }
             }
@@ -3017,6 +3132,7 @@ impl Session {
                 {
                     tracing::info!("sender address {} proven; moving the session there", addr);
                     self.peer = addr;
+                    self.peer_proven = true;
                     self.heard_peer_at = now;
                     #[cfg(feature = "nat-traversal")]
                     self.met_directly();
@@ -3057,6 +3173,7 @@ impl Session {
                         self.emit_failed(why, false);
                         return ControlFlow::Break(());
                     }
+                    Phase::Refusing { .. } => return ControlFlow::Break(()),
                     Phase::Verifying | Phase::Finishing { .. } => {}
                 }
             }
@@ -3397,8 +3514,13 @@ impl Session {
             }
             Phase::Pending { deadline } => {
                 if now >= *deadline {
-                    self.send_rejection(REASON_TIMEOUT, "no decision in time");
                     self.emit_failed("no decision in time".into(), false);
+                    return self.refuse(REASON_TIMEOUT, "no decision in time");
+                }
+                return ControlFlow::Continue(());
+            }
+            Phase::Refusing { until, .. } => {
+                if now >= *until {
                     return ControlFlow::Break(());
                 }
                 return ControlFlow::Continue(());
@@ -3718,6 +3840,27 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// A rejection is no longer than the initiation it answers: its message
+    /// is shortened to fit (on a character boundary), dropped if need be,
+    /// and with no room even for the bare rejection there is no answer.
+    #[test]
+    fn a_rejection_fits_the_initiation_it_answers() {
+        let message = "отказано: слишком много передач";
+        let decoded = |p: &[u8]| wire::decode_response(p).unwrap().ack;
+        let whole = rejection_within(7, REASON_BUSY, message, 1200).unwrap();
+        assert_eq!(decoded(&whole).message, message);
+        let bare = rejection_within(7, REASON_BUSY, "", 1200).unwrap();
+        let smallest = hs::RESPONSE_OVERHEAD + bare.len();
+        for limit in smallest..smallest + whole.len() - bare.len() + 2 {
+            let p = rejection_within(7, REASON_BUSY, message, limit).unwrap();
+            assert!(hs::RESPONSE_OVERHEAD + p.len() <= limit, "{}", limit);
+            let ack = decoded(&p);
+            assert_eq!((ack.status, ack.reason), (HELLO_REJECTED, REASON_BUSY));
+            assert!(message.starts_with(&ack.message), "{}", limit);
+        }
+        assert!(rejection_within(7, REASON_BUSY, message, smallest - 1).is_none());
     }
 
     /// A session running directly to a peer's host ends the punching at it:

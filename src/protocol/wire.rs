@@ -12,7 +12,7 @@
 //! encrypted payload: the initiation holds a HELLO, the response a
 //! HELLO_ACK (see [`Initiation`] and [`Response`]).
 
-use crate::crypto::handshake::RESPONSE_OVERHEAD;
+use crate::crypto::handshake::{INITIATION_OVERHEAD, RESPONSE_OVERHEAD};
 use crate::crypto::transport::OVERHEAD as TRANSPORT_OVERHEAD;
 use crate::protocol::constants::*;
 
@@ -762,6 +762,27 @@ pub fn encode_initiation(p: &Initiation) -> Vec<u8> {
     out
 }
 
+/// What a sender pads its initiation payload to when it resumes: the length
+/// that makes the initiation datagram [`MAX_CONTROL_DATAGRAM`] bytes.
+///
+/// The receiver's answer goes to an address nobody has proven, and so is
+/// held to the length of the initiation it answers: no more goes back than
+/// came in. A fresh transfer's answer is short; a resume's describes the
+/// holes in what the receiver holds, and a padded initiation leaves it room
+/// for them. The padding is zeros after the payload, inside the encryption;
+/// [`decode_initiation`] reads the payload and ignores what follows it, as
+/// receivers always have.
+pub const PADDED_INITIATION_PAYLOAD: usize = MAX_CONTROL_DATAGRAM - INITIATION_OVERHEAD;
+
+/// [`encode_initiation`], padded to [`PADDED_INITIATION_PAYLOAD`].
+pub fn encode_padded_initiation(p: &Initiation) -> Vec<u8> {
+    let mut out = encode_initiation(p);
+    if out.len() < PADDED_INITIATION_PAYLOAD {
+        out.resize(PADDED_INITIATION_PAYLOAD, 0);
+    }
+    out
+}
+
 pub fn decode_initiation(buf: &[u8]) -> Result<Initiation, WireError> {
     let mut r = Reader::new(buf);
     let timestamp = r.u64()?;
@@ -1141,6 +1162,16 @@ mod tests {
             "{} bytes",
             enc.len()
         );
+        // Padded, both are a full control datagram and read back the same.
+        for i in [&init, &big] {
+            let padded = encode_padded_initiation(i);
+            assert_eq!(padded.len(), PADDED_INITIATION_PAYLOAD);
+            assert_eq!(
+                padded.len() + crate::crypto::handshake::INITIATION_OVERHEAD,
+                MAX_CONTROL_DATAGRAM
+            );
+            assert_eq!(&decode_initiation(&padded).unwrap(), i);
+        }
 
         // A response with the fullest possible hole list and a long message
         // still fits the control datagram bound; holes are never cut.

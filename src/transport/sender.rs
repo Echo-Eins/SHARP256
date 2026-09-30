@@ -525,13 +525,14 @@ impl Sender {
         let peer_str = self.cfg.receiver_id.to_string();
         // Present the id of an interrupted attempt so the receiver resumes
         // it, unless the source changed since (its data would not match).
-        let transfer_id = self
+        let saved_id = self
             .store
             .as_ref()
             .and_then(|s| s.load_sender(&self.cfg.file_path, size, &peer_str))
             .filter(|st| st.file_mtime == mtime && st.manifest_hash == manifest_hex)
-            .and_then(|st| parse_hex16(&st.transfer_id))
-            .unwrap_or_else(rand::random::<[u8; 16]>);
+            .and_then(|st| parse_hex16(&st.transfer_id));
+        let resuming = saved_id.is_some();
+        let transfer_id = saved_id.unwrap_or_else(rand::random::<[u8; 16]>);
 
         // Hash of the whole stream in the background; it is only needed at
         // the end.
@@ -865,6 +866,7 @@ impl Sender {
             self.cfg.events.clone(),
             self.cancel.clone(),
         );
+        engine.resuming = resuming;
 
         #[cfg(feature = "nat-traversal")]
         {
@@ -1124,6 +1126,10 @@ const MAX_RECV_CALLS: usize = 64;
 const MAX_ATTEMPTS: usize = 4;
 /// While the receiver's user decides, ask for the decision this often.
 const DECISION_POLL: Duration = Duration::from_secs(1);
+/// What a ping to an address of the receiver's that has not proven itself
+/// is padded to on the wire: three address challenges' worth (see
+/// `Engine::send_unproven_ping`).
+const UNPROVEN_PING_LEN: usize = 128;
 /// Gap between initiations while candidate addresses are still untried.
 const CANDIDATE_PROBE: Duration = Duration::from_millis(250);
 /// Most addresses one transfer will ever try. Each costs a quarter of a
@@ -1349,6 +1355,9 @@ struct Engine {
     size: u64,
     file_name: String,
     transfer_id: [u8; 16],
+    /// The transfer id is that of an interrupted attempt: the receiver may
+    /// hold part of it, and its answer describe what is missing.
+    resuming: bool,
     clock: Clock,
     events: Option<EventCallback>,
     cancel: CancellationToken,
@@ -1576,6 +1585,7 @@ impl Engine {
             size,
             file_name,
             transfer_id,
+            resuming: false,
             clock: Clock::new(),
             events,
             cancel,
@@ -1758,6 +1768,43 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// An authenticated ping to an address of the receiver's that has not
+    /// proven itself, padded to [`UNPROVEN_PING_LEN`] (the receiver's
+    /// decoder ignores what follows the timestamp). The receiver answers a
+    /// packet from an address it does not know with address challenges, and
+    /// sends there no more than it got from there: a bare ping (37 bytes)
+    /// is shorter than one challenge (41), and a direct path waited a
+    /// second more to be asked about; padded, each ping pays for the
+    /// challenge and its first repeats.
+    fn send_unproven_ping(&mut self, to: SocketAddr) {
+        let Some(sec) = self.secure.as_mut() else {
+            return;
+        };
+        let pn = sec.next_pn;
+        sec.next_pn += 1;
+        let ts = self.clock.now_us();
+        begin_packet(
+            &mut self.ctl_buf,
+            sec.peer_cid,
+            type_byte(MsgType::Ping, 0),
+            pn,
+        );
+        wire::encode_body(
+            &Message::Ping(Ping { timestamp: ts }),
+            &mut self.ctl_buf,
+            MAX_CONTROL_BODY,
+        );
+        let tag = crate::crypto::transport::TAG_LEN;
+        let body_end = UNPROVEN_PING_LEN
+            .saturating_sub(tag)
+            .max(self.ctl_buf.len());
+        self.ctl_buf.resize(body_end, 0);
+        if sec.keys.send.seal(&mut self.ctl_buf).is_err() {
+            return;
+        }
+        let _ = self.socket_for(to).try_send(to, &self.ctl_buf);
     }
 
     /// Best-effort notice to the receiver that the transfer is over (sent
@@ -2112,9 +2159,8 @@ impl Engine {
         if carried {
             // The session is up; what is asked is whether the receiver
             // answers on this path too (see `probe_direct`).
-            let ping = self.ping_message();
             if let Some(to) = self.reach.native(from) {
-                let _ = self.send_frame_to(to, 0, &ping);
+                self.send_unproven_ping(to);
             }
             return Ok(());
         }
@@ -2137,13 +2183,24 @@ impl Engine {
         let mut attempt = Initiator::new(&self.auth.identity, &self.auth.receiver, &self.auth.psk)
             .map_err(|e| SendError::Handshake(e.to_string()))?;
         let ts = self.clock.now_us().max(1);
-        let payload = wire::encode_initiation(&wire::Initiation {
+        let init = wire::Initiation {
             timestamp: hs::initiation_timestamp(),
             suites: Suite::ALL_BITS,
             hardware_aes: Suite::hardware_aes(),
             hello_flags: HELLO_FLAG_RESUME,
             hello: self.hello(ts),
-        });
+        };
+        // The receiver's answer is no longer than the initiation, and only
+        // a resume's answer has much to say — the holes of what it holds.
+        // Padded then, so that they fit; a fresh transfer's answer is short,
+        // and its initiations — which go round every address the receiver
+        // may be at, found in the DHT or shown by a punch among them — stay
+        // as short as they are.
+        let payload = if self.secure.is_some() || self.resuming {
+            wire::encode_padded_initiation(&init)
+        } else {
+            wire::encode_initiation(&init)
+        };
         // A cookie proves our address to one receiver, so it is only worth
         // anything at the address that issued it.
         let cookie = self
@@ -2324,7 +2381,7 @@ impl Engine {
         // captured and repeated with a forged source. Until that address
         // answers a challenge, the file keeps going to the proven one.
         self.path.reset();
-        self.note_alive(now, from, pkt.len());
+        self.note_alive(now, from, pkt.len(), 0);
         tracing::debug!(
             "session with {} established ({})",
             self.auth.receiver.short(),
@@ -3345,7 +3402,14 @@ impl Engine {
             }
         };
         let now = Instant::now();
-        self.note_alive(now, from, len);
+        // A challenge is answered where it came from, and that answer is
+        // part of what the address may be sent (see `PathProbe::on_authentic`).
+        let answer = if matches!(msg, Message::PathChallenge(_)) {
+            crate::transport::path::CHALLENGE_BYTES
+        } else {
+            0
+        };
+        self.note_alive(now, from, len, answer);
         match msg {
             Message::Ack(ack) => self.on_ack(ack, now),
             Message::Fin(fin) => {
@@ -3488,7 +3552,7 @@ impl Engine {
     /// repeating one captured packet from a forged source address would have
     /// a multi-gigabit weapon pointed wherever it likes. It has to answer a
     /// challenge at the new address first (see [`crate::transport::path`]).
-    fn note_alive(&mut self, now: Instant, from: SocketAddr, len: usize) {
+    fn note_alive(&mut self, now: Instant, from: SocketAddr, len: usize, answer: usize) {
         self.last_rx = now;
         self.ping_backoff = 0;
         if from == self.peer {
@@ -3498,7 +3562,7 @@ impl Engine {
         // catching up, not moving (see `path::DIRECT_GRACE`).
         let held = from != self.peer && self.keeps_direct(from, now);
         if let Some(c) = (!held)
-            .then(|| self.path.on_authentic(from, self.peer, now, len))
+            .then(|| self.path.on_authentic(from, self.peer, now, len, answer))
             .flatten()
         {
             tracing::info!(
@@ -3848,11 +3912,6 @@ impl Engine {
         self.relayed.contains(&addr)
     }
 
-    fn ping_message(&self) -> Message<'static> {
-        let ts = self.clock.now_us();
-        Message::Ping(Ping { timestamp: ts })
-    }
-
     /// While a session is carried by a relay, asks the receiver's other
     /// addresses whether a direct path has opened: an authenticated ping to
     /// each, which the receiver answers from where it arrived if it arrives
@@ -3906,9 +3965,8 @@ impl Engine {
                 self.peer
             );
         }
-        let ping = self.ping_message();
         for a in asked {
-            let _ = self.send_frame_to(a, 0, &ping);
+            self.send_unproven_ping(a);
         }
     }
 

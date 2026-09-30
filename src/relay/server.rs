@@ -1679,6 +1679,85 @@ mod wire_tests {
         true
     }
 
+    /// No more goes back to an address the relay has not proven than came
+    /// from it: every request that carries a token, sent without one (or
+    /// with a stale one), draws a challenge no longer than itself, and the
+    /// confirmation an allocated port answers a first Open with is shorter
+    /// than the Open. Measured on the wire, from a fresh address each time.
+    #[tokio::test]
+    async fn nothing_goes_back_to_an_unproven_address_longer_than_what_came() {
+        let (relay, _, cancel) = start_relay().await;
+        let who = Identity::generate();
+        let target = Identity::generate().id();
+        let requests = [
+            Message::Register {
+                hints: Hints::none(),
+                id: who.id(),
+                token: [0; TOKEN_LEN],
+                flags: 0,
+                stamp: stamp(),
+                nonce: [1; 16],
+                proof: [0; crate::relay::PROOF_LEN],
+            },
+            Message::Connect {
+                target,
+                token: [0; TOKEN_LEN],
+                hints: Hints::none(),
+                nonce: [2; 16],
+            },
+            Message::ConnectAs {
+                hints: Hints::none(),
+                target,
+                token: [0; TOKEN_LEN],
+                id: who.id(),
+                proof: [0; crate::relay::PROOF_LEN],
+                nonce: [3; 16],
+            },
+            Message::Bye {
+                id: who.id(),
+                token: [0; TOKEN_LEN],
+                stamp: stamp(),
+                nonce: [4; 16],
+                proof: [0; crate::relay::PROOF_LEN],
+            },
+        ];
+        let mut answered = 0;
+        for msg in requests {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let bytes = msg.encode();
+            sock.send_to(&bytes, relay).await.unwrap();
+            let mut back = 0;
+            let mut buf = vec![0u8; 2048];
+            while let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(300), sock.recv_from(&mut buf)).await
+            {
+                back += n;
+            }
+            assert!(
+                back <= bytes.len(),
+                "{:?}: {} bytes back for {}",
+                msg,
+                back,
+                bytes.len()
+            );
+            answered += (back > 0) as usize;
+        }
+        assert_eq!(
+            answered, 4,
+            "every request without a token draws a challenge"
+        );
+        // An allocated port's first answer to an Open.
+        let open = Message::Open {
+            ticket: [5; TOKEN_LEN],
+            proof: [0; TOKEN_LEN],
+        };
+        let confirm = Message::Confirm {
+            proof: [6; TOKEN_LEN],
+        };
+        assert!(confirm.encode().len() < open.encode().len());
+        cancel.cancel();
+    }
+
     /// Encodes a message and fills in its proof.
     fn signed(key: &crate::crypto::SecretKey, msg: Message) -> Vec<u8> {
         let mut bytes = msg.encode();

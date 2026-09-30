@@ -22,6 +22,13 @@
 //! RFC 6762 section 6.7 answers by unicast) and a responder that answers
 //! them. Questions from beyond the link are ignored (section 11), and so is
 //! anything past a small rate.
+//!
+//! An answer goes to whoever asked, from wherever it says it asked, and is
+//! never longer than the question: a sender pads its question to
+//! [`QUERY_LEN`] with EDNS(0) padding (RFC 6891, RFC 7830), and the
+//! responder leaves addresses out, last first, until the answer fits — or
+//! does not answer at all. An unpadded question, some 100 bytes, would
+//! otherwise draw four times that.
 
 use crate::crypto::SharpId;
 use std::collections::HashSet;
@@ -58,6 +65,13 @@ const MAX_JUMPS: usize = 16;
 /// Lifetime of what an announcement says, in seconds (RFC 6762's 75 minutes
 /// for a host record would be long for an address that may change).
 const TTL: u32 = 120;
+/// What a sender's question is padded to: room for an answer with a score
+/// of addresses, in one datagram on any link.
+pub const QUERY_LEN: usize = 1200;
+/// EDNS(0): the OPT pseudo-record (RFC 6891) and its padding option
+/// (RFC 7830).
+const TYPE_OPT: u16 = 41;
+const OPTION_PADDING: u16 = 12;
 
 /// What a record says, for the types this uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +367,27 @@ pub fn query_for(id: &SharpId) -> Message {
     }
 }
 
+/// [`query_for`] `id` as a packet, padded to [`QUERY_LEN`] with an OPT
+/// record carrying padding: the length a responder may answer with.
+pub fn padded_query(id: &SharpId) -> Option<Vec<u8>> {
+    /// Root name, type, class, TTL, length; option code and length.
+    const OPT_FIXED: usize = 1 + 2 + 2 + 4 + 2 + 4;
+    let mut out = query_for(id).encode()?;
+    let pad = QUERY_LEN.checked_sub(out.len() + OPT_FIXED)?;
+    let additional = u16::from_be_bytes([out[10], out[11]]) + 1;
+    out[10..12].copy_from_slice(&additional.to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&TYPE_OPT.to_be_bytes());
+    // The class of an OPT record is the largest reply this end takes.
+    out.extend_from_slice(&(QUERY_LEN as u16).to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&((4 + pad) as u16).to_be_bytes());
+    out.extend_from_slice(&OPTION_PADDING.to_be_bytes());
+    out.extend_from_slice(&(pad as u16).to_be_bytes());
+    out.resize(out.len() + pad, 0);
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // Answering
 // ---------------------------------------------------------------------------
@@ -443,6 +478,33 @@ impl Announcement {
             None
         } else {
             Some(out)
+        }
+    }
+}
+
+impl Announcement {
+    /// [`Announcement::answer`] as a packet of at most `limit` bytes — the
+    /// length of the question, which nobody has proven came from where it
+    /// says. Addresses are left out, last first, until it fits; `None` if
+    /// nothing worth saying does.
+    pub fn answer_within(&self, query: &Message, limit: usize) -> Option<Vec<u8>> {
+        let mut msg = self.answer(query)?;
+        let is_address = |r: &Record| matches!(r.data, Data::A(_) | Data::Aaaa(_));
+        loop {
+            let bytes = msg.encode()?;
+            if bytes.len() <= limit {
+                return Some(bytes);
+            }
+            if let Some(i) = msg.additionals.iter().rposition(is_address) {
+                msg.additionals.remove(i);
+            } else if let Some(i) = msg.answers.iter().rposition(is_address) {
+                msg.answers.remove(i);
+                if msg.answers.is_empty() {
+                    return None;
+                }
+            } else {
+                return None;
+            }
         }
     }
 }
@@ -635,16 +697,15 @@ pub fn announce(
                 continue;
             }
             let ann = announcement();
-            let Some(answer) = ann.answer(&query) else {
+            // No longer than the question.
+            let Some(bytes) = ann.answer_within(&query, data.len()) else {
                 continue;
             };
             if !on_link(from.ip(), &interfaces()) || allowance < 1.0 {
                 continue;
             }
             allowance -= 1.0;
-            if let Some(bytes) = answer.encode() {
-                let _ = socket.send_to(&bytes, from).await;
-            }
+            let _ = socket.send_to(&bytes, from).await;
         }
     }))
 }
@@ -653,7 +714,7 @@ pub fn announce(
 /// it is, for at most `wait`. The question is repeated a couple of times,
 /// as RFC 6762 section 5.2 asks of a one-shot query.
 pub async fn find(id: &SharpId, wait: Duration) -> Vec<SocketAddr> {
-    let Some(query) = query_for(id).encode() else {
+    let Some(query) = padded_query(id) else {
         return Vec::new();
     };
     let ifaces = interfaces();
@@ -854,6 +915,50 @@ mod tests {
         let a = ann.answer(&host).unwrap();
         assert_eq!(a.answers.len(), 1);
         assert!(matches!(a.answers[0].data, Data::A(_)));
+    }
+
+    /// An answer is never longer than its question. A sender's question is
+    /// padded, and is still the question; unpadded, it gets no answer; an
+    /// announcement with more addresses than fit says the first of them.
+    #[test]
+    fn an_answer_is_never_longer_than_the_question() {
+        let ann = announcement();
+        let padded = padded_query(&ann.id).unwrap();
+        assert_eq!(padded.len(), QUERY_LEN);
+        let q = Message::decode(&padded).expect("a well-formed message");
+        assert_eq!(q.questions, query_for(&ann.id).questions);
+        assert!(matches!(
+            q.additionals[..],
+            [Record {
+                data: Data::Other,
+                ..
+            }]
+        ));
+        let a = ann.answer_within(&q, padded.len()).expect("answered");
+        assert!(a.len() <= padded.len());
+        let a = Message::decode(&a).unwrap();
+        assert_eq!(addresses_in(&a, &ann.id).len(), 2);
+
+        let bare = query_for(&ann.id).encode().unwrap();
+        assert!(bare.len() < 128);
+        assert!(ann
+            .answer_within(&Message::decode(&bare).unwrap(), bare.len())
+            .is_none());
+
+        let crowded = Announcement {
+            addresses: (1..=64u16)
+                .map(|i| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
+                .collect(),
+            ..ann.clone()
+        };
+        let a = crowded.answer_within(&q, padded.len()).expect("answered");
+        assert!(a.len() <= padded.len());
+        let said = addresses_in(&Message::decode(&a).unwrap(), &ann.id);
+        assert!(!said.is_empty() && said.len() < 64, "{}", said.len());
+        assert_eq!(
+            said[0].0,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
     }
 
     /// Names arrive compressed from other implementations, and are read;

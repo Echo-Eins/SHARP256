@@ -17,9 +17,10 @@
 //! an authenticated frame, so it takes the session keys to produce, and it
 //! has to come back *from the challenged address*, so it takes delivery
 //! there to return. Until that happens nothing else is sent to the new
-//! address, and the challenges themselves are held to three times what the
-//! address has sent us (RFC 9000 section 8): a copied packet from a forged
-//! source buys at most that, aimed at whoever owns the forged address.
+//! address, and the challenges themselves — with the answers to its own
+//! challenges — are held to what the address has sent us (RFC 9000 section
+//! 8 allows three times that): a copied packet from a forged source buys at
+//! most its own size, aimed at whoever owns the forged address.
 //!
 //! Replays of an old PATH_RESPONSE are caught before they reach this module,
 //! by the transport's replay window; a token is used once and forgotten.
@@ -45,10 +46,13 @@ const MAX_CLAIMS: usize = 4;
 /// and a new token for every new attempt meant it never matched anything.
 const REMEMBER: Duration = Duration::from_secs(30);
 /// Bytes of challenges sent to an address per byte received from it before
-/// it is proven: the three RFC 9000 (section 8) allows. A challenge answers
-/// traffic, so a copied packet from a forged source buys at most three
-/// times its own size aimed at the forged address.
-const AMPLIFICATION: usize = 3;
+/// it is proven: one. RFC 9000 (section 8) allows three; here no more goes
+/// to an address nobody has proven than came from it, so a packet copied
+/// from a forged source buys at most its own size aimed at the forged
+/// address. A challenge (41 bytes) is smaller than any packet that carries
+/// data or an acknowledgement, so a peer that really moved is challenged at
+/// once and again as its traffic keeps coming.
+const AMPLIFICATION: usize = 1;
 /// Size of one PATH_CHALLENGE datagram on the wire.
 pub const CHALLENGE_BYTES: usize = crate::crypto::transport::OVERHEAD + PATH_TOKEN_LEN;
 
@@ -128,12 +132,20 @@ impl PathProbe {
     /// is the address the session has proven and sends to. Returns the
     /// challenge to send when `from` is a new claim, or a given-up one
     /// speaking again.
+    ///
+    /// `answer` is what the packet draws back to `from` by itself — the
+    /// PATH_RESPONSE to a PATH_CHALLENGE it carries — and is counted before
+    /// any challenge of ours: one packet is answered with no more than its
+    /// own size in all, and the answer it asked for comes first. (A copy of
+    /// the peer's challenge sent from a forged address drew both an answer
+    /// and a challenge of the same size, twice what it cost.)
     pub fn on_authentic(
         &mut self,
         from: SocketAddr,
         peer: SocketAddr,
         now: Instant,
         len: usize,
+        answer: usize,
     ) -> Option<Challenge> {
         if from == peer {
             // The proven path is alive; claims for other addresses are no
@@ -144,6 +156,7 @@ impl PathProbe {
         self.forget_old(now);
         if let Some(p) = self.probes.iter_mut().find(|p| p.addr == from) {
             p.received = p.received.saturating_add(len);
+            p.sent = p.sent.saturating_add(answer);
             // Still being tested: nothing new to send.
             p.given_up?;
             // Speaking again after we gave up: test it again, with the same
@@ -172,7 +185,7 @@ impl PathProbe {
             sent_at: now,
             tries: 1,
             received: len,
-            sent: 0,
+            sent: answer,
             given_up: None,
         };
         let c = p.may_send().then(|| p.challenge(now));
@@ -272,15 +285,17 @@ mod tests {
         let mut p = PathProbe::new();
 
         // Packets from the proven address change nothing.
-        assert!(p.on_authentic(peer, peer, now, LEN).is_none());
+        assert!(p.on_authentic(peer, peer, now, LEN, 0).is_none());
 
         // A packet from elsewhere is a claim: challenge it, do not migrate.
-        let c = p.on_authentic(moved, peer, now, LEN).expect("challenged");
+        let c = p
+            .on_authentic(moved, peer, now, LEN, 0)
+            .expect("challenged");
         assert_eq!(c.to, moved);
         assert_eq!(p.probing(), vec![moved]);
 
         // More packets from the same address do not restart the challenge.
-        assert!(p.on_authentic(moved, peer, now, LEN).is_none());
+        assert!(p.on_authentic(moved, peer, now, LEN, 0).is_none());
 
         // A wrong token, or the right token from a third address, proves
         // nothing.
@@ -303,7 +318,7 @@ mod tests {
         let mut p = PathProbe::new();
 
         let first = p
-            .on_authentic(other, peer, start, 10_000)
+            .on_authentic(other, peer, start, 10_000, 0)
             .expect("challenged");
         // Too early to repeat.
         assert!(p.poll(start, rto).is_empty());
@@ -336,7 +351,7 @@ mod tests {
         let mut now = Instant::now();
         let mut p = PathProbe::new();
         let first = p
-            .on_authentic(other, peer, now, 10_000)
+            .on_authentic(other, peer, now, 10_000, 0)
             .expect("challenged");
         for _ in 0..=MAX_TRIES {
             now += MAX_RETRY;
@@ -345,11 +360,11 @@ mod tests {
         assert!(p.probing().is_empty());
         // It speaks again: challenged again, and a token from any round
         // proves it.
-        let again = p.on_authentic(other, peer, now, LEN).expect("re-tested");
+        let again = p.on_authentic(other, peer, now, LEN, 0).expect("re-tested");
         assert_eq!(again.nonce, first.nonce);
         // Long after it was given up, it is forgotten.
         let mut q = PathProbe::new();
-        let c = q.on_authentic(other, peer, now, 10_000).unwrap();
+        let c = q.on_authentic(other, peer, now, 10_000, 0).unwrap();
         for _ in 0..=MAX_TRIES {
             now += MAX_RETRY;
             q.poll(now, rto);
@@ -368,20 +383,22 @@ mod tests {
         let moved = addr("198.51.100.9:6000");
         let now = Instant::now();
         let mut p = PathProbe::new();
-        let real = p.on_authentic(moved, peer, now, LEN).expect("challenged");
+        let real = p
+            .on_authentic(moved, peer, now, LEN, 0)
+            .expect("challenged");
         for i in 0..MAX_CLAIMS - 1 {
             let forged = addr(&format!("203.0.113.{}:9", i + 1));
-            assert!(p.on_authentic(forged, peer, now, LEN).is_some());
+            assert!(p.on_authentic(forged, peer, now, LEN, 0).is_some());
             // The real claim's packets keep arriving in between.
-            assert!(p.on_authentic(moved, peer, now, LEN).is_none());
+            assert!(p.on_authentic(moved, peer, now, LEN, 0).is_none());
         }
         assert!(p.probing().contains(&moved));
         assert_eq!(p.on_response(moved, real.nonce), Some(moved));
     }
 
-    /// A challenge answers traffic, and never more than three times what
-    /// the address sent: one small copied packet from a forged source buys
-    /// one challenge, not a stream of them.
+    /// A challenge answers traffic, and never more than the address sent:
+    /// one small copied packet from a forged source buys no challenge at
+    /// all, and one of a challenge's size buys one, not a stream of them.
     #[test]
     fn challenges_to_an_unproven_address_are_bounded_by_what_it_sent() {
         let peer = addr("192.0.2.1:5555");
@@ -390,7 +407,10 @@ mod tests {
         let mut now = Instant::now();
         let mut p = PathProbe::new();
         let small = CHALLENGE_BYTES / 2;
-        let mut sent = p.on_authentic(forged, peer, now, small).into_iter().count();
+        let mut sent = p
+            .on_authentic(forged, peer, now, small, 0)
+            .into_iter()
+            .count();
         for _ in 0..3 * MAX_TRIES {
             now += MAX_RETRY;
             sent += p.poll(now, rto).len();
@@ -401,9 +421,40 @@ mod tests {
             sent,
             small
         );
-        // A packet big enough is answered, though.
+        // A packet big enough is answered, though — once.
         let mut q = PathProbe::new();
-        assert!(q.on_authentic(forged, peer, now, CHALLENGE_BYTES).is_some());
+        assert!(q
+            .on_authentic(forged, peer, now, CHALLENGE_BYTES, 0)
+            .is_some());
+        let mut repeats = 0;
+        for _ in 0..3 * MAX_TRIES {
+            now += MAX_RETRY;
+            repeats += q.poll(now, rto).len();
+        }
+        assert_eq!(repeats, 0);
+    }
+
+    /// A copy of the peer's challenge from a forged address is answered —
+    /// that answer is its own size — and draws no challenge on top; a
+    /// packet with room for both gets both.
+    #[test]
+    fn a_challenge_from_an_unproven_address_is_answered_and_nothing_more() {
+        let peer = addr("192.0.2.1:5555");
+        let forged = addr("198.51.100.9:6000");
+        let rto = Duration::from_millis(100);
+        let mut now = Instant::now();
+        let mut p = PathProbe::new();
+        assert!(p
+            .on_authentic(forged, peer, now, CHALLENGE_BYTES, CHALLENGE_BYTES)
+            .is_none());
+        for _ in 0..3 * MAX_TRIES {
+            now += MAX_RETRY;
+            assert!(p.poll(now, rto).is_empty());
+        }
+        let mut q = PathProbe::new();
+        assert!(q
+            .on_authentic(forged, peer, now, 2 * CHALLENGE_BYTES, CHALLENGE_BYTES)
+            .is_some());
     }
 
     #[test]
@@ -412,8 +463,10 @@ mod tests {
         let other = addr("198.51.100.9:6000");
         let now = Instant::now();
         let mut p = PathProbe::new();
-        let c = p.on_authentic(other, peer, now, LEN).expect("challenged");
-        assert!(p.on_authentic(peer, peer, now, LEN).is_none());
+        let c = p
+            .on_authentic(other, peer, now, LEN, 0)
+            .expect("challenged");
+        assert!(p.on_authentic(peer, peer, now, LEN, 0).is_none());
         assert!(p.probing().is_empty());
         // A late echo of the cancelled claim no longer migrates anything.
         assert!(p.on_response(other, c.nonce).is_none());
