@@ -282,6 +282,8 @@ cargo build --release --no-default-features
 получаются те же байты, что в выпуске. Зависимости проверяются
 (`scripts/supply-chain.sh`: cargo-deny, cargo-audit, cargo-vet) при каждом
 изменении и каждый день — см. [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md).
+Небезопасный код есть только там, где программа обращается к системе, и
+каждый такой блок обоснован — см. [docs/UNSAFE.md](docs/UNSAFE.md).
 
 ## Использование
 

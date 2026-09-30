@@ -1,0 +1,16 @@
+# scripts/miri.sh on 2197e9e, 2026-09-30T17:35Z; miri 0.1.0 (5c543b0b8c 2026-09-29)
+
++ set -eu
++ cd scripts/..
++ export MIRIFLAGS=-Zmiri-symbolic-alignment-check
++ MIRIFLAGS=-Zmiri-symbolic-alignment-check
++ cargo +nightly miri test --no-default-features --lib -- address::dns::tests::addresses_are_read_from_the_list_wherever_they_lie crypto::secret
+test address::dns::tests::addresses_are_read_from_the_list_wherever_they_lie ... ok
+test crypto::secret::tests::a_key_is_shared_compared_and_never_shown ... ok
+test crypto::secret::tests::a_page_is_unlocked_by_its_last_key_only ... ok
+test crypto::secret::tests::secret_text_is_never_shown ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 173 filtered out; finished in 1.20s
++ cargo +nightly miri test --target x86_64-pc-windows-gnu --no-default-features --lib -- crypto::keystore::dpapi
+test crypto::keystore::dpapi::tests::an_empty_blob_is_nothing ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 174 filtered out; finished in 0.27s
+exit status: 0

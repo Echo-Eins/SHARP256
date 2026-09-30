@@ -69,6 +69,21 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   Sigstore; left a draft to publish by hand.
 - GitHub Actions are pinned by commit, the tools CI installs by version.
 
+### Unsafe code
+- Unsafe code is denied crate-wide and allowed by name only where the
+  crate calls into the system (see [docs/UNSAFE.md](docs/UNSAFE.md)); each
+  block has its own `SAFETY` reason and one operation, `unsafe fn` bodies
+  too. Clippy now checks the Windows and macOS code as well.
+- Fixed: an empty answer from DPAPI with a null pointer was made into a
+  slice, which is undefined behaviour at any length; the addresses in
+  `getaddrinfo`'s list were taken by reference, which assumes an alignment
+  nothing promises (now read unaligned, from a walk of the list tested on
+  one built with misaligned addresses); `renameat2` was passed `int`s where
+  `syscall(2)` takes `long`s.
+- Miri (`scripts/miri.sh`, a CI job) runs what of this it can: the list
+  walk, keys in memory, and the DPAPI answer as Windows code. It stops the
+  code before each fix.
+
 ### Security
 - Long-term X25519 identities, created on first use and kept in the
   per-user data directory with owner-only permissions. A peer is addressed

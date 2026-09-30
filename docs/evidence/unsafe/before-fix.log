@@ -1,0 +1,32 @@
+# The code before each fix of 2197e9e, put back one at a time (scratchpad script, restoring from HEAD after each), 2026-09-30T17:34Z
+# rustc 1.95.0 (59807616e 2026-04-14); rustc 1.101.0-nightly (5c543b0b8 2026-09-29) with miri 0.1.0 (5c543b0b8c 2026-09-29)
+
+== getaddrinfo's sockaddr_in taken by reference (as before)
+  native, debug:
+    misaligned pointer dereference: address must be a multiple of 0x4 but is 0x7f1fe4000d11
+  Miri, symbolic alignment:
+    test address::dns::tests::addresses_are_read_from_the_list_wherever_they_lie ... error: Undefined Behavior: constructing invalid value of type &libc::sockaddr_in: encountered an unaligned reference (required 4 byte alignment but found 1)
+        |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+  Miri, default alignment check:
+    test address::dns::tests::addresses_are_read_from_the_list_wherever_they_lie ... error: Undefined Behavior: constructing invalid value of type &libc::sockaddr_in: encountered an unaligned reference (required 4 byte alignment but found 1)
+        |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+== getaddrinfo's sockaddr_in6 taken by reference (as before)
+  native, debug:
+    misaligned pointer dereference: address must be a multiple of 0x4 but is 0x7f3a20000d21
+  Miri, symbolic alignment:
+    test address::dns::tests::addresses_are_read_from_the_list_wherever_they_lie ... error: Undefined Behavior: constructing invalid value of type &libc::sockaddr_in6: encountered an unaligned reference (required 4 byte alignment but found 1)
+        |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+== DPAPI's empty answer made into a slice (as before)
+  Miri, Windows code:
+    test crypto::keystore::dpapi::tests::an_empty_blob_is_nothing ... error: Undefined Behavior: constructing invalid value of type &mut [u8]: encountered a null reference
+        |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+== as committed
+  native, debug:
+    test address::dns::tests::addresses_are_read_from_the_list_wherever_they_lie ... ok
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 177 filtered out; finished in 0.00s
+  Miri:
+    test address::dns::tests::addresses_are_read_from_the_list_wherever_they_lie ... ok
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 176 filtered out; finished in 0.18s
+  Miri, Windows code:
+    test crypto::keystore::dpapi::tests::an_empty_blob_is_nothing ... ok
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 174 filtered out; finished in 0.27s

@@ -1,0 +1,6 @@
+# Modules without system calls under Miri (-Zmiri-symbolic-alignment-check), a run on the working tree
+# just before 2197e9e (protocol/ as committed there), 2026-09-30; stopped during crypto::transport,
+# which Miri had been interpreting for over eight minutes: too slow for every change.
+
+crypto::secret [3s]: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 174 filtered out; finished in 0.92s 
+protocol:: [553s]: test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 159 filtered out; finished in 753.66s 
