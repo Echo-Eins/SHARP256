@@ -833,7 +833,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
     the sender printed — what two people read off their screens),
     "turn" (cards, and both are also given a TURN server to be
     reached through: coturn on the server host), or "dht" (no cards: both
-    announce in a DHT — a one-node one on the server host, written
+    announce in a DHT — two nodes per family on the server host, written
     independently of the client — and the sender is given the receiver's ID
     alone).
     `during(lab, topo)`, if given, is called every fifth of a second while
@@ -1054,9 +1054,13 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
     """Two hosts that know nothing of each other but the receiver's ID: both
     announce in a DHT and look for the other there."""
     # A DHT is one network per address family (BEP 32) and a host with both
-    # takes part in both: one node here on each address the hosts have, and
-    # the hosts start from both.
-    binds = ([f"{S1}:6881"] if topo.v4 else []) + ([f"[{S61}]:6881"] if topo.v6 else [])
+    # takes part in both: two nodes here on each family's two addresses, and
+    # the hosts start from all of them. Two, because an address is punched
+    # at in earnest only once two nodes at addresses of their own name it
+    # (nat::dht::VOUCHERS): an announcement is stored on every node it goes
+    # to, and one node alone could have made it up.
+    binds = ([f"{S1}:6881", f"{S2}:6881"] if topo.v4 else []) + (
+        [f"[{S61}]:6881", f"[{S62}]:6881"] if topo.v6 else [])
     dht = lab.spawn("S", ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "dht_node.py"),
                           *[a for b in binds for a in ("--bind", b)]], "dht.log")
     if not wait_for(lab, "dht.log", r"dht node", 10):
@@ -2174,12 +2178,13 @@ def planted_counter(lab):
 def cmd_dhtplant(args):
     """A DHT node on the lookup's path that answers every question with an
     address of its choosing beside the real ones — here one of the server
-    host's, where the kernel counts whatever arrives: what one sender that
-    meets its receiver through the DHT sends to an address planted this way
-    (docs/THREAT_MODEL.md, R24). With the receiver there (the meeting has to
-    happen all the same), and with nobody there at all, for as long as
-    `--wait` (the sender looks for five minutes). One pass of prediction is
-    8235 bytes (61 ports), a spray 18 432 (2048)."""
+    host's, where the kernel counts whatever arrives: what the two ends of a
+    meeting through the DHT send to an address planted this way
+    (docs/THREAT_MODEL.md, R24). An honest node beside it holds what the two
+    announce. With the receiver there (the meeting has to happen all the
+    same), and with nobody there at all, for as long as `--wait` (the sender
+    looks for five minutes). One pass of prediction is 8235 bytes (61
+    ports), a spray 18 432 (2048); plain punches are 135 bytes a pass."""
     failures = 0
     print(f"{'case':56} {'result':28} planted address got")
     for case, a_nat, b_nat in (("the receiver is there", "port_restricted", "full_cone"),
@@ -2197,12 +2202,16 @@ def cmd_dhtplant(args):
             lab.spawn("S", [f"{BIN}/sharp-relay", "--bind", "0.0.0.0:5560", "--stun", S1, "--stun", S2,
                             "--identity", f"{d}/relay.key", "--log", "info"], "relay.log")
             wait_for(lab, "relay.log", r"Receivers: --relay", 10)
-            lab.spawn("S", ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "dht_node.py"),
-                            "--bind", f"{S1}:6881", "--plant", f"{PLANTED}:7000"], "dht.log")
-            if not wait_for(lab, "dht.log", r"dht node", 10):
-                print("the DHT node did not start:\n" + lab.log("dht.log"))
+            # Two nodes, as a lookup meets in the real DHT: an honest one, and
+            # one that adds the planted address to every answer.
+            node = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dht_node.py")
+            lab.spawn("S", ["python3", node, "--bind", f"{S1}:6881"], "dht.log")
+            lab.spawn("S", ["python3", node, "--bind", f"{S2}:6881", "--plant", f"{PLANTED}:7000"],
+                      "dht-hostile.log")
+            if not (wait_for(lab, "dht.log", r"dht node", 10) and wait_for(lab, "dht-hostile.log", r"dht node", 10)):
+                print("a DHT node did not start:\n" + lab.log("dht.log") + lab.log("dht-hostile.log"))
                 return 1
-            dht_args = ["--dht", "--dht-bootstrap", f"{S1}:6881"]
+            dht_args = ["--dht", "--dht-bootstrap", f"{S1}:6881", "--dht-bootstrap", f"{S2}:6881"]
             data, want = make_payload(d)
             os.makedirs(f"{d}/out", exist_ok=True)
             there = case == "the receiver is there"

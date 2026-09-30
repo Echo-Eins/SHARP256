@@ -826,17 +826,24 @@ impl Sender {
                         crate::nat::dht::Role::Sender,
                         puncher.subscribe(),
                         nat_cancel.clone(),
-                        move |peer| {
+                        move |peer, news| {
+                            use crate::nat::dht::PeerNews;
+                            match news {
+                                PeerNews::Vouched | PeerNews::Found { vouched: true } => {
+                                    punch.vouch(peer.ip())
+                                }
+                                PeerNews::Found { vouched: false } => {}
+                            }
+                            // Vouched for later: the punching started when
+                            // it turned up, and only goes on in earnest now.
+                            if news == PeerNews::Vouched {
+                                return;
+                            }
                             let _ = found.send(Found::Relay(peer));
                             let (punch, cancel) = (punch.clone(), cancel.clone());
                             tokio::spawn(async move {
                                 punch
-                                    .run_for(
-                                        peer,
-                                        crate::nat::card::NatHints::unknown(),
-                                        crate::nat::punch::MEET_DURATION,
-                                        &cancel,
-                                    )
+                                    .run_for_found(peer, crate::nat::punch::MEET_DURATION, &cancel)
                                     .await;
                             });
                         },
@@ -874,6 +881,7 @@ impl Sender {
             engine.hits = Some(hits_rx);
             engine.turns = turns;
             engine.meeting = Some(meeting_cancel);
+            engine.puncher = Some(puncher.clone());
             // The addresses on the receiver's card that are on a TURN
             // server: where the transfer is carried, not where it is.
             if let Some(card) = &self.cfg.peer_card {
@@ -1399,6 +1407,10 @@ struct Engine {
     /// on a direct path it has nothing left to do.
     #[cfg(feature = "nat-traversal")]
     meeting: Option<CancellationToken>,
+    /// The puncher of the meeting, told of every punch that comes in (see
+    /// `Puncher::vouch`).
+    #[cfg(feature = "nat-traversal")]
+    puncher: Option<Arc<crate::nat::punch::Puncher>>,
     /// Addresses the introductions, the names and NAT64 turn up, as they
     /// turn up.
     found_rx: mpsc::UnboundedReceiver<Found>,
@@ -1605,6 +1617,8 @@ impl Engine {
             home: None,
             #[cfg(feature = "nat-traversal")]
             meeting: None,
+            #[cfg(feature = "nat-traversal")]
+            puncher: None,
             found_rx,
             unresolved,
             answered_at: None,
@@ -3365,6 +3379,11 @@ impl Engine {
                 crate::relay::Message::decode(pkt),
                 Some(crate::relay::Message::Punch)
             ) {
+                // A host punching at us is a peer's (see
+                // `Puncher::run_for_found`).
+                if let Some(p) = &self.puncher {
+                    p.vouch(from.ip());
+                }
                 return self.on_punch(from);
             }
             return Ok(());

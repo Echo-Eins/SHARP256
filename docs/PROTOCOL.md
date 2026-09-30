@@ -1468,7 +1468,15 @@ closest, three queries at a time, sixty at most, 256 candidates at most) and
 reads answers strictly and bounded: a reply is taken only from the address
 the query went to and under its four-byte transaction id, at most 32 nodes and
 32 peers are read from one, and a token longer than 64 bytes is not one.
-What turns up is punched at as an address on a card is. Nothing is said of the
+What turns up is punched at as an address on a card is, with one difference:
+a node answers a lookup with whatever it likes, and one on the lookup's path
+sees the infohash in the question, so an address from the DHT gets only the
+plain punches until it is vouched for — two nodes at addresses of their own
+have named it (`VOUCHERS`; an announcement is stored on every node it goes
+to), or a punch has come from its host — and the predictions, sprays and
+birthday sockets of unknown-NAT punching after. Until something vouched for
+has turned up, the lookups go on at the brisk pace: an address one node made
+up is no reason to look less often for the real one. Nothing is said of the
 NAT in front of an address, which is why unknown-NAT punching above exists.
 
 Every node asked learns this host's address and that it looks for, or

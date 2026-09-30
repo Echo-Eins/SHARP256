@@ -314,12 +314,40 @@ impl Shared {
         hints: crate::nat::card::NatHints,
         id: Option<SharpId>,
     ) {
+        self.meet_as(puncher, addr, hints, id, false)
+    }
+
+    /// [`Shared::meet`] at an address the DHT turned up: punched at in
+    /// earnest only once it is vouched for (see `Puncher::run_for_found`).
+    #[cfg(feature = "nat-traversal")]
+    fn meet_found(&self, puncher: &Arc<crate::nat::punch::Puncher>, addr: SocketAddr) {
+        self.meet_as(
+            puncher,
+            addr,
+            crate::nat::card::NatHints::unknown(),
+            None,
+            true,
+        )
+    }
+
+    #[cfg(feature = "nat-traversal")]
+    fn meet_as(
+        &self,
+        puncher: &Arc<crate::nat::punch::Puncher>,
+        addr: SocketAddr,
+        hints: crate::nat::card::NatHints,
+        id: Option<SharpId>,
+        found: bool,
+    ) {
         let stop = self.meetings.add(addr, id, &self.cancel);
         let puncher = puncher.clone();
         tokio::spawn(async move {
-            puncher
-                .run_for(addr, hints, crate::nat::punch::MEET_DURATION, &stop)
-                .await;
+            let duration = crate::nat::punch::MEET_DURATION;
+            if found {
+                puncher.run_for_found(addr, duration, &stop).await;
+            } else {
+                puncher.run_for(addr, hints, duration, &stop).await;
+            }
             // Over: its entry goes with the next change.
             stop.cancel();
         });
@@ -729,8 +757,17 @@ impl Receiver {
                         crate::nat::dht::Role::Receiver,
                         puncher.subscribe(),
                         shared.cancel.clone(),
-                        move |peer| {
-                            meeting.meet(&punch, peer, crate::nat::card::NatHints::unknown(), None);
+                        move |peer, news| {
+                            use crate::nat::dht::PeerNews;
+                            match news {
+                                PeerNews::Found { vouched } => {
+                                    if vouched {
+                                        punch.vouch(peer.ip());
+                                    }
+                                    meeting.meet_found(&punch, peer);
+                                }
+                                PeerNews::Vouched => punch.vouch(peer.ip()),
+                            }
                         },
                     );
                 }
@@ -803,7 +840,7 @@ impl Receiver {
                         let now = Instant::now();
                         for (buf, r) in bufs.iter_mut().zip(&got[..n]) {
                             #[cfg(feature = "nat-traversal")]
-                            if side_channel(nat.as_ref(), &relays, &buf[..r.len], r.from, r.stride) {
+                            if side_channel(nat.as_ref(), &relays, &puncher, &buf[..r.len], r.from, r.stride) {
                                 continue;
                             }
                             d.on_received(buf, *r, now);
@@ -830,7 +867,7 @@ impl Receiver {
                     let mut buf = data;
                     let r = Received { from, len: buf.len(), stride: buf.len(), dst: None };
                     #[cfg(feature = "nat-traversal")]
-                    if side_channel(nat.as_ref(), &relays, &buf, from, buf.len()) {
+                    if side_channel(nat.as_ref(), &relays, &puncher, &buf, from, buf.len()) {
                         continue;
                     }
                     d.on_received(&mut buf, r, Instant::now());
@@ -1481,6 +1518,7 @@ async fn resolve_relay(
 fn side_channel(
     nat: Option<&crate::nat::NatTask>,
     relays: &RelayClients,
+    puncher: &crate::nat::punch::Puncher,
     run: &[u8],
     from: SocketAddr,
     stride: usize,
@@ -1519,6 +1557,13 @@ fn side_channel(
                     let _ = c.tx.try_send((d.to_vec(), from));
                 }
             }
+        } else if matches!(
+            crate::relay::Message::decode(first),
+            Some(crate::relay::Message::Punch)
+        ) {
+            // A host punching at us is a peer's (see
+            // `Puncher::run_for_found`).
+            puncher.vouch(from.ip());
         }
         return true;
     }

@@ -74,6 +74,25 @@ const MAX_PEERS: usize = 64;
 const MAX_PER_REPLY: usize = 32;
 /// Longest token read.
 const MAX_TOKEN: usize = 64;
+/// Nodes, each at an address of its own, that must report an address before
+/// it is taken for one somebody announced. A node answers a lookup with
+/// whatever it likes, and one on the lookup's path — it sees the infohash
+/// in the question — can name any address to have punched at; an
+/// announcement is stored on up to [`K`] nodes, so the real one is named by
+/// several (see `nat::punch::Puncher::run_for_found`).
+pub const VOUCHERS: usize = 2;
+/// Peers whose reporting nodes are remembered across lookups.
+const REMEMBERED_PEERS: usize = 256;
+
+/// What a rendezvous has learnt of an address of the other end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerNews {
+    /// Turned up for the first time; `vouched` if [`VOUCHERS`] nodes named
+    /// it already.
+    Found { vouched: bool },
+    /// Turned up before, named by one node; now enough of them name it.
+    Vouched,
+}
 
 /// A node worth asking, and what became of asking it.
 struct Candidate {
@@ -95,6 +114,10 @@ enum State {
 pub struct Lookup {
     /// Addresses announced under the infohash, as the nodes report them.
     pub peers: Vec<SocketAddr>,
+    /// Which node said so, by its IP address: (peer, node). A peer that
+    /// several nodes report was announced; one that a single node reports
+    /// may be that node's invention (see [`VOUCHERS`]).
+    pub sources: Vec<(SocketAddr, IpAddr)>,
     /// The nodes closest to it that answered, with their tokens: where an
     /// announcement goes.
     closest: Vec<(SocketAddr, Vec<u8>)>,
@@ -166,6 +189,7 @@ impl Dht {
             }
         }
         let mut peers: Vec<SocketAddr> = Vec::new();
+        let mut sources: Vec<(SocketAddr, IpAddr)> = Vec::new();
         let mut queries = 0usize;
         loop {
             if Instant::now() >= deadline || queries >= MAX_QUERIES {
@@ -204,9 +228,13 @@ impl Dht {
                     Some(r) => {
                         cands[i].id = Some(r.id);
                         cands[i].state = State::Answered(r.token);
+                        let node = canonical(cands[i].addr).ip();
                         for p in r.values {
                             if peers.len() < MAX_PEERS && !peers.contains(&p) {
                                 peers.push(p);
+                            }
+                            if peers.contains(&p) && !sources.contains(&(p, node)) {
+                                sources.push((p, node));
                             }
                         }
                         for (id, addr) in r.nodes {
@@ -227,6 +255,7 @@ impl Dht {
         answered.sort_by_key(|(c, _)| distance(c.id.as_ref(), info_hash));
         Lookup {
             peers,
+            sources,
             closest: answered
                 .into_iter()
                 .take(K)
@@ -554,7 +583,7 @@ pub fn spawn_rendezvous(
     role: Role,
     aims: tokio::sync::watch::Receiver<crate::nat::card::FamilyHints>,
     cancel: CancellationToken,
-    on_peer: impl Fn(SocketAddr) + Send + Sync + 'static,
+    on_peer: impl Fn(SocketAddr, PeerNews) + Send + Sync + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (mine, theirs) = (
@@ -562,6 +591,10 @@ pub fn spawn_rendezvous(
             info_hash(key.expose(), role.other()),
         );
         let mut seen: HashSet<SocketAddr> = HashSet::new();
+        // Which nodes have reported each peer, over every lookup so far, and
+        // the peers already said to be vouched for.
+        let mut vouchers: HashMap<SocketAddr, HashSet<IpAddr>> = HashMap::new();
+        let mut vouched: HashSet<SocketAddr> = HashSet::new();
         let mut announced: Option<(Option<u16>, Option<u16>, Instant)> = None;
         let mut aims = aims;
         let mut round = 0u32;
@@ -573,10 +606,30 @@ pub fn spawn_rendezvous(
                 l = dht.lookup(&theirs, LOOKUP_WITHIN) => l,
                 _ = cancel.cancelled() => return,
             };
+            for (p, node) in found.sources {
+                if vouchers.len() < REMEMBERED_PEERS || vouchers.contains_key(&p) {
+                    vouchers.entry(p).or_default().insert(node);
+                }
+            }
             for p in found.peers {
+                let sure = vouchers.get(&p).is_some_and(|n| n.len() >= VOUCHERS);
                 if seen.insert(p) {
-                    tracing::info!("the DHT says the other end is at {}", p);
-                    on_peer(p);
+                    tracing::info!(
+                        "the DHT says the other end is at {}{}",
+                        p,
+                        if sure {
+                            ""
+                        } else {
+                            " (one node says so, so far)"
+                        }
+                    );
+                    if sure {
+                        vouched.insert(p);
+                    }
+                    on_peer(p, PeerNews::Found { vouched: sure });
+                } else if sure && vouched.insert(p) {
+                    tracing::info!("the DHT's nodes agree that the other end is at {}", p);
+                    on_peer(p, PeerNews::Vouched);
                 }
             }
             let (v4, v6) = {
@@ -614,8 +667,10 @@ pub fn spawn_rendezvous(
                 announced = Some((v4, v6, Instant::now()));
             }
             // Soon at first, while the other end may be about to announce,
-            // then every [`SEARCH_EVERY`].
-            let pause = if seen.is_empty() {
+            // then every [`SEARCH_EVERY`] — for as long as nothing the nodes
+            // agree on has turned up: an address one node made up is no
+            // reason to look less often for the real one.
+            let pause = if vouched.is_empty() {
                 (Duration::from_secs(2) * 2u32.pow((round - 1).min(4))).min(SEARCH_EVERY)
             } else {
                 KEEP_EVERY

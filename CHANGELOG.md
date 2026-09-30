@@ -225,6 +225,17 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   STUN server answers only a request at least as long as its answer.
 - mDNS questions are padded to 1200 bytes (EDNS(0) padding, RFC 7830); the
   responder's answer is no longer than the question.
+- An address from the DHT gets only plain punches until two nodes at
+  addresses of their own name it or a punch comes from its host; then the
+  predictions, sprays and birthday sockets of unknown-NAT punching. A node
+  on a lookup's path could name any address and have both ends of a
+  meeting punch at it: measured in the NAT laboratory (`natlab.py
+  dhtplant`), 123 KB in a 20-second meeting where the receiver's NAT draws
+  ports at random, now 1.4 KB, the meeting as fast as before. The lookups
+  also stay brisk until such an address turns up: one a node made up used
+  to slow the search for the real one to every two minutes. (Waiting for a
+  punch alone was tried: behind a NAT that draws its ports at random a real
+  peer's punches do not get through until somebody sprays.)
 - The relay already answered an unproven address with less than it sent;
   a test on the wire now holds it to that.
 - Tests on the wire: an on-path copier re-sends packets of both ends from

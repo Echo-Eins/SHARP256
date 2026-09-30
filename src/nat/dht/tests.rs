@@ -46,9 +46,23 @@ impl Net {
     /// neighbours by ID, so that everybody can be reached and nobody knows
     /// everybody.
     async fn start(n: usize, knows: usize) -> Net {
+        Self::start_at(n, knows, |_| Ipv4Addr::LOCALHOST.into(), None)
+            .await
+            .expect("loopback")
+    }
+
+    /// [`Net::start`] with node `i` at the address `at(i)`, and the first
+    /// node adding `plant` to every answer, as a hostile node would. `None`
+    /// where the addresses cannot be had (macOS has 127.0.0.1 alone).
+    async fn start_at(
+        n: usize,
+        knows: usize,
+        at: impl Fn(usize) -> IpAddr,
+        plant: Option<SocketAddr>,
+    ) -> Option<Net> {
         let mut socks = Vec::new();
-        for _ in 0..n {
-            let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        for i in 0..n {
+            let s = Arc::new(UdpSocket::bind(SocketAddr::new(at(i), 0)).await.ok()?);
             let mut id = [0u8; 20];
             rand::thread_rng().fill_bytes(&mut id);
             socks.push((id, s));
@@ -78,13 +92,14 @@ impl Net {
                 table,
                 cancel.clone(),
                 queries.clone(),
+                plant.filter(|_| i == 0),
             ));
         }
-        Net {
+        Some(Net {
             nodes: addrs,
             cancel,
             queries,
-        }
+        })
     }
 
     fn bootstrap(&self) -> Vec<String> {
@@ -104,6 +119,7 @@ async fn node_loop(
     table: Vec<(NodeId, SocketAddr)>,
     cancel: CancellationToken,
     queries: Arc<AtomicUsize>,
+    plant: Option<SocketAddr>,
 ) {
     let mut stored: HashMap<NodeId, Vec<SocketAddr>> = HashMap::new();
     let mut buf = vec![0u8; 2048];
@@ -160,7 +176,14 @@ async fn node_loop(
                     ("token", Value::Bytes(token_for(from.ip()))),
                     ("nodes", Value::Bytes(nodes)),
                 ];
-                if let Some(peers) = stored.get(&ih) {
+                let peers: Vec<SocketAddr> = stored
+                    .get(&ih)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .chain(plant)
+                    .collect();
+                if !peers.is_empty() {
                     r.push((
                         "values",
                         Value::List(peers.iter().map(|p| Value::Bytes(compact(*p))).collect()),
@@ -486,7 +509,7 @@ async fn two_ends_meet_through_the_dht() {
         Role::Receiver,
         recv_aims.1.clone(),
         cancel.clone(),
-        move |p| {
+        move |p, _| {
             let _ = recv_tx.send(p);
         },
     );
@@ -496,7 +519,7 @@ async fn two_ends_meet_through_the_dht() {
         Role::Sender,
         send_aims.1.clone(),
         cancel.clone(),
-        move |p| {
+        move |p, _| {
             let _ = send_tx.send(p);
         },
     );
@@ -515,6 +538,82 @@ async fn two_ends_meet_through_the_dht() {
         heard(&mut send_seen).await,
         "127.0.0.1:5555".parse::<SocketAddr>().unwrap()
     );
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = receiver.await;
+        let _ = sender.await;
+    })
+    .await;
+}
+
+/// An address one node names is not taken on its word: the other end,
+/// announced to the nodes nearest the infohash, is named by several and
+/// vouched for; an address a single node adds to its answers never is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_address_one_node_names_is_not_vouched_for() {
+    use crate::nat::card::FamilyHints;
+    let planted: SocketAddr = "192.0.2.77:7000".parse().unwrap();
+    // Every node at an address of its own: 127.0.0.10 and on.
+    let Some(net) = Net::start_at(
+        20,
+        6,
+        |i| Ipv4Addr::new(127, 0, 0, 10 + i as u8).into(),
+        Some(planted),
+    )
+    .await
+    else {
+        return;
+    };
+    let cancel = CancellationToken::new();
+    let key = rendezvous_key(&crate::crypto::Identity::generate().id(), None);
+    let aims = |port: u16| {
+        let mut h = FamilyHints::unknown();
+        h.aim4 = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port));
+        tokio::sync::watch::channel(h)
+    };
+    let (recv_aims, send_aims) = (aims(5555), aims(6666));
+    let (tx, mut news) = tokio::sync::mpsc::unbounded_channel();
+    let receiver = spawn_rendezvous(
+        Dht::start(net.bootstrap(), cancel.clone()).unwrap(),
+        key.clone(),
+        Role::Receiver,
+        recv_aims.1.clone(),
+        cancel.clone(),
+        |_, _| {},
+    );
+    let sender = spawn_rendezvous(
+        Dht::start(net.bootstrap(), cancel.clone()).unwrap(),
+        key,
+        Role::Sender,
+        send_aims.1.clone(),
+        cancel.clone(),
+        move |p, n| {
+            let _ = tx.send((p, n));
+        },
+    );
+    let receiver_at: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let mut said: Vec<(SocketAddr, PeerNews)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let vouched = |said: &[(SocketAddr, PeerNews)], a: SocketAddr| {
+        said.iter().any(|(p, n)| {
+            *p == a && matches!(n, PeerNews::Vouched | PeerNews::Found { vouched: true })
+        })
+    };
+    while !vouched(&said, receiver_at) {
+        match tokio::time::timeout_at(deadline, news.recv()).await {
+            Ok(Some(n)) => said.push(n),
+            _ => panic!("the receiver was never vouched for: {:?}", said),
+        }
+    }
+    while let Ok(n) = news.try_recv() {
+        said.push(n);
+    }
+    assert!(
+        said.contains(&(planted, PeerNews::Found { vouched: false })),
+        "the planted address was not even turned up, so this proved nothing: {:?}",
+        said
+    );
+    assert!(!vouched(&said, planted), "{:?}", said);
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = receiver.await;

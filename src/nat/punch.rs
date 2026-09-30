@@ -279,6 +279,10 @@ pub struct Puncher {
     settled: CancellationToken,
     /// When each address was last sprayed at.
     last_spray: parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, Instant>>,
+    /// Hosts vouched for (see [`Puncher::vouch`]), and when; and the news of
+    /// each, for the punches that wait for it.
+    vouched: parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, Instant>>,
+    vouched_news: tokio::sync::Notify,
     /// What to do with the socket a birthday meeting was made at. Without
     /// one, an end whose NAT draws ports at random can only punch from the
     /// one socket, which is a hope and not a method.
@@ -309,6 +313,8 @@ impl Puncher {
             mine,
             settled: CancellationToken::new(),
             last_spray: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            vouched: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            vouched_news: tokio::sync::Notify::new(),
             on_hit: None,
             turns: Vec::new(),
         }
@@ -395,6 +401,60 @@ impl Puncher {
         duration: Duration,
         cancel: &CancellationToken,
     ) {
+        self.punch(base, theirs, duration, cancel, false).await
+    }
+
+    /// Punches for a meeting at an address the DHT turned up, where any
+    /// node the lookup asked can answer with any address it likes. Nothing
+    /// is known of the NAT in front of it, and every plan for an unknown NAT
+    /// comes to prediction, spraying and birthday sockets — tens or hundreds
+    /// of kilobytes at an address that may be somebody else's. So until the
+    /// host is vouched for ([`Puncher::vouch`]: several of the DHT's nodes
+    /// name it, or a punch comes from it) only the plain punches go, a few
+    /// hundred bytes a pass, and the rest after. (Waiting for a punch alone
+    /// is not enough: behind a NAT that draws its ports at random a real
+    /// peer's punches do not get through until somebody sprays.)
+    pub async fn run_for_found(
+        &self,
+        base: SocketAddr,
+        duration: Duration,
+        cancel: &CancellationToken,
+    ) {
+        self.punch(base, NatHints::unknown(), duration, cancel, true)
+            .await
+    }
+
+    /// Vouches for the host at `ip` as a peer's: several of the DHT's nodes
+    /// named it, or a punch came from it. What [`Puncher::run_for_found`]
+    /// waits for.
+    pub fn vouch(&self, ip: std::net::IpAddr) {
+        /// Hosts remembered; a punch is nine bytes, and anybody may send one.
+        const REMEMBERED: usize = 256;
+        let ip = crate::address::canonical(SocketAddr::new(ip, 0)).ip();
+        let mut vouched = self.vouched.lock();
+        if vouched.len() >= REMEMBERED && !vouched.contains_key(&ip) {
+            if let Some(oldest) = vouched.iter().min_by_key(|(_, t)| **t).map(|(a, _)| *a) {
+                vouched.remove(&oldest);
+            }
+        }
+        vouched.insert(ip, Instant::now());
+        drop(vouched);
+        self.vouched_news.notify_waiters();
+    }
+
+    fn is_vouched(&self, ip: std::net::IpAddr) -> bool {
+        let ip = crate::address::canonical(SocketAddr::new(ip, 0)).ip();
+        self.vouched.lock().contains_key(&ip)
+    }
+
+    async fn punch(
+        &self,
+        base: SocketAddr,
+        theirs: NatHints,
+        duration: Duration,
+        cancel: &CancellationToken,
+        until_vouched: bool,
+    ) {
         // Stopped before it began: not a round, not a socket.
         if cancel.is_cancelled() {
             return;
@@ -440,14 +500,35 @@ impl Puncher {
                 handler(hit);
             }
         };
+        let plain = Plan {
+            verdict: Verdict::Direct,
+            ports: vec![base.port()],
+            spray: 0,
+            sockets: 0,
+        };
         let passes = async {
             let mut open_tx = Some(open_tx);
             let mut pass = 0usize;
+            let mut waiting = until_vouched;
             loop {
-                let plan = &schedule[pass % schedule.len()];
+                if waiting && self.is_vouched(base.ip()) {
+                    tracing::info!("{} is vouched for: punching at it in earnest", base);
+                    waiting = false;
+                    pass = 0;
+                }
+                let plan = if waiting {
+                    &plain
+                } else {
+                    &schedule[pass % schedule.len()]
+                };
                 // Said when it changes: the first pass, and each that tries
                 // something else.
-                if pass < schedule.len() {
+                if waiting && pass == 0 {
+                    tracing::info!(
+                        "punching towards {}: plainly, until it is vouched for (it came from the DHT)",
+                        base
+                    );
+                } else if !waiting && pass < schedule.len() {
                     tracing::info!("punching towards {}: {}", base, plan.verdict.describe());
                 }
                 if plan.sockets > 0 {
@@ -478,13 +559,26 @@ impl Puncher {
                     all.truncate(spray);
                     random = all;
                 }
-                self.send_rounds(base, &plan.ports, &random, cancel).await;
+                // While waiting for it to be vouched for, the news cuts the
+                // pass and the pause after it short.
+                let news = || async {
+                    if waiting {
+                        self.vouched_news.notified().await
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+                tokio::select! {
+                    _ = self.send_rounds(base, &plan.ports, &random, cancel) => {}
+                    _ = news() => {}
+                }
                 pass += 1;
                 if cancel.is_cancelled() || started.elapsed() + SPRAY_SPACING >= duration {
                     return;
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(SPRAY_SPACING - PUNCH_DURATION.min(SPRAY_SPACING)) => {}
+                    _ = news() => {}
                     _ = cancel.cancelled() => return,
                 }
             }
