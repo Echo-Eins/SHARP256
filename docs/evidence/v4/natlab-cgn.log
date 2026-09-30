@@ -1,0 +1,15 @@
+# natlab evidence: cgn (version 4: receivers print sh4- IDs, senders speak version 4)
+# code:      the commit this log is in (run on its working tree)
+# binaries:  debug, --no-default-features --features nat-traversal, built from this code before DHT addresses had to be vouched for to become handshake candidates (a change to the DHT paths alone; that build's hashes were not kept)
+# date:      2026-09-30T08:55:08Z (the run ended)
+# kernel:    Linux 6.19.2-gentoo-dist
+# nftables:  nftables v1.1.6 (Commodore Bullmoose #7)
+# command:   scripts/natlab/natlab.py cgn
+
+sender behind                              receiver behind                            via    result
+port_restricted + carrier port_restricted  port_restricted                            card   ok   direct-via-nat     5.4s as expected
+port_restricted                            port_restricted + carrier port_restricted  card   ok   direct-via-nat     5.4s as expected
+port_restricted + carrier symmetric_random port_restricted                            card   ok   direct-via-nat     4.8s as expected
+port_restricted                            port_restricted + carrier symmetric_random card   ok   direct-via-nat     5.6s as expected
+port_restricted + carrier symmetric_random port_restricted + carrier symmetric_random card   FAIL none              64.2s as expected
+port_restricted + carrier symmetric_random port_restricted + carrier symmetric_random relay  ok   relay              0.8s as expected

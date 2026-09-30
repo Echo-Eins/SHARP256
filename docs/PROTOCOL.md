@@ -1,4 +1,4 @@
-# SHARP-256 wire protocol, version 3
+# SHARP-256 wire protocol, versions 3 and 4
 
 SHARP-256 (Swift Hash Assurance Rust Protocol) moves a file or a whole
 directory tree from a sender to a receiver over UDP. Version 3 keeps the
@@ -28,6 +28,12 @@ Design goals, in priority order:
 5. **Universality.** No assumptions about MTU, link speed, NAT or data size
    beyond a 64-bit offset space. Every control datagram fits into
    1200 bytes.
+
+Version 4 (section 2, *Version 4*) is version 3 with a hybrid key exchange —
+X25519 and ML-KEM-768 together, so that traffic recorded today stays
+unreadable to whoever can break only one of them later — and with the
+HELLO moved after the handshake, where it has forward secrecy. Everything
+from section 3 on is the same in both.
 
 Section 12 lists the default values of every tunable mentioned below. All
 integers on the wire are big-endian unless stated otherwise.
@@ -65,6 +71,16 @@ lower-case base32 characters (RFC 4648 alphabet, no padding) encoding the
 32-byte public key and a 3-byte checksum,
 `BLAKE3-derive_key("sharp256 id checksum", public_key)[0..3]`, so that a
 mistyped ID is rejected instead of addressing somebody else.
+
+A receiver that speaks version 4 writes the same key as `sh4-` and 56
+characters, with a checksum of its own,
+`BLAKE3-derive_key("sharp256 id checksum v4", public_key)[0..3]`. The form
+of the ID says which version a sender speaks: to `sh4-` version 4 and
+nothing else, to `sh-` version 3. A version 4 receiver prints the `sh4-`
+form and answers both; a sender never falls back from version 4 to version
+3, so nobody on the way can talk it down to the classical handshake by
+dropping what it sends, and a `4` lost in copying is a checksum error, not
+the other version. A contact card says the same in flag bit 2.
 
 A sender addresses a receiver as `ID@host:port`. The ID is not a hint: the
 handshake succeeds only with the holder of the matching private key, so it
@@ -261,6 +277,73 @@ answer. A cookie reply counts only when it comes from the address the
 initiation went to. The session starts when a response authenticates.
 Send errors never end a handshake; its deadline does.
 
+### Version 4
+
+The handshake is `Noise_IKpsk2+hfs_25519+MLKEM768_ChaChaPoly_BLAKE2s`:
+IKpsk2 with the tokens of Noise's hybrid forward secrecy draft, in the
+layout I2P's proposal 169 uses for IK, and the prologue `SHARP-256 v4`:
+
+```
+  <- s
+  ...
+  -> e, es, e1, s, ss
+  <- e, ee, ekem1, se, psk
+```
+
+`e1` is the sender's ephemeral ML-KEM-768 (FIPS 203) encapsulation key,
+sent with `EncryptAndHash` (1184 + 16 bytes); `ekem1` is the receiver's
+ciphertext to it (`EncryptAndHash`, 1088 + 16 bytes) followed by `MixKey`
+of the shared secret. The receiver refuses an encapsulation key that fails
+FIPS 203's modulus check. The keys of the session depend on X25519 and on
+ML-KEM alike; authentication is version 3's (the static X25519 keys and the
+PSK).
+
+Message 1 is about 1300 bytes, too long for a control datagram, and goes in
+up to four **fragments** of about equal size (two in practice):
+
+```
+fragment    S → R   sender_cid[8] | index:4 count:4 | chunk | mac1[16] | mac2[16]
+response    R → S   sender_cid[8] | e[32] | enc(ct)[1104] | enc(receiver_cid[8] | payload)[n+24] | mac1[16]
+```
+
+Each fragment carries its own `mac1`, keyed
+`BLAKE3-derive_key("sharp256 v4 mac1", receiver_public_key)` — a version 3
+receiver hears nothing it knows in one, and a version 4 receiver tells the
+versions apart by it — and its own `mac2`: under load every fragment needs
+a cookie's, and a cookie reply to any fragment gives the cookie (sealed to
+that fragment's mac1). The receiver puts together only fragments whose mac1
+is its own, bounded: at most eight initiations per client (an IPv4 address
+or an IPv6 /64), 1024 in all (the oldest go first), each for two seconds;
+a fragment already there, or one that disagrees on the count, is not taken.
+Nothing is answered until every fragment is in.
+
+The response fits one control datagram: it has no clear copy of the
+receiver's connection id (only the sealed one ever counted) and no `mac2`
+(always zero in an answer); its `mac1` is keyed with the sender's key under
+the version 4 label. It is shorter than the fragments together.
+
+The payload of message 1 is `timestamp:u64 suites:u8 hardware_aes:u8` —
+no HELLO; the response's is `suite:u8 reason:u8`, the suite chosen or 0 and
+why the handshake is refused (the allow-list, no suite in common, busy).
+What the receiver makes of the transfer is said later, in answer to the
+HELLO.
+
+**HELLO after the handshake.** Once the response authenticates, the sender
+sends its HELLO as the first transport packet under the new keys, again
+until it is answered, and the receiver answers it with HELLO_ACK as it
+answers any HELLO in a session (section 5). Until that HELLO arrives the
+receiver holds keys and nothing else — at most 4096 such handshakes, each
+for ten seconds — and acts on nothing message 1 said beyond the allow-list,
+the replay guard and the suites: the HELLO is the first thing that proves
+the sender's key (message 1 can be made by anyone who holds the receiver's
+own key), and what it says (the name and size of the transfer) has forward
+secrecy, where message 1's payload does not. The HELLO names the transfer,
+which makes or finds the session; a refusal then (declined, busy) is a
+HELLO_ACK sealed under the handshake's keys, sent only to the address the
+HELLO has just proven. The HELLO_ACK of a resume, with its holes, goes to
+an address the HELLO has proven, so a version 4 initiation is never
+padded. This costs one round trip per handshake, resumes included.
+
 ## 3. Transport packets
 
 After the handshake every datagram is a transport packet:
@@ -416,7 +499,9 @@ Sender                                          Receiver
 
 The initiation carries HELLO; the response carries a HELLO_ACK that
 describes exactly what the receiver holds at that moment, so every
-handshake doubles as a resume point. If the receiver's application has to
+handshake doubles as a resume point. (In version 4 the HELLO is the first
+packet after the handshake and the HELLO_ACK its answer: section 2,
+*Version 4*; the rest is the same.) If the receiver's application has to
 decide (an accept dialog), the response says *pending*; the sender then
 sends a HELLO frame over the new session every second, each answered with
 the current status, and the receiver also sends an unsolicited HELLO_ACK as
@@ -1474,7 +1559,10 @@ sees the infohash in the question, so an address from the DHT gets only the
 plain punches until it is vouched for — two nodes at addresses of their own
 have named it (`VOUCHERS`; an announcement is stored on every node it goes
 to), or a punch has come from its host — and the predictions, sprays and
-birthday sockets of unknown-NAT punching after. Until something vouched for
+birthday sockets of unknown-NAT punching after. The sender tries it in the
+handshake only once it is vouched for, too (a version 4 initiation is a
+kilobyte and a half); a peer whose punches get through becomes a candidate
+by them anyway. Until something vouched for
 has turned up, the lookups go on at the brisk pace: an address one node made
 up is no reason to look less often for the real one. Nothing is said of the
 NAT in front of an address, which is why unknown-NAT punching above exists.

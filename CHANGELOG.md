@@ -1,11 +1,43 @@
 # Changelog
 
-## 0.5.0 — protocol v3 (unreleased)
+## 0.5.0 — protocols v3 and v4 (unreleased)
 
 Version 3 puts the version 2 transport inside an authenticated, encrypted
 channel, transfers whole directories and moves datagrams in batches for
 multi-gigabit links. Version 2 peers cannot talk to version 3 peers (the
 version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+### Protocol version 4
+- A hybrid post-quantum key exchange: `Noise_IKpsk2+hfs_25519+MLKEM768_
+  ChaChaPoly_BLAKE2s` — IKpsk2 with the tokens of Noise's hybrid forward
+  secrecy draft (`e1`, `ekem1`) in the layout I2P's proposal 169 uses for
+  IK. The session keys depend on X25519 and ML-KEM-768 (FIPS 203) alike, so
+  traffic recorded today stays unreadable to whoever can later break only
+  one. Authentication is version 3's. ML-KEM is RustCrypto's `ml-kem` 0.2
+  (0.3 needs Rust 1.85), with FIPS 203's modulus check of the encapsulation
+  key added (the crate does not make it), the decapsulation key in locked
+  memory and the shared secret wiped; checked against the accumulated
+  vectors of Go's `crypto/mlkem`.
+- Message 1, about 1300 bytes, goes in fragments within control datagrams,
+  each with its own `mac1` (a label of its own, so version 3 receivers hear
+  nothing they know) and `mac2`; the receiver puts them together within
+  bounds (8 per client, 1024 in all, two seconds). The answer fits one
+  datagram and is shorter than the fragments together.
+- The HELLO moves after the handshake, under its keys: the name and size of
+  a transfer get forward secrecy, and a thief of the receiver's key can no
+  longer make the receiver act on a message 1 written in anybody's name —
+  the receiver holds keys and nothing else until the HELLO, which takes the
+  sender's own key. One more round trip per handshake.
+- The version is in the ID: a version 4 receiver prints `sh4-…` (the same
+  key, a checksum of its own) and answers versions 3 and 4; a sender given
+  `sh4-` (or a card with the new flag bit) speaks version 4 and never falls
+  back to version 3, so nobody on the way can talk it down by dropping what
+  it sends. A `4` lost in copying is a checksum error.
+- Tests: the handshake and its fragments (order, duplicates, alteration,
+  bounds, cookies per fragment), transfers of files and directories, resume
+  after a receiver restart, refusals, no step down to a receiver that
+  speaks only version 3, the on-path copier for version 4; the NAT
+  laboratory runs version 4 end to end.
 
 ### Security
 - Long-term X25519 identities, created on first use and kept in the
@@ -235,7 +267,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   also stay brisk until such an address turns up: one a node made up used
   to slow the search for the real one to every two minutes. (Waiting for a
   punch alone was tried: behind a NAT that draws its ports at random a real
-  peer's punches do not get through until somebody sprays.)
+  peer's punches do not get through until somebody sprays.) In version 4
+  such an address is not tried in the handshake either until it is vouched
+  for — an initiation is a kilobyte and a half — and the planted address
+  gets 576 bytes in that meeting, 828 in a minute of looking for nobody.
 - The relay already answered an unproven address with less than it sent;
   a test on the wire now holds it to that.
 - Tests on the wire: an on-path copier re-sends packets of both ends from

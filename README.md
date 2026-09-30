@@ -14,13 +14,20 @@
 
 - **Шифрование и аутентификация.** Рукопожатие Noise `IKpsk2` (схема
   WireGuard): X25519, свежие ключи на каждую сессию (прямая секретность),
-  необязательный общий секрет (Argon2id) как дополнительный ключ. Каждый
+  необязательный общий секрет (Argon2id) как дополнительный ключ. Версия 4
+  протокола добавляет к X25519 постквантовый ML-KEM-768 (гибрид Noise HFS):
+  записанный сегодня трафик не прочтёт тот, кто сломает только одно из
+  двух; имя и размер передачи идут уже после рукопожатия, с прямой
+  секретностью. Каждый
   пакет после рукопожатия — AEAD (AES-256-GCM при аппаратном AES у обеих
   сторон, иначе ChaCha20-Poly1305) с защитой заголовка: наблюдатель не видит
   ни содержимого, ни имён, ни размеров, ни типов пакетов, ни номеров.
   Подделанные, повреждённые и повторённые пакеты отбрасываются до обработки.
 - **Идентичность вместо адреса.** Каждая сторона имеет ключ, её публичная
-  часть — SHARP ID вида `sh-…` (56 символов с контрольной суммой).
+  часть — SHARP ID вида `sh-…` (56 символов с контрольной суммой);
+  получатель печатает его в форме `sh4-…`, и отправитель, которому дана
+  такая форма, говорит с ним только на версии 4 — понизить её, мешая
+  пакетам, нельзя.
   Отправитель обращается к получателю как `ID@хост:порт` и тем самым
   проверяет, что говорит именно с ним. Получатель видит проверенный ID
   отправителя и может пускать только разрешённых (`--allow`, файл со
@@ -88,7 +95,7 @@
   Публикуются временные IPv6-адреса (RFC 8981), а не стабильные, которые
   позволили бы следить за узлом из сети в сеть; адреса канального уровня
   не публикуются никогда. IPv6-адрес пишется в скобках:
-  `sh-…@[2001:db8::5]:5555`, с зоной — `[fe80::1%eth0]:5555`.
+  `sh4-…@[2001:db8::5]:5555`, с зоной — `[fe80::1%eth0]:5555`.
 - **Живучесть.** Обрыв связи, смена адреса, перезапуск любой из сторон,
   отмена по Ctrl-C, отключение питания — состояние сохраняется (только
   после `fsync`, и файла, и каталога), передача продолжается с места
@@ -307,7 +314,7 @@ sharp-receiver --headless --relay sh-rrrr…@relay.example.org:5560 [--relay-pri
 ```
 
 При старте получатель печатает свой ID и строку для отправителей
-(`sh-…@<этот хост>:5555`), с NAT — внешний адрес. С
+(`sh4-…@<этот хост>:5555`), с NAT — внешний адрес. С
 `--relay ID@хост:порт --relay-private` строка — это один ID и `--relay`:
 получатель не публикует ни одного своего адреса. Частичные файлы лежат как
 `имя.sharp-part`, каталоги собираются в `имя.sharp-part/`; по завершении
@@ -318,14 +325,14 @@ sharp-receiver --headless --relay sh-rrrr…@relay.example.org:5560 [--relay-pri
 ### Отправитель
 
 ```bash
-sharp-sender /path/file.bin sh-abcd…@203.0.113.5:5555
-sharp-sender ~/Photos sh-abcd…@10.0.0.2:5555                  # каталог целиком
-sharp-sender file.bin sh-abcd…@nas.local:5555 --secret 'общая фраза'
-sharp-sender file.bin sh-abcd…@10.0.0.2:5555 --max-rate 200M  # ограничить 200 Мбит/с
-sharp-sender file.bin sh-abcd…@10.0.0.2:5555 --chunk-size 8927  # jumbo-кадры (проверяется зондом)
-sharp-sender file.bin sh-abcd…@10.0.0.2:5555 --log-level debug
-sharp-sender file.bin sh-abcd…@[2001:db8::5]:5555             # IPv6
-sharp-sender file.bin sh-abcd…@nas.example.org:5555,198.51.100.7:5555  # несколько кандидатов
+sharp-sender /path/file.bin sh4-abcd…@203.0.113.5:5555
+sharp-sender ~/Photos sh4-abcd…@10.0.0.2:5555                  # каталог целиком
+sharp-sender file.bin sh4-abcd…@nas.local:5555 --secret 'общая фраза'
+sharp-sender file.bin sh4-abcd…@10.0.0.2:5555 --max-rate 200M  # ограничить 200 Мбит/с
+sharp-sender file.bin sh4-abcd…@10.0.0.2:5555 --chunk-size 8927  # jumbo-кадры (проверяется зондом)
+sharp-sender file.bin sh4-abcd…@10.0.0.2:5555 --log-level debug
+sharp-sender file.bin sh4-abcd…@[2001:db8::5]:5555             # IPv6
+sharp-sender file.bin sh4-abcd…@nas.example.org:5555,198.51.100.7:5555  # несколько кандидатов
 sharp-sender file.bin sh-abcd… --relay relay.example.org:5560  # получатель доступен только через ретранслятор
 sharp-sender file.bin sh-abcd… --relay sh-rrrr…@relay.example.org:5560  # ретранслятор со списком отправителей
 ```
@@ -354,7 +361,7 @@ sharp-sender file.bin sh-abcd… --relay sh-rrrr…@relay.example.org:5560  # р
    $ sharp-receiver --headless
    Network: seen from outside at 198.51.100.7:5555, but inbound packets are filtered: …
    Your card:   shc1-…
-   Senders use: sh-…@198.51.100.7:5555,[2001:db8::7]:5555,192.168.1.5:5555
+   Senders use: sh4-…@198.51.100.7:5555,[2001:db8::7]:5555,192.168.1.5:5555
    ```
 
    `Senders use:` — ID получателя и его адреса, сначала видимые из
@@ -366,7 +373,7 @@ sharp-sender file.bin sh-abcd… --relay sh-rrrr…@relay.example.org:5560  # р
 
    ```text
    $ sharp-sender файл.bin shc1-<карточка получателя>
-   $ sharp-sender файл.bin sh-…@198.51.100.7:5555,[2001:db8::7]:5555 --card
+   $ sharp-sender файл.bin sh4-…@198.51.100.7:5555,[2001:db8::7]:5555 --card
    Network:   seen from outside at 203.0.113.9:40123, …
    Your card: shc1-…
    Addresses: 203.0.113.9:40123  [2001:db8:5::9]:40123
@@ -406,7 +413,7 @@ UPnP, свою карточку и `Addresses:`. Обменявшись карт
 ```bash
 sharp-relay                                                    # на любом сервере с публичным адресом
 sharp-receiver --headless --relay sh-rrrr…@relay.example.org:5560
-sharp-sender файл.bin sh-…@адрес --relay relay.example.org:5560
+sharp-sender файл.bin sh4-…@адрес --relay relay.example.org:5560
 # или любой TURN-сервер, которым вы вправе пользоваться (пароль лучше через SHARP256_TURN):
 sharp-receiver --headless --turn user:пароль@turn.example.org
 sharp-sender файл.bin shc1-… --turn user:пароль@turn.example.org
@@ -465,8 +472,10 @@ use sharp256::{Receiver, ReceiverConfig, Sender, SenderConfig, SharpId, Transfer
 use std::sync::Arc;
 
 async fn send() -> Result<(), Box<dyn std::error::Error>> {
-    let receiver: SharpId = "sh-…".parse()?;
+    // `sh4-…`: version 4, and nothing older (the version the form names).
+    let (receiver, version) = SharpId::parse_versioned("sh4-…")?;
     let mut cfg = SenderConfig::new("10.0.0.2:5555".parse()?, receiver, "big.iso".into());
+    cfg.receiver_version = version;
     cfg.events = Some(Arc::new(|ev: TransferEvent| {
         if let TransferEvent::Progress(s) = ev {
             println!("{:.1}% at {:.0} Mbit/s", s.fraction() * 100.0, s.rate_bps / 1e6);
@@ -480,7 +489,7 @@ async fn send() -> Result<(), Box<dyn std::error::Error>> {
 async fn receive() -> Result<(), sharp256::RecvError> {
     let cfg = ReceiverConfig::new("0.0.0.0:5555".parse().unwrap(), "./in".into());
     let receiver = Receiver::new(cfg).await?;
-    println!("senders use {}@<host>:5555", receiver.id());
+    println!("senders use {}@<host>:5555", receiver.id_text());
     receiver.run().await
 }
 ```
@@ -559,7 +568,7 @@ SHARP_REQUIRE_IPV6=1 cargo test --all-features
 cd fuzz && cargo +nightly fuzz run datagram -- -max_total_time=300
 ```
 
-Юнит-тесты (333 в библиотеке и 2 в программах; по запросу — замер скорости
+Юнит-тесты (345 в библиотеке и 2 в программах; по запросу — замер скорости
 AEAD, замеры времени `scripts/dudect.sh` и тест хранилища ключей ОС
 `scripts/keystore-test.sh`) покрывают ключи и ID, запечатанный файл ключа,
 закреплённую память, рукопожатие Noise (тестовый вектор и сравнение со
@@ -580,7 +589,7 @@ snow), отсутствие ключей и содержимого в журна
 продление и возврат, потерянная аллокация, слишком большие датаграммы, предел
 собеседников), bencode и обход DHT с враждебными ответами, mDNS, контактные
 карточки (опечатки, устаревание), планы пробивания и арифметику «дней
-рождения», общий запас их сокетов. Сквозные тесты (61, плюс 2 в сетевом
+рождения», общий запас их сокетов. Сквозные тесты (66, плюс 2 в сетевом
 пространстве имён и стенд профилей канала) поднимают настоящих отправителя и получателя: файлы
 0 байт … 6 МиБ и деревья каталогов (вложенность, пустые папки и файлы,
 Unicode, права, время изменения, символические ссылки) совпадают побайтно;

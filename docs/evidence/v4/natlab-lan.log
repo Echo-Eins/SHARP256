@@ -1,0 +1,11 @@
+# natlab evidence: lan (version 4: receivers print sh4- IDs, senders speak version 4)
+# code:      the commit this log is in (run on its working tree)
+# binaries:  debug, --no-default-features --features nat-traversal, built from this code before DHT addresses had to be vouched for to become handshake candidates (a change to the DHT paths alone; that build's hashes were not kept)
+# date:      2026-09-30T08:52:16Z (the run ended)
+# kernel:    Linux 6.19.2-gentoo-dist
+# nftables:  nftables v1.1.6 (Commodore Bullmoose #7)
+# command:   scripts/natlab/natlab.py lan
+
+announced and asked for: ok - via 10.9.0.2:5555 in 0.1s, as wanted
+announced but not asked for: ok - found nobody in 0.0s, as wanted
+asked for but not announced: ok - found nobody in 3.0s, as wanted
