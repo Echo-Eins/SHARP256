@@ -1,0 +1,157 @@
+# A release, on a tag v*: the binaries, a CycloneDX SBOM for each archive,
+# SHA256SUMS over it all, and a provenance attestation signed through
+# Sigstore with the workflow's own identity (GitHub's OIDC token: there is
+# no key to keep, and the signature is in Sigstore's public log). It is left
+# a draft, to be published by hand.
+#
+# The Linux binaries are built exactly as scripts/repro.sh builds them, so
+# anyone can build the tag again and get the same bytes; those for Windows
+# and macOS are built on GitHub's runners, and are not reproducible.
+#
+# Checking a downloaded release (docs/SUPPLY_CHAIN.md):
+#   sha256sum -c SHA256SUMS --ignore-missing
+#   gh attestation verify sharp256-v0.6.0-x86_64-linux.tar.gz --repo Echo-Eins/SHARP256
+#   scripts/repro.sh build v0.6.0      # its SHA256SUMS, and the archive's own
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.variant }}), reproducible
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Servers: every binary, no GUI (so no GTK needed to run them).
+          - variant: headless
+            suffix: ""
+          # sharp-sender and sharp-receiver with the GUI (GTK 3).
+          - variant: gui
+            suffix: "-gui"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build as scripts/repro.sh builds
+        env:
+          REPRO_VARIANT: ${{ matrix.variant }}
+        run: sh scripts/repro.sh build "$GITHUB_SHA" bin
+      - name: Archive (itself the same every time)
+        run: |
+          mkdir -p dist
+          name="sharp256-$GITHUB_REF_NAME-x86_64-linux${{ matrix.suffix }}"
+          mkdir "$name"
+          cp bin/* LICENSE README.md "$name/"
+          # Order, times, owners and modes fixed; gzip without name and time.
+          tar --sort=name --mtime="@$(git log -1 --format=%ct)" --owner=0 --group=0 --numeric-owner \
+            --mode='u+rwX,go+rX,go-w' -cf - "$name" | gzip -9n > "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-${{ matrix.variant }}
+          path: dist/
+
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            platform: x86_64-windows
+          - name: macOS
+            os: macos-latest
+            platform: aarch64-macos
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - name: Build
+        run: cargo build --release --locked --bins
+      - name: Archive
+        shell: bash
+        run: |
+          mkdir -p dist
+          name="sharp256-$GITHUB_REF_NAME-${{ matrix.platform }}"
+          mkdir "$name"
+          ext=""
+          if [ "$RUNNER_OS" = Windows ]; then ext=".exe"; fi
+          for b in sharp-sender sharp-receiver sharp-relay sharp-probe; do
+            cp "target/release/$b$ext" "$name/"
+          done
+          cp LICENSE README.md "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip "dist/$name.zip" "$name" >/dev/null
+          else
+            tar -czf "dist/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/
+
+  sbom:
+    name: SBOMs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx@0.5.9
+      - name: One for each archive, of what it was built from
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          sbom() {
+            cargo cyclonedx -q --format json --spec-version 1.5 --override-filename "$1" "${@:2}"
+          }
+          v="sharp256-$GITHUB_REF_NAME"
+          sbom "$v-x86_64-linux.cdx" --no-default-features --features nat-traversal --target x86_64-unknown-linux-gnu
+          sbom "$v-x86_64-linux-gui.cdx" --target x86_64-unknown-linux-gnu
+          sbom "$v-x86_64-windows.cdx" --target x86_64-pc-windows-msvc
+          sbom "$v-aarch64-macos.cdx" --target aarch64-apple-darwin
+          mkdir -p dist
+          mv ./*.cdx.json dist/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: dist/
+
+  publish:
+    name: Checksums, attestation, draft release
+    needs: [linux, native, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the draft release
+      id-token: write # Sigstore's certificate, for the workflow's identity
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "What changed: CHANGELOG.md. How to check what you downloaded: docs/SUPPLY_CHAIN.md."
+            echo
+            echo "The Linux archives are reproducible: \`scripts/repro.sh build $GITHUB_REF_NAME\` gives the SHA256SUMS inside them."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "SHARP-256 $GITHUB_REF_NAME" \
+            --notes-file notes.md dist/*

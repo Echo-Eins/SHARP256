@@ -1,6 +1,8 @@
 # The dependency graph's checks (scripts/supply-chain.sh; what each is for
 # is in docs/SUPPLY_CHAIN.md), on every change and every day: advisories are
-# published without any change here.
+# published without any change here. And the Linux release binaries, built
+# twice differing in everything but the source and the pinned image, have to
+# come out the same (scripts/repro.sh).
 #
 # Actions are pinned by commit, the tools by version.
 name: Supply chain
@@ -39,3 +41,21 @@ jobs:
           command -v cargo-audit || cargo install --locked cargo-audit@0.22.2
           command -v cargo-vet || cargo install --locked cargo-vet@0.10.2
       - run: sh scripts/supply-chain.sh
+
+  reproducible:
+    # Nothing it depends on changes by itself (the image is pinned by digest,
+    # Debian's snapshot and crates.io do not change): not on the daily run.
+    if: github.event_name != 'schedule'
+    name: Reproducible build (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [headless, gui]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build twice, compare
+        env:
+          REPRO_VARIANT: ${{ matrix.variant }}
+        run: sh scripts/repro.sh check "$GITHUB_SHA"
