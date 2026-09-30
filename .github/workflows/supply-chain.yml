@@ -1,0 +1,41 @@
+# The dependency graph's checks (scripts/supply-chain.sh; what each is for
+# is in docs/SUPPLY_CHAIN.md), on every change and every day: advisories are
+# published without any change here.
+#
+# Actions are pinned by commit, the tools by version.
+name: Supply chain
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependencies:
+    name: Advisories, licenses, duplicates, sources, audits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-vet
+          key: supply-chain-tools-deny-0.20.2-audit-0.22.2-vet-0.10.2
+      - name: The tools
+        run: |
+          command -v cargo-deny || cargo install --locked cargo-deny@0.20.2
+          command -v cargo-audit || cargo install --locked cargo-audit@0.22.2
+          command -v cargo-vet || cargo install --locked cargo-vet@0.10.2
+      - run: sh scripts/supply-chain.sh

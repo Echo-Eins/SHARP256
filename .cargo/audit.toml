@@ -1,0 +1,4 @@
+# cargo-audit fails on vulnerabilities (unsound and unmaintained crates are
+# cargo-deny's, deny.toml). The one ignored, with its reason, is deny.toml's.
+[advisories]
+ignore = ["RUSTSEC-2026-0257"]

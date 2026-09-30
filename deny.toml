@@ -1,0 +1,68 @@
+# cargo-deny: what the dependency graph may contain. scripts/supply-chain.sh
+# runs it twice, and CI with it, on every change and every day (advisories
+# are published without a change here):
+#
+#   cargo deny check                    every check, the default features
+#                                       (all of them), every target
+#   cargo deny --no-default-features --features nat-traversal check bans
+#                                       duplicates in the build without the GUI
+#
+# Every exception names the crate it is for and why. All but one are the
+# GUI's (egui 0.24), and go when it is updated.
+
+[advisories]
+# Vulnerabilities, unsound code, unmaintained and yanked crates are all
+# errors, in every crate of the graph (unsound code is checked only in the
+# crates named in Cargo.toml by default: memmap2 under blake3 had some),
+# except eframe 0.24's own dependencies, which have no fixed version it
+# can take:
+unsound = "all"
+ignore = [
+    { id = "RUSTSEC-2026-0257", reason = "webbrowser 0.8 (egui-winit 0.24): webbrowser::open runs only for a link the GUI outputs, and it outputs none; clippy.toml keeps it so" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative, unmaintained (accesskit_unix, atspi: the GUI's screen reader support)" },
+    { id = "RUSTSEC-2024-0384", reason = "instant, unmaintained (fastrand 1 under accesskit_unix)" },
+    { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained (the GUI's macOS and accesskit crates)" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, unmaintained (epaint's font rendering)" },
+    { id = "RUSTSEC-2026-0186", reason = "memmap2 0.5 (winit 0.28's Wayland crates): neither sctk-adwaita nor smithay-client-toolkit calls the functions it is about; the 0.9 of blake3 is the fixed 0.9.11" },
+]
+
+[licenses]
+# Licenses that let the MIT-licensed binaries be shipped as they are.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+exceptions = [
+    # Weak copyleft by file (dirs' `option-ext`), the files unchanged and
+    # their source public on crates.io.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    # The fonts built into the GUI.
+    { allow = ["OFL-1.1", "LicenseRef-UFL-1.0"], crate = "epaint" },
+]
+
+[bans]
+# Two versions of one crate: twice the code to trust.
+multiple-versions = "deny"
+wildcards = "deny"
+skip-tree = [
+    # egui 0.24's graph has some thirty; skipping it skips every version it
+    # uses anywhere, which is why the build without the GUI is checked on
+    # its own as well.
+    { crate = "eframe", reason = "egui 0.24's dependency graph: its duplicates go when the GUI is updated" },
+    # Generated bindings to the Windows API, without code of their own; the
+    # crates that need them move to newer ones at their own pace.
+    { crate = "windows-sys", reason = "generated Windows API bindings" },
+]
+
+[sources]
+# crates.io only: no git dependencies, no other registry.
+unknown-registry = "deny"
+unknown-git = "deny"

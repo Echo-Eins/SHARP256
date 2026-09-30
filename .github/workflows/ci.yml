@@ -1,4 +1,5 @@
-# Every check a change has to pass, on every push and pull request.
+# Every check a change has to pass, on every push and pull request. (The
+# dependency graph's are in supply-chain.yml.) Actions are pinned by commit.
 #
 # The tests run on Linux, macOS and Windows with IPv6 required
 # (SHARP_REQUIRE_IPV6): an IPv6 test that cannot run fails instead of
@@ -21,10 +22,10 @@ jobs:
     name: Format and lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -60,10 +61,10 @@ jobs:
     env:
       SHARP_REQUIRE_IPV6: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -91,10 +92,10 @@ jobs:
     name: Minimum supported Rust (1.82)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         run: rustup toolchain install 1.82 --profile minimal && rustup default 1.82
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -110,10 +111,10 @@ jobs:
     name: Network namespace tests (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -201,10 +202,10 @@ jobs:
               python3 scripts/natlab/natlab.py samenat
               python3 scripts/natlab/natlab.py timeout
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -233,19 +234,19 @@ jobs:
     name: Fuzzing (short run of every target)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         run: rustup toolchain install nightly --profile minimal && rustup default nightly
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin/cargo-fuzz
             fuzz/target
-          key: fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml') }}
+          key: fuzz-0.13.2-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml') }}
       - name: cargo-fuzz
-        run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+        run: command -v cargo-fuzz || cargo install --locked cargo-fuzz@0.13.2
       - name: Run every target for a minute
         working-directory: fuzz
         run: |
@@ -256,7 +257,7 @@ jobs:
           done
       - name: Keep what crashed
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts

@@ -1,0 +1,17 @@
+# The GUI opens no links. egui-winit 0.24 hands every link egui outputs to
+# webbrowser 0.8, whose Unix BROWSER handling lets a URL add arguments to
+# the browser's command line (RUSTSEC-2026-0257, fixed only in 1.2.2, which
+# egui 0.24 cannot take); while nothing here outputs a link, that code
+# never runs (deny.toml). These are the calls and types that output one;
+# clippy does not see a struct literal of OpenUrl, which nothing here writes
+# either.
+disallowed-methods = [
+    { path = "egui::Context::open_url", reason = "the GUI opens no links (RUSTSEC-2026-0257, deny.toml)" },
+    { path = "egui::PlatformOutput::open_url", reason = "the GUI opens no links (RUSTSEC-2026-0257, deny.toml)" },
+    { path = "egui::Ui::hyperlink", reason = "the GUI opens no links (RUSTSEC-2026-0257, deny.toml)" },
+    { path = "egui::Ui::hyperlink_to", reason = "the GUI opens no links (RUSTSEC-2026-0257, deny.toml)" },
+]
+disallowed-types = [
+    { path = "egui::Hyperlink", reason = "the GUI opens no links (RUSTSEC-2026-0257, deny.toml)" },
+    { path = "egui::OpenUrl", reason = "the GUI opens no links (RUSTSEC-2026-0257, deny.toml)" },
+]
