@@ -1,0 +1,36 @@
+# crashlab audit
+# commit:  72b38f0 (with local changes)
+# binaries: /tmp/claude-1000/-home-EchoEins/85eadbca-8a13-4d1e-befb-ca41c9ba0cb5/scratchpad/before-c1-target/release
+# sharp-sender sha256 3779f4b9b78cd50a
+# sharp-receiver sha256 f2f1dec4bfe4f127
+# kernel:  Linux 6.19.2-gentoo-dist
+# strace:  strace -- version 6.19
+# rate 64M, file 48 MiB
+# BEFORE THE FIX: binaries built from commit 72b38f0 with one change, so that
+# they receive anything on LazyFS at all (it reports no size, and the receiver
+# refused every transfer for want of space) - in available_space():
+#     if st.f_blocks == 0 { return Ok(u64::MAX); }
+
+  file 18926 system calls, 5 renames into place checked -> BROKEN
+    /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json.tmp renamed to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json with changes to it not flushed
+    rename to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json never flushed with its directory
+    /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json.tmp renamed to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json with changes to it not flushed
+    rename to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json never flushed with its directory
+    /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json.tmp renamed to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json with changes to it not flushed
+    rename to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json never flushed with its directory
+    /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json.tmp renamed to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json with changes to it not flushed
+    rename to /tmp/crashlab_audit_7g1tthv3/state/recv-dc295fcf5c59246d3ed899fcef22efbd.json never flushed with its directory
+    rename to /tmp/crashlab_audit_7g1tthv3/out/data.bin never flushed with its directory
+    kept for inspection: /tmp/crashlab_audit_7g1tthv3
+  tree 16022 system calls, 5 renames into place checked -> BROKEN
+    /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json.tmp renamed to /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json with changes to it not flushed
+    rename to /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json never flushed with its directory
+    rename to /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.manifest never flushed with its directory
+    /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json.tmp renamed to /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json with changes to it not flushed
+    rename to /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json never flushed with its directory
+    /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json.tmp renamed to /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json with changes to it not flushed
+    rename to /tmp/crashlab_audit_o5yi8dj2/state/recv-6ec0a470a726ab603f705f5242da5f29.json never flushed with its directory
+    /tmp/crashlab_audit_o5yi8dj2/out/tree.sharp-part/d16 renamed to /tmp/crashlab_audit_o5yi8dj2/out/tree with changes to it not flushed
+    rename to /tmp/crashlab_audit_o5yi8dj2/out/tree never flushed with its directory
+    kept for inspection: /tmp/crashlab_audit_o5yi8dj2
+audit: 2 BROKEN

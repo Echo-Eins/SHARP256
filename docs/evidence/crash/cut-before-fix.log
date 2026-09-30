@@ -1,0 +1,36 @@
+# crashlab cut
+# commit:  72b38f0 (with local changes)
+# binaries: /tmp/claude-1000/-home-EchoEins/85eadbca-8a13-4d1e-befb-ca41c9ba0cb5/scratchpad/before-c1-target/release
+# sharp-sender sha256 3779f4b9b78cd50a
+# sharp-receiver sha256 f2f1dec4bfe4f127
+# kernel:  Linux 6.19.2-gentoo-dist
+# lazyfs:  commit fa7d32e
+# rate 64M, file 48 MiB
+# BEFORE THE FIX: binaries built from commit 72b38f0 with one change, so that
+# they receive anything on LazyFS at all (it reports no size, and the receiver
+# refused every transfer for want of space) - in available_space():
+#     if st.f_blocks == 0 { return Ok(u64::MAX); }
+
+file: an uninterrupted transfer takes 6.5 s on LazyFS
+  file       cut at 0.4 s      -> kept  (state recv-3615a85ab25fb97786d00d9ef169b817.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at 1.2 s      -> kept  (state recv-5e05d3ce8f03dac5515ba87103f7e0e8.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at 2.0 s      -> kept  (state recv-e9b25192ea2afb5d46643dcb302e9de7.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at 2.8 s      -> kept  (state recv-d8c14200da6af5679dd98187191e9d9f.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at 3.6 s      -> kept  (state recv-541d3b4f5a4614dc84f783e64a51e38d.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at 4.5 s      -> kept  (state recv-af510eb962ac8aeaa0c2ff876859d30d.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at 5.3 s      -> kept  (state recv-f0dc7078cd5f033e2313e9941b67b471.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at 6.1 s      -> kept  (state recv-124b000e701e3ab0bde9e2a7fb79e6b9.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at verifying  -> kept  (state recv-af5cafa9761f54ae695d632fa76fe9ff.json unreadable (JSONDecodeError): its progress is lost)
+  file       cut at stored     -> kept
+tree: an uninterrupted transfer takes 4.8 s on LazyFS
+  tree       cut at 0.3 s      -> kept  (state recv-b190eff76dcfb4c4713b7e718b19c385.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at 0.9 s      -> kept  (state recv-8ac8b068a1e051528a12e1730c875693.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at 1.5 s      -> kept  (state recv-3468e83c6a584b51bc994529fdb0f050.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at 2.1 s      -> kept  (state recv-5cbd83170414c1f971909f5b7a5e27c0.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at 2.7 s      -> kept  (state recv-7e4f3f242cf88330e5fdb94658884a34.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at 3.3 s      -> kept  (state recv-a05c0db10eea03343dcc9e1a5be91711.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at 3.9 s      -> kept  (state recv-cd82338770c85f4f0821bec4e38a2102.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at 4.5 s      -> kept  (state recv-e7c308711146ffa6effed7e1e7037822.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at verifying  -> kept  (state recv-fc3f76c31bb144c1f4fc09e01f3120f0.json unreadable (JSONDecodeError): its progress is lost)
+  tree       cut at stored     -> kept
+cut: every promise kept

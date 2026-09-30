@@ -1,0 +1,26 @@
+# crashlab at
+# commit:  72b38f0 (with local changes)
+# binaries: /tmp/claude-1000/-home-EchoEins/85eadbca-8a13-4d1e-befb-ca41c9ba0cb5/scratchpad/before-c1-target/release
+# sharp-sender sha256 3779f4b9b78cd50a
+# sharp-receiver sha256 f2f1dec4bfe4f127
+# kernel:  Linux 6.19.2-gentoo-dist
+# lazyfs:  commit fa7d32e
+# rate 64M, file 48 MiB
+# BEFORE THE FIX: binaries built from commit 72b38f0 with one change, so that
+# they receive anything on LazyFS at all (it reports no size, and the receiver
+# refused every transfer for want of space) - in available_space():
+#     if st.f_blocks == 0 { return Ok(u64::MAX); }
+
+file: an uninterrupted transfer takes 6.5 s on LazyFS
+tree: an uninterrupted transfer takes 4.8 s on LazyFS
+  file died before a state file is flushed                     -> ?  (NOT REACHED: the operation never happened)
+    kept for inspection: /tmp/crashlab_0qip636j
+  file died right after a state file is renamed into place     -> kept  (the sender had stopped and was started again; state recv-db185a4910f95eab4257ddb6e0525429.json unreadable (JSONDecodeError): its progress is lost)
+  file died before the partial file is flushed                 -> kept  (the sender had stopped and was started again; state recv-b9db9c9a0c0c4ca1a4db8300a510ae89.json unreadable (JSONDecodeError): its progress is lost)
+  file died before the partial file is renamed into place      -> kept  (the sender had stopped and was started again; state recv-b28f65d03a36735abb29b30e3efe5bde.json unreadable (JSONDecodeError): its progress is lost)
+  file died right after it is linked into place                -> kept  (the sender had stopped and was started again; 2 whole copies under final names; state recv-846ca7ca0c1fff8cd6aefa416c20417b.json unreadable (JSONDecodeError): its progress is lost)
+  tree died before the manifest is flushed                     -> kept  (the sender had stopped and was started again; state recv-ccf24142eb11350d03db572ed9e99529.json unreadable (JSONDecodeError): its progress is lost)
+  tree died before a file of the tree is flushed               -> kept  (the sender had stopped and was started again; state recv-7194b976b7497262f48c0f0380b801d5.json unreadable (JSONDecodeError): its progress is lost)
+  tree died before the tree is renamed into place              -> kept  (the sender had stopped and was started again; state recv-09ad71a9fc9034849f1e6742e29d8920.json unreadable (JSONDecodeError): its progress is lost)
+  tree died right after it is renamed into place               -> kept  (the sender had stopped and was started again; 2 whole copies under final names; state recv-263bdf325daaa86150da3326bf4097b5.json unreadable (JSONDecodeError): its progress is lost)
+at: 1 BROKEN or not reached

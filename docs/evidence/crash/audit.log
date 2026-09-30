@@ -1,0 +1,12 @@
+# crashlab audit
+# commit:  72b38f0 (with local changes)
+# binaries: target/release
+# sharp-sender sha256 72e9e2e07be39b3b
+# sharp-receiver sha256 810a44a1a8f6db45
+# kernel:  Linux 6.19.2-gentoo-dist
+# strace:  strace -- version 6.19
+# rate 64M, file 48 MiB
+
+  file 19387 system calls, 6 renames into place checked -> kept
+  tree 16783 system calls, 6 renames into place checked -> kept
+audit: every promise kept

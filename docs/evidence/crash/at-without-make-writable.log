@@ -1,0 +1,25 @@
+# crashlab at
+# commit:  72b38f0 (with local changes)
+# binaries: /tmp/claude-1000/-home-EchoEins/85eadbca-8a13-4d1e-befb-ca41c9ba0cb5/scratchpad/no-mw-target/release
+# sharp-sender sha256 924a87e2cec102c1
+# sharp-receiver sha256 c7a472651cfcfd25
+# kernel:  Linux 6.19.2-gentoo-dist
+# lazyfs:  commit fa7d32e
+# rate 64M, file 48 MiB
+# WITHOUT ONE PART OF THE FIX: binaries built from this commit with the call of
+# tree::make_writable in Session::open_tree_writer taken out (a tree resumed
+# after its finishing was cut short is not made writable again).
+
+file: an uninterrupted transfer takes 6.5 s on LazyFS
+tree: an uninterrupted transfer takes 4.8 s on LazyFS
+  file died before a state file is flushed                     -> kept  (the sender had stopped and was started again; resumed with 15922466 of 50331648 B on disk)
+  file died right after a state file is renamed into place     -> kept  (the sender had stopped and was started again; resumed with 32168861 of 50331648 B on disk)
+  file died before the partial file is flushed                 -> kept  (the sender had stopped and was started again; resumed with 15916758 of 50331648 B on disk)
+  file died before the partial file is renamed into place      -> kept  (the sender had stopped and was started again; resumed with 50331648 of 50331648 B on disk)
+  file died right after it is linked into place                -> kept  (the sender had stopped and was started again; resumed with 50331648 of 50331648 B on disk; 2 whole copies under final names)
+  tree died before the manifest is flushed                     -> kept  (the sender had stopped and was started again; resumed with 0 of 36260940 B on disk)
+  tree died before a file of the tree is flushed               -> kept  (the sender had stopped and was started again; resumed with 15804025 of 36260939 B on disk)
+  tree died before the tree is renamed into place              -> BROKEN  (the sender had stopped and was started again; resumed with 36260940 of 36260940 B on disk; the transfer did not complete after the power came back (sender exit 1))
+    kept for inspection: /tmp/crashlab_f4e71zr0
+  tree died right after it is renamed into place               -> kept  (the sender had stopped and was started again; 2 whole copies under final names)
+at: 1 BROKEN or not reached
