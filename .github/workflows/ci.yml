@@ -252,6 +252,45 @@ jobs:
           key: miri-${{ hashFiles('Cargo.lock') }}
       - run: sh scripts/miri.sh
 
+  sanitizers:
+    # The library's and the end-to-end tests under each sanitizer, the
+    # standard library instrumented too (docs/SANITIZERS.md).
+    name: Sanitizer (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, memory]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/${{ matrix.sanitizer }}
+          key: sanitizer-${{ matrix.sanitizer }}-${{ hashFiles('Cargo.lock') }}
+      - run: sh scripts/sanitizers.sh ${{ matrix.sanitizer }}
+
+  loom:
+    name: Loom models of the shared invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/loom
+          key: loom-${{ hashFiles('Cargo.lock') }}
+      - run: sh scripts/loom.sh
+
   fuzz:
     name: Fuzzing (short run of every target)
     runs-on: ubuntu-latest

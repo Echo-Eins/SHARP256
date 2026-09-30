@@ -1,0 +1,10 @@
+# ThreadSanitizer suppressions for scripts/sanitizers.sh.
+#
+# tokio's I/O driver hands each socket's ScheduledIo to the thread that
+# polls epoll through the kernel: its address is epoll's token, registered
+# with epoll_ctl on one thread and returned by epoll_wait on another. That
+# orders the two, but in the kernel, where ThreadSanitizer cannot see it;
+# so every access to a ScheduledIo made before its registration (Arc::new
+# writing it, for a start) "races" with the poller's first. Every report
+# the tests gave before this line was of that kind (docs/SANITIZERS.md).
+race:tokio::runtime::io::scheduled_io
