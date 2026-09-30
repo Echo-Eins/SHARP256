@@ -1,0 +1,109 @@
+# cargo audit on Cargo.lock of 27d3cd4 (before B4), 2026-09-30T16:30Z
+# cargo-audit 0.22.2, no ignore list (run outside the repository)
+
+Crate:     bytes
+Version:   1.10.1
+Title:     Integer overflow in `BytesMut::reserve`
+Date:      2026-02-03
+ID:        RUSTSEC-2026-0007
+URL:       https://github.com/advisories/GHSA-434x-w66g-qw3r
+Solution:  Upgrade to >=1.11.1
+
+Crate:     crossbeam-epoch
+Version:   0.9.18
+Title:     Invalid pointer dereference in `fmt::Pointer` impl for `Atomic` and `Shared` when the underlying pointer is invalid
+Date:      2026-07-06
+ID:        RUSTSEC-2026-0204
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0204
+Solution:  Upgrade to >=0.9.20
+
+Crate:     tracing-subscriber
+Version:   0.3.19
+Title:     Logging user input may result in poisoning logs with ANSI escape sequences
+Date:      2025-08-29
+ID:        RUSTSEC-2025-0055
+URL:       https://rustsec.org/advisories/RUSTSEC-2025-0055
+Solution:  Upgrade to >=0.3.20
+
+Crate:     webbrowser
+Version:   0.8.15
+Title:     Unix `BROWSER` handling allows browser argument injection
+Date:      2026-07-29
+ID:        RUSTSEC-2026-0257
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0257
+Solution:  Upgrade to >=1.2.2
+
+Crate:     derivative
+Version:   2.2.0
+Warning:   unmaintained
+Title:     `derivative` is unmaintained; consider using an alternative
+Date:      2024-06-26
+ID:        RUSTSEC-2024-0388
+URL:       https://rustsec.org/advisories/RUSTSEC-2024-0388
+
+Crate:     instant
+Version:   0.1.13
+Warning:   unmaintained
+Title:     `instant` is unmaintained
+Date:      2024-09-01
+ID:        RUSTSEC-2024-0384
+URL:       https://rustsec.org/advisories/RUSTSEC-2024-0384
+
+Crate:     paste
+Version:   1.0.15
+Warning:   unmaintained
+Title:     paste - no longer maintained
+Date:      2024-10-07
+ID:        RUSTSEC-2024-0436
+URL:       https://rustsec.org/advisories/RUSTSEC-2024-0436
+
+Crate:     ttf-parser
+Version:   0.25.1
+Warning:   unmaintained
+Title:     `ttf-parser` is unmaintained
+Date:      2026-06-28
+ID:        RUSTSEC-2026-0192
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0192
+
+Crate:     anyhow
+Version:   1.0.98
+Warning:   unsound
+Title:     Unsoundness in `Error::downcast_mut()`
+Date:      2026-06-25
+ID:        RUSTSEC-2026-0190
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0190
+
+Crate:     event-listener
+Version:   5.4.0
+Warning:   unsound
+Title:     `event-listener` allows `!Send` tags to cross thread boundaries via `StackSlot`
+Date:      2026-07-13
+ID:        RUSTSEC-2026-0221
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0221
+
+Crate:     memmap2
+Version:   0.5.10
+Warning:   unsound
+Title:     Unchecked pointer offset in crate `memmap2`
+Date:      2026-06-20
+ID:        RUSTSEC-2026-0186
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0186
+
+Crate:     memmap2
+Version:   0.9.5
+Warning:   unsound
+Title:     Unchecked pointer offset in crate `memmap2`
+Date:      2026-06-20
+ID:        RUSTSEC-2026-0186
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0186
+
+Crate:     rand
+Version:   0.8.5
+Warning:   unsound
+Title:     Rand is unsound with a custom logger using `rand::rng()`
+Date:      2026-04-09
+ID:        RUSTSEC-2026-0097
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0097
+
+error: 4 vulnerabilities found!
+warning: 9 allowed warnings found

@@ -1,0 +1,11 @@
+# Crates in the build (normal and build dependencies, not tests), 2026-09-30T16:40Z
+# count: cargo tree <features> -e normal,build --target <target> --prefix none --format '{p}' | sed 's/ (\*)//; s/ (proc-macro)//' | sort -u, less sharp256 itself
+# before: 27d3cd4, after: e407efb
+
+features                                           target                     before  after
+--no-default-features --features nat-traversal     x86_64-unknown-linux-gnu      132    109
+--no-default-features --features nat-traversal     all                           179    152
+--no-default-features                              x86_64-unknown-linux-gnu      128    105
+--no-default-features                              all                           174    147
+--all-features                                     x86_64-unknown-linux-gnu      316    305
+--all-features                                     all                           456    443

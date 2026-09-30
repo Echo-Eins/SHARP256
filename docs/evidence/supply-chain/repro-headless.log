@@ -1,0 +1,14 @@
+# REPRO_VARIANT=headless scripts/repro.sh check 7bfca99 (headless rc=0 started=2026-09-30T16:42Z ended=2026-09-30T16:45Z)
+# first build: root, /build/sharp256, CARGO_HOME /usr/local/cargo, 16 jobs, umask 022, UTC
+# second: uid 4321, /tmp/some/other/place/sharp-256, a fresh CARGO_HOME, 2 jobs, umask 077, Asia/Tokyo, C.UTF-8, host 'elsewhere'
+# Finished `release` profile [optimized] target(s) in 1m 48s
+# Finished `release` profile [optimized] target(s) in 1m 52s
+
+commit:  7bfca9901eb3b05dbb923f3d87a68289de9b24c0
+image:   rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
+variant: headless
+76ea068802dbd8cf60ba9cbc46538cf18af4ffe2d9755123403141b6e1535777  sharp-sender
+2fc1883b8de243fd5a06d2d45ed38d91938ccfca614431bc2398075e67650924  sharp-receiver
+eafb58b79473ecbfea8610daf7aff5def53476649826add842a49f43c1f70a69  sharp-relay
+50a440ee744dbf9cac27fc9542c09d7bf3d087a6a54e4f6d1a22f4328120f81e  sharp-probe
+check: both builds are the same, byte for byte

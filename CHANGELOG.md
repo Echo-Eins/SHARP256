@@ -39,6 +39,36 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   speaks only version 3, the on-path copier for version 4; the NAT
   laboratory runs version 4 end to end.
 
+### Supply chain
+- Advisories fixed by updates within Rust 1.82: `bytes` (RUSTSEC-2026-0007),
+  `crossbeam-epoch` (RUSTSEC-2026-0204), `tracing-subscriber`
+  (RUSTSEC-2025-0055: escape sequences from received data reached the
+  log), `anyhow` (RUSTSEC-2026-0190), `rand` (RUSTSEC-2026-0097), `memmap2`
+  under `blake3` (RUSTSEC-2026-0186) and `event-listener` in the GUI
+  (RUSTSEC-2026-0221).
+- The build without the GUI takes 109 crates on Linux instead of 132:
+  logging without regular expressions (`RUST_LOG` and `--log-level` take a
+  level or `target=level` pairs, no longer span and field filters),
+  `tokio-util` without its runtime helpers, `clap` without colour (help and
+  errors are plain now), `rand` with the system's source only.
+- cargo-deny (advisories, with unsound code looked for in every crate and
+  not only the direct ones; licenses; duplicates, the build without the GUI
+  on its own; sources), cargo-audit and cargo-vet (audits imported from
+  Mozilla, Google, Bytecode Alliance, ISRG, Zcash and Embark, the rest
+  exempted by name) run in CI on every change and every day; each exception
+  says why. Clippy forbids the GUI to output links, which keeps the one
+  vulnerability left, in `webbrowser` 0.8 under egui 0.24, out of reach.
+  See [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md).
+- Reproducible Linux builds: `scripts/repro.sh` builds a commit in a
+  container pinned by digest; two builds differing in directory, user,
+  umask, time zone, locale, host, jobs and registry give the same binaries,
+  byte for byte, with the GUI and without. CI checks it on every change.
+- Releases (`.github/workflows/release.yml`, on a tag): Linux archives built
+  that way, Windows and macOS ones on GitHub's runners, a CycloneDX SBOM
+  for each, SHA256SUMS, and a provenance attestation signed through
+  Sigstore; left a draft to publish by hand.
+- GitHub Actions are pinned by commit, the tools CI installs by version.
+
 ### Security
 - Long-term X25519 identities, created on first use and kept in the
   per-user data directory with owner-only permissions. A peer is addressed

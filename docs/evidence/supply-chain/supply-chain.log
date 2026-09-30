@@ -1,0 +1,56 @@
+# scripts/supply-chain.sh on e407efb with the checks' configuration of the next commit, 2026-09-30T16:40Z
+# cargo-deny 0.20.2, cargo-audit 0.22.2, cargo-vet 0.10.2
+
++ set -eu
+++ dirname scripts/supply-chain.sh
++ cd scripts/..
++ cargo deny --locked check
+advisories ok, bans ok, licenses ok, sources ok
++ cargo deny --locked --no-default-features --features nat-traversal check bans
+warning[unmatched-skip-root]: skip tree root was not found in the dependency graph
+   ┌─ /home/EchoEins/Coding/Rust/SHARP256/deny.toml:59:16
+   │
+59 │     { crate = "eframe", reason = "egui 0.24's dependency graph: its duplicates go when the GUI is updated" },
+   │                ━━━━━━ no crate matched these criteria
+bans ok
++ cargo audit
+Crate:     derivative
+Version:   2.2.0
+Warning:   unmaintained
+Title:     `derivative` is unmaintained; consider using an alternative
+Date:      2024-06-26
+ID:        RUSTSEC-2024-0388
+URL:       https://rustsec.org/advisories/RUSTSEC-2024-0388
+Crate:     instant
+Version:   0.1.13
+Warning:   unmaintained
+Title:     `instant` is unmaintained
+Date:      2024-09-01
+ID:        RUSTSEC-2024-0384
+URL:       https://rustsec.org/advisories/RUSTSEC-2024-0384
+Crate:     paste
+Version:   1.0.15
+Warning:   unmaintained
+Title:     paste - no longer maintained
+Date:      2024-10-07
+ID:        RUSTSEC-2024-0436
+URL:       https://rustsec.org/advisories/RUSTSEC-2024-0436
+Crate:     ttf-parser
+Version:   0.25.1
+Warning:   unmaintained
+Title:     `ttf-parser` is unmaintained
+Date:      2026-06-28
+ID:        RUSTSEC-2026-0192
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0192
+Crate:     memmap2
+Version:   0.5.10
+Warning:   unsound
+Title:     Unchecked pointer offset in crate `memmap2`
+Date:      2026-06-20
+ID:        RUSTSEC-2026-0186
+URL:       https://rustsec.org/advisories/RUSTSEC-2026-0186
+warning: 5 allowed warnings found
++ cargo audit --file fuzz/Cargo.lock
++ cargo vet --locked
+Vetting Succeeded (135 fully audited, 2 partially audited, 313 exempted)
+exit status: 0

@@ -1,0 +1,23 @@
+# Control: scripts/repro.sh check with the line exporting RUSTFLAGS (--remap-path-prefix) removed,
+# everything else the same, on 27d3cd4, headless; ended 2026-09-30 19:29 local time.
+# The two builds must differ: the registry is at /usr/local/cargo in one and /tmp/another-cargo-home
+# in the other, and those paths end up in panic messages. They do, so the check can tell.
+
+commit:  27d3cd46f608e3d053102d1b206e2c98b36aa181
+image:   rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
+variant: headless
+bef9a7b6e995b6013cbab5e6f2742a1bee01ca9a3cf96ec6246e8c40a53ed1dc  sharp-sender
+040b9e6326291389628bf4007f15547d76242779f08a6737044422cbe26c0d0e  sharp-receiver
+4b79612fb5924580b354e7e7c2874a023438b11ea66174358fe118ea32d0bfec  sharp-relay
+47cdc9400355d7c288935ee9816e4cf5575c6c5b9e7eab6db41cd9ab1e3b9154  sharp-probe
+check: the builds differ
+1,4c1,4
+< bef9a7b6e995b6013cbab5e6f2742a1bee01ca9a3cf96ec6246e8c40a53ed1dc  sharp-sender
+< 040b9e6326291389628bf4007f15547d76242779f08a6737044422cbe26c0d0e  sharp-receiver
+< 4b79612fb5924580b354e7e7c2874a023438b11ea66174358fe118ea32d0bfec  sharp-relay
+< 47cdc9400355d7c288935ee9816e4cf5575c6c5b9e7eab6db41cd9ab1e3b9154  sharp-probe
+---
+> 5eb15601fbce435eba5bf2d31d4dacc4943d4771ec7bca7776461afcfd465f40  sharp-sender
+> 2f2bd9fb40ca141339d380ff629622d8514e8fb1682d641909b88243ce8eb80b  sharp-receiver
+> b085552ce679076e949787d7f4332888473fadf38ea4f0a86c6aa3c51a5f5d96  sharp-relay
+> 73210f4065ac07e46d5d09d1393a7c5a458d94db4316e332e439d04f170581d3  sharp-probe

@@ -1,0 +1,13 @@
+# REPRO_VARIANT=gui scripts/repro.sh check 7bfca99 (gui rc=0 started=2026-09-30T16:45Z ended=2026-09-30T16:57Z)
+# first build: root, /build/sharp256, CARGO_HOME /usr/local/cargo, 16 jobs, umask 022, UTC
+# second: uid 4321, /tmp/some/other/place/sharp-256, a fresh CARGO_HOME, 2 jobs, umask 077, Asia/Tokyo, C.UTF-8, host 'elsewhere'
+# GTK 3: Setting up libgtk-3-dev:amd64 (3.24.38-2~deb12u3) from snapshot.debian.org/archive/debian/20260518T000000Z; sharp-sender links libgtk-3.so.0 (file dialogs), sharp-receiver does not need it
+# Finished `release` profile [optimized] target(s) in 2m 51s
+# Finished `release` profile [optimized] target(s) in 4m 01s
+
+commit:  7bfca9901eb3b05dbb923f3d87a68289de9b24c0
+image:   rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
+variant: gui
+d655d1646f36f5126b69e5596b75297a71ade941928abc7473873dcebd271530  sharp-sender
+c356ffd9bfed9d95a13fbd1020c6ac611ff97eb5d99ea3a6b13b7ec720a95876  sharp-receiver
+check: both builds are the same, byte for byte

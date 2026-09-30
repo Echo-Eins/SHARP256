@@ -277,6 +277,12 @@ cargo build --release --no-default-features
 Бинарники: `target/release/sharp-sender`, `target/release/sharp-receiver` и
 `target/release/sharp-relay` (ретранслятор; нужна фича `nat-traversal`).
 
+Выпускные бинарники для Linux воспроизводимы: `scripts/repro.sh build
+<тег>` собирает их в закреплённом контейнере (нужен только Docker), и
+получаются те же байты, что в выпуске. Зависимости проверяются
+(`scripts/supply-chain.sh`: cargo-deny, cargo-audit, cargo-vet) при каждом
+изменении и каждый день — см. [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md).
+
 ## Использование
 
 При первом запуске каждая программа создаёт ключ в каталоге данных
