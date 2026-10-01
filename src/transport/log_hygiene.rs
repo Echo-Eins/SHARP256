@@ -98,7 +98,9 @@ fn spellings(secret: &[u8]) -> Vec<String> {
     const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut s = Vec::new();
-    for window in secret.windows(8) {
+    // Eight times the same byte is no key's, and is what a log is full of
+    // ("0000000000000000" turned up in one on Windows).
+    for window in secret.windows(8).filter(|w| w.iter().any(|b| *b != w[0])) {
         s.push(hex(window));
         s.push(hex(window).to_uppercase());
     }
@@ -289,7 +291,12 @@ async fn no_key_and_no_content_reaches_the_log() {
         keys.len()
     );
     let mut leaks = Vec::new();
-    for key in keys.iter().filter(|k| k[..] != control.expose()[..]) {
+    // An all-zero key is none: it is what a transfer without a shared secret
+    // uses as its PSK, which anybody may know.
+    for key in keys
+        .iter()
+        .filter(|k| k[..] != control.expose()[..] && k.iter().any(|b| *b != 0))
+    {
         if let Some(how) = found(&log, key) {
             leaks.push(format!("a key, written as {}", how));
         }

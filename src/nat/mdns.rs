@@ -497,13 +497,12 @@ impl Announcement {
             }
             if let Some(i) = msg.additionals.iter().rposition(is_address) {
                 msg.additionals.remove(i);
-            } else if let Some(i) = msg.answers.iter().rposition(is_address) {
+            } else {
+                let i = msg.answers.iter().rposition(is_address)?;
                 msg.answers.remove(i);
                 if msg.answers.is_empty() {
                     return None;
                 }
-            } else {
-                return None;
             }
         }
     }
