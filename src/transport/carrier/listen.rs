@@ -91,6 +91,13 @@ impl Streams {
         self.active.store(true, Ordering::Relaxed);
     }
 
+    /// Forgets every route on `link` (a stream that ended).
+    pub fn unroute_link(&self, link: &Link) {
+        let mut routes = self.routes.write();
+        routes.retain(|_, (l, _)| !Arc::ptr_eq(l.stats(), link.stats()));
+        self.active.store(!routes.is_empty(), Ordering::Relaxed);
+    }
+
     /// Forgets the route to `addr`, if it is still the one on `link`.
     pub fn unroute(&self, addr: SocketAddr, link: &Link) {
         let mut routes = self.routes.write();
@@ -125,7 +132,7 @@ pub fn bind(addr: SocketAddr, dual_stack: bool) -> io::Result<TcpListener> {
 
 /// Who a stream is counted against: an IPv4 address, or an IPv6 /64 (one
 /// host has a whole /64 to make addresses in).
-fn client_of(ip: IpAddr) -> IpAddr {
+pub(crate) fn client_of(ip: IpAddr) -> IpAddr {
     match canonical(SocketAddr::new(ip, 0)).ip() {
         IpAddr::V6(v6) => {
             let mut o = v6.octets();

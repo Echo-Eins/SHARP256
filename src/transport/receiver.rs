@@ -1823,12 +1823,8 @@ fn spawn_relay_clients(
                 continue;
             }
         };
-        let socket = shared.socket.udp();
-        let identity = shared.identity.clone();
-        let private = shared.cfg.relay_private;
         let cancel = shared.cancel.clone();
-        let relayed = shared.clone();
-        let events = shared.cfg.events.clone();
+        let shared = shared.clone();
         let list = list.clone();
         let keepalive = keepalive.clone();
         let puncher = puncher.clone();
@@ -1836,23 +1832,14 @@ fn spawn_relay_clients(
             let Some(addrs) = resolve_relay(&host, reach, &cancel).await else {
                 return;
             };
-            relayed.relayed.add_hosts(&addrs);
-            let (tx, rx) = mpsc::channel(32);
-            list.write().push(RelayClient {
-                addrs: addrs.clone(),
-                tx,
-            });
-            crate::relay::client::serve(
-                socket,
-                addrs,
-                relay_id,
-                identity,
-                private,
-                rx,
-                cancel,
-                keepalive,
-                puncher,
-                move |addr: SocketAddr, observed: SocketAddr| {
+            shared.relayed.add_hosts(&addrs);
+            let (events, private, h) = (
+                shared.cfg.events.clone(),
+                shared.cfg.relay_private,
+                host.clone(),
+            );
+            let on_registered: OnRegistered =
+                Arc::new(move |addr: SocketAddr, observed: SocketAddr| {
                     // Deliberately *not* published as an address to hand a
                     // sender. It is this receiver's NAT mapping towards that
                     // relay's control port, and under the NAT a relay exists
@@ -1860,27 +1847,298 @@ fn spawn_relay_clients(
                     // every destination — it is by definition not the mapping
                     // anybody else would arrive at. A sender reaches us here
                     // by naming the relay, not by naming this.
+                    // Over a stream the relay is known by its address alone.
+                    let at = if addr.port() == 0 {
+                        format!("{} over TCP", addr.ip())
+                    } else {
+                        addr.to_string()
+                    };
                     tracing::info!(
                         "registered with the relay at {} (it sees us at {}); senders reach us \
-                         through it with --relay {}",
-                        addr,
+                     through it with --relay {}",
+                        at,
                         observed,
-                        host
+                        h
                     );
                     emit(
                         &events,
                         TransferEvent::RelayRegistered {
-                            relay: host.clone(),
+                            relay: h.clone(),
                             observed: observed.to_string(),
                             private,
                         },
                     );
-                },
+                });
+            keep_registered(
+                &shared,
+                &list,
+                addrs,
+                relay_id,
+                &host,
+                &keepalive,
+                &puncher,
+                on_registered,
             )
             .await;
         }));
     }
     RelayClients { list, tasks }
+}
+
+/// What a relay client says when it is registered: where, and where the
+/// relay sees it.
+#[cfg(feature = "nat-traversal")]
+type OnRegistered = Arc<dyn Fn(SocketAddr, SocketAddr) + Send + Sync>;
+
+/// How long UDP is given to get a registration through — or back, once it
+/// fell — before the relay is reached over a stream instead (see
+/// `relay::tunnel`); and how long a stream then holds the registration
+/// before UDP is given another chance, alongside it.
+#[cfg(feature = "nat-traversal")]
+const UDP_PATIENCE: Duration = Duration::from_secs(8);
+#[cfg(feature = "nat-traversal")]
+const STREAM_SPELL: Duration = Duration::from_secs(600);
+
+/// One way of being registered with a relay, while it runs.
+#[cfg(feature = "nat-traversal")]
+struct Leg {
+    task: tokio::task::JoinHandle<()>,
+    cancel: CancellationToken,
+    /// Whether the relay holds the registration now (see
+    /// `relay::client::serve`), and since when it has not.
+    standing: tokio::sync::watch::Receiver<bool>,
+    down_since: Instant,
+    /// The stream, when the leg runs over one.
+    link: Option<crate::transport::carrier::Link>,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl Leg {
+    fn up(&self) -> bool {
+        *self.standing.borrow()
+    }
+
+    /// Stops it (saying goodbye, if it was registered), and forgets the
+    /// routes its stream carried.
+    async fn stop(self, shared: &Shared) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+        if let Some(link) = &self.link {
+            link.close();
+            shared.streams.unroute_link(link);
+        }
+    }
+}
+
+/// Keeps this receiver registered with one relay: over UDP from the
+/// transfer socket while that works — it is what lets a sender punch through
+/// to us — and over a stream when no registration gets through over UDP
+/// within [`UDP_PATIENCE`]. While a stream holds it, UDP is tried again now
+/// and then alongside, and takes the registration back as soon as it holds
+/// it: the two never both go on refreshing it, which would move it from one
+/// address to the other and back at every refresh.
+#[cfg(feature = "nat-traversal")]
+#[allow(clippy::too_many_arguments)]
+async fn keep_registered(
+    shared: &Arc<Shared>,
+    list: &Arc<parking_lot::RwLock<Vec<RelayClient>>>,
+    addrs: Vec<SocketAddr>,
+    relay_id: SharpId,
+    host: &str,
+    keepalive: &crate::nat::keepalive::SharedKeepalive,
+    puncher: &Arc<crate::nat::punch::Puncher>,
+    on_registered: OnRegistered,
+) {
+    let cancel = shared.cancel.clone();
+    let socket = shared.socket.udp();
+    let local = socket.local_addr().unwrap_or(shared.cfg.bind);
+    let start_udp = || {
+        let (tx, rx) = mpsc::channel(32);
+        {
+            // The dispatcher hands this relay's datagrams over here now.
+            let mut l = list.write();
+            l.retain(|c| c.addrs != addrs);
+            l.push(RelayClient {
+                addrs: addrs.clone(),
+                tx,
+            });
+        }
+        let (standing_tx, standing) = tokio::sync::watch::channel(false);
+        let leg_cancel = cancel.child_token();
+        let cb = on_registered.clone();
+        let task = tokio::spawn(crate::relay::client::serve(
+            socket.clone(),
+            addrs.clone(),
+            relay_id,
+            shared.identity.clone(),
+            shared.cfg.relay_private,
+            rx,
+            leg_cancel.clone(),
+            keepalive.clone(),
+            puncher.clone(),
+            standing_tx,
+            move |a, o| cb(a, o),
+        ));
+        Leg {
+            task,
+            cancel: leg_cancel,
+            standing,
+            down_since: Instant::now(),
+            link: None,
+        }
+    };
+    let mut udp = Some(start_udp());
+    let mut stream: Option<Leg> = None;
+    // When UDP is next tried while a stream holds the registration.
+    let mut udp_again = Instant::now();
+    let mut pause = Duration::from_secs(2);
+    loop {
+        let now = Instant::now();
+        if let Some(u) = &mut udp {
+            if u.up() {
+                // UDP holds it: a stream, if any, gives it up.
+                if let Some(s) = stream.take() {
+                    tracing::info!("relay {}: registered over UDP again; leaving TCP", host);
+                    s.stop(shared).await;
+                }
+                pause = Duration::from_secs(2);
+            } else if now.saturating_duration_since(u.down_since) >= UDP_PATIENCE {
+                // Nothing over UDP for its whole patience.
+                if let Some(u) = udp.take() {
+                    u.stop(shared).await;
+                }
+                if stream
+                    .as_ref()
+                    .is_none_or(|s| s.link.as_ref().is_some_and(|l| l.is_closed()))
+                {
+                    if let Some(s) = stream.take() {
+                        s.stop(shared).await;
+                    }
+                    tracing::info!("relay {}: no registration over UDP; trying TCP", host);
+                    stream =
+                        over_stream(shared, &addrs, relay_id, local, puncher, &on_registered).await;
+                }
+                udp_again = Instant::now()
+                    + if stream.is_some() {
+                        STREAM_SPELL
+                    } else {
+                        pause
+                    };
+                if stream.is_none() {
+                    pause = (pause * 2).min(Duration::from_secs(60));
+                }
+            }
+        } else {
+            let stream_dead = stream
+                .as_ref()
+                .is_none_or(|s| s.link.as_ref().is_some_and(|l| l.is_closed()));
+            if stream_dead {
+                if let Some(s) = stream.take() {
+                    tracing::info!("relay {}: the TCP stream ended", host);
+                    s.stop(shared).await;
+                }
+            }
+            if stream_dead || now >= udp_again {
+                udp = Some(start_udp());
+            }
+        }
+        if cancel.is_cancelled() {
+            break;
+        }
+        // Until either leg's registration changes, the stream ends, a
+        // patience or a spell runs out, or the receiver stops.
+        let deadline = match &udp {
+            Some(u) if !u.up() => u.down_since + UDP_PATIENCE,
+            Some(_) => now + Duration::from_secs(3600),
+            None => udp_again,
+        };
+        let stream_link = stream.as_ref().and_then(|s| s.link.clone());
+        tokio::select! {
+            r = async { udp.as_mut().unwrap().standing.changed().await }, if udp.is_some() => {
+                if r.is_ok() {
+                    if let Some(u) = &mut udp {
+                        if !u.up() {
+                            u.down_since = Instant::now();
+                        }
+                    }
+                }
+            }
+            _ = async { stream_link.as_ref().unwrap().closed().await }, if stream_link.is_some() => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+            _ = cancel.cancelled() => {}
+        }
+    }
+    // The receiver is stopping: each leg says goodbye, if it was registered.
+    if let Some(u) = udp {
+        u.stop(shared).await;
+    }
+    if let Some(s) = stream {
+        s.stop(shared).await;
+    }
+}
+
+/// Registers with the relay over a stream to the first of its addresses
+/// that takes one.
+#[cfg(feature = "nat-traversal")]
+async fn over_stream(
+    shared: &Arc<Shared>,
+    addrs: &[SocketAddr],
+    relay_id: SharpId,
+    local: SocketAddr,
+    puncher: &Arc<crate::nat::punch::Puncher>,
+    on_registered: &OnRegistered,
+) -> Option<Leg> {
+    let cancel = shared.cancel.clone();
+    for &addr in addrs {
+        let dialled = tokio::select! {
+            r = crate::relay::tunnel::dial(addr, local) => r,
+            _ = cancel.cancelled() => return None,
+        };
+        let stream = match dialled {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::info!("relay over TCP at {}: {}", addr, e);
+                continue;
+            }
+        };
+        let leg_cancel = cancel.child_token();
+        let (tunnel, rx) = crate::relay::tunnel::ClientTunnel::open(
+            stream,
+            addr,
+            shared.socket.udp(),
+            crate::relay::tunnel::Pairs::Dispatcher(shared.streams.clone()),
+            leg_cancel.clone(),
+        );
+        // A keepalive policy of its own: the stream's refreshes say nothing
+        // of the NAT mapping the UDP ones keep.
+        let keepalive = Arc::new(parking_lot::Mutex::new(
+            crate::nat::keepalive::Keepalive::new(shared.cfg.nat_keepalive),
+        ));
+        let (standing_tx, standing) = tokio::sync::watch::channel(false);
+        let cb = on_registered.clone();
+        let link = tunnel.link().clone();
+        let task = tokio::spawn(crate::relay::client::serve(
+            tunnel.via(),
+            vec![tunnel.relay()],
+            relay_id,
+            shared.identity.clone(),
+            shared.cfg.relay_private,
+            rx,
+            leg_cancel.clone(),
+            keepalive,
+            puncher.clone(),
+            standing_tx,
+            move |a, o| cb(a, o),
+        ));
+        return Some(Leg {
+            task,
+            cancel: leg_cancel,
+            standing,
+            down_since: Instant::now(),
+            link: Some(link),
+        });
+    }
+    None
 }
 
 /// Resolves a relay's name to the addresses this socket can reach, in the

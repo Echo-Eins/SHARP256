@@ -31,14 +31,20 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Addresses tried in one go.
 const MAX_TARGETS: usize = 8;
 
+/// What else to do whenever streams are asked for: a sender's relays are
+/// reached over streams too (see `relay::tunnel`).
+pub type Also = Box<dyn Fn() + Send + Sync>;
+
 /// Dials streams to the receiver at the addresses sent on the channel
 /// returned, from `local`'s address when it has one, and sends the address
 /// of each one's shim — joined to the engine at `engine` — on `found`.
+/// `also` is called with every request.
 pub fn spawn(
     engine: SocketAddr,
     local: SocketAddr,
     shims: Arc<Shims>,
     found: mpsc::UnboundedSender<SocketAddr>,
+    also: Option<Also>,
     cancel: CancellationToken,
 ) -> mpsc::UnboundedSender<Vec<SocketAddr>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<SocketAddr>>();
@@ -53,6 +59,9 @@ pub fn spawn(
                 },
                 _ = cancel.cancelled() => return,
             };
+            if let Some(also) = &also {
+                also();
+            }
             if current.as_ref().is_some_and(|s| s.alive()) {
                 continue;
             }
@@ -214,6 +223,7 @@ mod tests {
             engine.local_addr().unwrap(),
             shims.clone(),
             found_tx,
+            None,
             cancel.clone(),
         );
         // A dead address first: the live one is tried a quarter second

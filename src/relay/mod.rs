@@ -42,6 +42,7 @@
 
 pub mod client;
 pub mod server;
+pub mod tunnel;
 
 use crate::crypto::{Identity, SharpId};
 use crate::nat::card::{FamilyHints, NatHints};

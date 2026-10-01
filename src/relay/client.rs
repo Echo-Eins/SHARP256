@@ -10,7 +10,9 @@
 //! Both talk to the relay over the transfer socket. That is not incidental:
 //! the mapping a NAT opens belongs to a socket and a destination, so a
 //! registration made from any other socket would describe a way in that
-//! does not exist.
+//! does not exist. Where no UDP gets through to the relay at all, they talk
+//! to it over a stream instead ([`Via::Stream`], `relay::tunnel`): the same
+//! messages, framed with the relay's port each is to or from.
 
 use super::{Alt, Hints, Message, Refusal, NONCE_LEN, PROOF_LEN, TOKEN_LEN};
 use crate::crypto::{Identity, SharpId};
@@ -26,6 +28,56 @@ use tokio_util::sync::CancellationToken;
 
 /// Relay datagrams handed over by the socket's owner, with their source.
 pub type Incoming = (Vec<u8>, SocketAddr);
+
+/// How a client reaches its relay.
+#[derive(Clone)]
+pub enum Via {
+    /// From the transfer socket, over UDP.
+    Socket(Arc<UdpSocket>),
+    /// Over a stream (see `relay::tunnel`). The relay is then known by its
+    /// address with port 0 for its control port, and by its port for each of
+    /// its pairs: a datagram goes on the stream tagged with the port of the
+    /// address it is sent to. The transfer socket is still what punches go
+    /// out from, and what says which addresses this host can reach.
+    Stream {
+        link: crate::transport::carrier::Link,
+        socket: Arc<UdpSocket>,
+    },
+}
+
+impl From<Arc<UdpSocket>> for Via {
+    fn from(socket: Arc<UdpSocket>) -> Self {
+        Via::Socket(socket)
+    }
+}
+
+impl Via {
+    async fn send_to(&self, datagram: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Via::Socket(s) => s.send_to(datagram, to).await,
+            Via::Stream { link, .. } => {
+                if link.send(to.port(), datagram) {
+                    Ok(datagram.len())
+                } else if link.is_closed() {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                }
+            }
+        }
+    }
+
+    /// The transfer socket.
+    pub fn socket(&self) -> &Arc<UdpSocket> {
+        match self {
+            Via::Socket(s) | Via::Stream { socket: s, .. } => s,
+        }
+    }
+
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Via::Stream { .. })
+    }
+}
 
 /// How long to wait for each answer from the relay.
 const REPLY_WAIT: Duration = Duration::from_millis(600);
@@ -123,7 +175,7 @@ pub type SenderAuth<'a> = Option<(&'a Identity, SharpId)>;
 /// to know gets a proof it can check, made as a receiver's registration
 /// is.
 pub async fn connect(
-    socket: Arc<UdpSocket>,
+    via: impl Into<Via>,
     relay: SocketAddr,
     target: SharpId,
     incoming: &mut mpsc::Receiver<Incoming>,
@@ -131,6 +183,7 @@ pub async fn connect(
     auth: SenderAuth<'_>,
     hints: Hints,
 ) -> Result<Introduction, ConnectError> {
+    let via: Via = via.into();
     let mut token = [0u8; TOKEN_LEN];
     // What every answer to us has to carry back: without it, anybody who
     // can write the relay's address on a datagram could answer for it —
@@ -169,7 +222,7 @@ pub async fn connect(
             }
             .encode(),
         };
-        if let Err(e) = socket.send_to(&ask, relay).await {
+        if let Err(e) = via.send_to(&ask, relay).await {
             return Err(ConnectError::NoAnswer(format!(
                 "cannot reach the relay {}: {}",
                 relay, e
@@ -285,12 +338,13 @@ pub async fn connect(
 /// seen that address receive. `incoming` carries the relay's datagrams, as
 /// for [`connect`]; only those from the allocated port matter here.
 pub async fn hold(
-    socket: Arc<UdpSocket>,
+    via: impl Into<Via>,
     relayed: SocketAddr,
     ticket: [u8; TOKEN_LEN],
     incoming: &mut mpsc::Receiver<Incoming>,
     cancel: &CancellationToken,
 ) {
+    let via: Via = via.into();
     let ask = Message::Open {
         ticket,
         proof: [0; TOKEN_LEN],
@@ -302,7 +356,7 @@ pub async fn hold(
         let wait = next.saturating_duration_since(Instant::now());
         tokio::select! {
             _ = tokio::time::sleep(wait), if asked < REPEATS => {
-                let _ = socket.send_to(&ask, relayed).await;
+                let _ = via.send_to(&ask, relayed).await;
                 asked += 1;
                 next = Instant::now() + REPEAT_GAP;
             }
@@ -313,7 +367,7 @@ pub async fn hold(
                 }
                 if let Some(Message::Confirm { proof }) = Message::decode(&pkt) {
                     let open = Message::Open { ticket, proof }.encode();
-                    let _ = socket.send_to(&open, relayed).await;
+                    let _ = via.send_to(&open, relayed).await;
                 }
             }
             _ = cancel.cancelled() => return,
@@ -347,9 +401,12 @@ pub async fn hold(
 /// registration is sent again the moment that changes, so that a sender
 /// asking after the NAT tests finished is told what they found. When the
 /// relay introduces a sender, `puncher` pushes back at it.
+///
+/// `standing` says whether the relay holds the registration now: true from
+/// its confirmation, false again once a whole lease has gone unconfirmed.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
-    socket: Arc<UdpSocket>,
+    via: impl Into<Via>,
     relays: Vec<SocketAddr>,
     relay_id: SharpId,
     identity: Identity,
@@ -358,8 +415,11 @@ pub async fn serve(
     cancel: CancellationToken,
     keepalive: crate::nat::keepalive::SharedKeepalive,
     puncher: Arc<Puncher>,
+    standing: tokio::sync::watch::Sender<bool>,
     on_registered: impl Fn(SocketAddr, SocketAddr) + Send + 'static,
 ) {
+    let via: Via = via.into();
+    let socket = via.socket().clone();
     let Some(&first) = relays.first() else {
         return;
     };
@@ -438,6 +498,7 @@ pub async fn serve(
                 lease
             );
             registered = false;
+            standing.send_replace(false);
             retry = Duration::from_millis(500);
             unanswered = 0;
         }
@@ -463,7 +524,7 @@ pub async fn serve(
                     proof: [0; PROOF_LEN],
                 },
             );
-            match socket.send_to(&msg, relay).await {
+            match via.send_to(&msg, relay).await {
                 Ok(_) => {
                     send_failures = 0;
                     if registered {
@@ -513,7 +574,7 @@ pub async fn serve(
             }
             _ = cancel.cancelled() => {
                 if registered {
-                    goodbye(&socket, relay, &key, id, token, nonce, &mut stamps, &mut incoming).await;
+                    goodbye(&via, relay, &key, id, token, nonce, &mut stamps, &mut incoming).await;
                 }
                 return;
             }
@@ -537,7 +598,7 @@ pub async fn serve(
                         ticket: *ticket,
                         proof,
                     };
-                    let _ = socket.send_to(&open.encode(), from).await;
+                    let _ = via.send_to(&open.encode(), from).await;
                 }
             }
             continue;
@@ -562,14 +623,17 @@ pub async fn serve(
             } if authentic => {
                 lease = Duration::from_secs(secs.clamp(10, 3600) as u64);
                 confirmed_at = Instant::now();
+                standing.send_replace(true);
                 match observed {
                     None => {
                         tracing::info!("relay {} reached; it sees us at {}", relay, seen);
                         on_registered(relay, seen);
                     }
                     // The mapping lapsed although it was being refreshed:
-                    // the refreshes are too far apart for this NAT.
-                    Some(before) if before != seen => {
+                    // the refreshes are too far apart for this NAT. (Over a
+                    // stream there is no mapping of ours to keep, and a new
+                    // stream is seen from a new port.)
+                    Some(before) if before != seen && !via.is_stream() => {
                         let shorter = keepalive.lock().mapping_changed();
                         if shorter {
                             tracing::info!(
@@ -617,8 +681,8 @@ pub async fn serve(
                 // nothing — but it is not a new introduction, and must not
                 // spend the allowance below or punch again.
                 if handled.iter().any(|(t, _)| *t == ticket) {
-                    let socket = socket.clone();
-                    tokio::spawn(async move { announce(&socket, relayed, ticket).await });
+                    let via = via.clone();
+                    tokio::spawn(async move { announce(&via, relayed, ticket).await });
                     continue;
                 }
                 if handled.len() >= HANDLED_REMEMBERED {
@@ -673,7 +737,7 @@ pub async fn serve(
                     ),
                     _ => tracing::info!("relay {} is introducing {}", relay, peer),
                 }
-                let socket = socket.clone();
+                let via = via.clone();
                 let puncher = puncher.clone();
                 let cancel = cancel.clone();
                 // Both jobs at once, and that is not a figure of speech.
@@ -695,7 +759,7 @@ pub async fn serve(
                         }
                     };
                     tokio::join!(
-                        announce(&socket, relayed, ticket),
+                        announce(&via, relayed, ticket),
                         towards,
                         towards_other_family
                     );
@@ -763,7 +827,7 @@ const GOODBYE_WAIT: Duration = Duration::from_millis(700);
 /// then answers with a fresh one, and the goodbye is sent again with it.
 #[allow(clippy::too_many_arguments)]
 async fn goodbye(
-    socket: &UdpSocket,
+    via: &Via,
     relay: SocketAddr,
     key: &crate::crypto::SecretKey,
     id: SharpId,
@@ -783,7 +847,7 @@ async fn goodbye(
                 proof: [0; PROOF_LEN],
             },
         );
-        if socket.send_to(&bye, relay).await.is_err() {
+        if via.send_to(&bye, relay).await.is_err() {
             return;
         }
         match wait_for(incoming, relay, GOODBYE_WAIT, |pkt| {
@@ -810,14 +874,14 @@ fn signed(key: &crate::crypto::SecretKey, msg: Message) -> Vec<u8> {
 /// Says which side of an allocation we are, repeatedly: the first may be
 /// the one that opens the NAT rather than the one that arrives. Each draws
 /// a confirmation from the port, which [`serve`] answers.
-async fn announce(socket: &UdpSocket, allocated: SocketAddr, ticket: [u8; TOKEN_LEN]) {
+async fn announce(via: &Via, allocated: SocketAddr, ticket: [u8; TOKEN_LEN]) {
     let msg = Message::Open {
         ticket,
         proof: [0; TOKEN_LEN],
     }
     .encode();
     for i in 0..REPEATS {
-        if socket.send_to(&msg, allocated).await.is_err() {
+        if via.send_to(&msg, allocated).await.is_err() {
             return;
         }
         if i + 1 < REPEATS {
@@ -949,6 +1013,7 @@ mod tests {
                     crate::nat::keepalive::Keepalive::new(Duration::from_secs(15)),
                 )),
                 Arc::new(Puncher::without_hints(socket.clone())),
+                tokio::sync::watch::channel(false).0,
                 move |_relay, seen| told.lock().push(seen),
             ))
         };

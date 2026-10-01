@@ -88,6 +88,10 @@ pub struct Config {
     pub allowed_senders: Option<std::collections::HashSet<SharpId>>,
     /// Limits on what is carried.
     pub quotas: Quotas,
+    /// Take clients over TCP too, at the control port's address and port
+    /// number: for those whose network lets no UDP through (see
+    /// `relay::tunnel`). Everything else is as over UDP.
+    pub tcp: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -111,6 +115,7 @@ impl std::fmt::Debug for Config {
                 &self.allowed_senders.as_ref().map(|l| l.len()),
             )
             .field("quotas", &self.quotas)
+            .field("tcp", &self.tcp)
             .finish()
     }
 }
@@ -131,6 +136,7 @@ impl Default for Config {
             allowed_receivers: None,
             allowed_senders: None,
             quotas: Quotas::default(),
+            tcp: true,
         }
     }
 }
@@ -556,6 +562,11 @@ pub struct Relay {
     /// what came before it, and an older registration captured from the
     /// same address could be sent again and taken.
     forgotten: HashMap<SharpId, (u64, Instant)>,
+    /// Clients over streams (see `relay::tunnel`): what goes to them, and
+    /// what comes from them for the control port; and where they come in.
+    tunnels: Arc<super::tunnel::Tunnels>,
+    tunnel_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    listener: Option<tokio::net::TcpListener>,
 }
 
 impl Relay {
@@ -564,10 +575,31 @@ impl Relay {
         // stops an ICMP error from a vanished peer surfacing as a receive
         // error on this socket — and enough of those would stop the relay.
         let socket = crate::transport::socket::bind_udp(cfg.bind, CONTROL_BUFFER)?;
+        let takes_v4 = crate::address::Reach::of(&socket).v4();
         let socket = PktSocket::new(Arc::new(socket))?;
         let now = Instant::now();
         let (cfg_rate, cfg_burst) = (cfg.rate, cfg.burst);
         let meter = Arc::new(parking_lot::Mutex::new(Meter::new(cfg.quotas)));
+        let (tunnels, tunnel_rx) = super::tunnel::Tunnels::new();
+        // Clients whose network lets no UDP through reach the relay over
+        // TCP, at the address and port number its control port has.
+        let listener = if cfg.tcp {
+            let at = socket.local_addr()?;
+            let dual_stack = at.is_ipv6() && at.ip().is_unspecified() && takes_v4;
+            match super::tunnel::bind(at, dual_stack) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::warn!(
+                        "relay: cannot take clients over TCP at {} ({}); UDP only",
+                        at,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             socket: Arc::new(socket),
             via: None,
@@ -582,6 +614,9 @@ impl Relay {
             meter,
             last_prune: now,
             forgotten: HashMap::new(),
+            tunnels,
+            tunnel_rx,
+            listener,
         })
     }
 
@@ -597,6 +632,14 @@ impl Relay {
     /// Serves until cancelled.
     pub async fn run(mut self) -> io::Result<()> {
         tracing::info!("relay listening on {}", self.socket.local_addr()?);
+        if let Some(listener) = self.listener.take() {
+            tracing::info!("relay takes clients over TCP at {}", listener.local_addr()?);
+            tokio::spawn(super::tunnel::serve(
+                listener,
+                self.tunnels.clone(),
+                self.cancel.child_token(),
+            ));
+        }
         let socket = self.socket.clone();
         let cancel = self.cancel.clone();
         let mut buf = vec![0u8; BUF_LEN];
@@ -635,6 +678,12 @@ impl Relay {
                         self.handle(pkt, from, Instant::now()).await;
                     }
                 }
+                Some((pkt, from)) = self.tunnel_rx.recv() => {
+                    // From a client over a stream, for the control port: as
+                    // if over UDP, from the address the stream comes from.
+                    self.via = None;
+                    self.handle(&pkt, from, Instant::now()).await;
+                }
                 _ = cancel.cancelled() => {
                     for a in self.allocations.drain(..) {
                         a.task.abort();
@@ -662,7 +711,15 @@ impl Relay {
     }
 
     async fn reply(&self, to: SocketAddr, msg: Message) {
-        let _ = self.socket.send(to, self.via, &msg.encode()).await;
+        self.send_control(to, self.via, &msg.encode()).await;
+    }
+
+    /// Sends from the control port: on `to`'s stream when it has one, from
+    /// the socket otherwise.
+    async fn send_control(&self, to: SocketAddr, via: Option<std::net::IpAddr>, datagram: &[u8]) {
+        if self.tunnels.send(to, 0, datagram).is_none() {
+            let _ = self.socket.send(to, via, datagram).await;
+        }
     }
 
     /// A message to a receiver whose registration was proven, closed with
@@ -674,9 +731,7 @@ impl Relay {
         nonce: &[u8; NONCE_LEN],
         msg: Message,
     ) {
-        let _ = self
-            .socket
-            .send(to, self.via, &tagged(key, nonce, &msg))
+        self.send_control(to, self.via, &tagged(key, nonce, &msg))
             .await;
     }
 
@@ -1050,11 +1105,15 @@ impl Relay {
                 // Each side is told where the other appears to be,
                 // so they can try a direct path first and leave the
                 // relay carrying nothing.
+                // A client over a stream has no address of its own worth
+                // punching at: what the relay sees is the stream's.
+                let show_receiver = disclose && !self.tunnels.contains(receiver);
+                let show_sender = disclose && !self.tunnels.contains(from);
                 self.reply(
                     from,
                     Message::Allocated {
                         port,
-                        peer: shown(receiver, disclose),
+                        peer: shown(receiver, show_receiver),
                         ticket: sender_ticket,
                         hints: receiver_hints,
                         tag: nonce,
@@ -1064,19 +1123,17 @@ impl Relay {
                 let (key, receiver_nonce) = receiver_tag;
                 let incoming = Message::Incoming {
                     port,
-                    peer: shown(from, disclose),
+                    peer: shown(from, show_sender),
                     ticket: receiver_ticket,
                     hints: sender_hints,
                     tag: [0; TAG_LEN],
                 };
-                let _ = self
-                    .socket
-                    .send(
-                        receiver,
-                        receiver_via,
-                        &tagged(&key, &receiver_nonce, &incoming),
-                    )
-                    .await;
+                self.send_control(
+                    receiver,
+                    receiver_via,
+                    &tagged(&key, &receiver_nonce, &incoming),
+                )
+                .await;
                 tracing::info!(
                     "relay: port {} carries {} <-> {} ({})",
                     port,
@@ -1147,14 +1204,17 @@ impl Relay {
         let sender_ticket = random_token();
         let receiver_ticket = random_token();
         self.ports.lock().insert(port);
+        let streamed = self.tunnels.open_pair(port);
         let task = tokio::spawn(carry(Carried {
             sock,
+            tunnels: self.tunnels.clone(),
+            streamed,
             control: self.socket.clone(),
             ports: self.ports.clone(),
             port,
             sender_ticket,
             receiver_ticket,
-            sender_shown: shown(sender, disclose),
+            sender_shown: shown(sender, disclose && !self.tunnels.contains(sender)),
             sender_hints,
             receiver_control: receiver,
             receiver_via,
@@ -1222,10 +1282,12 @@ impl Relay {
         }
         self.forgotten.retain(|_, (_, until)| *until > now);
         let ports = self.ports.clone();
+        let tunnels = self.tunnels.clone();
         self.allocations.retain(|a| {
             if a.task.is_finished() {
                 tracing::debug!("relay: port {} released", a.port);
                 ports.lock().remove(&a.port);
+                tunnels.close_pair(a.port);
                 return false;
             }
             true
@@ -1237,6 +1299,9 @@ impl Relay {
 /// Everything one carried pair needs.
 struct Carried {
     sock: Arc<PktSocket>,
+    /// Sides that reach the pair over a stream, and what they send it.
+    tunnels: Arc<super::tunnel::Tunnels>,
+    streamed: tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     /// The control socket, for repeating an introduction that went missing.
     control: Arc<PktSocket>,
     /// Every port this relay has set aside, so a pair can refuse to treat
@@ -1358,6 +1423,8 @@ impl Drop for Tally {
 async fn carry(c: Carried) {
     let Carried {
         sock,
+        tunnels,
+        mut streamed,
         control,
         ports,
         port,
@@ -1421,106 +1488,26 @@ async fn carry(c: Carried) {
         } else {
             quiet
         };
-        tokio::select! {
-            r = sock.recv(&mut buf) => {
-                let got = match r {
-                    Ok(v) => {
-                        errors = 0;
-                        v
-                    }
-                    Err(_) => {
-                        errors += 1;
-                        if errors >= MAX_ERRORS {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-                let from = got.from;
-                // One datagram, or a run the system handed over together;
-                // each is carried on its own.
-                for pkt in buf[..got.len].chunks(got.stride.max(1)) {
-                    let n = pkt.len();
-                    // Which of the relay's addresses each side knows this
-                    // port by: what its datagrams are sent from, going back.
-                    if Some(from) == a {
-                        via_a = got.dst;
-                    } else if Some(from) == b {
-                        via_b = got.dst;
-                    }
-                    if is_control(pkt) {
-                        // A side saying which one it is. The address it comes
-                        // from is the one to use, whatever the control port saw.
-                        if let Some(Message::Open { ticket, proof }) = Message::decode(pkt) {
-                            let is_a = constant_time_eq(&ticket, &sender_ticket);
-                            let is_b = constant_time_eq(&ticket, &receiver_ticket);
-                            if !is_a && !is_b {
-                                continue;
-                            }
-                            if !acceptable(from) {
-                                tracing::debug!("relay: port {} will not carry to {}", port, from);
-                                continue;
-                            }
-                            // Bound only once it has shown it receives here:
-                            // the first Open is answered with a confirmation,
-                            // to this address and nowhere else, and only an
-                            // Open carrying it binds the side. A forged source
-                            // never sees it.
-                            let expected = confirmation(&confirm_key, &ticket, from);
-                            if !constant_time_eq(&proof, &expected) {
-                                let reply = Message::Confirm { proof: expected }.encode();
-                                let _ = sock.send(from, got.dst, &reply).await;
-                                continue;
-                            }
-                            // The two sides have to be two. One address holding
-                            // both tickets is a pair talking to itself, and a
-                            // datagram put into it would never stop going round.
-                            if (is_a && b == Some(from)) || (is_b && a == Some(from)) {
-                                tracing::debug!("relay: port {} refuses {} as both sides", port, from);
-                                continue;
-                            }
-                            if is_a {
-                                a = Some(from);
-                                via_a = got.dst;
-                            } else {
-                                b = Some(from);
-                                via_b = got.dst;
-                            }
-                            last = Instant::now();
-                        }
-                        continue;
-                    }
-                    // Traffic, carried only between the two bound addresses.
-                    let (to, to_via) = if Some(from) == a {
-                        (b, via_b)
-                    } else if Some(from) == b {
-                        (a, via_a)
-                    } else {
-                        continue;
-                    };
-                    if let Some(to) = to {
-                        let now = Instant::now();
-                        // Within the client's and the relay's limits, or not
-                        // carried at all: a policed datagram is lost like any
-                        // other, and the transfer's own congestion control
-                        // slows it to what the relay will carry.
-                        if !meter.lock().allow(from, n, now) {
-                            tally.refused += 1;
-                            continue;
-                        }
-                        tally.carried += n as u64;
-                        if pair_bytes > 0 && tally.carried > pair_bytes {
-                            tracing::info!(
-                                "relay: port {} has carried the {} bytes a pair may; closing it",
-                                port,
-                                pair_bytes
-                            );
-                            return;
-                        }
-                        last = now;
-                        let _ = sock.send(to, to_via, pkt).await;
-                    }
+        // A run of datagrams off the socket, or one from a side over a
+        // stream: from where, how long, how cut, to which of our addresses.
+        let (len, stride, from, dst) = tokio::select! {
+            r = sock.recv(&mut buf) => match r {
+                Ok(got) => {
+                    errors = 0;
+                    (got.len, got.stride, got.from, got.dst)
                 }
+                Err(_) => {
+                    errors += 1;
+                    if errors >= MAX_ERRORS {
+                        return;
+                    }
+                    continue;
+                }
+            },
+            Some((pkt, from)) = streamed.recv() => {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                (n, n, from, None)
             }
             _ = tokio::time::sleep(wake) => {
                 let now = Instant::now();
@@ -1541,12 +1528,101 @@ async fn carry(c: Carried) {
                         tag: [0; TAG_LEN],
                     };
                     let (key, nonce) = &receiver_tag;
-                    let _ = control
-                        .send(receiver_control, receiver_via, &tagged(key, nonce, &msg))
-                        .await;
+                    let bytes = tagged(key, nonce, &msg);
+                    if tunnels.send(receiver_control, 0, &bytes).is_none() {
+                        let _ = control.send(receiver_control, receiver_via, &bytes).await;
+                    }
                 }
+                continue;
             }
             _ = cancel.cancelled() => return,
+        };
+        // One datagram, or a run the system handed over together; each is
+        // carried on its own.
+        for pkt in buf[..len].chunks(stride.max(1)) {
+            let n = pkt.len();
+            // Which of the relay's addresses each side knows this port by:
+            // what its datagrams are sent from, going back.
+            if Some(from) == a {
+                via_a = dst;
+            } else if Some(from) == b {
+                via_b = dst;
+            }
+            if is_control(pkt) {
+                // A side saying which one it is. The address it comes from
+                // is the one to use, whatever the control port saw.
+                if let Some(Message::Open { ticket, proof }) = Message::decode(pkt) {
+                    let is_a = constant_time_eq(&ticket, &sender_ticket);
+                    let is_b = constant_time_eq(&ticket, &receiver_ticket);
+                    if !is_a && !is_b {
+                        continue;
+                    }
+                    if !acceptable(from) {
+                        tracing::debug!("relay: port {} will not carry to {}", port, from);
+                        continue;
+                    }
+                    // Bound only once it has shown it receives here: the
+                    // first Open is answered with a confirmation, to this
+                    // address and nowhere else, and only an Open carrying it
+                    // binds the side. A forged source never sees it.
+                    let expected = confirmation(&confirm_key, &ticket, from);
+                    if !constant_time_eq(&proof, &expected) {
+                        let reply = Message::Confirm { proof: expected }.encode();
+                        if tunnels.send(from, port, &reply).is_none() {
+                            let _ = sock.send(from, dst, &reply).await;
+                        }
+                        continue;
+                    }
+                    // The two sides have to be two. One address holding both
+                    // tickets is a pair talking to itself, and a datagram put
+                    // into it would never stop going round.
+                    if (is_a && b == Some(from)) || (is_b && a == Some(from)) {
+                        tracing::debug!("relay: port {} refuses {} as both sides", port, from);
+                        continue;
+                    }
+                    if is_a {
+                        a = Some(from);
+                        via_a = dst;
+                    } else {
+                        b = Some(from);
+                        via_b = dst;
+                    }
+                    last = Instant::now();
+                }
+                continue;
+            }
+            // Traffic, carried only between the two bound addresses.
+            let (to, to_via) = if Some(from) == a {
+                (b, via_b)
+            } else if Some(from) == b {
+                (a, via_a)
+            } else {
+                continue;
+            };
+            if let Some(to) = to {
+                let now = Instant::now();
+                // Within the client's and the relay's limits, or not carried
+                // at all: a policed datagram is lost like any other, and the
+                // transfer's own congestion control slows it to what the
+                // relay will carry.
+                if !meter.lock().allow(from, n, now) {
+                    tally.refused += 1;
+                    continue;
+                }
+                tally.carried += n as u64;
+                if pair_bytes > 0 && tally.carried > pair_bytes {
+                    tracing::info!(
+                        "relay: port {} has carried the {} bytes a pair may; closing it",
+                        port,
+                        pair_bytes
+                    );
+                    return;
+                }
+                last = now;
+                if tunnels.send(to, port, pkt).is_none() {
+                    let _ = sock.send(to, to_via, pkt).await;
+                }
+            }
         }
     }
 }

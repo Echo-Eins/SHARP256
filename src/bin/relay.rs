@@ -120,6 +120,13 @@ struct Args {
     #[arg(long, default_value_t = 3478)]
     stun_port: u16,
 
+    /// Take no clients over TCP. By default the relay also listens on TCP
+    /// at the address and port number it listens on for UDP, for clients
+    /// whose network lets no UDP through: the same messages, framed on a
+    /// stream.
+    #[arg(long)]
+    no_tcp: bool,
+
     /// The STUN port the "change port" tests answer from (default: one
     /// above).
     #[arg(long, default_value_t = 0)]
@@ -210,6 +217,7 @@ async fn main() -> Result<()> {
         allowed_receivers: allowed_receivers.clone(),
         allowed_senders: allowed_senders.clone(),
         quotas,
+        tcp: !args.no_tcp,
     };
 
     let cancel = CancellationToken::new();

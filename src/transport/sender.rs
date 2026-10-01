@@ -406,6 +406,61 @@ impl Sender {
         inboxes
     }
 
+    /// What reaches each configured relay over a stream when streams are
+    /// asked for (see `relay::tunnel`): the same introduction as over UDP,
+    /// and the relay's port for the pair joined to the engine through a
+    /// shim, a stream like any other to it. One stream per relay at a time.
+    #[cfg(feature = "nat-traversal")]
+    fn relay_tunnels(
+        &self,
+        engine: SocketAddr,
+        local: SocketAddr,
+        shims: Arc<crate::transport::carrier::Shims>,
+        streams: mpsc::UnboundedSender<SocketAddr>,
+        found: mpsc::UnboundedSender<Found>,
+        cancel: CancellationToken,
+    ) -> Option<crate::transport::carrier::dial::Also> {
+        let relays: Vec<(Option<SharpId>, String)> = self
+            .cfg
+            .relays
+            .iter()
+            .filter_map(|r| crate::relay::parse_relay(r).ok())
+            .collect();
+        if relays.is_empty() {
+            return None;
+        }
+        let socket = self.socket.udp();
+        let (identity, target) = (self.identity.clone(), self.cfg.receiver_id);
+        let live: Arc<
+            parking_lot::Mutex<Vec<Option<Arc<crate::transport::carrier::StreamStats>>>>,
+        > = Arc::new(parking_lot::Mutex::new(vec![None; relays.len()]));
+        let busy: Arc<parking_lot::Mutex<Vec<bool>>> =
+            Arc::new(parking_lot::Mutex::new(vec![false; relays.len()]));
+        Some(Box::new(move || {
+            for (i, (relay_id, host)) in relays.iter().enumerate() {
+                {
+                    let mut b = busy.lock();
+                    if b[i] || live.lock()[i].as_ref().is_some_and(|s| s.alive()) {
+                        continue;
+                    }
+                    b[i] = true;
+                }
+                let (relay_id, host) = (*relay_id, host.clone());
+                let (socket, identity, shims) = (socket.clone(), identity.clone(), shims.clone());
+                let (streams, found, cancel) = (streams.clone(), found.clone(), cancel.clone());
+                let (live, busy) = (live.clone(), busy.clone());
+                tokio::spawn(async move {
+                    relay_over_stream(
+                        &host, relay_id, target, &identity, socket, engine, local, &shims,
+                        &streams, &found, &live, i, &cancel,
+                    )
+                    .await;
+                    busy.lock()[i] = false;
+                });
+            }
+        }))
+    }
+
     /// Resolves the names the receiver is published under while the
     /// handshake is already trying its addresses, both families at once,
     /// each address joining the attempts as RFC 8305 says it may (see
@@ -868,29 +923,51 @@ impl Sender {
                 Err(e) => tracing::warn!("cannot use the DHT: {}", e),
             }
         }
+        #[cfg(feature = "nat-traversal")]
+        let tunnels_found = found_tx.clone();
         self.spawn_nat64(&given, reach, found_tx);
         // Streams to the receiver, dialled when UDP does not answer or stops
         // (see `transport::carrier`). They end with the transfer.
         let carrier_cancel = self.cancel.child_token();
-        let carriers = match crate::transport::carrier::shim::engine_address(&self.socket.udp()) {
-            Some(engine_at) if self.cfg.carriers => {
-                let shims = Arc::new(crate::transport::carrier::Shims::default());
-                let (tx, found) = mpsc::unbounded_channel();
-                let dial = crate::transport::carrier::dial::spawn(
-                    engine_at,
-                    local,
-                    shims.clone(),
-                    tx,
-                    carrier_cancel.clone(),
-                );
-                Carriers {
-                    shims,
-                    dial: Some(dial),
-                    found,
-                    asked_at: None,
+        let carriers = {
+            // Kept only by what will use it: the found channel closing is
+            // how the handshake learns there is nothing more to wait for.
+            #[cfg(feature = "nat-traversal")]
+            let tunnels_found = tunnels_found;
+            match crate::transport::carrier::shim::engine_address(&self.socket.udp()) {
+                Some(engine_at) if self.cfg.carriers => {
+                    let shims = Arc::new(crate::transport::carrier::Shims::default());
+                    let (tx, found) = mpsc::unbounded_channel();
+                    // The relays too, over streams of their own, when streams
+                    // are asked for.
+                    #[cfg(feature = "nat-traversal")]
+                    let also = self.relay_tunnels(
+                        engine_at,
+                        local,
+                        shims.clone(),
+                        tx.clone(),
+                        tunnels_found,
+                        carrier_cancel.clone(),
+                    );
+                    #[cfg(not(feature = "nat-traversal"))]
+                    let also = None;
+                    let dial = crate::transport::carrier::dial::spawn(
+                        engine_at,
+                        local,
+                        shims.clone(),
+                        tx,
+                        also,
+                        carrier_cancel.clone(),
+                    );
+                    Carriers {
+                        shims,
+                        dial: Some(dial),
+                        found,
+                        asked_at: None,
+                    }
                 }
+                _ => Carriers::none(),
             }
-            _ => Carriers::none(),
         };
 
         let mut engine = Engine::new(
@@ -1275,6 +1352,109 @@ fn spawn_turn_dials(
                 }
             }
         });
+    }
+}
+
+/// One relay over a stream, for as long as the stream lasts: dialled at the
+/// relay's addresses in turn, asked to put us through as over UDP, and its
+/// port for the pair joined to the engine through a shim (see
+/// `relay::tunnel`). What the relay says of where the receiver is joins the
+/// candidates, as over UDP.
+#[cfg(feature = "nat-traversal")]
+#[allow(clippy::too_many_arguments)]
+async fn relay_over_stream(
+    host: &str,
+    relay_id: Option<SharpId>,
+    target: SharpId,
+    identity: &Identity,
+    socket: Arc<tokio::net::UdpSocket>,
+    engine: SocketAddr,
+    local: SocketAddr,
+    shims: &crate::transport::carrier::Shims,
+    streams: &mpsc::UnboundedSender<SocketAddr>,
+    found: &mpsc::UnboundedSender<Found>,
+    live: &parking_lot::Mutex<Vec<Option<Arc<crate::transport::carrier::StreamStats>>>>,
+    index: usize,
+    cancel: &CancellationToken,
+) {
+    let resolved = tokio::select! {
+        r = tokio::time::timeout(RELAY_RESOLVE_TIMEOUT, crate::address::resolve_all(host)) => r,
+        _ = cancel.cancelled() => return,
+    };
+    let Ok(Ok(addrs)) = resolved else {
+        tracing::info!("relay {}: the name did not resolve", host);
+        return;
+    };
+    let mut dialled = None;
+    for addr in addrs {
+        let attempt = tokio::select! {
+            r = crate::relay::tunnel::dial(addr, local) => r,
+            _ = cancel.cancelled() => return,
+        };
+        match attempt {
+            Ok(stream) => {
+                dialled = Some((addr, stream));
+                break;
+            }
+            Err(e) => tracing::info!("relay {} over TCP at {}: {}", host, addr, e),
+        }
+    }
+    let Some((addr, stream)) = dialled else {
+        return;
+    };
+    let (tunnel, mut rx) = crate::relay::tunnel::ClientTunnel::open(
+        stream,
+        addr,
+        socket,
+        crate::relay::tunnel::Pairs::Engine,
+        cancel.child_token(),
+    );
+    live.lock()[index] = Some(tunnel.link().stats().clone());
+    tracing::info!("relay {} reached over TCP at {}", host, addr);
+    let auth = relay_id.map(|r| (identity, r));
+    let asked = crate::relay::client::connect(
+        tunnel.via(),
+        tunnel.relay(),
+        target,
+        &mut rx,
+        cancel,
+        auth,
+        crate::relay::Hints::none(),
+    )
+    .await;
+    let i = match asked {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::info!("relay {} over TCP: {}", host, e);
+            tunnel.link().close();
+            return;
+        }
+    };
+    if let Some(peer) = i.peer {
+        let _ = found.send(Found::Relay(peer));
+    }
+    match tunnel.attach(i.relayed.port(), engine, shims) {
+        Ok(shim) => {
+            tracing::info!(
+                "relay {} will carry the transfer on its port {}, over TCP",
+                host,
+                i.relayed.port()
+            );
+            let _ = streams.send(shim);
+        }
+        Err(e) => {
+            tracing::info!(
+                "relay {}: cannot join its port to the transfer: {}",
+                host,
+                e
+            );
+            tunnel.link().close();
+            return;
+        }
+    }
+    tokio::select! {
+        _ = crate::relay::client::hold(tunnel.via(), i.relayed, i.ticket, &mut rx, cancel) => {}
+        _ = tunnel.link().closed() => {}
     }
 }
 
@@ -4212,15 +4392,14 @@ impl Engine {
         {
             return;
         }
+        // None at all is still worth the asking: the relays are reached
+        // over streams too.
         let targets: Vec<SocketAddr> = self
             .candidates
             .iter()
             .copied()
             .filter(|a| !self.is_relayed(*a))
             .collect();
-        if targets.is_empty() {
-            return;
-        }
         if self.carriers.asked_at.is_none() {
             tracing::info!("{}; trying the receiver over TCP as well", why);
         }

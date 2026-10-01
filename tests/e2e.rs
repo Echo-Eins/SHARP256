@@ -4685,3 +4685,132 @@ async fn a_transfer_moves_to_tcp_when_udp_stops_and_back_when_it_returns() {
     }
     stop_receiver(r).await;
 }
+
+// ---------------------------------------------------------------------------
+// carriers: a relay over TCP
+// ---------------------------------------------------------------------------
+
+/// A relay on loopback: its address and identity, and what stops it.
+#[cfg(feature = "nat-traversal")]
+async fn start_relay() -> (SocketAddr, SharpId, CancellationToken) {
+    use sharp256::relay::server::{Config, Relay};
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let (addr, id) = (relay.local_addr().unwrap(), relay.id());
+    tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+    (addr, id, cancel)
+}
+
+/// The relay as a network that lets no UDP through reaches it: the same
+/// address, over TCP only.
+#[cfg(feature = "nat-traversal")]
+async fn relay_over_tcp_only(relay: SocketAddr) -> (Proxy, TcpForward) {
+    let proxy = start_proxy(relay, Impairment::none()).await;
+    proxy.blackhole.store(true, Ordering::Relaxed);
+    let tcp = start_tcp_forward(proxy.addr, relay).await;
+    (proxy, tcp)
+}
+
+/// Waits for the receiver to say it is registered with a relay.
+#[cfg(feature = "nat-traversal")]
+async fn wait_registered(rx: &mut mpsc::UnboundedReceiver<TransferEvent>, within: Duration) {
+    let deadline = Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Some(TransferEvent::RelayRegistered { .. })) => return,
+            Ok(Some(_)) => {}
+            _ => panic!("the receiver did not register with its relay in time"),
+        }
+    }
+}
+
+/// A transfer through the relay only (the receiver keeps to it, and takes
+/// no TCP of its own), its sender and its receiver each reaching the relay
+/// at the address given — over TCP only, or not.
+#[cfg(feature = "nat-traversal")]
+async fn through_the_relay(sender_udp_blocked: bool, receiver_udp_blocked: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let (relay, relay_id, relay_cancel) = start_relay().await;
+    let (r_proxy, r_tcp) = relay_over_tcp_only(relay).await;
+    let (s_proxy, s_tcp) = relay_over_tcp_only(relay).await;
+    let receiver_sees = if receiver_udp_blocked {
+        r_proxy.addr
+    } else {
+        relay
+    };
+    let sender_sees = if sender_udp_blocked {
+        s_proxy.addr
+    } else {
+        relay
+    };
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![format!("{}@{}", relay_id, receiver_sees)];
+        cfg.relay_private = true;
+        cfg.tcp = false;
+    })
+    .await;
+    wait_registered(&mut r.events, Duration::from_secs(30)).await;
+    let size = 2_000_000;
+    let path = make_file(&src, "relayed.bin", size, 13);
+    let mut cfg = sender_cfg(&path, "0.0.0.0:0".parse().unwrap(), r.id, &state);
+    cfg.relays = vec![format!("{}@{}", relay_id, sender_sees)];
+    tokio::time::timeout(Duration::from_secs(90), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("send");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    } else {
+        panic!("unexpected event");
+    }
+    if sender_udp_blocked {
+        assert!(
+            s_tcp.to_target_bytes.load(Ordering::Relaxed) >= size as u64,
+            "the sender's side carried over TCP"
+        );
+    }
+    if receiver_udp_blocked {
+        assert!(
+            r_tcp.to_target_bytes.load(Ordering::Relaxed) > 0,
+            "the receiver registered over TCP"
+        );
+    }
+    stop_receiver(r).await;
+    relay_cancel.cancel();
+}
+
+/// A sender whose UDP gets nowhere is put through the relay over TCP, and
+/// the transfer is carried on the relay's port over that stream.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_whose_udp_is_blocked_is_put_through_a_relay_over_tcp() {
+    through_the_relay(true, false).await;
+}
+
+/// A receiver whose UDP gets nowhere registers with its relay over TCP, and
+/// is carried over that stream.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_whose_udp_is_blocked_registers_with_its_relay_over_tcp() {
+    through_the_relay(false, true).await;
+}
+
+/// Both: the relay carries a pair whose two sides are both streams.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_carries_between_two_streams() {
+    through_the_relay(true, true).await;
+}
