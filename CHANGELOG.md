@@ -39,6 +39,46 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   speaks only version 3, the on-path copier for version 4; the NAT
   laboratory runs version 4 end to end.
 
+### Carriers: TCP and TLS when UDP does not get through
+- The same sealed datagrams over a TCP stream, framed with their length: to
+  the receiver at the TCP port with the number of its UDP port, to a relay
+  at its port, and to a relay over TLS 1.3 (`sharp-relay --tls [::]:443`)
+  for networks that let little but HTTPS out. Nothing above the carrier
+  knows it is there; a stream is one more address of the other end's,
+  proven before it is used, and on a stream the engine leaves congestion
+  control and loss recovery to TCP.
+- Senders dial streams when UDP has not answered within 1.5 s or goes quiet
+  in a transfer (RFC 8305 Happy Eyeballs over the receiver's addresses),
+  and while carried by a relay whose UDP straight to the receiver gets no
+  answer; a stream straight to the receiver is preferred to a relay's.
+  Receivers take streams, and register with their relays over TCP or TLS
+  when UDP does not get the registration through within 8 s, trying UDP
+  again every 10 minutes. The relay carries between streams and UDP in any
+  combination.
+- UDP that answers but is held back (policed, or dropped in part) is found
+  out by a trial on a stream and left for 2 minutes and longer if TCP does
+  1.25 times better; otherwise the session goes back to UDP and the next
+  trial waits. Paths are ranked — UDP straight to the other end, a stream
+  straight to it, a server — and neither end follows the other onto a worse
+  one while its own is heard.
+- TLS to a relay is a way through, not the security: the relay's
+  certificate is self-signed, and a client checks instead that the session
+  is the relay's own, by a MAC over a key exported from it (RFC 8446 7.5)
+  that only the relay's key can make. A TLS-inspecting proxy is found out,
+  its session refused, and the user told. TLS is the `tls` feature (on by
+  default; rustls with ring), apart from `nat-traversal` because ring
+  compiles C.
+- `--no-tcp` on all three programs, `--relay-tls-port` on the sender and
+  receiver.
+- A laboratory of networks that block, cut and police UDP, let out only
+  TCP to 443, or open TLS on the way (`scripts/carrierlab/`: network
+  namespaces, nftables, tc, a TLS-inspecting proxy on Python's ssl); every
+  case on both families as expected (`docs/evidence/carriers/`).
+- Fixed on the way: the answer to a stream's first frame could go nowhere
+  when the stream's reader beat its registration; an address found during
+  the handshake was not tried at once but whatever was next round the
+  ring.
+
 ### Supply chain
 - Advisories fixed by updates within Rust 1.82: `bytes` (RUSTSEC-2026-0007),
   `crossbeam-epoch` (RUSTSEC-2026-0204), `tracing-subscriber`

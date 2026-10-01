@@ -1,0 +1,23 @@
+# sender's network: open; IPv4; 0.4 s; UDP
+
+## sender
+2026-10-01T20:49:48.986562Z  INFO sharp256::transport::sender: relay [::ffff:11.33.0.2]:5560 says the receiver is at 11.32.0.2:5555, and will carry the transfer on [::ffff:11.33.0.2]:45535
+Connected to [::ffff:11.32.0.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+2026-10-01T20:49:49.266623Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
+
+## receiver
+2026-10-01T20:49:48.692419Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at 0.0.0.0:5555
+2026-10-01T20:49:48.753600Z  INFO sharp256::relay::client: relay 11.33.0.2:5560 reached; it sees us at 11.32.0.2:5555
+2026-10-01T20:49:48.753621Z  INFO sharp256::transport::receiver: registered with the relay at 11.33.0.2:5560 (it sees us at 11.32.0.2:5555); senders reach us through it with --relay 11.33.0.2:5560
+Relay:       registered with 11.33.0.2:5560; senders can add --relay 11.33.0.2:5560
+2026-10-01T20:49:48.986574Z  INFO sharp256::relay::client: relay 11.33.0.2:5560 is introducing 11.31.0.2:36108
+
+## relay
+Receivers: --relay sh-nszlwaywbrhc42paflmvhrfnn2j3kkhl4rtfvguys7atpojiyegqlx65@<this host>:5560
+Senders:   --relay <this host>:5560
+Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
+2026-10-01T20:49:48.490460Z  INFO sharp256::relay::server: relay listening on 0.0.0.0:5560
+2026-10-01T20:49:48.490474Z  INFO sharp256::relay::server: relay takes clients over TCP at 0.0.0.0:5560
+2026-10-01T20:49:48.490482Z  INFO sharp256::relay::server: relay takes clients over TLS at 0.0.0.0:443
+2026-10-01T20:49:48.743460Z  INFO sharp256::relay::server: relay: sh-j4xnqyjq… registered at 11.32.0.2:5555
+2026-10-01T20:49:48.976509Z  INFO sharp256::relay::server: relay: port 45535 carries 11.31.0.2:36108 <-> 11.32.0.2:5555 (sh-j4xnqyjq…)

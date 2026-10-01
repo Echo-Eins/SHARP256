@@ -209,6 +209,11 @@ jobs:
               python3 scripts/natlab/natlab.py lan --v6
               python3 scripts/natlab/natlab.py samenat
               python3 scripts/natlab/natlab.py timeout
+          - name: carriers - UDP blocked, cut, policed; only TCP to 443; TLS opened on the way; both families
+            # scripts/carrierlab: the same namespaces and nftables, tc's
+            # netem for the round trips (without it, the cells run on none),
+            # and a TLS-inspecting proxy on Python's ssl.
+            run: python3 scripts/carrierlab/carrierlab.py matrix -v
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain

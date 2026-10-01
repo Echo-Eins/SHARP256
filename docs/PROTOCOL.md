@@ -1628,7 +1628,10 @@ all along (seen in the laboratory where the server's path is the slower
 one). The sender knows which of the receiver's addresses are servers'; the
 receiver counts its own TURN shims, the hosts of its relays, and the TURN
 addresses on the cards it was given. A direct path that stays quiet longer
-is left in the usual way (below).
+is left in the usual way (below). A stream straight to the other end
+(see carriers, below) stands between the two: a session on UDP does not
+follow the other end onto a stream while UDP is heard, and one on a stream
+does not follow it onto a server's address while the stream is.
 
 A sender whose NAT draws its ports at random meets a receiver behind an
 ordinary one with many sockets (section 8, punching), and only the socket
@@ -1662,6 +1665,123 @@ long as they run — or nothing, and the transfer then ends after
 `give_up_timeout` with its state kept for a resume. A session back on a
 server asks the receiver's other addresses again, as above, the meeting's
 first.
+
+### Carriers other than UDP
+
+Some networks let no UDP through, cut it in the middle of a transfer, or
+let it through held back — policed to a trickle, or dropped in part — while
+TCP passes; some let nothing out but TCP to port 443. For them the same
+datagrams go over a TCP stream, and, to a relay, over TLS on that stream
+(the `tls` build feature, on by default). Nothing above the carrier knows
+it is there: a datagram on a stream is exactly the datagram that would
+have gone over UDP, sealed end to end, with its connection id and packet
+number.
+
+**Framing.** The side that opens a stream sends an 8-byte preamble,
+`"SHRP" | version (1) | kind | 0 0`, kind 1 for a stream to a receiver and
+2 for one to a relay; the side that accepts it sends the same eight bytes
+back, which tells the opener that a SHARP-256 endpoint is there (and not a
+web server on port 443). Then each way, frames: `length (u16) | port (u16)
+| datagram[length]`. On a stream to a receiver the port is 0. On one to a
+relay it is the relay's port the datagram is to or from: 0 for its control
+port, a pair's port otherwise. A frame of length 0 is ignored; one whose
+length has its top bit set (`0x8000`) is the carrier's own business — the
+TLS binding below — and not a datagram. No datagram is longer than a jumbo
+frame's UDP payload; a frame claiming more ends the stream.
+
+**Receivers** accept streams on the TCP port with the number of their UDP
+port, on the same address (both families where the UDP socket takes both),
+and hand what they carry to the dispatcher as if it had come in on the
+socket, from the address the stream comes from; what they send to that
+address goes back on the stream. At most 64 streams at once, 4 from one
+client (an IPv4 address, an IPv6 /64); the preamble must come within 5 s,
+and a stream that carries nothing for 60 s is closed. `sharp-receiver
+--no-tcp` keeps to UDP.
+
+**Senders** dial streams when UDP has not answered the first initiations
+within 1.5 s, when the receiver has gone quiet for `min(stall_timeout, 3 s)`
+in the middle of a transfer, when a stream the session ran on ends, and
+while the session is carried by a server and the receiver's own UDP
+addresses have not answered five rounds of pings (see leaving a relay,
+above). The receiver's addresses are tried as RFC 8305 tries them: one at a
+time, 250 ms apart, families taking turns, the first stream up kept; one
+stream at a time, an address that failed tried again after 30 s at the
+soonest, streams asked for at most every 10 s. The relays the sender was
+given are reached over streams of their own at the same moments (below).
+Each stream is joined to the engine through a *shim*, a loopback UDP socket
+that stands for the stream as a TURN shim stands for the server, so a
+stream is one more address of the receiver's, moved to and from by proving
+it like any other (section 8, address validation). A stream that comes up
+while the session has been quiet for a second gets an initiation at once.
+An initiation makes the one before it moot; so while a stream straight to
+the receiver is up, a relay's stream gets none, and a session that ended
+up on a relay's stream all the same moves to the direct one — by proving
+it, asked every two seconds — when there is one. `sharp-sender --no-tcp`
+keeps to UDP.
+
+**On a stream**, the engine steps aside for TCP: a stream is reliable and
+has congestion control of its own, and running the session's own as well
+would have both resend what one of them only delayed. The window is what is
+in flight plus the room left in the stream's queue (1 MiB), capped by the
+receiver's window; nothing is paced (unless a rate cap is set); there are no
+tail loss probes; the retransmission timer is at least 10 s and only
+notices a stream that died without saying so. Moving between a stream and
+a datagram path starts congestion control and the round-trip estimate
+afresh, and what was in flight on a path quiet for a second or more is sent
+again at once.
+
+**Relays** accept streams on the TCP port with the number of their UDP port
+(`sharp-relay --no-tcp` turns it off), and over TLS where `--tls ADDR` says
+(`[::]:443`, typically). A client's stream to a relay carries its control
+messages on port 0 and each pair's datagrams on the pair's port, so a
+sender and a receiver can each reach the relay over UDP or a stream, in any
+combination, and the relay carries between them as before. A client on a
+stream is known to the relay by its TCP address, and shown to others as no
+address at all (it has none they could send to). 256 streams at once, 8
+from one client, idle ones closed after 120 s. A receiver registers over
+UDP while that works, which is what lets senders punch through to it; after
+8 s with no registration over UDP it registers over a stream instead, and
+every 10 minutes it tries UDP again alongside, going back to it — and
+closing the stream — as soon as UDP holds the registration. Clients try a
+relay over TCP at its port and, 250 ms later, over TLS at port 443
+(`--relay-tls-port`), the first up winning — TLS only to a relay whose ID
+they were given, for the reason below.
+
+**TLS to a relay** is a way through a network that lets out only what looks
+like HTTPS, not a layer of security: everything inside is sealed already.
+TLS 1.3 only (rustls, ring). The relay's certificate is a self-signed
+Ed25519 one it makes at start-up, and a client takes any certificate whose
+key signed the handshake. What a client checks instead is that the session
+is the relay's own and not one a TLS-inspecting proxy opened on the way:
+after the preambles it sends, in a frame of its own, `1 | ephemeral X25519
+key (32) | nonce (16)`; the relay answers `2 | MAC (32)`, a keyed BLAKE3
+MAC under `derive_secret("sharp256 relay tls binding v1", [DH(ephemeral,
+relay key), ephemeral key, relay ID, nonce])` over a key both ends export
+from the TLS session (RFC 8446 section 7.5, label
+`EXPORTER-sharp256-relay-binding`, the nonce as context). Only the holder
+of the relay's long-term key can make the MAC, and a proxy that ended the
+client's TLS and opened its own has a different exported key on each side.
+A client that gets a wrong answer, or none, does not use the stream, and
+says why: the sender's error names the relay whose TLS was opened on the
+way, should nothing else get through, and the receiver logs it.
+
+**UDP held back.** A policer looks, from inside, just like a slow link with
+a shallow buffer; only the other carrier tells them apart. Over windows of
+5 s the sender measures what had to be sent again and what got through.
+When a tenth or more was sent again — or a hundredth, with at least 30 s
+still to go at the rate measured — and at least 15 s are left, it moves the
+session to a stream for a trial: one already up, or one dialled now, which
+the sender proves as a path on its own initiative (a packet on the UDP path
+does not end that asking, as it ends a claim the other end made). 4 s are
+given to the receiver to follow, 6 s are measured. TCP that carries at
+least 1.25 times what UDP did is kept for 2 minutes, twice as long after
+each such trial in a row, up to 30; otherwise the session goes back to UDP
+and the next trial waits a minute, doubling likewise. While a trial or a
+hold keeps it on the stream, the sender asks no UDP address whether it
+answers, and does not follow the receiver back to UDP; the receiver follows
+onto the stream once it no longer hears the sender over UDP
+(`DIRECT_GRACE`). After a hold the session goes back to UDP as after any
+stream, and a UDP still held back is found out again and left for longer.
 
 ## 9. Security considerations
 
