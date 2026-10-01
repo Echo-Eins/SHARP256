@@ -4814,3 +4814,150 @@ async fn a_receiver_whose_udp_is_blocked_registers_with_its_relay_over_tcp() {
 async fn a_relay_carries_between_two_streams() {
     through_the_relay(true, true).await;
 }
+
+// ---------------------------------------------------------------------------
+// carriers: a relay over TLS
+// ---------------------------------------------------------------------------
+
+/// A relay on loopback that takes TLS too: its address, identity, TLS
+/// address, and what stops it.
+#[cfg(feature = "tls")]
+async fn start_tls_relay() -> (SocketAddr, SharpId, SocketAddr, CancellationToken) {
+    use sharp256::relay::server::{Config, Relay};
+    let cancel = CancellationToken::new();
+    let relay = Relay::bind(
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls: Some("127.0.0.1:0".parse().unwrap()),
+            ..Config::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .expect("the relay binds");
+    let (addr, id, tls) = (
+        relay.local_addr().unwrap(),
+        relay.id(),
+        relay.tls_addr().unwrap(),
+    );
+    tokio::spawn(async move {
+        let _ = relay.run().await;
+    });
+    (addr, id, tls, cancel)
+}
+
+/// A TLS-inspecting proxy in front of `relay_tls`: it ends a client's TLS
+/// with a certificate of its own, opens its own TLS to the relay, and
+/// passes along what is inside. Returns where it listens.
+#[cfg(feature = "tls")]
+async fn tls_inspecting_proxy(relay_tls: SocketAddr) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let front =
+                    tokio_rustls::TlsAcceptor::from(sharp256::relay::tls::server_config().unwrap())
+                        .accept(client)
+                        .await;
+                let Ok(front) = front else { return };
+                let Ok(upstream) = tokio::net::TcpStream::connect(relay_tls).await else {
+                    return;
+                };
+                let name = rustls::pki_types::ServerName::try_from("relay.example").unwrap();
+                let back = tokio_rustls::TlsConnector::from(
+                    sharp256::relay::tls::client_config().unwrap(),
+                )
+                .connect(name, upstream)
+                .await;
+                let Ok(back) = back else { return };
+                let (mut fr, mut fw) = tokio::io::split(front);
+                let (mut br, mut bw) = tokio::io::split(back);
+                tokio::join!(
+                    async { tokio::io::copy(&mut fr, &mut bw).await.ok() },
+                    async { tokio::io::copy(&mut br, &mut fw).await.ok() }
+                );
+            });
+        }
+    });
+    at
+}
+
+/// A sender whose network lets only TLS out — no UDP, no TCP to the relay's
+/// own port — reaches the relay over TLS, and is carried over it.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_that_may_speak_only_tls_reaches_the_relay_over_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let (relay, relay_id, relay_tls, relay_cancel) = start_tls_relay().await;
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![format!("{}@{}", relay_id, relay)];
+        cfg.relay_private = true;
+        cfg.tcp = false;
+    })
+    .await;
+    wait_registered(&mut r.events, Duration::from_secs(30)).await;
+    // The relay's address as this network has it: UDP dropped, and nothing
+    // at that port over TCP.
+    let blocked = start_proxy(relay, Impairment::none()).await;
+    blocked.blackhole.store(true, Ordering::Relaxed);
+    let size = 1_500_000;
+    let path = make_file(&src, "over-tls.bin", size, 14);
+    let mut cfg = sender_cfg(&path, "0.0.0.0:0".parse().unwrap(), r.id, &state);
+    cfg.relays = vec![format!("{}@{}", relay_id, blocked.addr)];
+    cfg.relay_tls_port = relay_tls.port();
+    tokio::time::timeout(Duration::from_secs(90), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("send");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    } else {
+        panic!("unexpected event");
+    }
+    stop_receiver(r).await;
+    relay_cancel.cancel();
+}
+
+/// TLS to the relay opened on the way, by a proxy that shows a certificate
+/// of its own: the sender finds it out, does not use it, and says so — the
+/// transfer fails with that, not with a bare timeout.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_opened_on_the_way_is_refused_and_said() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let (relay, relay_id, relay_tls, relay_cancel) = start_tls_relay().await;
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![format!("{}@{}", relay_id, relay)];
+        cfg.relay_private = true;
+        cfg.tcp = false;
+    })
+    .await;
+    wait_registered(&mut r.events, Duration::from_secs(30)).await;
+    let blocked = start_proxy(relay, Impairment::none()).await;
+    blocked.blackhole.store(true, Ordering::Relaxed);
+    let inspecting = tls_inspecting_proxy(relay_tls).await;
+    let path = make_file(&src, "inspected.bin", 100_000, 15);
+    let mut cfg = sender_cfg(&path, "0.0.0.0:0".parse().unwrap(), r.id, &state);
+    cfg.relays = vec![format!("{}@{}", relay_id, blocked.addr)];
+    cfg.relay_tls_port = inspecting.port();
+    cfg.transport.handshake_timeout = Duration::from_secs(8);
+    let err = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("ended in time")
+        .expect_err("nothing gets through but the opened TLS");
+    let text = err.to_string();
+    assert!(
+        text.contains("TLS") && text.contains("opened"),
+        "the error does not say the TLS was opened on the way: {}",
+        text
+    );
+    stop_receiver(r).await;
+    relay_cancel.cancel();
+}

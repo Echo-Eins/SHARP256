@@ -37,7 +37,7 @@ cd "$(dirname "$0")/.."
 VARIANT="${REPRO_VARIANT:-headless}"
 case "$VARIANT" in
   headless)
-    FEATURES="--no-default-features --features nat-traversal"
+    FEATURES="--no-default-features --features nat-traversal,tls"
     BINS="sharp-sender sharp-receiver sharp-relay sharp-probe"
     ;;
   gui)

@@ -70,6 +70,195 @@ pub async fn dial(relay: SocketAddr, local: SocketAddr) -> io::Result<TcpStream>
     Ok(stream)
 }
 
+/// A stream to a relay: plain TCP, or TLS over it.
+pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
+
+/// The TLS session to a relay is not the relay's own: something on the way
+/// ended the client's and opened another (see `relay::tls`).
+#[derive(Debug)]
+pub struct Intercepted;
+
+impl std::fmt::Display for Intercepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the TLS session is not the relay's own: something on the way opened it \
+             (a TLS-inspecting proxy?), so it is not used",
+        )
+    }
+}
+
+impl std::error::Error for Intercepted {}
+
+/// Whether `e` says a TLS session was opened on the way.
+pub fn is_intercepted(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<Intercepted>().is_some())
+}
+
+/// Where a relay takes TLS, and what it is: its port (on each of its
+/// addresses), the name to give it, and its identity, which the TLS
+/// session is bound to (see `relay::tls`).
+#[cfg(feature = "tls")]
+#[derive(Clone)]
+pub struct TlsTo {
+    pub port: u16,
+    pub name: rustls::pki_types::ServerName<'static>,
+    pub relay: crate::crypto::SharpId,
+}
+
+/// Built without TLS (the `tls` feature): no relay is reached over it.
+#[cfg(not(feature = "tls"))]
+#[derive(Clone)]
+pub enum TlsTo {}
+
+#[cfg(not(feature = "tls"))]
+impl TlsTo {
+    pub fn new(_host: &str, _relay: Option<crate::crypto::SharpId>, _port: u16) -> Option<Self> {
+        None
+    }
+
+    pub fn port(&self) -> u16 {
+        match *self {}
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+async fn dial_tls(_at: SocketAddr, to: &TlsTo, _local: SocketAddr) -> io::Result<Box<dyn Stream>> {
+    match *to {}
+}
+
+#[cfg(feature = "tls")]
+impl TlsTo {
+    /// For a relay written `host:port` with its identity known (the session
+    /// is bound to it; a relay known only by address is not reached over
+    /// TLS), taking TLS on `port`.
+    pub fn new(host: &str, relay: Option<crate::crypto::SharpId>, port: u16) -> Option<Self> {
+        let relay = relay?;
+        let (h, _) = crate::address::dns::split_host_port(host).ok()?;
+        let name = rustls::pki_types::ServerName::try_from(h.to_string()).ok()?;
+        Some(Self { port, name, relay })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// A TLS stream to the relay at `at`, the session proven its own.
+#[cfg(feature = "tls")]
+pub async fn dial_tls(
+    at: SocketAddr,
+    to: &TlsTo,
+    local: SocketAddr,
+) -> io::Result<Box<dyn Stream>> {
+    let at = canonical(at);
+    let socket = if at.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    let ip = canonical(local).ip();
+    if !ip.is_unspecified() && ip.is_ipv4() == at.is_ipv4() {
+        socket.bind(SocketAddr::new(ip, 0))?;
+    }
+    let tcp = tokio::time::timeout(CONNECT_WAIT, socket.connect(at))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no answer"))??;
+    tcp.set_nodelay(true)?;
+    let connector = tokio_rustls::TlsConnector::from(super::tls::client_config()?);
+    let mut tls = tokio::time::timeout(CONNECT_WAIT, connector.connect(to.name.clone(), tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no TLS answer"))??;
+    opened(&mut tls).await?;
+    super::tls::bind(&mut tls, &to.relay).await?;
+    Ok(Box::new(tls))
+}
+
+/// Why a relay was not reached over a stream.
+#[derive(Debug)]
+pub enum Unreached {
+    /// A TLS session to it was opened on the way: refused, and to be said.
+    Intercepted(String),
+    /// Nothing answered, or not as a relay.
+    Failed(String),
+}
+
+impl std::fmt::Display for Unreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unreached::Intercepted(why) | Unreached::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// A stream to the relay at the first of `addrs` that takes one: plain TCP
+/// at each address's own port, and — a quarter of a second later, as RFC
+/// 8305 staggers attempts — TLS at `tls`'s, where the relay is known well
+/// enough to bind the session to. The first up wins.
+pub async fn reach(
+    addrs: &[SocketAddr],
+    tls: Option<&TlsTo>,
+    local: SocketAddr,
+) -> Result<(SocketAddr, Box<dyn Stream>), Unreached> {
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut plan: Vec<(SocketAddr, bool)> = Vec::new();
+    for &a in addrs {
+        plan.push((a, false));
+        if let Some(t) = tls {
+            plan.push((SocketAddr::new(a.ip(), t.port()), true));
+        }
+    }
+    let mut next = 0;
+    let mut why: Vec<String> = Vec::new();
+    let mut intercepted = false;
+    loop {
+        if next < plan.len() {
+            let (at, over_tls) = plan[next];
+            next += 1;
+            let tls = tls.cloned();
+            attempts.spawn(async move {
+                let r = match (over_tls, &tls) {
+                    (true, Some(t)) => dial_tls(at, t, local).await,
+                    _ => dial(at, local)
+                        .await
+                        .map(|s| Box::new(s) as Box<dyn Stream>),
+                };
+                (at, over_tls, r)
+            });
+        }
+        let wait = async {
+            if next < plan.len() {
+                tokio::time::sleep(Duration::from_millis(250)).await
+            } else {
+                std::future::pending::<()>().await
+            }
+        };
+        tokio::select! {
+            done = attempts.join_next() => match done {
+                Some(Ok((at, _, Ok(stream)))) => return Ok((at, stream)),
+                Some(Ok((at, over_tls, Err(e)))) => {
+                    if is_intercepted(&e) {
+                        intercepted = true;
+                    }
+                    why.push(format!("{} {}: {}", if over_tls { "TLS at" } else { "TCP at" }, at, e));
+                }
+                Some(Err(_)) => {}
+                None if next >= plan.len() => {
+                    let why = why.join("; ");
+                    return Err(if intercepted {
+                        Unreached::Intercepted(why)
+                    } else {
+                        Unreached::Failed(why)
+                    });
+                }
+                None => {}
+            },
+            _ = wait => {}
+        }
+    }
+}
+
 /// Says a stream leads to a relay, and waits for the relay to say so too.
 pub async fn opened<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> io::Result<()> {
     stream.write_all(&frame::preamble(Kind::Relay)).await?;
@@ -319,8 +508,22 @@ struct Held {
     per_client: HashMap<IpAddr, usize>,
 }
 
-/// Accepts streams to the relay on `listener` until `cancel` fires.
-pub async fn serve(listener: TcpListener, tunnels: Arc<Tunnels>, cancel: CancellationToken) {
+/// What a relay speaks TLS with, and the identity it proves sessions by.
+#[cfg(feature = "tls")]
+pub type Tls = (tokio_rustls::TlsAcceptor, crate::crypto::Identity);
+/// Built without TLS: nothing to speak it with.
+#[cfg(not(feature = "tls"))]
+pub enum Tls {}
+
+/// Accepts streams to the relay on `listener` until `cancel` fires: TLS
+/// streams when `tls` is given, each session proven the relay's own.
+pub async fn serve(
+    listener: TcpListener,
+    tunnels: Arc<Tunnels>,
+    tls: Option<Tls>,
+    cancel: CancellationToken,
+) {
+    let tls = tls.map(Arc::new);
     let held = Arc::new(parking_lot::Mutex::new(Held::default()));
     let mut failures = 0u32;
     loop {
@@ -355,10 +558,30 @@ pub async fn serve(listener: TcpListener, tunnels: Arc<Tunnels>, cancel: Cancell
             h.total += 1;
             *h.per_client.entry(client).or_insert(0) += 1;
         }
-        let (tunnels, cancel, held) = (tunnels.clone(), cancel.child_token(), held.clone());
+        let (tunnels, cancel, held, tls) = (
+            tunnels.clone(),
+            cancel.child_token(),
+            held.clone(),
+            tls.clone(),
+        );
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
-            take(stream, peer, &tunnels, cancel).await;
+            match &tls {
+                None => take(stream, peer, &tunnels, cancel).await,
+                #[cfg(not(feature = "tls"))]
+                Some(tls) => match **tls {},
+                #[cfg(feature = "tls")]
+                Some(tls) => {
+                    let (acceptor, identity) = &**tls;
+                    let opened = tokio::time::timeout(CONNECT_WAIT, acceptor.accept(stream)).await;
+                    if let Ok(Ok(mut s)) = opened {
+                        if accept(&mut s).await && super::tls::prove(&mut s, identity).await.is_ok()
+                        {
+                            run(s, peer, &tunnels, cancel).await;
+                        }
+                    }
+                }
+            }
             let mut h = held.lock();
             h.total -= 1;
             if let Some(n) = h.per_client.get_mut(&client) {
@@ -398,9 +621,19 @@ pub async fn take<S>(
         tracing::debug!("relay: {} did not open a stream to a relay", peer);
         return;
     }
+    run(stream, peer, tunnels, cancel).await
+}
+
+/// Carries a client's stream, opened, for as long as it lasts.
+async fn run<S>(stream: S, peer: SocketAddr, tunnels: &Arc<Tunnels>, cancel: CancellationToken)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let last = Arc::new(parking_lot::Mutex::new(Instant::now()));
     let (heard, t) = (last.clone(), tunnels.clone());
-    let link = link::run(
+    // Known to the relay before the first frame is read: the answer to it
+    // goes back this way.
+    let link = link::run_with(
         stream,
         move |f| {
             let (heard, t) = (heard.clone(), t.clone());
@@ -412,8 +645,8 @@ pub async fn take<S>(
             }
         },
         cancel,
+        |link| tunnels.add(peer, link.clone()),
     );
-    tunnels.add(peer, link.clone());
     tracing::debug!("relay: stream from {}", peer);
     loop {
         let quiet = last.lock().elapsed();

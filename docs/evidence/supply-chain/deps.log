@@ -9,3 +9,10 @@ features                                           target                     be
 --no-default-features                              all                           174    147
 --all-features                                     x86_64-unknown-linux-gnu      316    305
 --all-features                                     all                           456    443
+
+# 2026-10-01, with TLS to relays (the `tls` feature: rustls, tokio-rustls, rustls-pki-types,
+# rustls-webpki, ring, untrusted), counted the same way
+--no-default-features --features nat-traversal,tls x86_64-unknown-linux-gnu             115
+--no-default-features --features nat-traversal,tls all                                  158
+--all-features                                     x86_64-unknown-linux-gnu             311
+--all-features                                     all                                  449

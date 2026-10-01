@@ -268,7 +268,7 @@ lint-проверки для FreeBSD; вручную проверялись 1.82
 cargo build --release
 
 # без GUI (серверы, контейнеры)
-cargo build --release --no-default-features --features nat-traversal
+cargo build --release --no-default-features --features nat-traversal,tls
 
 # минимальная сборка (только транспорт и CLI)
 cargo build --release --no-default-features

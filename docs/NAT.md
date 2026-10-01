@@ -809,7 +809,7 @@ IPv6-адрес и порт (ни ретранслятора, ни карточ�
 `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`.
 
 ```
-cargo build --release --no-default-features --features nat-traversal --bins
+cargo build --release --no-default-features --features nat-traversal,tls --bins
 export SHARP_BIN_DIR=$PWD/target/release
 python3 scripts/natlab/natlab.py oracle                   # сначала: виды NAT — те, что заявлены
 python3 scripts/natlab/natlab.py matrix                   # 36 пар через ретранслятор, который несёт

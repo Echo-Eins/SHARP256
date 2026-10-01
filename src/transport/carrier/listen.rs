@@ -228,7 +228,9 @@ async fn take(
     }
     let last = Arc::new(parking_lot::Mutex::new(Instant::now()));
     let (heard, s) = (last.clone(), streams.clone());
-    let link = link::run(
+    // Routed before the first frame is read: the answer to it goes back
+    // this way.
+    let link = link::run_with(
         stream,
         move |f| {
             let (heard, s) = (heard.clone(), s.clone());
@@ -242,8 +244,8 @@ async fn take(
             }
         },
         cancel,
+        |link| streams.route(peer, link.clone(), 0),
     );
-    streams.route(peer, link.clone(), 0);
     tracing::debug!("carrier: stream from {}", peer);
     loop {
         let quiet = last.lock().elapsed();

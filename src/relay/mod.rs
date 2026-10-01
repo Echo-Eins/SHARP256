@@ -42,6 +42,8 @@
 
 pub mod client;
 pub mod server;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod tunnel;
 
 use crate::crypto::{Identity, SharpId};

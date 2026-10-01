@@ -1952,6 +1952,7 @@ async fn keep_registered(
     let cancel = shared.cancel.clone();
     let socket = shared.socket.udp();
     let local = socket.local_addr().unwrap_or(shared.cfg.bind);
+    let tls = crate::relay::tunnel::TlsTo::new(host, Some(relay_id), shared.cfg.relay_tls_port);
     let start_udp = || {
         let (tx, rx) = mpsc::channel(32);
         {
@@ -2015,8 +2016,16 @@ async fn keep_registered(
                         s.stop(shared).await;
                     }
                     tracing::info!("relay {}: no registration over UDP; trying TCP", host);
-                    stream =
-                        over_stream(shared, &addrs, relay_id, local, puncher, &on_registered).await;
+                    stream = over_stream(
+                        shared,
+                        &addrs,
+                        tls.as_ref(),
+                        relay_id,
+                        local,
+                        puncher,
+                        &on_registered,
+                    )
+                    .await;
                 }
                 udp_again = Instant::now()
                     + if stream.is_some() {
@@ -2083,24 +2092,33 @@ async fn keep_registered(
 async fn over_stream(
     shared: &Arc<Shared>,
     addrs: &[SocketAddr],
+    tls: Option<&crate::relay::tunnel::TlsTo>,
     relay_id: SharpId,
     local: SocketAddr,
     puncher: &Arc<crate::nat::punch::Puncher>,
     on_registered: &OnRegistered,
 ) -> Option<Leg> {
     let cancel = shared.cancel.clone();
-    for &addr in addrs {
-        let dialled = tokio::select! {
-            r = crate::relay::tunnel::dial(addr, local) => r,
-            _ = cancel.cancelled() => return None,
-        };
-        let stream = match dialled {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::info!("relay over TCP at {}: {}", addr, e);
-                continue;
-            }
-        };
+    let reached = tokio::select! {
+        r = crate::relay::tunnel::reach(addrs, tls, local) => r,
+        _ = cancel.cancelled() => return None,
+    };
+    let (addr, stream) = match reached {
+        Ok(v) => v,
+        Err(crate::relay::tunnel::Unreached::Intercepted(why)) => {
+            tracing::warn!(
+                "relay: {} ({}); not using it",
+                crate::relay::tunnel::Intercepted,
+                why
+            );
+            return None;
+        }
+        Err(crate::relay::tunnel::Unreached::Failed(why)) => {
+            tracing::info!("relay over TCP or TLS: {}", why);
+            return None;
+        }
+    };
+    {
         let leg_cancel = cancel.child_token();
         let (tunnel, rx) = crate::relay::tunnel::ClientTunnel::open(
             stream,
@@ -2130,15 +2148,14 @@ async fn over_stream(
             standing_tx,
             move |a, o| cb(a, o),
         ));
-        return Some(Leg {
+        Some(Leg {
             task,
             cancel: leg_cancel,
             standing,
             down_since: Instant::now(),
             link: Some(link),
-        });
+        })
     }
-    None
 }
 
 /// Resolves a relay's name to the addresses this socket can reach, in the

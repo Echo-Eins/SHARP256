@@ -411,6 +411,7 @@ impl Sender {
     /// and the relay's port for the pair joined to the engine through a
     /// shim, a stream like any other to it. One stream per relay at a time.
     #[cfg(feature = "nat-traversal")]
+    #[allow(clippy::too_many_arguments)]
     fn relay_tunnels(
         &self,
         engine: SocketAddr,
@@ -418,6 +419,7 @@ impl Sender {
         shims: Arc<crate::transport::carrier::Shims>,
         streams: mpsc::UnboundedSender<SocketAddr>,
         found: mpsc::UnboundedSender<Found>,
+        refusals: Arc<parking_lot::Mutex<Vec<String>>>,
         cancel: CancellationToken,
     ) -> Option<crate::transport::carrier::dial::Also> {
         let relays: Vec<(Option<SharpId>, String)> = self
@@ -431,6 +433,7 @@ impl Sender {
         }
         let socket = self.socket.udp();
         let (identity, target) = (self.identity.clone(), self.cfg.receiver_id);
+        let tls_port = self.cfg.relay_tls_port;
         let live: Arc<
             parking_lot::Mutex<Vec<Option<Arc<crate::transport::carrier::StreamStats>>>>,
         > = Arc::new(parking_lot::Mutex::new(vec![None; relays.len()]));
@@ -448,11 +451,12 @@ impl Sender {
                 let (relay_id, host) = (*relay_id, host.clone());
                 let (socket, identity, shims) = (socket.clone(), identity.clone(), shims.clone());
                 let (streams, found, cancel) = (streams.clone(), found.clone(), cancel.clone());
-                let (live, busy) = (live.clone(), busy.clone());
+                let (live, busy, refusals) = (live.clone(), busy.clone(), refusals.clone());
                 tokio::spawn(async move {
+                    let tls = crate::relay::tunnel::TlsTo::new(&host, relay_id, tls_port);
                     relay_over_stream(
-                        &host, relay_id, target, &identity, socket, engine, local, &shims,
-                        &streams, &found, &live, i, &cancel,
+                        &host, relay_id, tls, target, &identity, socket, engine, local, &shims,
+                        &streams, &found, &refusals, &live, i, &cancel,
                     )
                     .await;
                     busy.lock()[i] = false;
@@ -938,6 +942,7 @@ impl Sender {
                 Some(engine_at) if self.cfg.carriers => {
                     let shims = Arc::new(crate::transport::carrier::Shims::default());
                     let (tx, found) = mpsc::unbounded_channel();
+                    let refusals: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
                     // The relays too, over streams of their own, when streams
                     // are asked for.
                     #[cfg(feature = "nat-traversal")]
@@ -947,6 +952,7 @@ impl Sender {
                         shims.clone(),
                         tx.clone(),
                         tunnels_found,
+                        refusals.clone(),
                         carrier_cancel.clone(),
                     );
                     #[cfg(not(feature = "nat-traversal"))]
@@ -964,6 +970,7 @@ impl Sender {
                         dial: Some(dial),
                         found,
                         asked_at: None,
+                        refusals,
                     }
                 }
                 _ => Carriers::none(),
@@ -1365,6 +1372,7 @@ fn spawn_turn_dials(
 async fn relay_over_stream(
     host: &str,
     relay_id: Option<SharpId>,
+    tls: Option<crate::relay::tunnel::TlsTo>,
     target: SharpId,
     identity: &Identity,
     socket: Arc<tokio::net::UdpSocket>,
@@ -1373,6 +1381,7 @@ async fn relay_over_stream(
     shims: &crate::transport::carrier::Shims,
     streams: &mpsc::UnboundedSender<SocketAddr>,
     found: &mpsc::UnboundedSender<Found>,
+    refusals: &parking_lot::Mutex<Vec<String>>,
     live: &parking_lot::Mutex<Vec<Option<Arc<crate::transport::carrier::StreamStats>>>>,
     index: usize,
     cancel: &CancellationToken,
@@ -1385,22 +1394,35 @@ async fn relay_over_stream(
         tracing::info!("relay {}: the name did not resolve", host);
         return;
     };
-    let mut dialled = None;
-    for addr in addrs {
-        let attempt = tokio::select! {
-            r = crate::relay::tunnel::dial(addr, local) => r,
-            _ = cancel.cancelled() => return,
-        };
-        match attempt {
-            Ok(stream) => {
-                dialled = Some((addr, stream));
-                break;
+    let reached = tokio::select! {
+        r = crate::relay::tunnel::reach(&addrs, tls.as_ref(), local) => r,
+        _ = cancel.cancelled() => return,
+    };
+    let (addr, stream) = match reached {
+        Ok(v) => v,
+        Err(crate::relay::tunnel::Unreached::Intercepted(why)) => {
+            // Not a failure to pass over: the network reads what goes
+            // through it, and the user is to know.
+            tracing::warn!(
+                "relay {}: {} ({}); not using it",
+                host,
+                crate::relay::tunnel::Intercepted,
+                why
+            );
+            let mut r = refusals.lock();
+            if r.len() < 8 {
+                r.push(format!(
+                    "relay {}: {}",
+                    host,
+                    crate::relay::tunnel::Intercepted
+                ));
             }
-            Err(e) => tracing::info!("relay {} over TCP at {}: {}", host, addr, e),
+            return;
         }
-    }
-    let Some((addr, stream)) = dialled else {
-        return;
+        Err(crate::relay::tunnel::Unreached::Failed(why)) => {
+            tracing::info!("relay {} over TCP or TLS: {}", host, why);
+            return;
+        }
     };
     let (tunnel, mut rx) = crate::relay::tunnel::ClientTunnel::open(
         stream,
@@ -1410,7 +1432,11 @@ async fn relay_over_stream(
         cancel.child_token(),
     );
     live.lock()[index] = Some(tunnel.link().stats().clone());
-    tracing::info!("relay {} reached over TCP at {}", host, addr);
+    let over = match &tls {
+        Some(t) if t.port() == addr.port() => "TLS",
+        _ => "TCP",
+    };
+    tracing::info!("relay {} reached over {} at {}", host, over, addr);
     let auth = relay_id.map(|r| (identity, r));
     let asked = crate::relay::client::connect(
         tunnel.via(),
@@ -1436,9 +1462,10 @@ async fn relay_over_stream(
     match tunnel.attach(i.relayed.port(), engine, shims) {
         Ok(shim) => {
             tracing::info!(
-                "relay {} will carry the transfer on its port {}, over TCP",
+                "relay {} will carry the transfer on its port {}, over {}",
                 host,
-                i.relayed.port()
+                i.relayed.port(),
+                over
             );
             let _ = streams.send(shim);
         }
@@ -1571,6 +1598,9 @@ struct Carriers {
     found: mpsc::UnboundedReceiver<SocketAddr>,
     /// When streams were last asked for, and why.
     asked_at: Option<Instant>,
+    /// Streams refused because something on the way opened their TLS: said
+    /// in the error, should nothing else get through.
+    refusals: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl Carriers {
@@ -1582,6 +1612,7 @@ impl Carriers {
             dial: None,
             found,
             asked_at: None,
+            refusals: Arc::default(),
         }
     }
 }
@@ -2834,6 +2865,12 @@ impl Engine {
                 }
             }
             if now >= deadline {
+                // A stream refused because its TLS was opened on the way is
+                // what the user has to hear about, before a bare timeout.
+                let refused = self.carriers.refusals.lock().join("; ");
+                if next_poll.is_none() && self.handshake_failures == 0 && !refused.is_empty() {
+                    return Err(SendError::Unreachable(refused));
+                }
                 return Err(if next_poll.is_some() {
                     SendError::Rejected {
                         reason: reason_name(REASON_TIMEOUT).to_string(),

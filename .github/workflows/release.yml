@@ -113,7 +113,7 @@ jobs:
             cargo cyclonedx -q --format json --spec-version 1.5 --override-filename "$1" "${@:2}"
           }
           v="sharp256-$GITHUB_REF_NAME"
-          sbom "$v-x86_64-linux.cdx" --no-default-features --features nat-traversal --target x86_64-unknown-linux-gnu
+          sbom "$v-x86_64-linux.cdx" --no-default-features --features nat-traversal,tls --target x86_64-unknown-linux-gnu
           sbom "$v-x86_64-linux-gui.cdx" --target x86_64-unknown-linux-gnu
           sbom "$v-x86_64-windows.cdx" --target x86_64-pc-windows-msvc
           sbom "$v-aarch64-macos.cdx" --target aarch64-apple-darwin

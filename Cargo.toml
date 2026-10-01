@@ -84,6 +84,15 @@ if-addrs = { version = "0.6", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
+# TLS 1.3 to a relay (`relay::tls`), for networks that let little but
+# HTTPS out: rustls on ring, TLS 1.3 alone, without logging. A transfer is
+# sealed end to end inside it as always; TLS is a way through, and the
+# relay's long-term key, bound to the TLS session, shows whether anything on
+# the way opened it. ring also makes the relay's TLS key and signs the
+# certificate it presents (`relay::tls::certificate`).
+rustls = { version = "0.23.20", optional = true, default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+ring = { version = "0.17", optional = true }
 # ML-KEM-768 (FIPS 203) for protocol version 4's hybrid key exchange. The
 # 0.2 series: 0.3 needs Rust 1.85, above this crate's 1.82.
 ml-kem = { version = "0.2.1", default-features = false, features = ["zeroize"] }
@@ -120,9 +129,13 @@ sha3 = "0.10"
 loom = "0.7"
 
 [features]
-default = ["gui", "nat-traversal"]
+default = ["gui", "nat-traversal", "tls"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "tracing-subscriber/tracing-log"]
 nat-traversal = ["dep:if-addrs", "dep:md-5", "dep:sha1", "dep:hmac"]
+# TLS 1.3 to relays (`relay::tls`). Apart from NAT traversal because ring,
+# under rustls, compiles C for its target: the sanitizers would not see
+# into it, and a check for macOS from Linux cannot build it.
+tls = ["nat-traversal", "dep:rustls", "dep:tokio-rustls", "dep:ring"]
 
 [[bin]]
 name = "sharp-sender"

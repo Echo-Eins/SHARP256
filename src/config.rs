@@ -211,6 +211,10 @@ pub struct SenderConfig {
     /// well — the same datagrams, framed on a stream — and go back to UDP
     /// when it answers again (see `transport::carrier`).
     pub carriers: bool,
+    /// The port the relays take TLS on (see `relay::tls`), tried alongside
+    /// TCP at their own port when streams are: 443, where a network lets
+    /// little but HTTPS out.
+    pub relay_tls_port: u16,
     pub events: Option<EventCallback>,
 }
 
@@ -235,6 +239,7 @@ impl std::fmt::Debug for SenderConfig {
             .field("turn_servers", &self.turn_servers.len())
             .field("dht", &self.dht)
             .field("carriers", &self.carriers)
+            .field("relay_tls_port", &self.relay_tls_port)
             .field("events", &self.events.is_some())
             .finish()
     }
@@ -286,6 +291,7 @@ impl SenderConfig {
             dht: false,
             dht_bootstrap: Vec::new(),
             carriers: true,
+            relay_tls_port: 443,
             events: None,
         }
     }
@@ -322,6 +328,10 @@ pub struct ReceiverConfig {
     /// for those whose network lets no UDP out (see `transport::carrier`).
     /// The same datagrams, framed on a stream; nothing else changes.
     pub tcp: bool,
+    /// The port the relays take TLS on (see `relay::tls`): what a
+    /// registration is made over, alongside TCP at their own port, when no
+    /// registration gets through over UDP.
+    pub relay_tls_port: u16,
     pub output_dir: PathBuf,
     /// Replace an existing complete file with the same name instead of
     /// writing `name (1).ext`. Directories are never replaced (nor merged):
@@ -420,6 +430,7 @@ impl std::fmt::Debug for ReceiverConfig {
         f.debug_struct("ReceiverConfig")
             .field("bind", &self.bind)
             .field("tcp", &self.tcp)
+            .field("relay_tls_port", &self.relay_tls_port)
             .field("output_dir", &self.output_dir)
             .field("overwrite", &self.overwrite)
             .field("max_sessions", &self.max_sessions)
@@ -491,6 +502,7 @@ impl ReceiverConfig {
         Self {
             bind,
             tcp: true,
+            relay_tls_port: 443,
             output_dir,
             overwrite: false,
             max_sessions: 16,

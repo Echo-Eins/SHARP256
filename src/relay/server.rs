@@ -92,6 +92,11 @@ pub struct Config {
     /// number: for those whose network lets no UDP through (see
     /// `relay::tunnel`). Everything else is as over UDP.
     pub tcp: bool,
+    /// Take clients over TLS 1.3 at this address too — port 443, for those
+    /// whose network lets little but HTTPS out (see `relay::tls`). The
+    /// certificate is the relay's own, made at start-up; a client binds the
+    /// session to the relay's identity and refuses one opened on the way.
+    pub tls: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for Config {
@@ -116,6 +121,7 @@ impl std::fmt::Debug for Config {
             )
             .field("quotas", &self.quotas)
             .field("tcp", &self.tcp)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -137,6 +143,7 @@ impl Default for Config {
             allowed_senders: None,
             quotas: Quotas::default(),
             tcp: true,
+            tls: None,
         }
     }
 }
@@ -567,6 +574,8 @@ pub struct Relay {
     tunnels: Arc<super::tunnel::Tunnels>,
     tunnel_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     listener: Option<tokio::net::TcpListener>,
+    #[cfg(feature = "tls")]
+    tls_listener: Option<(tokio::net::TcpListener, tokio_rustls::TlsAcceptor)>,
 }
 
 impl Relay {
@@ -600,6 +609,23 @@ impl Relay {
         } else {
             None
         };
+        #[cfg(not(feature = "tls"))]
+        if cfg.tls.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this relay was built without TLS (the `tls` feature)",
+            ));
+        }
+        #[cfg(feature = "tls")]
+        let tls_listener = match cfg.tls {
+            Some(at) => {
+                let dual_stack = at.is_ipv6() && at.ip().is_unspecified() && takes_v4;
+                let listener = super::tunnel::bind(at, dual_stack)?;
+                let acceptor = tokio_rustls::TlsAcceptor::from(super::tls::server_config()?);
+                Some((listener, acceptor))
+            }
+            None => None,
+        };
         Ok(Self {
             socket: Arc::new(socket),
             via: None,
@@ -617,7 +643,20 @@ impl Relay {
             tunnels,
             tunnel_rx,
             listener,
+            #[cfg(feature = "tls")]
+            tls_listener,
         })
+    }
+
+    /// Where the relay takes TLS, if it does.
+    pub fn tls_addr(&self) -> Option<SocketAddr> {
+        #[cfg(feature = "tls")]
+        return self
+            .tls_listener
+            .as_ref()
+            .and_then(|(l, _)| l.local_addr().ok());
+        #[cfg(not(feature = "tls"))]
+        None
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -637,6 +676,17 @@ impl Relay {
             tokio::spawn(super::tunnel::serve(
                 listener,
                 self.tunnels.clone(),
+                None,
+                self.cancel.child_token(),
+            ));
+        }
+        #[cfg(feature = "tls")]
+        if let Some((listener, acceptor)) = self.tls_listener.take() {
+            tracing::info!("relay takes clients over TLS at {}", listener.local_addr()?);
+            tokio::spawn(super::tunnel::serve(
+                listener,
+                self.tunnels.clone(),
+                Some((acceptor, self.identity.clone())),
                 self.cancel.child_token(),
             ));
         }

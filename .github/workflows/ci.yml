@@ -40,6 +40,7 @@ jobs:
           cargo clippy --all-features --all-targets -- -D warnings
           cargo clippy --no-default-features --all-targets -- -D warnings
           cargo clippy --no-default-features --features nat-traversal --all-targets -- -D warnings
+          cargo clippy --no-default-features --features tls --all-targets -- -D warnings
       - name: Library documentation, broken links included
         # The binaries' doc comments are their --help text, written for a
         # terminal rather than for rustdoc; the library's are documentation.
@@ -51,10 +52,12 @@ jobs:
           rustup target add x86_64-unknown-freebsd
           cargo clippy --target x86_64-unknown-freebsd --no-default-features --features nat-traversal,blake3/pure --all-targets -- -D warnings
       - name: Clippy for Windows and macOS (their system calls' unsafe blocks; the tests run there below)
+        # Without TLS: ring compiles C for its target, and Linux has no
+        # compiler for theirs. The tests below build it there, natively.
         run: |
           rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin
-          cargo clippy --target x86_64-pc-windows-gnu --all-features --features blake3/pure --all-targets -- -D warnings
-          cargo clippy --target x86_64-apple-darwin --all-features --features blake3/pure --all-targets -- -D warnings
+          cargo clippy --target x86_64-pc-windows-gnu --no-default-features --features gui,nat-traversal,blake3/pure --all-targets -- -D warnings
+          cargo clippy --target x86_64-apple-darwin --no-default-features --features gui,nat-traversal,blake3/pure --all-targets -- -D warnings
 
   test:
     name: Tests (${{ matrix.os }})
@@ -229,7 +232,7 @@ jobs:
         # Ubuntu 24.04 restricts them through AppArmor by default.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Build (no GUI)
-        run: cargo build --release --no-default-features --features nat-traversal --bins
+        run: cargo build --release --no-default-features --features nat-traversal,tls --bins
       - name: ${{ matrix.name }}
         env:
           SHARP_BIN_DIR: ${{ github.workspace }}/target/release

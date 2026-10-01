@@ -13,9 +13,12 @@ if rustup target list --installed 2>/dev/null | grep -q x86_64-unknown-freebsd; 
 else
   echo "(the FreeBSD target is not installed, so its lint is skipped: rustup target add x86_64-unknown-freebsd)"
 fi
+# Without TLS: ring compiles C for its target, and there is no compiler here
+# for theirs. (The tests run there, TLS and all, in CI.)
 for t in x86_64-pc-windows-gnu x86_64-apple-darwin; do
   if rustup target list --installed 2>/dev/null | grep -q "$t"; then
-    cargo clippy --target "$t" --all-features --features blake3/pure --all-targets -- -D warnings
+    cargo clippy --target "$t" --no-default-features --features gui,nat-traversal,blake3/pure \
+      --all-targets -- -D warnings
   else
     echo "(the $t target is not installed, so its lint is skipped: rustup target add $t)"
   fi

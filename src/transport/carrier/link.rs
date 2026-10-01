@@ -135,12 +135,34 @@ where
     S: AsyncRead + AsyncWrite + Send + 'static,
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    run_with(stream, on_frame, cancel, |_| {})
+}
+
+/// [`run`], with `before` given the link before the first frame is read:
+/// where the answer to that frame is to go back on the link, the link must
+/// be found there by then.
+pub fn run_with<S, F>(
+    stream: S,
+    on_frame: impl FnMut(Frame) -> F + Send + 'static,
+    cancel: CancellationToken,
+    before: impl FnOnce(&Link),
+) -> Link
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let (rd, wr) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel(QUEUE);
     let stats = Arc::new(StreamStats::default());
+    let link = Link {
+        tx,
+        stats: stats.clone(),
+        cancel: cancel.clone(),
+    };
+    before(&link);
     tokio::spawn(read_loop(rd, on_frame, stats.clone(), cancel.clone()));
-    tokio::spawn(write_loop(wr, rx, stats.clone(), cancel.clone()));
-    Link { tx, stats, cancel }
+    tokio::spawn(write_loop(wr, rx, stats, cancel));
+    link
 }
 
 async fn read_loop<R: AsyncRead + Unpin, F: std::future::Future<Output = ()>>(

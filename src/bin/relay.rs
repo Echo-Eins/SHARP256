@@ -127,6 +127,13 @@ struct Args {
     #[arg(long)]
     no_tcp: bool,
 
+    /// Also take clients over TLS 1.3 at this address — `[::]:443`, for
+    /// clients whose network lets little but HTTPS out. The certificate is
+    /// the relay's own, made at start-up; a client binds the session to the
+    /// relay's identity, and refuses one that something on the way opened.
+    #[arg(long, value_name = "ADDR")]
+    tls: Option<SocketAddr>,
+
     /// The STUN port the "change port" tests answer from (default: one
     /// above).
     #[arg(long, default_value_t = 0)]
@@ -218,6 +225,7 @@ async fn main() -> Result<()> {
         allowed_senders: allowed_senders.clone(),
         quotas,
         tcp: !args.no_tcp,
+        tls: args.tls,
     };
 
     let cancel = CancellationToken::new();
