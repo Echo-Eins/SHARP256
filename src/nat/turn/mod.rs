@@ -40,6 +40,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+pub use crate::transport::carrier::shim::engine_address;
+use crate::transport::carrier::shim::make_shim;
 use wire::{
     Builder, Class, Credentials, ALLOCATE, ATTR_CHANNEL_NUMBER, ATTR_DATA, ATTR_LIFETIME,
     ATTR_NONCE, ATTR_REALM, ATTR_REQUESTED_ADDRESS_FAMILY, ATTR_REQUESTED_TRANSPORT,
@@ -369,24 +372,6 @@ impl Turn {
     pub fn is_shim(&self, addr: SocketAddr) -> bool {
         self.shared.shims.read().contains(&canonical(addr))
     }
-}
-
-/// Where a datagram sent from this host reaches `socket`: its own address,
-/// or loopback when it is bound to a wildcard. This is what the shims
-/// deliver to.
-pub fn engine_address(socket: &UdpSocket) -> Option<SocketAddr> {
-    let local = socket.local_addr().ok()?;
-    if !local.ip().is_unspecified() {
-        return Some(local);
-    }
-    // A wildcard IPv6 socket takes IPv4 loopback as well, unless it was made
-    // to take IPv6 alone.
-    let ip: IpAddr = if crate::address::Reach::of(socket).v4() {
-        std::net::Ipv4Addr::LOCALHOST.into()
-    } else {
-        std::net::Ipv6Addr::LOCALHOST.into()
-    };
-    Some(SocketAddr::new(ip, local.port()))
 }
 
 /// Starts an allocation on each of `servers` for the transfer socket,
@@ -1315,15 +1300,6 @@ fn refusal(code: u16, reason: &str) -> Failure {
         403 | 441 | 442 | 440 => Failure::Fatal(text),
         _ => Failure::Transient(text),
     }
-}
-
-/// A loopback socket for one peer, connected to the engine's.
-fn make_shim(engine: SocketAddr) -> std::io::Result<UdpSocket> {
-    let bind = SocketAddr::new(engine.ip(), 0);
-    let std_sock = std::net::UdpSocket::bind(bind)?;
-    std_sock.connect(engine)?;
-    std_sock.set_nonblocking(true)?;
-    UdpSocket::from_std(std_sock)
 }
 
 /// Hands what the engine sends to a peer's shim to the allocation, for the

@@ -869,6 +869,29 @@ impl Sender {
             }
         }
         self.spawn_nat64(&given, reach, found_tx);
+        // Streams to the receiver, dialled when UDP does not answer or stops
+        // (see `transport::carrier`). They end with the transfer.
+        let carrier_cancel = self.cancel.child_token();
+        let carriers = match crate::transport::carrier::shim::engine_address(&self.socket.udp()) {
+            Some(engine_at) if self.cfg.carriers => {
+                let shims = Arc::new(crate::transport::carrier::Shims::default());
+                let (tx, found) = mpsc::unbounded_channel();
+                let dial = crate::transport::carrier::dial::spawn(
+                    engine_at,
+                    local,
+                    shims.clone(),
+                    tx,
+                    carrier_cancel.clone(),
+                );
+                Carriers {
+                    shims,
+                    dial: Some(dial),
+                    found,
+                    asked_at: None,
+                }
+            }
+            _ => Carriers::none(),
+        };
 
         let mut engine = Engine::new(
             self.cfg.transport.clone(),
@@ -891,6 +914,7 @@ impl Sender {
             self.cancel.clone(),
         );
         engine.resuming = resuming;
+        engine.carriers = carriers;
 
         #[cfg(feature = "nat-traversal")]
         {
@@ -978,6 +1002,7 @@ impl Sender {
                 false => store.remove_sender(&self.cfg.file_path, size, &peer_str),
             }
         }
+        carrier_cancel.cancel();
         result
     }
 }
@@ -1358,6 +1383,42 @@ struct AckRecord {
     stale: bool,
 }
 
+/// Streams to the receiver (see `transport::carrier`): their shims, the
+/// dialler asked for more, and the shims it reports as they come up.
+struct Carriers {
+    shims: Arc<crate::transport::carrier::Shims>,
+    dial: Option<mpsc::UnboundedSender<Vec<SocketAddr>>>,
+    found: mpsc::UnboundedReceiver<SocketAddr>,
+    /// When streams were last asked for, and why.
+    asked_at: Option<Instant>,
+}
+
+impl Carriers {
+    /// No streams, and nobody to ask for one.
+    fn none() -> Self {
+        let (_, found) = mpsc::unbounded_channel();
+        Self {
+            shims: Arc::new(crate::transport::carrier::Shims::default()),
+            dial: None,
+            found,
+            asked_at: None,
+        }
+    }
+}
+
+/// How often streams are asked for, at most: the dialler tries each
+/// address once in half a minute anyway, and keeps one stream at a time.
+const STREAM_ASK_EVERY: Duration = Duration::from_secs(10);
+/// The retransmission timer on a stream, at least: it only has to notice a
+/// stream that died, which the stream says itself, and a stream that stalls
+/// for a moment delivers everything later.
+const STREAM_RTO: Duration = Duration::from_secs(10);
+/// The pace on a stream with no rate set: none to speak of. The stream
+/// takes what it has room for.
+const STREAM_PACE: f64 = 5e9;
+/// How long to wait when a stream's queue would take no more.
+const STREAM_FULL_BACKOFF: Duration = Duration::from_millis(1);
+
 struct Engine {
     cfg: TransportConfig,
     /// Which addresses the socket can send to, and how it writes them.
@@ -1461,6 +1522,10 @@ struct Engine {
     /// session over one keeps asking the other addresses whether a direct
     /// path has opened (see `probe_direct`).
     relayed: std::collections::HashSet<SocketAddr>,
+    /// Streams to the receiver, and the one the session runs on now (its
+    /// window is the stream's room, not the congestion window).
+    carriers: Carriers,
+    stream: Option<Arc<crate::transport::carrier::StreamStats>>,
     /// When the next such question goes out, and how many rounds have.
     next_direct_probe: Instant,
     direct_probes: u32,
@@ -1651,6 +1716,8 @@ impl Engine {
             #[cfg(feature = "nat-traversal")]
             turns: Vec::new(),
             relayed: std::collections::HashSet::new(),
+            carriers: Carriers::none(),
+            stream: None,
             next_direct_probe: now,
             direct_probes: 0,
             probes_sent: 0,
@@ -1800,7 +1867,7 @@ impl Engine {
             .send
             .seal(&mut self.ctl_buf)
             .map_err(io::Error::other)?;
-        match self.socket_for(to).try_send(to, &self.ctl_buf) {
+        match self.send_datagram(to, &self.ctl_buf) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => Ok(()),
             Err(e) => Err(e),
@@ -1841,7 +1908,21 @@ impl Engine {
         if sec.keys.send.seal(&mut self.ctl_buf).is_err() {
             return;
         }
-        let _ = self.socket_for(to).try_send(to, &self.ctl_buf);
+        let _ = self.send_datagram(to, &self.ctl_buf);
+    }
+
+    /// Sends one datagram to `to`: onto its stream when `to` is a stream's
+    /// shim (the stream's queue takes it, or says it is full), and from the
+    /// socket `to` is reached from otherwise.
+    fn send_datagram(&self, to: SocketAddr, datagram: &[u8]) -> io::Result<()> {
+        if let Some((link, port)) = self.carriers.shims.route(to) {
+            return if link.send(port, datagram) {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            };
+        }
+        self.socket_for(to).try_send(to, datagram)
     }
 
     /// Best-effort notice to the receiver that the transfer is over (sent
@@ -2273,7 +2354,7 @@ impl Engine {
             .map_err(|e| SendError::Handshake(e.to_string()))?;
         let sent = datagrams
             .iter()
-            .try_for_each(|pkt| self.socket_for(to).try_send(to, pkt));
+            .try_for_each(|pkt| self.send_datagram(to, pkt));
         match sent {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&e) => {}
@@ -2457,12 +2538,14 @@ impl Engine {
         // it, so `target` is reachable and is the receiver: that round trip
         // is the proof, and it settles which of the candidate addresses a
         // name resolved to is the real one.
+        let (old, old_heard) = (self.peer, self.heard_peer_at);
         if self.peer != target {
             tracing::info!("receiver answered at {}", target);
             self.peer = target;
         }
         self.heard_peer_at = Instant::now();
         self.follow_peer();
+        self.peer_moved(old, old_heard, now);
         // The new keys are in place, so liveness and — when the answer came
         // from an address we have not proven — its validation can both run
         // under them. A handshake response is authentic, but authenticity
@@ -2523,7 +2606,8 @@ impl Engine {
     // ----- handshake -------------------------------------------------------
 
     async fn handshake(&mut self) -> Result<HelloAck, SendError> {
-        let deadline = Instant::now() + self.cfg.handshake_timeout;
+        let started = Instant::now();
+        let deadline = started + self.cfg.handshake_timeout;
         let mut delay = Duration::from_millis(250);
         let mut next_attempt = Instant::now();
         let mut next_poll: Option<Instant> = None;
@@ -2535,6 +2619,14 @@ impl Engine {
             }
             let now = Instant::now();
             self.take_new_candidates();
+            if self.take_new_streams() {
+                next_attempt = now;
+            }
+            // UDP has had its chance: the network may let none through.
+            let streams_due = started + crate::transport::carrier::CARRIER_DELAY;
+            if self.secure.is_none() && now >= streams_due {
+                self.ask_for_streams(now, "no answer over UDP yet");
+            }
             if let Some(ack) = self.answer.take() {
                 match ack.status {
                     HELLO_ACCEPTED => {
@@ -2618,6 +2710,9 @@ impl Engine {
             let mut wake = deadline;
             if self.secure.is_none() {
                 wake = wake.min(next_attempt);
+                if self.carriers.asked_at.is_none() && self.carriers.dial.is_some() {
+                    wake = wake.min(streams_due);
+                }
             }
             if let Some(at) = next_poll {
                 wake = wake.min(at);
@@ -2652,10 +2747,13 @@ impl Engine {
             let mut hit = None;
             let hits_pending = self.hits.is_some() && self.secure.is_none();
             let other = self.other_socket();
+            let streams_pending = !self.carriers.found.is_closed();
+            let mut stream = None;
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
                 r = async { other.as_ref().unwrap().readable().await }, if other.is_some() => { let _ = r; }
                 a = self.found_rx.recv(), if finders_pending => { found = a; }
+                s = self.carriers.found.recv(), if streams_pending => { stream = s; }
                 h = async { self.hits.as_mut().unwrap().recv().await }, if hits_pending => { hit = h; }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
                 _ = cancel.cancelled() => return Err(SendError::Cancelled),
@@ -2672,6 +2770,14 @@ impl Engine {
                 if self.candidates.len() != before {
                     // Untried, so probe it now rather than after the backoff.
                     next_attempt = Instant::now();
+                }
+            }
+            if let Some(shim) = stream {
+                // Tried at once, not at its turn round the ring: it came up
+                // because nothing else has answered.
+                self.add_stream(shim);
+                if self.secure.is_none() {
+                    self.send_initiation_to(self.reach.native(shim))?;
                 }
             }
             self.drain_socket()?;
@@ -2762,6 +2868,17 @@ impl Engine {
     }
 
     fn update_pacer(&mut self) {
+        if self.stream.is_some() {
+            // A stream paces itself, by what it takes; only a rate the user
+            // set holds on it.
+            let (rate, burst) = match self.cfg.max_rate_bytes {
+                Some(m) => (m as f64, burst_for_rate(m as f64, self.chunk)),
+                None => (STREAM_PACE, crate::transport::carrier::STREAM_ROOM as f64),
+            };
+            self.pacer.set_rate(rate);
+            self.pacer.set_burst(burst);
+            return;
+        }
         let rate = self
             .cc
             .pacing_rate(self.rtt.srtt(), self.cfg.max_rate_bytes);
@@ -2987,9 +3104,22 @@ impl Engine {
             let other = self.other_socket();
             let hits_open = self.hits.is_some() && self.can_take_meeting();
             let mut late_hit = None;
+            let streams_pending = !self.carriers.found.is_closed();
             tokio::select! {
                 r = socket.readable() => { let _ = r; }
                 r = socket.writable(), if want_write => { let _ = r; }
+                s = self.carriers.found.recv(), if streams_pending => {
+                    if let Some(shim) = s {
+                        self.add_stream(shim);
+                        // The path the session runs on has gone quiet: ask
+                        // the receiver over the stream now, rather than once
+                        // the stall rules start trying everything.
+                        let quiet = Instant::now().saturating_duration_since(self.last_rx);
+                        if quiet >= Duration::from_secs(1) && self.fin_verdict.is_none() {
+                            self.send_initiation_to(self.reach.native(shim))?;
+                        }
+                    }
+                }
                 r = async { other.as_ref().unwrap().readable().await }, if other.is_some() => { let _ = r; }
                 h = async { self.hits.as_mut().unwrap().recv().await }, if hits_open => { late_hit = h; }
                 r = self.pipe.results.recv(), if sealing => {
@@ -3072,7 +3202,14 @@ impl Engine {
     // ----- sending ---------------------------------------------------------
 
     fn window(&self) -> u64 {
-        self.cc.cwnd().min(self.rwnd).max(2 * self.chunk as u64)
+        let floor = 2 * self.chunk as u64;
+        if let Some(stream) = &self.stream {
+            // A stream carries what it is given, in order, at the rate its
+            // own congestion control finds: it gets what it has room for.
+            let room = crate::transport::carrier::STREAM_ROOM.saturating_sub(stream.queued());
+            return (self.inflight_bytes + room).min(self.rwnd).max(floor);
+        }
+        self.cc.cwnd().min(self.rwnd).max(floor)
     }
 
     /// Makes the payload for `[s, e)` available, from the read-ahead block
@@ -3327,6 +3464,24 @@ impl Engine {
                 self.unsend(&batch.ranges);
                 return Err(SendError::Protocol("cannot encrypt a packet".into()));
             }
+            // On a stream each datagram goes onto its queue, as many as it
+            // takes; the rest go back to wait (the window keeps this rare).
+            if let Some((link, port)) = self.carriers.shims.route(self.peer) {
+                let taken = batch
+                    .buf
+                    .chunks(batch.segment)
+                    .take_while(|d| link.send(port, d))
+                    .count();
+                if taken < batch.ranges.len() {
+                    self.unsend(&batch.ranges[taken..]);
+                }
+                self.pipe.next_send += 1;
+                self.pipe.recycle(batch.buf);
+                if taken < batch.ranges.len() {
+                    return Ok(Some(SendBlock::Pacer(STREAM_FULL_BACKOFF)));
+                }
+                continue;
+            }
             let sent = self
                 .socket
                 .try_send_segments(self.peer, &batch.buf, batch.segment);
@@ -3367,7 +3522,7 @@ impl Engine {
     /// into `pending`. Returns what to wait for, if it had to stop.
     fn send_singly(&mut self, batch: &Batch) -> Option<SendBlock> {
         for (k, datagram) in batch.buf.chunks(batch.segment).enumerate() {
-            match self.socket.try_send(self.peer, datagram) {
+            match self.send_datagram(self.peer, datagram) {
                 Ok(()) => {}
                 Err(err) => {
                     self.unsend(&batch.ranges[k..]);
@@ -3621,9 +3776,11 @@ impl Engine {
                     .filter(|a| !self.keeps_direct(*a, now))
                 {
                     tracing::info!("receiver address {} proven; sending there now", addr);
+                    let (old, old_heard) = (self.peer, self.heard_peer_at);
                     self.peer = addr;
                     self.heard_peer_at = now;
                     self.follow_peer();
+                    self.peer_moved(old, old_heard, now);
                     // A move from IPv4 to IPv6 makes every header 20 bytes
                     // longer.
                     let fitted = self.family_chunk(self.chunk);
@@ -4036,7 +4193,108 @@ impl Engine {
         if self.turns.iter().any(|t| t.is_shim(addr)) {
             return true;
         }
-        self.relayed.contains(&addr)
+        // A stream is the receiver, but over TCP: a way through until UDP
+        // answers again, as a relay's port is.
+        self.relayed.contains(&addr) || self.carriers.shims.contains(addr)
+    }
+
+    /// Asks for streams to the receiver at the addresses it is known by (not
+    /// those of relays or TURN servers, which carry UDP only), at most once
+    /// in [`STREAM_ASK_EVERY`].
+    fn ask_for_streams(&mut self, now: Instant, why: &str) {
+        let Some(dial) = &self.carriers.dial else {
+            return;
+        };
+        if self
+            .carriers
+            .asked_at
+            .is_some_and(|t| now.saturating_duration_since(t) < STREAM_ASK_EVERY)
+        {
+            return;
+        }
+        let targets: Vec<SocketAddr> = self
+            .candidates
+            .iter()
+            .copied()
+            .filter(|a| !self.is_relayed(*a))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if self.carriers.asked_at.is_none() {
+            tracing::info!("{}; trying the receiver over TCP as well", why);
+        }
+        self.carriers.asked_at = Some(now);
+        let _ = dial.send(targets);
+    }
+
+    /// A stream that came up: its shim is an address of the receiver's to
+    /// try like any other, and one that carries rather than is (see
+    /// [`Engine::is_relayed`]).
+    fn add_stream(&mut self, shim: SocketAddr) {
+        // Only an address the dialler made; anybody else's loopback is what
+        // the screen in `add_candidate` exists to refuse.
+        if !self.carriers.shims.contains(shim) {
+            return;
+        }
+        let Some(addr) = self.reach.native(shim) else {
+            return;
+        };
+        if self.candidates.contains(&addr) {
+            return;
+        }
+        // A stream is worth a place even when the ring is full: it is the
+        // way through when nothing else is.
+        if self.candidates.len() >= MAX_CANDIDATES {
+            self.candidates.pop();
+        }
+        self.candidates.push(addr);
+    }
+
+    /// Takes the streams that came up since the last look.
+    fn take_new_streams(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(shim) = self.carriers.found.try_recv() {
+            self.add_stream(shim);
+            any = true;
+        }
+        any
+    }
+
+    /// The session has moved from `old`, last heard from at `old_heard`, to
+    /// `self.peer`. Between a stream and a datagram path nothing carries
+    /// over: the round trip over a stream includes its buffers, and its
+    /// window is its own. What was in flight on a path that had gone quiet
+    /// is lost, and goes again now rather than when a timer says.
+    fn peer_moved(&mut self, old: SocketAddr, old_heard: Instant, now: Instant) {
+        let was_stream = self.stream.is_some();
+        self.stream = self.carriers.shims.stats(self.peer);
+        if was_stream == self.stream.is_some() {
+            return;
+        }
+        if self.stream.is_some() {
+            tracing::info!("the session runs over TCP now ({} -> {})", old, self.peer);
+        } else {
+            tracing::info!("the session runs over UDP again ({} -> {})", old, self.peer);
+        }
+        if now.saturating_duration_since(old_heard) >= Duration::from_secs(1) {
+            let lost: Vec<(u64, u64)> =
+                self.inflight.iter().map(|(&s, inf)| (s, inf.end)).collect();
+            for (s, e) in lost {
+                self.remove_inflight(s);
+                self.pending.insert(s, e);
+            }
+        }
+        let ack_delay = self.rtt.max_ack_delay();
+        self.rtt = RttEstimator::new(self.cfg.min_rto, self.cfg.max_rto);
+        self.rtt.set_max_ack_delay(ack_delay);
+        self.cc = Cubic::new(
+            self.chunk,
+            self.cfg.initial_cwnd_chunks,
+            self.cfg.max_cwnd_bytes,
+        );
+        self.tail_probes = 0;
+        self.update_pacer();
     }
 
     /// While a session is carried by a relay, asks the receiver's other
@@ -4098,7 +4356,10 @@ impl Engine {
     }
 
     fn maybe_send_tail_probe(&mut self, now: Instant) -> Result<(), SendError> {
+        // On a stream nothing is lost that a probe could find: the stream
+        // delivers it, or dies.
         if self.inflight.is_empty()
+            || self.stream.is_some()
             || self.stalled
             || self.tail_probes >= MAX_TAIL_PROBES
             || self.secure.is_none()
@@ -4135,7 +4396,7 @@ impl Engine {
             )
             .map_err(|e| SendError::Protocol(e.to_string()))?;
         }
-        match self.socket.try_send(self.peer, &self.tx_buf) {
+        match self.send_datagram(self.peer, &self.tx_buf) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::WouldBlock || is_no_buffer_error(&err) => {
                 return Ok(())
@@ -4218,8 +4479,12 @@ impl Engine {
         }
         self.probe_direct(now);
         self.maybe_send_tail_probe(now)?;
-        // Retransmission timeout.
-        let rto = self.rtt.rto();
+        // Retransmission timeout. On a stream it only has to notice one that
+        // died without saying so.
+        let rto = match self.stream {
+            Some(_) => self.rtt.rto().max(STREAM_RTO),
+            None => self.rtt.rto(),
+        };
         let mut expired: Vec<u64> = Vec::new();
         while let Some(&(sent_at, off, seq)) = self.send_log.front() {
             match self.inflight.get(&off) {
@@ -4312,8 +4577,57 @@ impl Engine {
             self.last_idle_probe = None;
         }
 
+        // The stream the session runs on has ended: nothing sent there
+        // arrives any more. What was in flight goes again, and the session
+        // looks for the receiver elsewhere — another stream, UDP — as after
+        // a silence, at once.
+        if self.stream.as_ref().is_some_and(|s| !s.alive()) && self.candidates.contains(&self.peer)
+        {
+            let dead = self.peer;
+            tracing::info!("the TCP stream the session ran on has ended");
+            self.candidates.retain(|c| *c != dead);
+            let lost: Vec<(u64, u64)> =
+                self.inflight.iter().map(|(&s, inf)| (s, inf.end)).collect();
+            for (s, e) in lost {
+                self.remove_inflight(s);
+                self.pending.insert(s, e);
+            }
+            if !self.stalled {
+                self.stalled = true;
+                emit(
+                    &self.events,
+                    TransferEvent::Stalled {
+                        transfer_id: self.tid_hex(),
+                        since: now.saturating_duration_since(self.last_rx),
+                    },
+                );
+            }
+            self.carriers.asked_at = None;
+            self.ask_for_streams(now, "the stream ended");
+            if self.fin_verdict.is_none() {
+                self.send_initiation()?;
+            }
+        }
+
+        // Streams that ended elsewhere than under the session: nothing to
+        // try there any more.
+        {
+            let (peer, shims) = (self.peer, self.carriers.shims.clone());
+            self.candidates
+                .retain(|c| *c == peer || shims.stats(*c).is_none_or(|s| s.alive()));
+        }
+
         // Liveness.
         let since_rx = now.saturating_duration_since(self.last_rx);
+        // A path that has gone quiet may be one the network stopped
+        // letting through: a stream to the receiver is worth having ready.
+        if self.secure.is_some()
+            && self.stream.is_none()
+            && self.fin_verdict.is_none()
+            && since_rx >= self.cfg.stall_timeout.min(Duration::from_secs(3))
+        {
+            self.ask_for_streams(now, "the receiver has gone quiet over UDP");
+        }
         if since_rx >= self.cfg.stall_timeout && !self.stalled {
             self.stalled = true;
             tracing::warn!(

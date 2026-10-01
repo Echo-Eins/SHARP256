@@ -4525,3 +4525,163 @@ async fn version_4_resumes_after_the_receiver_restarts() {
     );
     stop_receiver(r2).await;
 }
+
+// ---------------------------------------------------------------------------
+// carriers: the same datagrams over TCP when UDP does not get through
+// ---------------------------------------------------------------------------
+
+/// Waits up to twenty seconds for `check` to hold.
+async fn eventually(what: &str, check: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !check() {
+        assert!(Instant::now() < deadline, "{} did not happen in time", what);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A TCP port that passes every stream on to `target`, counting what goes
+/// that way: the TCP half of a network whose UDP is blocked (or is not).
+struct TcpForward {
+    to_target_bytes: Arc<AtomicU64>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+/// Forwards streams accepted at `at` — the address of a UDP proxy, so that
+/// a sender given it finds the receiver there over both — to `target`.
+async fn start_tcp_forward(at: SocketAddr, target: SocketAddr) -> TcpForward {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(at).await.unwrap();
+    let to_target_bytes = Arc::new(AtomicU64::new(0));
+    let counted = to_target_bytes.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _)) = listener.accept().await else {
+                continue;
+            };
+            let Ok(outbound) = tokio::net::TcpStream::connect(target).await else {
+                continue;
+            };
+            let (mut in_r, mut in_w) = inbound.into_split();
+            let (mut out_r, mut out_w) = outbound.into_split();
+            let counted = counted.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 << 10];
+                while let Ok(n) = in_r.read(&mut buf).await {
+                    if n == 0 || out_w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    counted.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                let _ = out_w.shutdown().await;
+            });
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut out_r, &mut in_w).await;
+                let _ = in_w.shutdown().await;
+            });
+        }
+    });
+    TcpForward {
+        to_target_bytes,
+        _task: task,
+    }
+}
+
+/// A sender whose network lets no UDP through reaches the receiver over
+/// TCP, at the port its UDP has, and the transfer goes over that stream —
+/// with nothing resent: a stream loses nothing, and the engine leaves its
+/// congestion control to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_whose_udp_is_blocked_reaches_the_receiver_over_tcp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(r.addr, Impairment::none()).await;
+    proxy.blackhole.store(true, Ordering::Relaxed);
+    let tcp = start_tcp_forward(proxy.addr, r.addr).await;
+    let size = 3_000_000;
+    let path = make_file(&src, "over-tcp.bin", size, 11);
+    let summary = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_sender(sender_cfg(&path, proxy.addr, r.id, &state)),
+    )
+    .await
+    .expect("finished in time")
+    .expect("send");
+    assert_eq!(
+        summary.retransmitted_bytes, 0,
+        "nothing resent over a stream"
+    );
+    assert!(
+        tcp.to_target_bytes.load(Ordering::Relaxed) >= size as u64,
+        "carried over TCP"
+    );
+    assert_eq!(
+        proxy.to_target_bytes.load(Ordering::Relaxed),
+        0,
+        "nothing over UDP"
+    );
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    } else {
+        panic!("unexpected event");
+    }
+    stop_receiver(r).await;
+}
+
+/// UDP that stops in the middle of a transfer: the session moves to a
+/// stream and carries on; UDP that comes back: the session goes back to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_moves_to_tcp_when_udp_stops_and_back_when_it_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(r.addr, Impairment::none()).await;
+    let tcp = start_tcp_forward(proxy.addr, r.addr).await;
+    // Slow enough to be caught in the middle: about twelve seconds.
+    let size = 24_000_000;
+    let path = make_file(&src, "moves.bin", size, 12);
+    let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(2_000_000);
+    let sender = tokio::spawn(run_sender(cfg));
+
+    let (udp, streamed) = (&proxy.to_target_bytes, &tcp.to_target_bytes);
+    eventually("the transfer starting over UDP", || {
+        udp.load(Ordering::Relaxed) > 2_000_000
+    })
+    .await;
+    assert_eq!(
+        streamed.load(Ordering::Relaxed),
+        0,
+        "UDP works: no stream yet"
+    );
+
+    // UDP stops: the session finds the receiver over TCP.
+    proxy.blackhole.store(true, Ordering::Relaxed);
+    let before = streamed.load(Ordering::Relaxed);
+    eventually("the transfer moving to TCP", || {
+        streamed.load(Ordering::Relaxed) > before + 2_000_000
+    })
+    .await;
+
+    // UDP comes back: the session goes back to it.
+    let udp_before = udp.load(Ordering::Relaxed);
+    proxy.blackhole.store(false, Ordering::Relaxed);
+    eventually("the transfer going back to UDP", || {
+        udp.load(Ordering::Relaxed) > udp_before + 2_000_000
+    })
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(60), sender)
+        .await
+        .expect("finished in time")
+        .unwrap()
+        .expect("send");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    } else {
+        panic!("unexpected event");
+    }
+    stop_receiver(r).await;
+}

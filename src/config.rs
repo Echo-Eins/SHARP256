@@ -206,6 +206,11 @@ pub struct SenderConfig {
     pub dht: bool,
     /// DHT nodes to start from, `host:port`; empty means the well-known ones.
     pub dht_bootstrap: Vec<String>,
+    /// When UDP does not answer within `transport::carrier::CARRIER_DELAY`,
+    /// or stops in the middle of a transfer, try the receiver over TCP as
+    /// well — the same datagrams, framed on a stream — and go back to UDP
+    /// when it answers again (see `transport::carrier`).
+    pub carriers: bool,
     pub events: Option<EventCallback>,
 }
 
@@ -229,6 +234,7 @@ impl std::fmt::Debug for SenderConfig {
             .field("find_lan", &self.find_lan)
             .field("turn_servers", &self.turn_servers.len())
             .field("dht", &self.dht)
+            .field("carriers", &self.carriers)
             .field("events", &self.events.is_some())
             .finish()
     }
@@ -279,6 +285,7 @@ impl SenderConfig {
             turn_servers: Vec::new(),
             dht: false,
             dht_bootstrap: Vec::new(),
+            carriers: true,
             events: None,
         }
     }
@@ -311,6 +318,10 @@ impl SenderConfig {
 #[derive(Clone)]
 pub struct ReceiverConfig {
     pub bind: SocketAddr,
+    /// Take senders over TCP too, at the port number the UDP socket has:
+    /// for those whose network lets no UDP out (see `transport::carrier`).
+    /// The same datagrams, framed on a stream; nothing else changes.
+    pub tcp: bool,
     pub output_dir: PathBuf,
     /// Replace an existing complete file with the same name instead of
     /// writing `name (1).ext`. Directories are never replaced (nor merged):
@@ -408,6 +419,7 @@ impl std::fmt::Debug for ReceiverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReceiverConfig")
             .field("bind", &self.bind)
+            .field("tcp", &self.tcp)
             .field("output_dir", &self.output_dir)
             .field("overwrite", &self.overwrite)
             .field("max_sessions", &self.max_sessions)
@@ -478,6 +490,7 @@ impl ReceiverConfig {
     pub fn new(bind: SocketAddr, output_dir: PathBuf) -> Self {
         Self {
             bind,
+            tcp: true,
             output_dir,
             overwrite: false,
             max_sessions: 16,

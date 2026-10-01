@@ -1,5 +1,6 @@
 //! Reliable transport built on top of the wire protocol.
 
+pub mod carrier;
 pub mod congestion;
 pub mod io;
 #[cfg(test)]

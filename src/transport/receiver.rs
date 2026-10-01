@@ -216,6 +216,9 @@ struct Shared {
     /// claimed or published it (see [`Unwritten`]); held to three quarters
     /// of the budget.
     unwritten_total: Budget,
+    /// Senders reached over a stream rather than the socket (see
+    /// `transport::carrier`): what goes to them goes on their stream.
+    streams: Arc<crate::transport::carrier::Streams>,
     /// Sockets particular peers are answered from.
     #[cfg(feature = "nat-traversal")]
     routes: Arc<crate::nat::birthday::Routes>,
@@ -443,11 +446,31 @@ impl Shared {
     /// through: the receiver's own, unless the peer had to be met at another
     /// (see `nat::birthday`).
     fn send(&self, to: SocketAddr, datagram: &[u8]) -> io::Result<()> {
+        if let Some(sent) = self.streams.send(to, datagram) {
+            return sent;
+        }
         #[cfg(feature = "nat-traversal")]
         if let Some(sent) = self.routes.send(to, datagram) {
             return sent;
         }
         self.socket.try_send(to, datagram)
+    }
+
+    /// Whether `addr` carries a sender rather than being where it is: a
+    /// stream, a relay's port, a TURN address (see [`Relayed`]). A sender
+    /// moves to a stream when its UDP has gone quiet, and from one when UDP
+    /// answers again: in both, what still arrives over the path it left is
+    /// what was on its way, and following that back would have the session
+    /// swap paths for as long as it lasts.
+    fn carried(&self, addr: SocketAddr) -> bool {
+        if self.streams.contains(addr) {
+            return true;
+        }
+        #[cfg(feature = "nat-traversal")]
+        if self.relayed.contains(addr) {
+            return true;
+        }
+        false
     }
 
     /// Takes `bytes` of the queue budget; false when it is spent.
@@ -570,6 +593,10 @@ pub struct Receiver {
     #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
     addrs_tx: mpsc::UnboundedSender<SocketAddr>,
     addrs_rx: mpsc::UnboundedReceiver<SocketAddr>,
+    /// Where senders reach this receiver over TCP, and what comes in on
+    /// their streams (see `transport::carrier`).
+    listener: Option<tokio::net::TcpListener>,
+    streams_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
 }
 
 /// A peer's contact card; there is no such thing without NAT traversal.
@@ -623,6 +650,28 @@ impl Receiver {
         let (_aux_tx, aux_rx) = mpsc::channel(1);
         let (cards_tx, cards_rx) = mpsc::unbounded_channel();
         let (addrs_tx, addrs_rx) = mpsc::unbounded_channel();
+        let (streams, streams_rx) = crate::transport::carrier::Streams::new();
+        // Senders whose network lets no UDP out reach the receiver over TCP,
+        // at the port number its UDP socket has. A port taken by something
+        // else costs them that, and nobody else anything.
+        let listener = if cfg.tcp {
+            let udp = socket.local_addr()?;
+            let dual_stack = udp.is_ipv6()
+                && udp.ip().is_unspecified()
+                && crate::address::Reach::of(&socket.udp()).v4();
+            match crate::transport::carrier::listen::bind(udp, dual_stack) {
+                Ok(l) => {
+                    tracing::info!("receiver also takes senders over TCP at {}", udp);
+                    Some(l)
+                }
+                Err(e) => {
+                    tracing::warn!("cannot take senders over TCP at {} ({}); UDP only", udp, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let memory_budget = cfg.memory_budget;
         Ok(Self {
             aux_rx,
@@ -630,6 +679,8 @@ impl Receiver {
             cards_rx,
             addrs_tx,
             addrs_rx,
+            listener,
+            streams_rx,
             #[cfg(not(feature = "nat-traversal"))]
             _aux_tx,
             shared: Arc::new(Shared {
@@ -639,6 +690,7 @@ impl Receiver {
                 cancel: CancellationToken::new(),
                 identity,
                 declined: parking_lot::Mutex::new(HashMap::new()),
+                streams,
                 queued_total: Budget::new(memory_budget / 4),
                 receiving: std::sync::atomic::AtomicUsize::new(0),
                 unwritten_total: Budget::new(memory_budget / 4 * 3),
@@ -696,6 +748,14 @@ impl Receiver {
         let mut aux_rx = self.aux_rx;
         let mut cards_rx = self.cards_rx;
         let mut addrs_rx = self.addrs_rx;
+        let mut streams_rx = self.streams_rx;
+        if let Some(listener) = self.listener {
+            tokio::spawn(crate::transport::carrier::listen::serve(
+                listener,
+                shared.streams.clone(),
+                shared.cancel.child_token(),
+            ));
+        }
 
         // NAT discovery runs in the background; its STUN responses arrive on
         // this socket and are handed over below.
@@ -935,6 +995,23 @@ impl Receiver {
                     meet_addr(&shared, &puncher, addr);
                     #[cfg(not(feature = "nat-traversal"))]
                     let _ = addr;
+                }
+                Some(first) = streams_rx.recv() => {
+                    // From senders on streams: as if it had come in on the
+                    // socket, from the address each stream comes from — what
+                    // is waiting, at once, as a batch off the socket is.
+                    let now = Instant::now();
+                    let mut next = Some(first);
+                    let mut taken = 0;
+                    while let Some((mut buf, from)) = next.take() {
+                        let r = Received { from, len: buf.len(), stride: buf.len(), dst: None };
+                        d.on_received(&mut buf, r, now);
+                        taken += 1;
+                        if taken < RECV_BATCH * RECV_CALLS_PER_WAKEUP {
+                            next = streams_rx.try_recv().ok();
+                        }
+                    }
+                    d.flush();
                 }
                 Some((data, from)) = aux_rx.recv() => {
                     // From a peer met at a socket of its own: routed like
@@ -3471,20 +3548,11 @@ impl Session {
     /// on a direct address the sender was heard from lately (see
     /// [`crate::transport::path::DIRECT_GRACE`]).
     fn keeps_direct(&self, to: SocketAddr, now: Instant) -> bool {
-        #[cfg(feature = "nat-traversal")]
-        {
-            let relayed = &self.shared.relayed;
-            crate::transport::path::keeps_direct(
-                relayed.contains(to),
-                relayed.contains(self.peer),
-                now.saturating_duration_since(self.heard_peer_at),
-            )
-        }
-        #[cfg(not(feature = "nat-traversal"))]
-        {
-            let _ = (to, now);
-            false
-        }
+        crate::transport::path::keeps_direct(
+            self.shared.carried(to),
+            self.shared.carried(self.peer),
+            now.saturating_duration_since(self.heard_peer_at),
+        )
     }
 
     /// An authentic packet from an address we have not proven does *not*
