@@ -84,6 +84,12 @@ RustSec. Проверяет и `fuzz/Cargo.lock`. Небезопасный ко�
 пропустил. Исключение одно — то же, что для `webbrowser` в `deny.toml`
 (`.cargo/audit.toml`).
 
+**Лок фаззинга.** У фаззеров своё рабочее пространство и свой
+`fuzz/Cargo.lock`. Он разошёлся с `Cargo.lock` на 72 крейта, и фаззеры
+проверяли не те версии, что идут в выпуск. Теперь `scripts/supply-chain.sh`
+падает, если в `fuzz/Cargo.lock` есть версия, которой нет в `Cargo.lock`
+(кроме самого libFuzzer).
+
 **cargo-vet** (`supply-chain/`) требует, чтобы каждый крейт был проверен
 кем-то, кому доверяют, или назван исключением. Импортированы аудиты
 Mozilla, Google, Bytecode Alliance, ISRG, Zcash и Embark. Ими покрыто 135
@@ -104,7 +110,9 @@ Mozilla, Google, Bytecode Alliance, ISRG, Zcash и Embark. Ими покрыто
 
 **Действия GitHub** во всех workflow закреплены по коммиту, инструменты
 (`cargo-deny`, `cargo-audit`, `cargo-vet`, `cargo-fuzz`, `cargo-cyclonedx`)
-— по версии.
+— по версии. Образ, в котором ClusterFuzzLite собирает цели, закреплён по
+хешу (`.clusterfuzzlite/Dockerfile`). Образы самого ClusterFuzzLite
+названы внутри его действия меткой `v1`, и снаружи их не закрепить.
 
 ## Воспроизводимая сборка
 

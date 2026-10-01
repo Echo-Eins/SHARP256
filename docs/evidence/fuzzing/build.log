@@ -1,0 +1,97 @@
+# .clusterfuzzlite/build.sh on c380807 as ClusterFuzzLite runs it (SANITIZER=address), outside its image: 2026-09-30T23:55Z to 2026-09-30T23:56Z, exit status 0
+# rustc 1.101.0-nightly (5c543b0b8 2026-09-29); cargo-fuzz 0.13.2; the image's own toolchain is nightly-2025-09-05
+
++ cargo fuzz build -O --debug-assertions
+    Finished `release` profile [optimized + debuginfo] target(s) in 1.33s
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/addresses $OUT/
++ zip -q -r $OUT/addresses_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/card $OUT/
++ zip -q -r $OUT/card_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/datagram $OUT/
++ zip -q -r $OUT/datagram_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/dht $OUT/
++ zip -q -r $OUT/dht_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/handshake $OUT/
++ zip -q -r $OUT/handshake_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/handshake_payload $OUT/
++ zip -q -r $OUT/handshake_payload_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/manifest $OUT/
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/mdns $OUT/
++ zip -q -r $OUT/mdns_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/portmap $OUT/
++ zip -q -r $OUT/portmap_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/relay $OUT/
++ zip -q -r $OUT/relay_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/relay_message $OUT/
++ zip -q -r $OUT/relay_message_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/roundtrip $OUT/
++ zip -q -r $OUT/roundtrip_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/session $OUT/
++ zip -q -r $OUT/session_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/stun $OUT/
++ zip -q -r $OUT/stun_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/text $OUT/
++ zip -q -r $OUT/text_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/turn $OUT/
++ zip -q -r $OUT/turn_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/upnp $OUT/
++ zip -q -r $OUT/upnp_seed_corpus.zip .
++ cp fuzz/target/x86_64-unknown-linux-gnu/release/wire_frame $OUT/
++ zip -q -r $OUT/wire_frame_seed_corpus.zip .
+
+# $OUT:
+40543032 bytes  addresses
+184 bytes  addresses_seed_corpus.zip
+40785536 bytes  card
+431 bytes  card_seed_corpus.zip
+42263840 bytes  datagram
+725 bytes  datagram_seed_corpus.zip
+40507232 bytes  dht
+433 bytes  dht_seed_corpus.zip
+51385992 bytes  handshake
+40569784 bytes  handshake_payload
+639 bytes  handshake_payload_seed_corpus.zip
+5018 bytes  handshake_seed_corpus.zip
+40451344 bytes  manifest
+41489632 bytes  mdns
+539 bytes  mdns_seed_corpus.zip
+40485552 bytes  portmap
+344 bytes  portmap_seed_corpus.zip
+44782728 bytes  relay
+40682984 bytes  relay_message
+2052 bytes  relay_message_seed_corpus.zip
+5018 bytes  relay_seed_corpus.zip
+42715512 bytes  roundtrip
+3314 bytes  roundtrip_seed_corpus.zip
+51432056 bytes  session
+5018 bytes  session_seed_corpus.zip
+40468896 bytes  stun
+733 bytes  stun_seed_corpus.zip
+40953016 bytes  text
+831 bytes  text_seed_corpus.zip
+40796360 bytes  turn
+973 bytes  turn_seed_corpus.zip
+40731520 bytes  upnp
+1173 bytes  upnp_seed_corpus.zip
+40589784 bytes  wire_frame
+632 bytes  wire_frame_seed_corpus.zip
+
+# every target once over its seeds (-runs=0)
+addresses          #2	DONE   cov: 267 ft: 268 corp: 1/25b lim: 25 
+card               #3	DONE   cov: 567 ft: 699 corp: 2/169b lim: 128 
+datagram           #4	DONE   cov: 1407 ft: 2168 corp: 3/366b lim: 207 
+dht                #3	DONE   cov: 269 ft: 395 corp: 2/205b lim: 167 
+handshake          #14	DONE   cov: 6718 ft: 14519 corp: 12/4800b lim: 400 
+handshake_payload  #3	DONE   cov: 281 ft: 312 corp: 2/3303b lim: 3240 
+manifest           #2	DONE   cov: 29 ft: 30 corp: 1/1b lim: 4 
+mdns               #3	DONE   cov: 490 ft: 651 corp: 2/422b lim: 324 
+portmap            #3	DONE   cov: 83 ft: 106 corp: 2/72b lim: 60 
+relay              #13	DONE   cov: 3738 ft: 8951 corp: 12/4800b lim: 400 
+relay_message      #12	DONE   cov: 411 ft: 418 corp: 11/860b lim: 152 
+roundtrip          #18	DONE   cov: 2386 ft: 2808 corp: 14/910b lim: 65 
+session            #21	DONE   cov: 8168 ft: 16226 corp: 12/4800b lim: 400 
+stun               #5	DONE   cov: 106 ft: 126 corp: 4/452b lim: 128 
+text               #6	DONE   cov: 368 ft: 426 corp: 5/137b lim: 57 
+turn               #7	DONE   cov: 376 ft: 420 corp: 5/298b lim: 92 
+upnp               #6	DONE   cov: 400 ft: 613 corp: 5/593b lim: 220 
+wire_frame         #5	DONE   cov: 165 ft: 175 corp: 4/75b lim: 53 

@@ -1,0 +1,8 @@
+# scripts/fuzz-coverage.sh CORPUS text on 49f143d, 2026-10-01T00:14Z, exit status 0
+# CORPUS/text: the text corpus of coverage.log (545 inputs), its seeds, and what a minute of libFuzzer on 49f143d added
+# (built as build.log; 1044780 inputs, nothing found): 1346 inputs
+#
+# branches taken / branches          c380807 (coverage.log)   49f143d
+# card::parse_peer_addr             0/8                      7/8
+# card::parse_peer_addrs            0/8                      7/8
+# address::parse_peer_versioned     2/10                     9/10

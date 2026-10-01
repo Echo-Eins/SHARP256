@@ -102,6 +102,28 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   synchronisation it checks broken on purpose. See
   [docs/SANITIZERS.md](docs/SANITIZERS.md).
 
+### Fuzzing
+- Four targets read their input as a plan instead of bytes to parse:
+  `handshake` and `session` drive a receiver's dispatcher (handshakes of
+  both versions, whole and in fragments, with cookies; a session sending
+  any frame at any packet number), `relay` drives a relay (registrations,
+  connections, port pairs, goodbyes), each with a stranger copying,
+  forging and flooding while time passes; `roundtrip` builds a message of
+  every codec, encodes it and decodes it back. After every step: no
+  panic, no more bytes to an address that proved nothing than came from
+  it, every bound held, nothing written outside the receiving directory.
+- Found: the manifest builder took a root mode the decoder refuses (no
+  scan makes one; refused now); the fuzzers' lockfile had drifted from
+  the crate's by 72 crates, so they built other versions than ship (the
+  crate's again, and the supply-chain check fails on drift); coverage
+  showed the cookie exchange and typed peer addresses out of the fuzzers'
+  reach (both reached now).
+- Continuous fuzzing on ClusterFuzzLite: ten minutes on every push and
+  pull request, five hours every six hours on all the runner's cores, the
+  corpus pruned and a coverage report with branches every day. It
+  replaces the minute per target. `scripts/fuzz-coverage.sh` measures any
+  corpus down to its branches. See [docs/FUZZING.md](docs/FUZZING.md).
+
 ### Security
 - Long-term X25519 identities, created on first use and kept in the
   per-user data directory with owner-only permissions. A peer is addressed
@@ -825,8 +847,8 @@ real kernel's NAT against independent implementations (`docs/NAT.md`,
 - GitHub Actions: formatting and clippy for every feature set (and for
   FreeBSD), all tests on Linux, macOS and Windows with IPv6 required
   (`SHARP_REQUIRE_IPV6`: an IPv6 test that cannot run fails instead of
-  skipping), the minimum Rust version, the network-namespace tests, and a
-  minute of fuzzing per target.
+  skipping), the minimum Rust version, the network-namespace tests, and
+  fuzzing (continuous now: see Fuzzing above).
 
 ### Directories
 - A directory is sent as one stream: a manifest (structure, sizes, Unix

@@ -1,0 +1,22 @@
+# Executions per second of every target on c380807, as ClusterFuzzLite builds them (build.log): 2026-09-30T23:56Z to 2026-10-01T00:00Z
+# one libFuzzer process each, ten seconds from the corpus of the coverage run (coverage.log), on one core of a Ryzen 9 5900HX at nice 19; crashes, leaks or timeouts: 0
+
+target               exec/s    runs  corpus coverage rss MB
+addresses             20365  224019     539      798    450
+card                   6801   74819     172      749    173
+datagram               1751   19265      33     1662     78
+dht                   84028  924311     323      428    491
+handshake_payload     49841  548260     209      521    407
+handshake               149    1640     967     7603    251
+manifest             237332 2610654     233      399    514
+mdns                  78609  864702     411      677    533
+portmap              294612 3240732      36      168    465
+relay_message        558392 6142312     113      618    467
+relay                   279    3078     765     4115    116
+roundtrip              4749   52249    1984     4343    461
+session                 123    1363     342     8757    243
+stun                 305744 3363186     118      183    471
+text                  38652  425179     545      840    488
+turn                 274391 3018310     106      454    527
+upnp                  26122  287345     625      584    504
+wire_frame           124236 1366602     301      700    580

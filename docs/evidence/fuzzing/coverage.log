@@ -1,0 +1,152 @@
+# scripts/fuzz-coverage.sh on c380807 (its code; the script as committed there), 2026-09-30T23:55Z, exit status 0
+# rustc 1.101.0-nightly (5c543b0b8 2026-09-29); -Cinstrument-coverage -Zcoverage-options=branch, debug, no debug assertions: as ClusterFuzzLite's coverage build
+# the corpus: the seeds (fuzz/corpus) and what local runs added on 2026-10-01, fifteen seconds per parser target,
+# two to three minutes for roundtrip, handshake, session and relay, one more minute for handshake after the change below;
+# inputs per target: addresses 539, card 172, datagram 33, dht 323, handshake 967, handshake_payload 209, manifest 233, mdns 411, portmap 36, relay 765, relay_message 113, roundtrip 1984, session 342, stun 118, text 545, turn 106, upnp 625, wire_frame 301
+# what ClusterFuzzLite's batch runs gather will reach further: this is where it starts, not where it ends
+
+## per file of the crate (its own code only, src/fuzz/ excluded): lines, and branches taken both ways
+
+file                                  lines    branches        
+src/address/class.rs                 89.13%       69/80   86.2%
+src/address/dns.rs                   17.48%        8/56   14.3%
+src/address/mod.rs                   51.40%       16/44   36.4%
+src/address/nat64.rs                 52.00%       15/30   50.0%
+src/config.rs                        31.47%        2/10   20.0%
+src/crypto/blake2s.rs               100.00%         6/6  100.0%
+src/crypto/handshake.rs              87.41%       66/96   68.8%
+src/crypto/identity.rs               59.62%       17/30   56.7%
+src/crypto/identity_file.rs           0.00%        0/62    0.0%
+src/crypto/kem.rs                    96.23%         2/4   50.0%
+src/crypto/keystore.rs                0.00%         0/8    0.0%
+src/crypto/mod.rs                    53.33%           -        
+src/crypto/noise.rs                  97.36%       25/32   78.1%
+src/crypto/replay.rs                 74.36%         5/8   62.5%
+src/crypto/secret.rs                 68.68%       10/16   62.5%
+src/crypto/transport.rs              85.60%       15/28   53.6%
+src/file/durable.rs                  87.18%         3/6   50.0%
+src/file/mod.rs                      49.62%       31/90   34.4%
+src/file/tree.rs                     35.99%      95/212   44.8%
+src/lib.rs                            0.00%           -        
+src/nat/behaviour.rs                  0.00%       0/106    0.0%
+src/nat/birthday.rs                  10.67%        1/28    3.6%
+src/nat/card.rs                      64.66%       40/78   51.3%
+src/nat/dht/bencode.rs               85.71%       31/34   91.2%
+src/nat/dht/mod.rs                   12.18%       17/46   37.0%
+src/nat/keepalive.rs                  0.00%         0/2    0.0%
+src/nat/mdns.rs                      45.77%      61/144   42.4%
+src/nat/mod.rs                        2.19%       8/124    6.5%
+src/nat/portmap.rs                   20.93%      38/120   31.7%
+src/nat/probe.rs                      0.00%           -        
+src/nat/punch.rs                      0.00%        0/84    0.0%
+src/nat/stun.rs                      62.27%      77/100   77.0%
+src/nat/stunserver.rs                 0.00%        0/16    0.0%
+src/nat/turn/mod.rs                   0.00%       0/162    0.0%
+src/nat/turn/wire.rs                 96.73%       40/44   90.9%
+src/nat/upnp.rs                      22.19%       39/84   46.4%
+src/progress.rs                      63.74%       17/38   44.7%
+src/protocol/constants.rs           100.00%         2/4   50.0%
+src/protocol/range_set.rs            29.57%        5/50   10.0%
+src/protocol/wire.rs                 92.79%       42/52   80.8%
+src/relay/client.rs                   0.00%       0/118    0.0%
+src/relay/mod.rs                     87.39%       15/26   57.7%
+src/relay/server.rs                  68.88%     101/190   53.2%
+src/state/mod.rs                     32.29%        1/46    2.2%
+src/sync.rs                          75.00%         1/2   50.0%
+src/transport/congestion.rs           0.00%        0/50    0.0%
+src/transport/io.rs                  49.10%        6/26   23.1%
+src/transport/parallel.rs            77.78%         3/6   50.0%
+src/transport/path.rs                61.11%        5/18   27.8%
+src/transport/receiver.rs            55.43%     243/552   44.0%
+src/transport/sender.rs               0.00%       0/524    0.0%
+src/transport/socket.rs              50.63%       13/38   34.2%
+TOTAL                                36.42%   1191/3730   31.9%
+
+## per function that parses or answers what came from outside, in those files (branches taken / branches)
+
+src/address/class.rs     address::class::classify_v4                                           9/10    90.0%
+src/address/class.rs     address::class::classify_v6                                          22/26    84.6%
+src/address/class.rs     address::class::is_sendable_hint                                      4/4    100.0%
+src/address/class.rs     address::class::is_sendable_named                                     5/6     83.3%
+src/address/dns.rs       <address::dns::Interleaver>::answer                                   0/4      0.0%
+src/address/dns.rs       address::dns::parse_literal                                           2/2    100.0%
+src/address/mod.rs       address::parse_peer_versioned                                         2/10    20.0%
+src/address/nat64.rs     address::nat64::from_answers                                         10/10   100.0%
+src/crypto/handshake.rs  <crypto::handshake::CookieJar>::mac2_ok                               1/2     50.0%
+src/crypto/handshake.rs  <crypto::handshake::CookieJar>::reply                                 1/2     50.0%
+src/crypto/handshake.rs  <crypto::handshake::Initiator>::read_response                         8/12    66.7%
+src/crypto/handshake.rs  <crypto::handshake::Responder>::read_initiation                       4/4    100.0%
+src/crypto/handshake.rs  <crypto::handshake::Responder>::read_initiation_v4                    1/2     50.0%
+src/crypto/handshake.rs  crypto::handshake::open_cookie                                        4/4    100.0%
+src/crypto/noise.rs      <crypto::noise::Initiator>::read_response                             7/10    70.0%
+src/crypto/noise.rs      <crypto::noise::Responder>::read                                      6/6    100.0%
+src/file/tree.rs         <file::tree::Cursor>::take                                            2/2    100.0%
+src/file/tree.rs         <file::tree::Cursor>::varint                                         11/12    91.7%
+src/file/tree.rs         <file::tree::Manifest>::decode                                       18/20    90.0%
+src/file/tree.rs         <file::tree::TreeSource>::read_at                                     0/6      0.0%
+src/file/tree.rs         <file::tree::TreeSource>::read_at::{closure#3}                        0/2      0.0%
+src/file/tree.rs         file::tree::put_varint                                                2/2    100.0%
+src/file/tree.rs         file::tree::valid_name                                                7/8     87.5%
+src/file/tree.rs         file::tree::valid_name::{closure#0}                                   2/2    100.0%
+src/file/tree.rs         file::tree::windows_name                                              0/10     0.0%
+src/file/tree.rs         file::tree::windows_name::{closure#1}                                 0/2      0.0%
+src/nat/card.rs          <nat::card::Card>::decode                                            15/16    93.8%
+src/nat/card.rs          <nat::card::Card>::decode::{closure#0}                                2/2    100.0%
+src/nat/card.rs          <nat::card::Card>::from_text                                          6/6    100.0%
+src/nat/card.rs          <nat::card::Card>::from_text::{closure#0}                             2/2    100.0%
+src/nat/card.rs          <nat::card::NatHints>::from_bytes                                     8/8    100.0%
+src/nat/card.rs          <nat::card::Reader>::addr                                             2/2    100.0%
+src/nat/card.rs          nat::card::parse_peer_addr                                            0/8      0.0%
+src/nat/card.rs          nat::card::parse_peer_addrs                                           0/8      0.0%
+src/nat/card.rs          nat::card::parse_peer_addrs::{closure#0}                              0/2      0.0%
+src/nat/dht/bencode.rs   nat::dht::bencode::take                                              21/24    87.5%
+src/nat/dht/bencode.rs   nat::dht::bencode::take_bytes                                        10/10   100.0%
+src/nat/dht/mod.rs       nat::dht::parse_reply                                                10/10   100.0%
+src/nat/dht/mod.rs       nat::dht::parse_reply::{closure#0}                                    1/2     50.0%
+src/nat/dht/mod.rs       nat::dht::read_replies::{closure#0}                                   0/10     0.0%
+src/nat/mdns.rs          <nat::mdns::Announcement>::answer                                     6/10    60.0%
+src/nat/mdns.rs          <nat::mdns::Announcement>::answer::{closure#1}::{closure#0}           3/4     75.0%
+src/nat/mdns.rs          <nat::mdns::Announcement>::answer::{closure#2}::{closure#0}           0/8      0.0%
+src/nat/mdns.rs          <nat::mdns::Announcement>::answer_within                              0/8      0.0%
+src/nat/mdns.rs          <nat::mdns::Message>::decode                                         10/10   100.0%
+src/nat/mdns.rs          nat::mdns::take_name                                                 12/12   100.0%
+src/nat/mdns.rs          nat::mdns::take_record                                                8/8    100.0%
+src/nat/portmap.rs       nat::portmap::parse_proc_ipv6_route::<nat::portmap::linux_default_    0/20     0.0%
+src/nat/portmap.rs       nat::portmap::pcp_parse_map_response                                 16/18    88.9%
+src/nat/portmap.rs       nat::portmap::pmp_parse_external_response                             8/8    100.0%
+src/nat/portmap.rs       nat::portmap::pmp_parse_map_response                                 11/12    91.7%
+src/nat/stun.rs          nat::stun::is_stun_message                                            2/2    100.0%
+src/nat/stun.rs          nat::stun::is_stun_request                                            4/4    100.0%
+src/nat/stun.rs          nat::stun::is_stun_response                                           6/6    100.0%
+src/nat/stun.rs          nat::stun::parse_address                                             12/12   100.0%
+src/nat/stun.rs          nat::stun::parse_binding_response                                    16/18    88.9%
+src/nat/turn/wire.rs     <nat::turn::wire::Message>::integrity_is_good                         5/6     83.3%
+src/nat/turn/wire.rs     <nat::turn::wire::Message>::text                                      1/2     50.0%
+src/nat/turn/wire.rs     nat::turn::wire::parse                                               21/22    95.5%
+src/nat/turn/wire.rs     nat::turn::wire::parse_channel_data                                   4/4    100.0%
+src/nat/turn/wire.rs     nat::turn::wire::parse_xor_address                                    5/6     83.3%
+src/nat/upnp.rs          <nat::upnp::Url>::parse                                               2/2    100.0%
+src/nat/upnp.rs          <nat::upnp::Url>::parse::{closure#0}                                  2/2    100.0%
+src/nat/upnp.rs          nat::upnp::answer_v6                                                  8/12    66.7%
+src/nat/upnp.rs          nat::upnp::parse_authority                                            3/4     75.0%
+src/protocol/wire.rs     <protocol::wire::Reader>::holes                                      10/10   100.0%
+src/protocol/wire.rs     <protocol::wire::Reader>::take                                        2/2    100.0%
+src/protocol/wire.rs     <protocol::wire::Reader>::text                                        1/2     50.0%
+src/protocol/wire.rs     <protocol::wire::Reader>::varint                                      7/8     87.5%
+src/protocol/wire.rs     <protocol::wire::Writer>::text                                        4/4    100.0%
+src/protocol/wire.rs     <protocol::wire::Writer>::varint                                      2/2    100.0%
+src/protocol/wire.rs     protocol::wire::decode_body                                          14/14   100.0%
+src/protocol/wire.rs     protocol::wire::describe_holes_within                                 1/6     16.7%
+src/protocol/wire.rs     protocol::wire::varint_len                                            0/2      0.0%
+src/relay/mod.rs         <relay::Message>::decode                                              8/8    100.0%
+src/relay/mod.rs         relay::parse_relay                                                    4/4    100.0%
+
+## the cookie exchange, before and after the harness's receiver went under load at 3 initiations a second (200 before)
+# measured during the work on the tree that became the commit, same script, the corpus above without the last minute (before) and with it (after)
+#                                   before    after
+# crypto/handshake.rs, branches      58/96     66/96
+# transport/receiver.rs, branches  214/552   248/552
+# CookieJar::reply                  0/2 (never called)   1/2 (called 258 times; the branch left is a length check its callers make first)
+# open_cookie                       3/4       4/4
+# receiver.rs:1151 (v3 under load and no valid mac2)   -   under load 2270 times: 193 answered with a cookie, 2080 with a valid one let through
+# receiver.rs:1330 (v4 fragment, the same)              -   under load 76 times: 65 answered with a cookie, 11 let through
