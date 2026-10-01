@@ -133,6 +133,16 @@ pub fn manifest(data: &[u8]) {
 pub fn text(data: &[u8]) {
     let s = String::from_utf8_lossy(data);
     let _ = address::parse_peer(&s);
+    // Addresses a person types in: all good or none, each once, at most
+    // as many as a card lists, and each typed back in as itself.
+    #[cfg(feature = "nat-traversal")]
+    if let Ok(addrs) = crate::nat::card::parse_peer_addrs(&s) {
+        assert!(!addrs.is_empty() && addrs.len() <= crate::nat::card::MAX_CANDIDATES);
+        for (i, a) in addrs.iter().enumerate() {
+            assert!(!addrs[..i].contains(a), "{} twice", a);
+            assert_eq!(crate::nat::card::parse_peer_addr(&a.to_string()), Ok(*a));
+        }
+    }
     if let Ok((host, port)) = dns::split_host_port(&s) {
         assert!(!host.is_empty());
         let _ = port;
@@ -473,13 +483,25 @@ pub fn seeds(target: &str) -> Vec<Vec<u8>> {
                 v
             })
             .collect(),
-        "text" => vec![
-            b"sh-aaaa@203.0.113.5:5555,[2001:db8::1]:5555,example.org:1".to_vec(),
-            b"[fe80::1%eth0]:5555".to_vec(),
-            b"100M".to_vec(),
-            b"4GiB".to_vec(),
-            b"20010db8000000000000000000000001 02 40 00 01     eth0".to_vec(),
-        ],
+        "text" => {
+            // A real ID in both its forms: without one, every `ID@hosts`
+            // stops at the ID's checksum.
+            let id = crate::crypto::SharpId::from_public([0x5a; 32]);
+            vec![
+                b"sh-aaaa@203.0.113.5:5555,[2001:db8::1]:5555,example.org:1".to_vec(),
+                b"[fe80::1%eth0]:5555".to_vec(),
+                b"100M".to_vec(),
+                b"4GiB".to_vec(),
+                b"20010db8000000000000000000000001 02 40 00 01     eth0".to_vec(),
+                format!("{}@203.0.113.5:5555,[2001:db8::1]:5555,example.org:1", id).into_bytes(),
+                format!(
+                    "{}@[2001:db8::2]:47239",
+                    id.text(crate::crypto::handshake::Version::V4)
+                )
+                .into_bytes(),
+                b"203.0.113.7:47239  [2001:db8::1]:5555,10.0.0.2:5555".to_vec(),
+            ]
+        }
         "addresses" => {
             let mut v = vec![96u8, 1, 2];
             v.extend_from_slice(
