@@ -1462,10 +1462,11 @@ async fn relay_over_stream(
     match tunnel.attach(i.relayed.port(), engine, shims) {
         Ok(shim) => {
             tracing::info!(
-                "relay {} will carry the transfer on its port {}, over {}",
+                "relay {} will carry the transfer on its port {}, over {}; carried from {}",
                 host,
                 i.relayed.port(),
-                over
+                over,
+                shim
             );
             let _ = streams.send(shim);
         }
@@ -1629,6 +1630,10 @@ const STREAM_RTO: Duration = Duration::from_secs(10);
 const STREAM_PACE: f64 = 5e9;
 /// How long to wait when a stream's queue would take no more.
 const STREAM_FULL_BACKOFF: Duration = Duration::from_millis(1);
+/// How often a carried session asks about a stream straight to the
+/// receiver, and after how many rounds of asking UDP in vain one is dialled.
+const DIRECT_STREAM_ASK: Duration = Duration::from_secs(2);
+const DIRECT_ROUNDS_BEFORE_TCP: u32 = 5;
 
 struct Engine {
     cfg: TransportConfig,
@@ -1739,6 +1744,9 @@ struct Engine {
     stream: Option<Arc<crate::transport::carrier::StreamStats>>,
     /// Whether UDP, answering, is held back (see `carrier::throttle`).
     throttle: crate::transport::carrier::throttle::Throttle,
+    /// When the session, on a relay's stream, last asked about a stream
+    /// straight to the receiver (see `prefer_direct_stream`).
+    direct_stream_asked_at: Instant,
     /// When the next such question goes out, and how many rounds have.
     next_direct_probe: Instant,
     direct_probes: u32,
@@ -1932,6 +1940,7 @@ impl Engine {
             carriers: Carriers::none(),
             stream: None,
             throttle: crate::transport::carrier::throttle::Throttle::new(now),
+            direct_stream_asked_at: now,
             next_direct_probe: now,
             direct_probes: 0,
             probes_sent: 0,
@@ -2384,7 +2393,8 @@ impl Engine {
     /// apart, that draw no answer from anyone but the receiver. A name the
     /// user gave may point at this host (see
     /// `address::class::is_sendable_named`).
-    fn add_candidate(&mut self, found: Found) {
+    /// Returns the address, as replies from it will arrive, when it is new.
+    fn add_candidate(&mut self, found: Found) -> Option<SocketAddr> {
         let local = self.socket.local_addr().unwrap_or(self.peer);
         let (addr, usable) = match found {
             Found::Relay(a) | Found::Carrier(a) => {
@@ -2400,15 +2410,13 @@ impl Engine {
         };
         if !usable {
             tracing::debug!("ignoring {}: not an address worth sending to", addr);
-            return;
+            return None;
         }
         // Written as replies from it will arrive, like every other
         // candidate.
-        let Some(addr) = self.reach.native(addr) else {
-            return;
-        };
+        let addr = self.reach.native(addr)?;
         if self.candidates.len() >= MAX_CANDIDATES || self.candidates.contains(&addr) {
-            return;
+            return None;
         }
         tracing::debug!("another address to try: {}", addr);
         // What a relay carries is not where the receiver is, and is no
@@ -2420,6 +2428,7 @@ impl Engine {
             self.peer_ips.insert(crate::address::canonical(addr).ip());
         }
         self.candidates.push(addr);
+        Some(addr)
     }
 
     /// A punch from an address that is not one we were given, but whose IP
@@ -2985,18 +2994,23 @@ impl Engine {
                 socket = self.socket.clone();
             }
             if let Some(found) = found {
-                let before = self.candidates.len();
-                self.add_candidate(found);
-                if self.candidates.len() != before {
-                    // Untried, so probe it now rather than after the backoff.
-                    next_attempt = Instant::now();
+                // Untried, so probed now rather than after the backoff —
+                // itself, not whatever is next round the ring.
+                if let Some(new) = self.add_candidate(found) {
+                    if self.secure.is_none() {
+                        self.send_initiation_to(Some(new))?;
+                    }
                 }
             }
             if let Some(shim) = stream {
                 // Tried at once, not at its turn round the ring: it came up
                 // because nothing else has answered.
                 self.add_stream(shim);
-                if self.secure.is_none() {
+                // Not a relay's while one straight to the receiver is up
+                // (see the same in `run`).
+                let passed_over =
+                    self.carriers.shims.via_relay(shim) && self.live_direct_stream().is_some();
+                if self.secure.is_none() && !passed_over {
                     self.send_initiation_to(self.reach.native(shim))?;
                 }
             }
@@ -3333,16 +3347,23 @@ impl Engine {
                         self.add_stream(shim);
                         // The path the session runs on has gone quiet: ask
                         // the receiver over the stream now, rather than once
-                        // the stall rules start trying everything.
+                        // the stall rules start trying everything. Not over a
+                        // relay's while one straight to the receiver is up:
+                        // that one is better, and each initiation makes the
+                        // one before it moot.
                         let now = Instant::now();
                         let quiet = now.saturating_duration_since(self.last_rx);
-                        if quiet >= Duration::from_secs(1) && self.fin_verdict.is_none() {
-                            self.send_initiation_to(self.reach.native(shim))?;
-                        } else if self.throttle.wants_stream() {
-                            // UDP answers, but is held back: the stream
-                            // dialled for the trial.
-                            if let Some(to) = self.reach.native(shim) {
-                                self.ask_stream_path(to, now);
+                        let passed_over = self.carriers.shims.via_relay(shim)
+                            && self.live_direct_stream().is_some();
+                        if !passed_over {
+                            if quiet >= Duration::from_secs(1) && self.fin_verdict.is_none() {
+                                self.send_initiation_to(self.reach.native(shim))?;
+                            } else if self.throttle.wants_stream() {
+                                // UDP answers, but is held back: the stream
+                                // dialled for the trial.
+                                if let Some(to) = self.reach.native(shim) {
+                                    self.ask_stream_path(to, now);
+                                }
                             }
                         }
                     }
@@ -4393,19 +4414,9 @@ impl Engine {
         lost > expected + 3.0 * (expected + 1.0).sqrt() + 1.0
     }
 
-    /// Tail loss probe: when data is in flight but nothing was sent and no
-    /// ACK made progress for about two RTTs, resend the last packet to
-    /// provoke an ACK that reveals which packets were lost, instead of
-    /// waiting for the RTO. ACKs without progress (the receiver repeating its
-    /// holes) do not postpone the probe, and the probe fires no later than
-    /// the RTO would, which it then postpones (RFC 8985 section 7.2): a lost
-    /// tail is repaired with the current window instead of a collapsed one.
-    /// Whether `addr` carries the transfer without being the receiver: a
-    /// port a relay set aside, or an address on a TURN server, or a
-    /// loopback address that stands for the receiver through one.
-    /// Whether `to` is passed over for now: a relay's or a TURN server's
-    /// address while the session runs directly and the receiver was heard
-    /// from there lately (see [`crate::transport::path::DIRECT_GRACE`]).
+    /// Whether `to` is passed over for now: a worse path than the one the
+    /// session runs on, while the receiver was heard there lately (see
+    /// [`crate::transport::path::DIRECT_GRACE`]).
     ///
     /// With UDP held back (see `carrier::throttle`) a stream is where the
     /// session goes, under a trial, and stays, while one holds it there.
@@ -4418,12 +4429,29 @@ impl Engine {
             return true;
         }
         crate::transport::path::keeps_direct(
-            self.is_relayed(to),
-            self.is_relayed(self.peer),
+            self.standing(to),
+            self.standing(self.peer),
             now.saturating_duration_since(self.heard_peer_at),
         )
     }
 
+    /// How good a path `addr` is (see `path::Standing`): a relay's or a TURN
+    /// server's, a stream straight to the receiver, or the receiver itself.
+    fn standing(&self, addr: SocketAddr) -> crate::transport::path::Standing {
+        use crate::transport::path::Standing;
+        let shims = &self.carriers.shims;
+        if shims.contains(addr) && !shims.via_relay(addr) {
+            Standing::Stream
+        } else if self.is_relayed(addr) {
+            Standing::Server
+        } else {
+            Standing::Direct
+        }
+    }
+
+    /// Whether `addr` carries the transfer without being the receiver: a
+    /// port a relay set aside, or an address on a TURN server, or a
+    /// loopback address that stands for the receiver through one.
     fn is_relayed(&self, addr: SocketAddr) -> bool {
         let addr = crate::address::canonical(addr);
         #[cfg(feature = "nat-traversal")]
@@ -4487,12 +4515,42 @@ impl Engine {
         self.candidates.push(addr);
     }
 
-    /// A stream to the receiver that is up: its address, if there is one.
+    /// A stream to the receiver that is up — one straight to it rather than
+    /// a relay's, if there is one: its address.
     fn live_stream(&self) -> Option<SocketAddr> {
-        self.candidates
-            .iter()
-            .copied()
-            .find(|c| self.carriers.shims.stats(*c).is_some_and(|s| s.alive()))
+        self.live_direct_stream().or_else(|| {
+            self.candidates
+                .iter()
+                .copied()
+                .find(|c| self.carriers.shims.stats(*c).is_some_and(|s| s.alive()))
+        })
+    }
+
+    /// A stream straight to the receiver that is up, if there is one.
+    fn live_direct_stream(&self) -> Option<SocketAddr> {
+        self.candidates.iter().copied().find(|c| {
+            !self.carriers.shims.via_relay(*c)
+                && self.carriers.shims.stats(*c).is_some_and(|s| s.alive())
+        })
+    }
+
+    /// The session is carried — by a relay's port, a TURN server or a
+    /// relay's stream — while a stream straight to the receiver is up: it
+    /// moves there, proving it as any path (a relay is somewhere to stand
+    /// until the way opens, not a place to stay; see `probe_direct`).
+    /// Asked every [`DIRECT_STREAM_ASK`] at most.
+    fn prefer_direct_stream(&mut self, now: Instant) {
+        let carried = self.standing(self.peer) == crate::transport::path::Standing::Server;
+        if self.secure.is_none()
+            || !carried
+            || now < self.direct_stream_asked_at + DIRECT_STREAM_ASK
+        {
+            return;
+        }
+        if let Some(to) = self.live_direct_stream() {
+            self.direct_stream_asked_at = now;
+            self.ask_stream_path(to, now);
+        }
     }
 
     /// Proves the stream at `to` as a path for the session, asking on our
@@ -4621,7 +4679,9 @@ impl Engine {
     /// address first, as for any change of address). A relay is somewhere to
     /// stand until the way opens, not a place to stay: it costs whoever runs
     /// it the bandwidth and is slower than what the two ends can manage
-    /// between them.
+    /// between them. After [`DIRECT_ROUNDS_BEFORE_TCP`] rounds with no
+    /// answer, TCP straight to the receiver is tried as well (see
+    /// `prefer_direct_stream`).
     ///
     /// Bounded: a few addresses, a datagram each, once a second at first
     /// and then every few seconds, and only while the session is carried.
@@ -4674,8 +4734,21 @@ impl Engine {
         for a in asked {
             self.send_unproven_ping(a);
         }
+        // UDP straight to the receiver has not answered for a while: TCP
+        // straight to it may, where a network lets no UDP through (see
+        // `prefer_direct_stream`).
+        if self.direct_probes >= DIRECT_ROUNDS_BEFORE_TCP && self.live_direct_stream().is_none() {
+            self.ask_for_streams(now, "no direct path over UDP while carried");
+        }
     }
 
+    /// Tail loss probe: when data is in flight but nothing was sent and no
+    /// ACK made progress for about two RTTs, resend the last packet to
+    /// provoke an ACK that reveals which packets were lost, instead of
+    /// waiting for the RTO. ACKs without progress (the receiver repeating its
+    /// holes) do not postpone the probe, and the probe fires no later than
+    /// the RTO would, which it then postpones (RFC 8985 section 7.2): a lost
+    /// tail is repaired with the current window instead of a collapsed one.
     fn maybe_send_tail_probe(&mut self, now: Instant) -> Result<(), SendError> {
         // On a stream nothing is lost that a probe could find: the stream
         // delivers it, or dies.
@@ -4805,6 +4878,7 @@ impl Engine {
             }
         }
         self.watch_throttle(now);
+        self.prefer_direct_stream(now);
         self.probe_direct(now);
         self.maybe_send_tail_probe(now)?;
         // Retransmission timeout. On a stream it only has to notice one that

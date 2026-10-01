@@ -78,6 +78,15 @@ impl Shims {
         self.map.read().contains_key(&canonical(addr))
     }
 
+    /// Whether the stream behind `addr` goes to a relay, which carries on a
+    /// port of its own, rather than to the receiver (port 0).
+    pub fn via_relay(&self, addr: SocketAddr) -> bool {
+        self.map
+            .read()
+            .get(&canonical(addr))
+            .is_some_and(|(_, port)| *port != 0)
+    }
+
     fn insert(&self, addr: SocketAddr, link: Link, port: u16) {
         self.map.write().insert(canonical(addr), (link, port));
     }

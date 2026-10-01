@@ -45,6 +45,19 @@ struct Args {
     #[arg(long)]
     relay_private: bool,
 
+    /// Keep to UDP. By default the receiver also takes senders over TCP, at
+    /// the port number of its UDP port, for networks that let no UDP
+    /// through; and reaches its relays over TCP, or TLS (see
+    /// --relay-tls-port), when its own UDP does not get through.
+    #[arg(long)]
+    no_tcp: bool,
+
+    /// The port relays take TLS on (see sharp-relay --tls), for a network
+    /// that lets little but HTTPS out. The session is bound to the relay's
+    /// identity, and one that something on the way opened is refused.
+    #[arg(long, value_name = "PORT", default_value_t = 443)]
+    relay_tls_port: u16,
+
     /// Do not publish this host's addresses on the local network (private
     /// IPv4, unique-local IPv6), only those the internet routes. Senders on
     /// the same network then come in through the router, or not at all;
@@ -233,6 +246,8 @@ async fn main() -> Result<()> {
     cfg.nat_traversal = !args.no_nat && cfg!(feature = "nat-traversal");
     cfg.relays = args.relays.clone();
     cfg.relay_private = args.relay_private;
+    cfg.tcp = !args.no_tcp;
+    cfg.relay_tls_port = args.relay_tls_port;
     cfg.publish_lan_addresses = !args.no_lan_addresses;
     cfg.announce_lan = args.announce_lan && cfg!(feature = "nat-traversal");
     cfg.nat_keepalive = std::time::Duration::from_secs(args.keepalive.clamp(1, 3600));

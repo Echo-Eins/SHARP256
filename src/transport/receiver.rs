@@ -456,21 +456,22 @@ impl Shared {
         self.socket.try_send(to, datagram)
     }
 
-    /// Whether `addr` carries a sender rather than being where it is: a
-    /// stream, a relay's port, a TURN address (see [`Relayed`]). A sender
-    /// moves to a stream when its UDP has gone quiet, and from one when UDP
-    /// answers again: in both, what still arrives over the path it left is
-    /// what was on its way, and following that back would have the session
-    /// swap paths for as long as it lasts.
-    fn carried(&self, addr: SocketAddr) -> bool {
-        if self.streams.contains(addr) {
-            return true;
-        }
+    /// How good a path `addr` is (see `path::Standing`): a relay's host or a
+    /// TURN address (see [`Relayed`]), a stream of a sender's own, or the
+    /// sender itself. A sender moves to a stream when its UDP has gone quiet,
+    /// and from one when UDP answers again: in both, what still arrives over
+    /// the path it left is what was on its way, and following that back
+    /// would have the session swap paths for as long as it lasts.
+    fn standing(&self, addr: SocketAddr) -> crate::transport::path::Standing {
+        use crate::transport::path::Standing;
         #[cfg(feature = "nat-traversal")]
         if self.relayed.contains(addr) {
-            return true;
+            return Standing::Server;
         }
-        false
+        if self.streams.contains(addr) {
+            return Standing::Stream;
+        }
+        Standing::Direct
     }
 
     /// Takes `bytes` of the queue budget; false when it is spent.
@@ -2118,6 +2119,11 @@ async fn over_stream(
             return None;
         }
     };
+    let over = match tls {
+        Some(t) if t.port() == addr.port() => "TLS",
+        _ => "TCP",
+    };
+    tracing::info!("relay reached over {} at {}", over, addr);
     {
         let leg_cancel = cancel.child_token();
         let (tunnel, rx) = crate::relay::tunnel::ClientTunnel::open(
@@ -3818,14 +3824,13 @@ impl Session {
 
     /// Something authentic arrived from the sender.
     ///
-    /// Whether `to` is passed over for now: a relay's port, a TURN shim of
-    /// ours or a TURN address on the sender's card, while the session runs
-    /// on a direct address the sender was heard from lately (see
+    /// Whether `to` is passed over for now: a worse path than the one the
+    /// session runs on, while the sender was heard there lately (see
     /// [`crate::transport::path::DIRECT_GRACE`]).
     fn keeps_direct(&self, to: SocketAddr, now: Instant) -> bool {
         crate::transport::path::keeps_direct(
-            self.shared.carried(to),
-            self.shared.carried(self.peer),
+            self.shared.standing(to),
+            self.shared.standing(self.peer),
             now.saturating_duration_since(self.heard_peer_at),
         )
     }

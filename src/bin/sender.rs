@@ -94,6 +94,21 @@ struct Args {
     #[arg(long = "relay", value_name = "[ID@]HOST:PORT")]
     relays: Vec<String>,
 
+    /// Keep to UDP. By default, when UDP does not get through — or gets
+    /// through held back, by a network that polices it — the transfer goes
+    /// over TCP instead: to the receiver at the port number of its UDP
+    /// port, and to the relays at theirs, or over TLS (see
+    /// --relay-tls-port).
+    #[arg(long)]
+    no_tcp: bool,
+
+    /// The port relays take TLS on: a relay whose ID is written in front of
+    /// it (--relay ID@HOST:PORT) is tried there too, for a network that
+    /// lets little but HTTPS out. The session is bound to the relay's
+    /// identity, and one that something on the way opened is refused.
+    #[arg(long, value_name = "PORT", default_value_t = 443)]
+    relay_tls_port: u16,
+
     /// Largest chunk of file bytes per packet (probed downwards if the path
     /// cannot carry it). Default fits a 1500-byte MTU.
     #[arg(long)]
@@ -296,6 +311,8 @@ async fn run_headless(args: &Args, file: PathBuf, receiver: String) -> Result<()
     }
     cfg.stun_servers = args.stun.clone();
     cfg.relays.extend(args.relays.iter().cloned());
+    cfg.carriers = !args.no_tcp;
+    cfg.relay_tls_port = args.relay_tls_port;
     cfg.state_dir = args.state_dir.clone();
     cfg.identity = Some(identity);
     if let Some(secret) = &args.secret {

@@ -69,13 +69,22 @@ pub const CHALLENGE_BYTES: usize = crate::crypto::transport::OVERHEAD + PATH_TOK
 /// (see the sender's re-handshakes after a stall).
 pub const DIRECT_GRACE: Duration = Duration::from_secs(3);
 
-/// Whether a claim for an address is to be passed over: it is a server's
-/// (`to_relayed`) while the session runs on a direct address
-/// (`!peer_relayed`) heard from `quiet` ago, within [`DIRECT_GRACE`]. A
-/// direct address is always worth asking, and a server's is when the
-/// session is on one already.
-pub fn keeps_direct(to_relayed: bool, peer_relayed: bool, quiet: Duration) -> bool {
-    to_relayed && !peer_relayed && quiet < DIRECT_GRACE
+/// How good a path is to stay on, best first: straight to the peer over
+/// UDP; straight to it over a stream (see `transport::carrier`); through
+/// somebody else's server — a relay's port or stream, a TURN server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Standing {
+    Direct,
+    Stream,
+    Server,
+}
+
+/// Whether a claim for an address is to be passed over: its path (`to`) is
+/// worse than the one the session runs on (`peer`), which was heard from
+/// `quiet` ago, within [`DIRECT_GRACE`]. A path as good or better is always
+/// worth asking, and a worse one once the session's own has gone quiet.
+pub fn keeps_direct(to: Standing, peer: Standing, quiet: Duration) -> bool {
+    to > peer && quiet < DIRECT_GRACE
 }
 
 /// A challenge the caller should send: `nonce` to `to`, as an authenticated
@@ -539,27 +548,36 @@ mod tests {
 
     /// A session on a direct path does not follow its peer to a server's
     /// address while the direct one is heard from; it does once that has
-    /// gone quiet, and a direct address is always worth asking.
+    /// gone quiet, and a direct address is always worth asking. A stream
+    /// straight to the peer stands between the two.
     #[test]
     fn a_direct_path_is_not_given_up_for_a_server_while_it_is_heard() {
+        use Standing::{Direct, Server, Stream};
         let recent = Duration::from_millis(200);
         let quiet = DIRECT_GRACE + Duration::from_millis(1);
-        assert!(keeps_direct(true, false, recent));
+        assert!(keeps_direct(Server, Direct, recent));
         assert!(
-            !keeps_direct(true, false, quiet),
+            !keeps_direct(Server, Direct, quiet),
             "gone quiet: back to the server"
         );
         assert!(
-            !keeps_direct(false, false, recent),
+            !keeps_direct(Direct, Direct, recent),
             "another direct address"
         );
         assert!(
-            !keeps_direct(false, true, recent),
+            !keeps_direct(Direct, Server, recent),
             "from a server to a direct one"
         );
         assert!(
-            !keeps_direct(true, true, recent),
+            !keeps_direct(Server, Server, recent),
             "from one server to another"
         );
+        assert!(keeps_direct(Stream, Direct, recent), "UDP over a stream");
+        assert!(
+            keeps_direct(Server, Stream, recent),
+            "a stream over a server"
+        );
+        assert!(!keeps_direct(Direct, Stream, recent), "back to UDP");
+        assert!(!keeps_direct(Stream, Server, recent), "off a server");
     }
 }
