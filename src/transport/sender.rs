@@ -894,22 +894,19 @@ impl Sender {
                         move |peer, news| {
                             use crate::nat::dht::PeerNews;
                             // Tried in the handshake only once vouched for,
-                            // like the punching in earnest: an initiation
-                            // is a kilobyte and a half in version 4, and
-                            // the handshakes go round every candidate for
-                            // as long as the meeting lasts. A peer whose
-                            // punches get through becomes a candidate by
-                            // them anyway (`Engine::on_punch`).
-                            let vouched = match news {
+                            // like the punching in earnest, and then only
+                            // so much until a punch from its host backs it
+                            // (see `Found::Dht`): an initiation is a
+                            // kilobyte and a half in version 4. What one
+                            // node named waits for that punch.
+                            let agreed = match news {
                                 PeerNews::Vouched | PeerNews::Found { vouched: true } => {
                                     punch.vouch(peer.ip());
                                     true
                                 }
                                 PeerNews::Found { vouched: false } => false,
                             };
-                            if vouched {
-                                let _ = found.send(Found::Relay(peer));
-                            }
+                            let _ = found.send(Found::Dht { addr: peer, agreed });
                             // Vouched for later: the punching started when
                             // it turned up, and only goes on in earnest now.
                             if news == PeerNews::Vouched {
@@ -1312,7 +1309,24 @@ enum Found {
     /// transfer over it is worth moving to a direct path once one opens.
     #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
     Carrier(SocketAddr),
+    /// From the DHT, whose nodes are anybody's: `agreed` when several of
+    /// them named it. Neither is enough by itself (see `DHT_INITIATIONS`):
+    /// in the real DHT one node often holds the receiver's announcement,
+    /// and nodes that answer with addresses of their own making agree with
+    /// each other.
+    #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
+    Dht { addr: SocketAddr, agreed: bool },
 }
+
+/// Initiations an address the DHT's nodes agree on gets before a punch from
+/// its host backs it. In the real DHT, nodes answered a receiver nobody
+/// else could know of with an address that was not its own, and agreed on
+/// it: 75 initiations, 100 kB, went there in five minutes. A receiver that
+/// is where the DHT says punches back (it looks the sender up too), and a
+/// punch lifts the bound; one reachable without punching answers within
+/// these.
+#[cfg(feature = "nat-traversal")]
+const DHT_INITIATIONS: u32 = 8;
 
 /// Each of `candidates` — as many as three, the ones the internet routes —
 /// reached through each TURN allocation too, once it has an address: the
@@ -1729,6 +1743,12 @@ struct Engine {
     /// the last went.
     #[cfg(feature = "nat-traversal")]
     reflexive: std::collections::HashMap<SocketAddr, (u32, Instant)>,
+    /// What the DHT named that no punch from its host has backed yet: an
+    /// address one node named (not tried; a punch from its host makes it a
+    /// candidate), or one its nodes agreed on and the initiations it has
+    /// had (see [`DHT_INITIATIONS`]).
+    #[cfg(feature = "nat-traversal")]
+    dht_unbacked: std::collections::HashMap<SocketAddr, Option<u32>>,
     /// TURN allocations, whose loopback addresses are places the receiver
     /// can be sent to and be heard from.
     #[cfg(feature = "nat-traversal")]
@@ -1934,6 +1954,8 @@ impl Engine {
             peer_ips,
             #[cfg(feature = "nat-traversal")]
             reflexive: std::collections::HashMap::new(),
+            #[cfg(feature = "nat-traversal")]
+            dht_unbacked: std::collections::HashMap::new(),
             #[cfg(feature = "nat-traversal")]
             turns: Vec::new(),
             relayed: std::collections::HashSet::new(),
@@ -2171,17 +2193,26 @@ impl Engine {
             // A receiver that has gone silent may simply have moved — its
             // address changed, or it is only reachable through a relay now —
             // so while it is silent the re-handshakes take turns among
-            // everything it is known by, its last address first. The
-            // answer, if any, says which one it is.
-            if !self.stalled || self.candidates.is_empty() {
+            // everything it is known by, its last address first, the rest
+            // best first (see `path::Standing`): UDP before a stream, the
+            // receiver before a server. The answer, if any, says which one
+            // it is. From the moment streams are asked for, not only once
+            // the stall rules start: else a relay's stream, up in a moment,
+            // beat its UDP port, which got its turn only after twenty
+            // seconds.
+            let quiet = Instant::now().saturating_duration_since(self.last_rx);
+            if (!self.stalled && quiet < self.quiet_for_alternatives())
+                || self.candidates.is_empty()
+            {
                 return Some(self.peer);
             }
-            let others: Vec<SocketAddr> = self
+            let mut others: Vec<SocketAddr> = self
                 .candidates
                 .iter()
                 .copied()
-                .filter(|c| *c != self.peer)
+                .filter(|c| *c != self.peer && !self.dht_spent(*c))
                 .collect();
+            others.sort_by_key(|c| self.standing(*c));
             let i = self.next_candidate % (others.len() + 1);
             self.next_candidate = self.next_candidate.wrapping_add(1);
             return Some(if i == 0 { self.peer } else { others[i - 1] });
@@ -2196,10 +2227,16 @@ impl Engine {
         }
         // Round the ring, however short. A single address used not to move
         // it, so it counted as untried for ever and the handshake never
-        // started backing off.
-        let target = self.candidates[self.next_candidate % self.candidates.len()];
-        self.next_candidate = self.next_candidate.wrapping_add(1);
-        Some(target)
+        // started backing off. Past what has had all it may.
+        let len = self.candidates.len();
+        for _ in 0..len {
+            let target = self.candidates[self.next_candidate % len];
+            self.next_candidate = self.next_candidate.wrapping_add(1);
+            if !self.dht_spent(target) {
+                return Some(target);
+            }
+        }
+        None
     }
 
     /// Whether any candidate address is still untried. While that holds, the
@@ -2397,7 +2434,7 @@ impl Engine {
     fn add_candidate(&mut self, found: Found) -> Option<SocketAddr> {
         let local = self.socket.local_addr().unwrap_or(self.peer);
         let (addr, usable) = match found {
-            Found::Relay(a) | Found::Carrier(a) => {
+            Found::Relay(a) | Found::Carrier(a) | Found::Dht { addr: a, .. } => {
                 (a, crate::address::class::is_sendable_hint(a, local))
             }
             Found::Named(a) => (a, crate::address::class::is_sendable_named(a, local)),
@@ -2415,6 +2452,28 @@ impl Engine {
         // Written as replies from it will arrive, like every other
         // candidate.
         let addr = self.reach.native(addr)?;
+        #[cfg(feature = "nat-traversal")]
+        match found {
+            // Named by one node: kept until a punch from its host backs it.
+            Found::Dht { agreed: false, .. } => {
+                if !self.candidates.contains(&addr) && self.dht_unbacked.len() < MAX_CANDIDATES {
+                    self.dht_unbacked.entry(addr).or_insert(None);
+                }
+                return None;
+            }
+            // Bounded only when the DHT is all that names it: an address the
+            // user gave, or a relay told, is tried as before.
+            Found::Dht { agreed: true, .. } if !self.candidates.contains(&addr) => {
+                let e = self.dht_unbacked.entry(addr).or_insert(Some(0));
+                if e.is_none() {
+                    *e = Some(0);
+                }
+            }
+            Found::Dht { .. } => {}
+            _ => {
+                self.dht_unbacked.remove(&addr);
+            }
+        }
         if self.candidates.len() >= MAX_CANDIDATES || self.candidates.contains(&addr) {
             return None;
         }
@@ -2464,7 +2523,7 @@ impl Engine {
         let via_turn = self.turns.iter().any(|t| t.is_shim(from));
         if !via_turn {
             let ip = crate::address::canonical(from).ip();
-            if !self.peer_ips.contains(&ip) {
+            if !self.back_dht(ip) && !self.peer_ips.contains(&ip) {
                 return Ok(());
             }
             let local = self.socket.local_addr().unwrap_or(self.peer);
@@ -2508,6 +2567,44 @@ impl Engine {
         self.send_initiation_to(self.reach.native(from))
     }
 
+    /// A punch came from `ip`: whatever the DHT named there is backed by it
+    /// — the receiver looks the sender up and punches at it, and what a
+    /// node merely says is not enough (see [`Found::Dht`]). Named
+    /// addresses become candidates, and the agreed ones get initiations
+    /// without bound. Whether there was any.
+    #[cfg(feature = "nat-traversal")]
+    fn back_dht(&mut self, ip: std::net::IpAddr) -> bool {
+        let named: Vec<(SocketAddr, Option<u32>)> = self
+            .dht_unbacked
+            .iter()
+            .filter(|(a, _)| crate::address::canonical(**a).ip() == ip)
+            .map(|(a, n)| (*a, *n))
+            .collect();
+        for (a, n) in &named {
+            self.dht_unbacked.remove(a);
+            if n.is_none() {
+                tracing::info!("a punch from its host backs what the DHT said: {}", a);
+                self.add_candidate(Found::Relay(*a));
+            }
+        }
+        !named.is_empty()
+    }
+
+    /// Whether `to` is an address only the DHT's nodes vouch for that has had
+    /// its [`DHT_INITIATIONS`].
+    fn dht_spent(&self, to: SocketAddr) -> bool {
+        #[cfg(feature = "nat-traversal")]
+        return self
+            .dht_unbacked
+            .get(&to)
+            .is_some_and(|n| n.is_some_and(|n| n >= DHT_INITIATIONS));
+        #[cfg(not(feature = "nat-traversal"))]
+        {
+            let _ = to;
+            false
+        }
+    }
+
     /// Starts a new handshake attempt: a fresh ephemeral key and connection
     /// id, carrying HELLO. The receiver answers with its current state.
     fn send_initiation(&mut self) -> Result<(), SendError> {
@@ -2521,6 +2618,20 @@ impl Engine {
         let Some(to) = to.or_else(|| self.next_target()) else {
             return Ok(());
         };
+        #[cfg(feature = "nat-traversal")]
+        if let Some(Some(n)) = self.dht_unbacked.get_mut(&to) {
+            if *n >= DHT_INITIATIONS {
+                return Ok(());
+            }
+            *n += 1;
+            if *n == DHT_INITIATIONS {
+                tracing::info!(
+                    "{}: as many initiations as an address the DHT alone vouches for gets; \
+                     more once a punch from its host backs it",
+                    to
+                );
+            }
+        }
         let (mut attempt, payload) = match self.auth.version {
             hs::Version::V3 => {
                 let attempt =
@@ -3356,7 +3467,13 @@ impl Engine {
                         let passed_over = self.carriers.shims.via_relay(shim)
                             && self.live_direct_stream().is_some();
                         if !passed_over {
-                            if quiet >= Duration::from_secs(1) && self.fin_verdict.is_none() {
+                            // UDP first: where another datagram path is
+                            // known, the stream waits for its turn round
+                            // the re-handshakes (see `next_target`).
+                            if quiet >= Duration::from_secs(1)
+                                && self.fin_verdict.is_none()
+                                && !self.other_datagram_path()
+                            {
                                 self.send_initiation_to(self.reach.native(shim))?;
                             } else if self.throttle.wants_stream() {
                                 // UDP answers, but is held back: the stream
@@ -4440,8 +4557,12 @@ impl Engine {
     fn standing(&self, addr: SocketAddr) -> crate::transport::path::Standing {
         use crate::transport::path::Standing;
         let shims = &self.carriers.shims;
-        if shims.contains(addr) && !shims.via_relay(addr) {
-            Standing::Stream
+        if shims.contains(addr) {
+            if shims.via_relay(addr) {
+                Standing::ServerStream
+            } else {
+                Standing::Stream
+            }
         } else if self.is_relayed(addr) {
             Standing::Server
         } else {
@@ -4540,7 +4661,7 @@ impl Engine {
     /// until the way opens, not a place to stay; see `probe_direct`).
     /// Asked every [`DIRECT_STREAM_ASK`] at most.
     fn prefer_direct_stream(&mut self, now: Instant) {
-        let carried = self.standing(self.peer) == crate::transport::path::Standing::Server;
+        let carried = self.standing(self.peer) >= crate::transport::path::Standing::Server;
         if self.secure.is_none()
             || !carried
             || now < self.direct_stream_asked_at + DIRECT_STREAM_ASK
@@ -4585,6 +4706,7 @@ impl Engine {
             delivered: self.received_bytes,
             left: self.size.saturating_sub(self.received_bytes),
             on_stream: self.stream.is_some(),
+            quiet: now.saturating_duration_since(self.last_rx),
         });
         let mbit = |rate: f64| rate * 8.0 / 1e6;
         match verdict {
@@ -4706,12 +4828,20 @@ impl Engine {
             } else {
                 SLOW
             };
+        // On a relay's stream, a relay's or TURN server's UDP port is a
+        // better place too (see `path::Standing`).
+        let on_relay_stream =
+            self.standing(self.peer) == crate::transport::path::Standing::ServerStream;
         #[cfg_attr(not(feature = "nat-traversal"), allow(unused_mut))]
         let mut asked: Vec<SocketAddr> = self
             .candidates
             .iter()
             .copied()
-            .filter(|a| *a != self.peer && !self.is_relayed(*a))
+            .filter(|a| {
+                *a != self.peer
+                    && !self.carriers.shims.contains(*a)
+                    && (on_relay_stream || !self.is_relayed(*a))
+            })
             .take(ADDRESSES)
             .collect();
         // The address of a meeting being proven is asked whatever else is
@@ -5026,7 +5156,7 @@ impl Engine {
         if self.secure.is_some()
             && self.stream.is_none()
             && self.fin_verdict.is_none()
-            && since_rx >= self.cfg.stall_timeout.min(Duration::from_secs(3))
+            && since_rx >= self.quiet_for_alternatives()
         {
             self.ask_for_streams(now, "the receiver has gone quiet over UDP");
         }
@@ -5074,12 +5204,27 @@ impl Engine {
             // live session answers with its current state, and a restarted
             // receiver (which lost the session keys) resumes from its saved
             // state.
-            let resync_after = self.cfg.stall_timeout.min(Duration::from_secs(3));
-            if since_rx >= resync_after && self.fin_verdict.is_none() {
+            if since_rx >= self.quiet_for_alternatives() && self.fin_verdict.is_none() {
                 self.send_initiation()?;
             }
         }
         Ok(())
+    }
+
+    /// How long the session's path may be quiet before the others are
+    /// tried: streams are dialled, and the re-handshakes go round every
+    /// address the receiver is known by.
+    fn quiet_for_alternatives(&self) -> Duration {
+        self.cfg.stall_timeout.min(Duration::from_secs(3))
+    }
+
+    /// Whether the receiver is known by a datagram path other than the one
+    /// the session is on: a stream is then tried at its turn, after it,
+    /// rather than at once (see `next_target`).
+    fn other_datagram_path(&self) -> bool {
+        self.candidates
+            .iter()
+            .any(|c| *c != self.peer && !self.carriers.shims.contains(*c) && !self.dht_spent(*c))
     }
 
     /// Sends HELLO over the session; the receiver answers with its exact

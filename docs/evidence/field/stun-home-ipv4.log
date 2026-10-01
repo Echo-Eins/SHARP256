@@ -1,0 +1,15 @@
+# sharp-probe with the default public STUN servers, port forwarding not asked
+SHARP-256 v0.5.0 (protocol v3) on linux x86_64 with 16 CPU threads
+Measuring (a few seconds)...
+2026-10-01T22:22:22.515388Z  INFO sharp256::nat: NAT: seen from outside at <this-network>:65006, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time))
+This host:           <lan>, <lan>, <lan>, <lan>, <lan>, <lan>
+IPv4:                your address as the internet sees it: <this-network>:65006; one port for every destination; filtering not measured (needs a STUN server with a second address); hairpinning works; reachable by punching (both sides send at the same time)
+IPv6:                not measured (no global IPv6 address, or no STUN server over IPv6)
+Port forwarding:     not asked
+Relays on the card:  0
+Addresses:           <this-network>:65006
+
+# which servers answered (debug log)
+DEBUG sharp256::nat::behaviour: STUN: Google stun.l.google.com:19302 sees us at <this-network>:54079
+DEBUG sharp256::nat::behaviour: STUN: Cloudflare stun.cloudflare.com:3478 sees us at <this-network>:54079
+DEBUG sharp256::nat::behaviour: STUN: Google stun.l.google.com:19302 offers no usable second address; falling back to comparing two servers

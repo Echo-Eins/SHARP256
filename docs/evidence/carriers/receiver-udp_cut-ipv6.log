@@ -2,32 +2,32 @@
 
 ## sender
 Connected to [2a0e:aa00:32::2]:5555 (encrypted, AES-256-GCM; chunk 1407 B)
-2026-10-01T20:52:28.459596Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 says the receiver is at [2a0e:aa00:32::2]:5555, and will carry the transfer on [2a0e:aa00:33::2]:53653
-2026-10-01T20:52:29.350886Z  WARN sharp256::transport::sender: full-size packets are lost while small ones get through (MTU black hole?): reducing chunk 1407 -> 1187
-2026-10-01T20:52:30.554130Z  WARN sharp256::transport::sender: full-size packets are lost while small ones get through (MTU black hole?): reducing chunk 1187 -> 593
-2026-10-01T20:52:31.966269Z  INFO sharp256::transport::sender: the receiver has gone quiet over UDP; trying the receiver over TCP as well
-2026-10-01T20:52:31.966357Z  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [[2a0e:aa00:32::2]:5555]
-2026-10-01T20:52:32.006730Z  INFO sharp256::transport::carrier::dial: the receiver answers over TCP at [2a0e:aa00:32::2]:5555; carried from 127.0.0.1:38476
-2026-10-01T20:52:32.006848Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 reached over TCP at [2a0e:aa00:33::2]:5560
-2026-10-01T20:52:32.031915Z  INFO sharp256::transport::sender: the session runs over TCP now ([2a0e:aa00:32::2]:5555 -> [::ffff:127.0.0.1]:38476)
-2026-10-01T20:52:32.050114Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 will carry the transfer on its port 40325, over TCP; carried from 127.0.0.1:37587
-2026-10-01T20:52:34.769069Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
+2026-10-01T23:03:21.215324Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 says the receiver is at [2a0e:aa00:32::2]:5555, and will carry the transfer on [2a0e:aa00:33::2]:44429
+2026-10-01T23:03:22.105321Z  WARN sharp256::transport::sender: full-size packets are lost while small ones get through (MTU black hole?): reducing chunk 1407 -> 1187
+2026-10-01T23:03:23.311715Z  WARN sharp256::transport::sender: full-size packets are lost while small ones get through (MTU black hole?): reducing chunk 1187 -> 593
+2026-10-01T23:03:24.719768Z  INFO sharp256::transport::sender: the receiver has gone quiet over UDP; trying the receiver over TCP as well
+2026-10-01T23:03:24.719862Z  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [[2a0e:aa00:32::2]:5555]
+2026-10-01T23:03:24.760937Z  INFO sharp256::transport::carrier::dial: the receiver answers over TCP at [2a0e:aa00:32::2]:5555; carried from 127.0.0.1:50256
+2026-10-01T23:03:24.761133Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 reached over TCP at [2a0e:aa00:33::2]:5560
+2026-10-01T23:03:24.788108Z  INFO sharp256::transport::sender: the session runs over TCP now ([2a0e:aa00:32::2]:5555 -> [::ffff:127.0.0.1]:50256)
+2026-10-01T23:03:24.802226Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 will carry the transfer on its port 37835, over TCP; carried from 127.0.0.1:59226
+2026-10-01T23:03:27.519132Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
 
 ## receiver
-2026-10-01T20:52:27.137417Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
-2026-10-01T20:52:27.208854Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 reached; it sees us at [2a0e:aa00:32::2]:5555
-2026-10-01T20:52:27.208877Z  INFO sharp256::transport::receiver: registered with the relay at [2a0e:aa00:33::2]:5560 (it sees us at [2a0e:aa00:32::2]:5555); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
+2026-10-01T23:03:19.884664Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
+2026-10-01T23:03:19.956898Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 reached; it sees us at [2a0e:aa00:32::2]:5555
+2026-10-01T23:03:19.956930Z  INFO sharp256::transport::receiver: registered with the relay at [2a0e:aa00:33::2]:5560 (it sees us at [2a0e:aa00:32::2]:5555); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
 Relay:       registered with [2a0e:aa00:33::2]:5560; senders can add --relay [2a0e:aa00:33::2]:5560
-2026-10-01T20:52:28.459606Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 is introducing [2a0e:aa00:31::2]:50809
-2026-10-01T20:52:32.086553Z  INFO sharp256::transport::receiver: sender address [2a0e:aa00:31::2]:46114 proven; moving the session there
+2026-10-01T23:03:21.214857Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 is introducing [2a0e:aa00:31::2]:35626
+2026-10-01T23:03:24.842452Z  INFO sharp256::transport::receiver: sender address [2a0e:aa00:31::2]:49116 proven; moving the session there
 
 ## relay
-Receivers: --relay sh-os6d7c42mplg7anx5oaj7pjl6hsbs6emsg3elvo23z4nrwb7vmfd2qqh@<this host>:5560
+Receivers: --relay sh-4tqj325shmq2glarthljssurtl5x6fdwj7uop7oc674qsr4orr3avwfp@<this host>:5560
 Senders:   --relay <this host>:5560
 Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
-2026-10-01T20:52:26.935523Z  INFO sharp256::relay::server: relay listening on [::]:5560
-2026-10-01T20:52:26.935532Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
-2026-10-01T20:52:26.935539Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
-2026-10-01T20:52:27.198673Z  INFO sharp256::relay::server: relay: sh-nn33wrao… registered at [2a0e:aa00:32::2]:5555
-2026-10-01T20:52:28.449527Z  INFO sharp256::relay::server: relay: port 53653 carries [2a0e:aa00:31::2]:50809 <-> [2a0e:aa00:32::2]:5555 (sh-nn33wrao…)
-2026-10-01T20:52:32.040009Z  INFO sharp256::relay::server: relay: port 40325 carries [2a0e:aa00:31::2]:38054 <-> [2a0e:aa00:32::2]:5555 (sh-nn33wrao…)
+2026-10-01T23:03:19.682246Z  INFO sharp256::relay::server: relay listening on [::]:5560
+2026-10-01T23:03:19.682257Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
+2026-10-01T23:03:19.682266Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
+2026-10-01T23:03:19.946637Z  INFO sharp256::relay::server: relay: sh-b4w7igeq… registered at [2a0e:aa00:32::2]:5555
+2026-10-01T23:03:21.204704Z  INFO sharp256::relay::server: relay: port 44429 carries [2a0e:aa00:31::2]:35626 <-> [2a0e:aa00:32::2]:5555 (sh-b4w7igeq…)
+2026-10-01T23:03:24.792116Z  INFO sharp256::relay::server: relay: port 37835 carries [2a0e:aa00:31::2]:39426 <-> [2a0e:aa00:32::2]:5555 (sh-b4w7igeq…)

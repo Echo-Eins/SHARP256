@@ -1,0 +1,48 @@
+# dht2: receiver announced in the Mainline DHT, sender given its ID alone; both on this host
+
+## receiver
+Output:      <dir>/out
+INFO sharp256::transport::receiver: receiver sh-<id> listening on 0.0.0.0:49518 (up to 64 datagrams per send), output <dir>/out
+INFO sharp256::transport::receiver: announcing in the DHT: every node asked learns this host's address, and anybody who knows this receiver's ID can look it up (a shared secret prevents that)
+DEBUG sharp256::nat: NAT: NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time)
+INFO sharp256::nat: NAT: seen from outside at <this-network>:3651, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time))
+Network: seen from outside at <this-network>:3651, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time))
+INFO sharp256::nat::dht: announced on the DHT to 7 node(s) (port Some(3651)/None)
+      2 INFO sharp256::nat::dht: the DHT says the other end is at <elsewhere>:37533 (one node says so, so far)
+      2 INFO sharp256::nat::punch: punching towards <elsewhere>:37533: plainly, until it is vouched for (it came from the DHT)
+INFO sharp256::nat::dht: the DHT says the other end is at <this-network>:12319 (one node says so, so far)
+INFO sharp256::nat::punch: <this-network>:12319 is vouched for: punching at it in earnest
+INFO sharp256::nat::punch: punching towards <this-network>:12319: the peer's address as told
+INFO sharp256::transport::receiver: transfer 84e81f1467ef2358c5ee16af94f470fe from <this-network>:12319 (sh-<id>): payload.bin (2000000 bytes) -> <dir>/payload.bin, AES-256-GCM
+DEBUG sharp256::transport::receiver: <this-network>:12319 reached directly: punching at it no more
+INFO sharp256::transport::receiver: transfer 84e81f1467ef2358c5ee16af94f470fe stored as <dir>/payload.bin (BLAKE3 f0f8e4552dbe0b90c95aee655baf95683503e3b55b7ec195ab44f341a6ccf714); confirming with sender
+INFO sharp256::transport::receiver: transfer 84e81f1467ef2358c5ee16af94f470fe finished: <dir>/payload.bin in 923.49ms, avg 17.3 Mbit/s
+Received <dir>/payload.bin in 923.49ms (17.3 Mbit/s avg), BLAKE3 f0f8e4552dbe0b90c95aee655baf95683503e3b55b7ec195ab44f341a6ccf714
+INFO sharp256::nat::dht: the DHT's nodes agree that the other end is at <this-network>:12319
+INFO sharp256::nat::dht: announced on the DHT to 7 node(s) (port Some(3651)/None)
+INFO sharp256::nat::dht: the DHT says the other end is at <elsewhere>:31961
+INFO sharp256::nat::punch: <elsewhere>:31961 is vouched for: punching at it in earnest
+INFO sharp256::nat::punch: punching towards <elsewhere>:31961: the peer's address as told
+INFO sharp256::nat::punch: punching towards <elsewhere>:31961: the ports the peer's NAT will hand out next (it counts up)
+INFO sharp256::nat::dht: announced on the DHT to 7 node(s) (port Some(3651)/None)
+INFO sharp256::nat::punch: punching towards <elsewhere>:31961: very many ports at the peer, which opens very many sockets at us
+
+## sender
+INFO sharp256::transport::sender: sender bound to [::]:44153 (up to 64 datagrams per send), file <dir>/payload.bin (2000000 bytes)
+File:      <dir>/payload.bin (1.91 MiB)
+INFO sharp256::transport::sender: no direct address for the receiver; asking the DHT and the relays
+INFO sharp256::transport::sender: looking for the receiver in the DHT: every node asked learns this host's address, and anybody who knows the receiver's ID can see it (a shared secret prevents that)
+DEBUG sharp256::nat: NAT: NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time)
+INFO sharp256::nat: NAT: seen from outside at <this-network>:12319, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time))
+INFO sharp256::nat::dht: the DHT says the other end is at <this-network>:3651 (one node says so, so far)
+INFO sharp256::nat::punch: punching towards [::ffff:<this-network>]:3651: plainly, until it is vouched for (it came from the DHT)
+INFO sharp256::nat::dht: announced on the DHT to 8 node(s) (port Some(12319)/None)
+INFO sharp256::nat::punch: [::ffff:<this-network>]:3651 is vouched for: punching at it in earnest
+INFO sharp256::transport::sender: a punch from its host backs what the DHT said: [::ffff:<this-network>]:3651
+INFO sharp256::nat::punch: punching towards [::ffff:<this-network>]:3651: the peer's address as told
+DEBUG sharp256::transport::sender: handshake initiation sent to [::ffff:<this-network>]:3651 (sh-<id>…)
+INFO sharp256::transport::sender: receiver answered at [::ffff:<this-network>]:3651
+Connected to [::ffff:<this-network>]:3651 (encrypted, AES-256-GCM; chunk 1427 B)
+DEBUG sharp256::transport::sender: the session runs directly to [::ffff:<this-network>]:3651; punching no more
+INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
+Done: 1.91 MiB in 822.43ms (19.5 Mbit/s avg), 0 B retransmitted, 0 loss events, BLAKE3 f0f8e4552dbe0b90c95aee655baf95683503e3b55b7ec195ab44f341a6ccf714

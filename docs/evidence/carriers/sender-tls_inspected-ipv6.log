@@ -1,26 +1,26 @@
 # sender's network: tls_inspected; IPv6; 7.6 s; refused: TLS opened on the way
 
 ## sender
-2026-10-01T20:51:31.133236Z  INFO sharp256::transport::sender: no answer over UDP yet; trying the receiver over TCP as well
-2026-10-01T20:51:31.133343Z  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [[2a0e:aa00:32::2]:5555]
-2026-10-01T20:51:33.640746Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560: the relay [2a0e:aa00:33::2]:5560 did not answer
-2026-10-01T20:51:36.135591Z  WARN sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used (TLS at [2a0e:aa00:33::2]:443: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used; TCP at [2a0e:aa00:33::2]:5560: no answer); not using it
-2026-10-01T20:51:36.135668Z  INFO sharp256::transport::carrier::dial: the receiver does not answer over TCP either
+2026-10-01T23:02:24.144364Z  INFO sharp256::transport::sender: no answer over UDP yet; trying the receiver over TCP as well
+2026-10-01T23:02:24.144548Z  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [[2a0e:aa00:32::2]:5555]
+2026-10-01T23:02:26.650483Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560: the relay [2a0e:aa00:33::2]:5560 did not answer
+2026-10-01T23:02:29.145761Z  INFO sharp256::transport::carrier::dial: the receiver does not answer over TCP either
+2026-10-01T23:02:29.145998Z  WARN sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used (TLS at [2a0e:aa00:33::2]:443: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used; TCP at [2a0e:aa00:33::2]:5560: no answer); not using it
 
 ## receiver
-2026-10-01T20:51:29.412700Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
-2026-10-01T20:51:29.484366Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 reached; it sees us at [2a0e:aa00:32::2]:5555
-2026-10-01T20:51:29.484392Z  INFO sharp256::transport::receiver: registered with the relay at [2a0e:aa00:33::2]:5560 (it sees us at [2a0e:aa00:32::2]:5555); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
+2026-10-01T23:02:22.419984Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
+2026-10-01T23:02:22.491958Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 reached; it sees us at [2a0e:aa00:32::2]:5555
+2026-10-01T23:02:22.491984Z  INFO sharp256::transport::receiver: registered with the relay at [2a0e:aa00:33::2]:5560 (it sees us at [2a0e:aa00:32::2]:5555); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
 Relay:       registered with [2a0e:aa00:33::2]:5560; senders can add --relay [2a0e:aa00:33::2]:5560
 
 ## relay
-Receivers: --relay sh-ufhokhiscdiuvnpfs64te5okragn6v7fijijqeehv3uo75fvmqavcewk@<this host>:5560
+Receivers: --relay sh-7cix3piyxdso3jtweoqmwrsxorcyty6gdc7t36e4l5rgitkzr4nsje7d@<this host>:5560
 Senders:   --relay <this host>:5560
 Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
-2026-10-01T20:51:29.005587Z  INFO sharp256::relay::server: relay listening on [::]:5560
-2026-10-01T20:51:29.005597Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
-2026-10-01T20:51:29.005604Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
-2026-10-01T20:51:29.474073Z  INFO sharp256::relay::server: relay: sh-6bfqoo43… registered at [2a0e:aa00:32::2]:5555
+2026-10-01T23:02:22.010234Z  INFO sharp256::relay::server: relay listening on [::]:5560
+2026-10-01T23:02:22.010245Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
+2026-10-01T23:02:22.010253Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
+2026-10-01T23:02:22.481712Z  INFO sharp256::relay::server: relay: sh-37b6cryx… registered at [2a0e:aa00:32::2]:5555
 
 ## proxy
 inspecting TLS on port 8443

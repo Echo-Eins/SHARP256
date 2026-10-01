@@ -35,6 +35,11 @@ use std::time::{Duration, Instant};
 pub const WINDOW: Duration = Duration::from_secs(5);
 /// What a window must have sent to say anything.
 const ENOUGH: u64 = 64 << 10;
+/// Silence that makes a window an outage's, not a policer's: the path went
+/// quiet, which the stall rules deal with (in the laboratory, a cut direct
+/// path was taken for UDP held back, and the session held on a relay's
+/// stream for two minutes).
+const OUTAGE: Duration = Duration::from_secs(1);
 /// Resent over sent, past which UDP is suspect whatever is left.
 const HEAVY_LOSS: f64 = 0.10;
 /// Resent over sent, past which UDP is suspect when much is left.
@@ -68,6 +73,8 @@ pub struct Sample {
     pub left: u64,
     /// Whether the session runs on a stream.
     pub on_stream: bool,
+    /// How long since anything came from the other end.
+    pub quiet: Duration,
 }
 
 /// What has to be done, or said.
@@ -257,6 +264,11 @@ impl Throttle {
         }
         // Back on UDP: whatever kept the session off it is over.
         self.keep_until = None;
+        if s.quiet >= OUTAGE {
+            // Measured afresh once the path speaks again.
+            self.window = None;
+            return Verdict::Nothing;
+        }
         let Some(w) = self.window else {
             self.window = Some(Mark::of(&s));
             return Verdict::Nothing;
@@ -314,6 +326,7 @@ mod tests {
                     delivered: 0,
                     left: size,
                     on_stream: false,
+                    quiet: Duration::ZERO,
                 },
             }
         }
@@ -421,6 +434,25 @@ mod tests {
             r.carry(6.0, 1.0 * MB, 0.02)[..],
             [Verdict::Try { .. }]
         ));
+    }
+
+    #[test]
+    fn an_outage_is_not_taken_for_a_policer() {
+        let mut r = Run::new(10_000_000_000);
+        r.carry(3.0, 1.0 * MB, 0.0);
+        // The path goes quiet: everything sent is resent, nothing arrives,
+        // nothing comes back — a tenth and more lost, a window's worth sent.
+        for i in 1..=24u32 {
+            r.s.now += Duration::from_millis(250);
+            r.s.sent += 250_000;
+            r.s.resent += 250_000;
+            r.s.quiet = Duration::from_millis(250) * i;
+            assert_eq!(r.t.tick(r.s), Verdict::Nothing);
+        }
+        // It speaks again, as it was: measured afresh, and clean.
+        r.s.quiet = Duration::ZERO;
+        assert!(r.carry(6.0, 1.0 * MB, 0.0).is_empty());
+        assert!(!r.t.wants_stream());
     }
 
     #[test]

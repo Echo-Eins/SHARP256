@@ -1,0 +1,43 @@
+# dht: receiver announced in the Mainline DHT, sender given its ID alone; both on this host
+
+## receiver
+Output:      <dir>/out
+INFO sharp256::transport::receiver: receiver sh-<id> listening on 0.0.0.0:53876 (up to 64 datagrams per send), output <dir>/out
+INFO sharp256::transport::receiver: announcing in the DHT: every node asked learns this host's address, and anybody who knows this receiver's ID can look it up (a shared secret prevents that)
+DEBUG sharp256::nat: NAT: NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time)
+INFO sharp256::nat: NAT: seen from outside at <this-network>:58377, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time))
+Network: seen from outside at <this-network>:58377, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time))
+INFO sharp256::nat::dht: announced on the DHT to 8 node(s) (port Some(58377)/None)
+INFO sharp256::nat::dht: the DHT says the other end is at <this-network>:14955 (one node says so, so far)
+INFO sharp256::nat::punch: punching towards <this-network>:14955: plainly, until it is vouched for (it came from the DHT)
+INFO sharp256::nat::dht: the DHT's nodes agree that the other end is at <this-network>:14955
+INFO sharp256::nat::punch: <this-network>:14955 is vouched for: punching at it in earnest
+INFO sharp256::nat::punch: punching towards <this-network>:14955: the peer's address as told
+INFO sharp256::nat::punch: punching towards <this-network>:14955: the ports the peer's NAT will hand out next (it counts up)
+INFO sharp256::nat::punch: punching towards <this-network>:14955: very many ports at the peer, which opens very many sockets at us
+INFO sharp256::nat::dht: announced on the DHT to 8 node(s) (port Some(58377)/None)
+
+## sender
+INFO sharp256::transport::sender: sender bound to [::]:38247 (up to 64 datagrams per send), file <dir>/payload.bin (2000000 bytes)
+File:      <dir>/payload.bin (1.91 MiB)
+INFO sharp256::transport::sender: no direct address for the receiver; asking the DHT and the relays
+INFO sharp256::transport::sender: looking for the receiver in the DHT: every node asked learns this host's address, and anybody who knows the receiver's ID can see it (a shared secret prevents that)
+DEBUG sharp256::nat: NAT: NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time)
+INFO sharp256::nat: NAT: seen from outside at <this-network>:14955, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairpinning works; reachable by punching (both sides send at the same time))
+INFO sharp256::nat::dht: the DHT says the other end is at <elsewhere>:31817
+INFO sharp256::nat::punch: [::ffff:<elsewhere>]:31817 is vouched for: punching at it in earnest
+INFO sharp256::nat::punch: punching towards [::ffff:<elsewhere>]:31817: the peer's address as told
+      5 DEBUG sharp256::transport::sender: handshake initiation sent to [::ffff:<elsewhere>]:31817 (sh-<id>…)
+INFO sharp256::nat::punch: punching towards [::ffff:<elsewhere>]:31817: the ports the peer's NAT will hand out next (it counts up)
+INFO sharp256::nat::dht: announced on the DHT to 8 node(s) (port Some(14955)/None)
+      2 DEBUG sharp256::transport::sender: handshake initiation sent to [::ffff:<elsewhere>]:31817 (sh-<id>…)
+INFO sharp256::nat::punch: punching towards [::ffff:<elsewhere>]:31817: very many ports at the peer, which opens very many sockets at us
+     34 DEBUG sharp256::transport::sender: handshake initiation sent to [::ffff:<elsewhere>]:31817 (sh-<id>…)
+INFO sharp256::nat::dht: the DHT says the other end is at <this-network>:58377 (one node says so, so far)
+INFO sharp256::nat::punch: [::ffff:<this-network>]:58377 is vouched for: punching at it in earnest
+INFO sharp256::nat::punch: punching towards [::ffff:<this-network>]:58377: the peer's address as told
+      3 DEBUG sharp256::transport::sender: handshake initiation sent to [::ffff:<elsewhere>]:31817 (sh-<id>…)
+INFO sharp256::nat::punch: punching towards [::ffff:<this-network>]:58377: the ports the peer's NAT will hand out next (it counts up)
+      2 DEBUG sharp256::transport::sender: handshake initiation sent to [::ffff:<elsewhere>]:31817 (sh-<id>…)
+INFO sharp256::nat::punch: punching towards [::ffff:<this-network>]:58377: very many ports at the peer, which opens very many sockets at us
+     29 DEBUG sharp256::transport::sender: handshake initiation sent to [::ffff:<elsewhere>]:31817 (sh-<id>…)

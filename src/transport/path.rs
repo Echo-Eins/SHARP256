@@ -71,12 +71,15 @@ pub const DIRECT_GRACE: Duration = Duration::from_secs(3);
 
 /// How good a path is to stay on, best first: straight to the peer over
 /// UDP; straight to it over a stream (see `transport::carrier`); through
-/// somebody else's server — a relay's port or stream, a TURN server.
+/// somebody else's server — a relay's port or a TURN server; a relay's
+/// stream, which is that server and TCP's costs on top. (Only a sender
+/// tells the last two apart: to a receiver both come from the relay's port.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Standing {
     Direct,
     Stream,
     Server,
+    ServerStream,
 }
 
 /// Whether a claim for an address is to be passed over: its path (`to`) is
@@ -552,7 +555,7 @@ mod tests {
     /// straight to the peer stands between the two.
     #[test]
     fn a_direct_path_is_not_given_up_for_a_server_while_it_is_heard() {
-        use Standing::{Direct, Server, Stream};
+        use Standing::{Direct, Server, ServerStream, Stream};
         let recent = Duration::from_millis(200);
         let quiet = DIRECT_GRACE + Duration::from_millis(1);
         assert!(keeps_direct(Server, Direct, recent));
@@ -579,5 +582,13 @@ mod tests {
         );
         assert!(!keeps_direct(Direct, Stream, recent), "back to UDP");
         assert!(!keeps_direct(Stream, Server, recent), "off a server");
+        assert!(
+            keeps_direct(ServerStream, Server, recent),
+            "a relay's port over its stream"
+        );
+        assert!(
+            !keeps_direct(Server, ServerStream, recent),
+            "and back to it"
+        );
     }
 }

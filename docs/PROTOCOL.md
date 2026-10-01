@@ -1561,8 +1561,14 @@ have named it (`VOUCHERS`; an announcement is stored on every node it goes
 to), or a punch has come from its host — and the predictions, sprays and
 birthday sockets of unknown-NAT punching after. The sender tries it in the
 handshake only once it is vouched for, too (a version 4 initiation is a
-kilobyte and a half); a peer whose punches get through becomes a candidate
-by them anyway. Until something vouched for
+kilobyte and a half), and an address only the nodes vouch for gets eight
+initiations (`DHT_INITIATIONS`) until a punch from its host backs it: in the
+real DHT, nodes answered a receiver nobody else could know of with an
+address that was not its own, and agreed on it (`docs/evidence/field/`). A
+punch from the host of an address the DHT named — the receiver looks the
+sender up and punches at it — makes that address a candidate at once,
+however many nodes named it: in the real DHT one node often holds the
+announcement. Until something vouched for
 has turned up, the lookups go on at the brisk pace: an address one node made
 up is no reason to look less often for the real one. Nothing is said of the
 NAT in front of an address, which is why unknown-NAT punching above exists.
@@ -1631,7 +1637,8 @@ addresses on the cards it was given. A direct path that stays quiet longer
 is left in the usual way (below). A stream straight to the other end
 (see carriers, below) stands between the two: a session on UDP does not
 follow the other end onto a stream while UDP is heard, and one on a stream
-does not follow it onto a server's address while the stream is.
+does not follow it onto a server's address while the stream is. A relay's
+stream ranks below the relay's own UDP port.
 
 A sender whose NAT draws its ports at random meets a receiver behind an
 ordinary one with many sockets (section 8, punching), and only the socket
@@ -1652,12 +1659,15 @@ socket is let go.
 ### Going back to a server
 
 A direct path can die in the middle of a transfer: a gateway reboots and
-forgets its mappings, a firewall rule changes, a route goes. The sender
-notices the silence after `stall_timeout` (20 s by default); from then on
-its re-handshakes go round every address the receiver is known by, the
-servers' among them, each from the socket it is reached from, and whichever
-answers carries the session (the transfer resumes where it stopped, as after
-any silence). A server's way stays open only as long as the server keeps
+forgets its mappings, a firewall rule changes, a route goes. Once the
+session's path has been quiet for `min(stall_timeout, 3 s)`, the sender's
+re-handshakes go round every address the receiver is known by — its last
+one first, then the rest best first: UDP straight to the receiver, a stream
+straight to it, a server's UDP port, a relay's stream (see carriers, below)
+— each from the socket it is reached from, and whichever answers carries the
+session (the transfer resumes where it stopped, as after any silence). The
+stall rules proper (`stall_timeout`, 20 s by default) only pause sending
+and say so. A server's way stays open only as long as the server keeps
 it: a relay releases a pair's port after a minute with nothing flowing
 (`sharp-relay --idle`), so a direct path that dies later than that has only
 a TURN server to go back to — its allocations are kept by both ends for as
@@ -1712,12 +1722,15 @@ Each stream is joined to the engine through a *shim*, a loopback UDP socket
 that stands for the stream as a TURN shim stands for the server, so a
 stream is one more address of the receiver's, moved to and from by proving
 it like any other (section 8, address validation). A stream that comes up
-while the session has been quiet for a second gets an initiation at once.
-An initiation makes the one before it moot; so while a stream straight to
-the receiver is up, a relay's stream gets none, and a session that ended
-up on a relay's stream all the same moves to the direct one — by proving
-it, asked every two seconds — when there is one. `sharp-sender --no-tcp`
-keeps to UDP.
+while the session has been quiet for a second gets an initiation at once
+when no other datagram path is known; otherwise it waits its turn round the
+re-handshakes, after the UDP ones (going back to a server, above): UDP
+first, a stream where UDP does not get through. An initiation makes the one
+before it moot; so while a stream straight to the receiver is up, a relay's
+stream gets none, and a session that ended up on a relay's stream all the
+same moves to the direct one — by proving it, asked every two seconds —
+when there is one; on a relay's stream the sender also asks the servers'
+UDP ports, which rank above it. `sharp-sender --no-tcp` keeps to UDP.
 
 **On a stream**, the engine steps aside for TCP: a stream is reliable and
 has congestion control of its own, and running the session's own as well
@@ -1766,22 +1779,25 @@ says why: the sender's error names the relay whose TLS was opened on the
 way, should nothing else get through, and the receiver logs it.
 
 **UDP held back.** A policer looks, from inside, just like a slow link with
-a shallow buffer; only the other carrier tells them apart. Over windows of
-5 s the sender measures what had to be sent again and what got through.
-When a tenth or more was sent again — or a hundredth, with at least 30 s
-still to go at the rate measured — and at least 15 s are left, it moves the
-session to a stream for a trial: one already up, or one dialled now, which
-the sender proves as a path on its own initiative (a packet on the UDP path
-does not end that asking, as it ends a claim the other end made). 4 s are
-given to the receiver to follow, 6 s are measured. TCP that carries at
-least 1.25 times what UDP did is kept for 2 minutes, twice as long after
-each such trial in a row, up to 30; otherwise the session goes back to UDP
-and the next trial waits a minute, doubling likewise. While a trial or a
-hold keeps it on the stream, the sender asks no UDP address whether it
-answers, and does not follow the receiver back to UDP; the receiver follows
-onto the stream once it no longer hears the sender over UDP
-(`DIRECT_GRACE`). After a hold the session goes back to UDP as after any
-stream, and a UDP still held back is found out again and left for longer.
+a shallow buffer; only the other carrier tells them apart. Over windows of 5
+s the sender measures what had to be sent again and what got through. A
+window in which the path went quiet for a second or more is an outage's, not
+a policer's, and is not counted (in the laboratory, a direct path that was
+cut had been taken for a policed one). When a tenth or more was sent again —
+or a hundredth, with at least 30 s still to go at the rate measured — and at
+least 15 s are left, it moves the session to a stream for a trial: one
+already up, or one dialled now, which the sender proves as a path on its own
+initiative (a packet on the UDP path does not end that asking, as it ends a
+claim the other end made). 4 s are given to the receiver to follow, 6 s are
+measured. TCP that carries at least 1.25 times what UDP did is kept for 2
+minutes, twice as long after each such trial in a row, up to 30; otherwise
+the session goes back to UDP and the next trial waits a minute, doubling
+likewise. While a trial or a hold keeps it on the stream, the sender asks no
+UDP address whether it answers, and does not follow the receiver back to
+UDP; the receiver follows onto the stream once it no longer hears the sender
+over UDP (`DIRECT_GRACE`). After a hold the session goes back to UDP as
+after any stream, and a UDP still held back is found out again and left for
+longer.
 
 ## 9. Security considerations
 
