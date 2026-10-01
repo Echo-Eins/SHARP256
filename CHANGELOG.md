@@ -264,6 +264,11 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - `docs/THREAT_MODEL.md`: adversary classes and what each can achieve, every
   guarantee with the mechanism responsible, explicit non-goals and residual
   risks.
+- `docs/ROADMAP.md`: what is left and in which order, each item with its
+  priority, a "done when" and the residual risk it closes: proofs, checks of
+  the implementation, storage and transport, denial of service, NAT in real
+  networks, carriers, traffic analysis, the specification, operations and
+  independent review, with the status of each.
 
 ### Secret hygiene
 - Every crate that holds a key now wipes it when it is dropped. The
