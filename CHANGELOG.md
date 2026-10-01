@@ -78,6 +78,35 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   when the stream's reader beat its registration; an address found during
   the handshake was not tried at once but whatever was next round the
   ring.
+- After the direct path went quiet, a relay's stream — up in a moment —
+  carried the rest of the transfer while the relay's UDP port, which
+  worked, got its turn only after the 20 s stall timeout; and the cut was
+  taken for UDP held back, holding the session on TCP for two minutes.
+  Now the re-handshakes go round every address once the path has been
+  quiet for 3 s, UDP first and a relay's stream last; a stream waits its
+  turn where another datagram path is known; a window with an outage in it
+  is not measured for a policer.
+
+### Field tests, and the real network
+- `docs/FIELD.md` and `scripts/field/field.sh`: how two people in
+  different networks run SHARP-256 and send back what happened — the
+  scenarios, the commands (Windows too), a table to fill in, and an
+  archive of the reports without keys, state or received files.
+- `docs/RELAY.md` and `contrib/systemd/sharp-relay.service`: a relay on a
+  server of one's own — the ports, a hardened unit (exposure 1.5 by
+  `systemd-analyze security`, run under its syscall filter), lists and
+  quotas, what the relay sees.
+- Logs are coloured only on a terminal (and never with `NO_COLOR`): sent
+  to a file or a pipe they were full of escapes.
+- Checked from a home network for the first time (`docs/evidence/field/`):
+  the default public STUN servers answer, and the real Mainline DHT works
+  — after two fixes. The receiver's announcement was held by one node,
+  and an address one node names was tried only once two agreed, though
+  the receiver's punches were coming in: now a punch from the host of an
+  address the DHT named makes it a candidate. And for a fresh ID the
+  DHT's nodes named a stranger's address and agreed on it, so all 75
+  initiations of five minutes went there: an address only the nodes vouch
+  for now gets eight until a punch backs it.
 
 ### Supply chain
 - Advisories fixed by updates within Rust 1.82: `bytes` (RUSTSEC-2026-0007),

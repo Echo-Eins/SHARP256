@@ -40,10 +40,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// with an optional default (`sharp256::nat=trace,info`); one that does not
 /// parse is passed over.
 pub fn init_logging(level: &str) {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, prelude::*};
     let filter = log_filter(std::env::var("RUST_LOG").ok().as_deref(), level);
+    // Colours for a terminal only: a log kept in a file or sent through a
+    // pipe — the way one is sent back from a field test — is read as text,
+    // and escapes in it are noise. NO_COLOR (no-color.org) turns them off
+    // anywhere.
+    let ansi = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let _ = tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_ansi(ansi))
         .with(filter)
         .try_init();
 }
