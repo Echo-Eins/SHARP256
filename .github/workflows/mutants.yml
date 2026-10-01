@@ -1,0 +1,186 @@
+# Mutation testing (docs/MUTANTS.md): cargo-mutants changes the code one
+# place at a time and runs the tests; a change no test notices is a test
+# missing. Every mutant of the crate, in shards — by hand, once a month,
+# and when what is mutated or how changes (.cargo/mutants.toml, this
+# file); on a pull request, the mutants in the lines it changes. Actions
+# are pinned by commit, cargo-mutants by version.
+name: Mutation testing
+
+on:
+  pull_request:
+  push:
+    paths:
+      - .cargo/mutants.toml
+      - .github/workflows/mutants.yml
+  schedule:
+    - cron: "23 1 9 * *"
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: Shards to split the mutants into
+        default: "80"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_MUTANTS: 27.1.0
+  # No debug information: most of what each build writes, and nothing
+  # mutation testing reads.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  build:
+    name: Build once for every shard
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+      toolchain: ${{ steps.plan.outputs.toolchain }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: GTK (the GUI's file dialogs link against it on Linux)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev
+      - name: cargo-mutants
+        run: cargo install --locked "cargo-mutants@$CARGO_MUTANTS"
+      - name: The tests, built as cargo-mutants builds them
+        run: cargo test --all-features --tests --no-run
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/cargo-mutants
+            target
+          key: mutants-${{ github.sha }}
+      - name: Shards
+        id: plan
+        run: |
+          n="${{ github.event.inputs.shards || '80' }}"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          # The shards build with this very compiler, or the cache is no use
+          # to them: a run takes the better part of a day.
+          echo "toolchain=$(rustc -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+          echo "shards=[$(seq -s, 0 $((n - 1)))]" >> "$GITHUB_OUTPUT"
+          echo "$(cargo mutants --list | wc -l) mutants in $n shards" >> "$GITHUB_STEP_SUMMARY"
+
+  shard:
+    name: Mutants, shard ${{ matrix.shard }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain (the build's)
+        run: |
+          rustup toolchain install "${{ needs.build.outputs.toolchain }}" --profile minimal
+          rustup default "${{ needs.build.outputs.toolchain }}"
+      - name: GTK
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/cargo-mutants
+            target
+          key: mutants-${{ github.sha }}
+          fail-on-cache-miss: true
+      - name: Mutants
+        run: |
+          set +e
+          # Stopped short of the job's limit, so that what was tested is kept.
+          timeout -s INT 320m cargo mutants --in-place --no-shuffle -vV \
+            --shard "${{ matrix.shard }}/${{ needs.build.outputs.count }}"
+          status=$?
+          set -e
+          # 0 all caught, 2 some missed, 3 some timed out, 124 out of time:
+          # the results are the artifact. Anything else (4: the tests fail
+          # unmutated) is a failure of the run.
+          echo "cargo mutants: exit status $status"
+          case $status in 0|2|3|124) ;; *) exit "$status" ;; esac
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+
+  summary:
+    name: Summary
+    needs: [build, shard]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: mutants-shard-*
+          path: shards
+      - name: Merge
+        run: |
+          python3 scripts/mutants-summary.py shards summary
+          cat summary/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutants-summary
+          path: summary
+
+  changes:
+    name: Mutants in the change
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: GTK
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/cargo-mutants
+            target
+          key: mutants-pr-${{ hashFiles('Cargo.lock') }}
+      - name: cargo-mutants
+        run: command -v cargo-mutants || cargo install --locked "cargo-mutants@$CARGO_MUTANTS"
+      - name: Mutants in the lines the pull request changes
+        run: |
+          git diff "origin/${{ github.base_ref }}...HEAD" -- '*.rs' > change.diff
+          if [ ! -s change.diff ]; then
+            echo "no Rust changed" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          n=$(cargo mutants --list --in-diff change.diff | wc -l)
+          echo "$n mutants in the change" | tee -a "$GITHUB_STEP_SUMMARY"
+          # About two minutes each: a change with more is left to the
+          # monthly run of them all.
+          if [ "$n" -gt 150 ]; then
+            echo "more than 150: left to the run of every mutant" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$n" -gt 0 ]; then
+            cargo mutants --in-place --no-shuffle -vV --in-diff change.diff
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: mutants-change
+          path: mutants.out
+          if-no-files-found: ignore

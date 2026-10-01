@@ -124,6 +124,15 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   replaces the minute per target. `scripts/fuzz-coverage.sh` measures any
   corpus down to its branches. See [docs/FUZZING.md](docs/FUZZING.md).
 
+### Mutation testing
+- cargo-mutants over the whole crate in CI (7740 mutants; the code only
+  tests and fuzzers compile is left out): every mutant in 80 shards once a
+  month, by hand and when its settings change, and on a pull request the
+  mutants in the lines it changes. The summary sets apart the mutants in
+  code not compiled where the run is (a `#[cfg]` false on Linux with every
+  feature). A missed mutant is a test to write. See
+  [docs/MUTANTS.md](docs/MUTANTS.md).
+
 ### Security
 - Long-term X25519 identities, created on first use and kept in the
   per-user data directory with owner-only permissions. A peer is addressed

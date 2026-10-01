@@ -109,7 +109,8 @@ Mozilla, Google, Bytecode Alliance, ISRG, Zcash и Embark. Ими покрыто
 проекта.
 
 **Действия GitHub** во всех workflow закреплены по коммиту, инструменты
-(`cargo-deny`, `cargo-audit`, `cargo-vet`, `cargo-fuzz`, `cargo-cyclonedx`)
+(`cargo-deny`, `cargo-audit`, `cargo-vet`, `cargo-fuzz`, `cargo-mutants`,
+`cargo-cyclonedx`)
 — по версии. Образ, в котором ClusterFuzzLite собирает цели, закреплён по
 хешу (`.clusterfuzzlite/Dockerfile`). Образы самого ClusterFuzzLite
 названы внутри его действия меткой `v1`, и снаружи их не закрепить.

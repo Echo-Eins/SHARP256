@@ -288,7 +288,9 @@ cargo build --release --no-default-features
 чтения), а синхронизация общих инвариантов проверена моделями loom — см.
 [docs/SANITIZERS.md](docs/SANITIZERS.md). Всё, что приходит извне, и
 автоматы рукопожатия, сессии и ретранслятора фаззятся непрерывно — см.
-[docs/FUZZING.md](docs/FUZZING.md).
+[docs/FUZZING.md](docs/FUZZING.md). Замечают ли тесты ошибку в любом месте
+кода, проверяет мутационное тестирование — см.
+[docs/MUTANTS.md](docs/MUTANTS.md).
 
 ## Использование
 

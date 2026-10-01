@@ -1,0 +1,27 @@
+# What cargo-mutants mutates and how it runs the tests (docs/MUTANTS.md;
+# .github/workflows/mutants.yml runs it).
+
+# Every feature, so that the GUI and everything else is compiled: a mutant
+# in code that is not would change nothing, and pass for missed.
+all_features = true
+
+# The library's, the programs' and the end-to-end tests. Not the doctests:
+# each is a crate of its own to build again for every mutant.
+additional_cargo_test_args = ["--tests"]
+
+# Lints are not capped: the crate denies only unsafe code, which no
+# mutation adds, and capping them changes RUSTFLAGS, which would make the
+# shards build every dependency again instead of taking the build's cache.
+
+# What only the tests and the fuzzers compile is no part of the program:
+# the fuzz targets' entry points and harnesses (src/fuzz/), and what the
+# harnesses reach in through (#[cfg(any(test, fuzzing))] in the modules).
+exclude_globs = ["src/fuzz/**"]
+exclude_re = [
+    "DispatcherHarness::",
+    "RelayHarness::",
+    "ListingBuilder::",
+    "forge::",
+    "fuzz_reply",
+    "fuzz_answer_v6",
+]
