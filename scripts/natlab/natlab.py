@@ -718,12 +718,31 @@ def session_path(log, topo, turn=False):
     the last address proven, and where it began is said next to it."""
     conn = re.search(r"Connected to (\S+)", log)
     proven = re.findall(r"receiver address (\S+) proven", log)
-    path = classify(proven[-1] if proven else (conn.group(1) if conn else None), topo, 5560, turn=turn)
+
+    def kind(addr):
+        return stream_kind(addr, log) or classify(addr, topo, 5560, turn=turn)
+
+    path = kind(proven[-1]) if proven else (kind(conn.group(1)) if conn else "none")
     if proven and conn:
-        started = classify(conn.group(1), topo, 5560, turn=turn)
+        started = kind(conn.group(1))
         if started != path:
             path += f" (from {started})"
     return path
+
+
+def stream_kind(addr, log):
+    """What a loopback address a sender's session runs on stands for: the
+    shim of a TCP stream (see `transport::carrier`), to a relay or straight
+    to the receiver, as the sender's log says when the stream comes up.
+    None for any other address."""
+    a = plain(addr)
+    if not a.startswith("127.0.0.1:"):
+        return None
+    if re.search(r"will carry the transfer on its port \d+, over \w+; carried from " + re.escape(a) + r"\b", log):
+        return "relay-tcp"
+    if re.search(r"the receiver answers over TCP at \S+; carried from " + re.escape(a) + r"\b", log):
+        return "direct-tcp"
+    return None
 
 
 def classify(connected, topo, relay_port, turn=False):

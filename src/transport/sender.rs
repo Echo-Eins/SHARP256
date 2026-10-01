@@ -1767,6 +1767,11 @@ struct Engine {
     /// When the session, on a relay's stream, last asked about a stream
     /// straight to the receiver (see `prefer_direct_stream`).
     direct_stream_asked_at: Instant,
+    /// Until when a datagram path learned during the handshake — a relay's
+    /// port, an address a name resolved to — has the handshake to itself:
+    /// a stream that comes up meanwhile waits its turn round the ring
+    /// rather than making that attempt moot with one of its own.
+    fresh_datagram_until: Instant,
     /// When the next such question goes out, and how many rounds have.
     next_direct_probe: Instant,
     direct_probes: u32,
@@ -1963,6 +1968,7 @@ impl Engine {
             stream: None,
             throttle: crate::transport::carrier::throttle::Throttle::new(now),
             direct_stream_asked_at: now,
+            fresh_datagram_until: now,
             next_direct_probe: now,
             direct_probes: 0,
             probes_sent: 0,
@@ -2487,6 +2493,9 @@ impl Engine {
             self.peer_ips.insert(crate::address::canonical(addr).ip());
         }
         self.candidates.push(addr);
+        if self.secure.is_none() && !self.carriers.shims.contains(addr) {
+            self.fresh_datagram_until = Instant::now() + crate::transport::carrier::CARRIER_DELAY;
+        }
         Some(addr)
     }
 
@@ -3118,9 +3127,13 @@ impl Engine {
                 // because nothing else has answered.
                 self.add_stream(shim);
                 // Not a relay's while one straight to the receiver is up
-                // (see the same in `run`).
-                let passed_over =
-                    self.carriers.shims.via_relay(shim) && self.live_direct_stream().is_some();
+                // (see the same in `run`); and not while a datagram path
+                // just learned is being tried — UDP first, as at the start
+                // (in the laboratory, over IPv6, a relay's port came a second
+                // late, and the stream that came after made its attempt moot).
+                let passed_over = (self.carriers.shims.via_relay(shim)
+                    && self.live_direct_stream().is_some())
+                    || Instant::now() < self.fresh_datagram_until;
                 if self.secure.is_none() && !passed_over {
                     self.send_initiation_to(self.reach.native(shim))?;
                 }

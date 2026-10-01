@@ -85,7 +85,9 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   Now the re-handshakes go round every address once the path has been
   quiet for 3 s, UDP first and a relay's stream last; a stream waits its
   turn where another datagram path is known; a window with an outage in it
-  is not measured for a policer.
+  is not measured for a policer. During the handshake, a datagram path
+  learned late (a relay's port over IPv6 comes a second after the start)
+  has 1.5 s before a stream may make its attempt moot.
 
 ### Field tests, and the real network
 - `docs/FIELD.md` and `scripts/field/field.sh`: how two people in

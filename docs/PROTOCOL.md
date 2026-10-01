@@ -1725,7 +1725,10 @@ it like any other (section 8, address validation). A stream that comes up
 while the session has been quiet for a second gets an initiation at once
 when no other datagram path is known; otherwise it waits its turn round the
 re-handshakes, after the UDP ones (going back to a server, above): UDP
-first, a stream where UDP does not get through. An initiation makes the one
+first, a stream where UDP does not get through. During the handshake the
+same holds for a datagram path learned late — a relay's port, an address a
+name resolved to: for 1.5 s after it, a stream that comes up waits its turn
+round the ring rather than making that path's attempt moot. An initiation makes the one
 before it moot; so while a stream straight to the receiver is up, a relay's
 stream gets none, and a session that ended up on a relay's stream all the
 same moves to the direct one — by proving it, asked every two seconds —
