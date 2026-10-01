@@ -97,6 +97,8 @@ struct Probe {
     sent: usize,
     /// When the claim was given up; its token still counts for a while.
     given_up: Option<Instant>,
+    /// Asked by us ([`PathProbe::ask`]) rather than claimed by the peer.
+    asked: bool,
 }
 
 impl Probe {
@@ -112,6 +114,12 @@ impl Probe {
             nonce: self.nonce,
         }
     }
+}
+
+fn nonce() -> [u8; PATH_TOKEN_LEN] {
+    let mut nonce = [0u8; PATH_TOKEN_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    nonce
 }
 
 /// Tracks the unproven address claims a session has outstanding.
@@ -149,8 +157,9 @@ impl PathProbe {
     ) -> Option<Challenge> {
         if from == peer {
             // The proven path is alive; claims for other addresses are no
-            // longer interesting.
-            self.probes.clear();
+            // longer interesting. A path we asked about is: the proven one
+            // being alive is why it was asked.
+            self.probes.retain(|p| p.asked);
             return None;
         }
         self.forget_old(now);
@@ -165,32 +174,66 @@ impl PathProbe {
             p.tries = 1;
             return p.may_send().then(|| p.challenge(now));
         }
-        if self.probes.len() >= MAX_CLAIMS {
-            // Room for this one: a given-up claim goes first, then the
-            // oldest.
-            let victim = self
-                .probes
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, p)| (p.given_up.is_none(), p.sent_at))
-                .map(|(i, _)| i)
-                .expect("full");
-            self.probes.remove(victim);
-        }
-        let mut nonce = [0u8; PATH_TOKEN_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        self.make_room();
         let mut p = Probe {
             addr: from,
-            nonce,
+            nonce: nonce(),
             sent_at: now,
             tries: 1,
             received: len,
             sent: answer,
             given_up: None,
+            asked: false,
         };
         let c = p.may_send().then(|| p.challenge(now));
         self.probes.push(p);
         c
+    }
+
+    /// A path of our own making to prove — a stream we dialled to the peer
+    /// ourselves — while the peer is heard on the proven one. Nothing came
+    /// from it to hold the challenges to, and nobody but us aimed it, so
+    /// it is allowed its challenges outright; and a packet on the proven
+    /// path does not end the asking. Returns the challenge to send, or
+    /// None while one is out already.
+    pub fn ask(&mut self, to: SocketAddr, now: Instant) -> Option<Challenge> {
+        if self
+            .probes
+            .iter()
+            .any(|p| p.addr == to && p.given_up.is_none())
+        {
+            return None;
+        }
+        self.probes.retain(|p| p.addr != to);
+        self.make_room();
+        let mut p = Probe {
+            addr: to,
+            nonce: nonce(),
+            sent_at: now,
+            tries: 1,
+            received: MAX_TRIES as usize * CHALLENGE_BYTES,
+            sent: 0,
+            given_up: None,
+            asked: true,
+        };
+        let c = p.challenge(now);
+        self.probes.push(p);
+        Some(c)
+    }
+
+    /// Room for one more claim: a given-up one goes first, then the oldest.
+    fn make_room(&mut self) {
+        if self.probes.len() < MAX_CLAIMS {
+            return;
+        }
+        let victim = self
+            .probes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| (p.given_up.is_none(), p.sent_at))
+            .map(|(i, _)| i)
+            .expect("full");
+        self.probes.remove(victim);
     }
 
     /// A PATH_RESPONSE carrying `data` arrived from `from`. Returns the
@@ -307,6 +350,28 @@ mod tests {
         assert!(p.probing().is_empty());
         // The token is spent: repeating it does nothing.
         assert!(p.on_response(moved, c.nonce).is_none());
+    }
+
+    #[test]
+    fn a_path_we_ask_about_outlives_the_proven_one_being_heard() {
+        let peer = addr("192.0.2.1:5555");
+        let stream = addr("127.0.0.1:40000");
+        let start = Instant::now();
+        let mut p = PathProbe::new();
+        let c = p.ask(stream, start).expect("challenged");
+        assert_eq!(c.to, stream);
+        // One out at a time.
+        assert!(p.ask(stream, start).is_none());
+        // The peer goes on being heard where it was: a claim it made would
+        // be dropped, the asked path is not.
+        let claimed = addr("198.51.100.9:6000");
+        assert!(p.on_authentic(claimed, peer, start, 10_000, 0).is_some());
+        assert!(p.on_authentic(peer, peer, start, 100, 0).is_none());
+        assert_eq!(p.probing(), vec![stream]);
+        // Nothing came from it, yet its repeats go out.
+        let rto = Duration::from_millis(200);
+        assert_eq!(p.poll(start + rto, rto), vec![c]);
+        assert_eq!(p.on_response(stream, c.nonce), Some(stream));
     }
 
     #[test]

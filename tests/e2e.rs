@@ -188,6 +188,9 @@ struct Impairment {
     /// From this long after the proxy starts, silently drop every datagram
     /// longer than this: a path MTU that shrank, with no ICMP to say so.
     mtu_after: Option<(Duration, usize)>,
+    /// Police what goes to the target to this many bytes a second, with a
+    /// bucket of 64 KiB: what a network that holds UDP back does to it.
+    police: Option<u64>,
 }
 
 impl Impairment {
@@ -204,6 +207,7 @@ impl Impairment {
             drop_first_len: None,
             corrupt: 0.0,
             mtu_after: None,
+            police: None,
         }
     }
 }
@@ -246,6 +250,8 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
         let mut dropped_first: u32 = 0;
         let mut buf_a = vec![0u8; 65536];
         let mut buf_b = vec![0u8; 65536];
+        const BUCKET: f64 = 65536.0;
+        let (mut tokens, mut filled_at) = (BUCKET, Instant::now());
         loop {
             let (pkt, to_target) = tokio::select! {
                 r = a.recv_from(&mut buf_a) => {
@@ -288,6 +294,16 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
             };
             if drop_applies && rng.f64() < imp.drop {
                 continue;
+            }
+            if let (Some(rate), true) = (imp.police, to_target) {
+                let now = Instant::now();
+                tokens = (tokens + now.duration_since(filled_at).as_secs_f64() * rate as f64)
+                    .min(BUCKET);
+                filled_at = now;
+                if (pkt.len() as f64) > tokens {
+                    continue;
+                }
+                tokens -= pkt.len() as f64;
             }
             let mut pkt = pkt;
             if rng.f64() < imp.corrupt && !pkt.is_empty() {
@@ -408,6 +424,7 @@ async fn survives_loss_duplication_and_reordering() {
             drop_first_len: None,
             corrupt: 0.0,
             mtu_after: None,
+            police: None,
         },
     )
     .await;
@@ -458,6 +475,7 @@ async fn survives_heavy_loss() {
             drop_first_len: None,
             corrupt: 0.0,
             mtu_after: None,
+            police: None,
         },
     )
     .await;
@@ -4532,7 +4550,11 @@ async fn version_4_resumes_after_the_receiver_restarts() {
 
 /// Waits up to twenty seconds for `check` to hold.
 async fn eventually(what: &str, check: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    eventually_within(what, Duration::from_secs(20), check).await
+}
+
+async fn eventually_within(what: &str, within: Duration, check: impl Fn() -> bool) {
+    let deadline = Instant::now() + within;
     while !check() {
         assert!(Instant::now() < deadline, "{} did not happen in time", what);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4549,6 +4571,12 @@ struct TcpForward {
 /// Forwards streams accepted at `at` — the address of a UDP proxy, so that
 /// a sender given it finds the receiver there over both — to `target`.
 async fn start_tcp_forward(at: SocketAddr, target: SocketAddr) -> TcpForward {
+    start_tcp_forward_at(at, target, None).await
+}
+
+/// [`start_tcp_forward`], passing at most `rate` bytes a second towards
+/// `target` when given: a path where TCP is slow too.
+async fn start_tcp_forward_at(at: SocketAddr, target: SocketAddr, rate: Option<u64>) -> TcpForward {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind(at).await.unwrap();
     let to_target_bytes = Arc::new(AtomicU64::new(0));
@@ -4565,12 +4593,18 @@ async fn start_tcp_forward(at: SocketAddr, target: SocketAddr) -> TcpForward {
             let (mut out_r, mut out_w) = outbound.into_split();
             let counted = counted.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 64 << 10];
+                let mut buf = vec![0u8; if rate.is_some() { 16 << 10 } else { 64 << 10 }];
+                let (started, mut passed) = (Instant::now(), 0u64);
                 while let Ok(n) = in_r.read(&mut buf).await {
                     if n == 0 || out_w.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                     counted.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Some(rate) = rate {
+                        passed += n as u64;
+                        let due = started + Duration::from_secs_f64(passed as f64 / rate as f64);
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                    }
                 }
                 let _ = out_w.shutdown().await;
             });
@@ -4683,6 +4717,110 @@ async fn a_transfer_moves_to_tcp_when_udp_stops_and_back_when_it_returns() {
     } else {
         panic!("unexpected event");
     }
+    stop_receiver(r).await;
+}
+
+/// UDP that answers, but is policed to a trickle, while TCP does four
+/// times better: the sender finds it out with a trial on a stream, and
+/// stays there — not going back to UDP, though the receiver goes on
+/// answering over it for a while and UDP answers the sender's own pings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_leaves_udp_that_is_held_back_for_tcp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            police: Some(250_000),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let tcp = start_tcp_forward_at(proxy.addr, r.addr, Some(1_000_000)).await;
+    // A minute and more over UDP alone; a quarter of that over TCP, which
+    // the trial, over in fifteen seconds, leaves time to settle on.
+    let size = 16_000_000;
+    let path = make_file(&src, "held_back.bin", size, 14);
+    let cfg = sender_cfg(&path, proxy.addr, r.id, &state);
+    let started = Instant::now();
+    let sender = tokio::spawn(run_sender(cfg));
+    let (udp, streamed) = (&proxy.to_target_bytes, &tcp.to_target_bytes);
+    eventually("a trial on TCP", || {
+        streamed.load(Ordering::Relaxed) > 500_000
+    })
+    .await;
+    let udp_then = udp.load(Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(90), sender)
+        .await
+        .expect("finished in time")
+        .unwrap()
+        .expect("send");
+    let took = started.elapsed();
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    } else {
+        panic!("unexpected event");
+    }
+    let udp_since = udp.load(Ordering::Relaxed) - udp_then;
+    assert!(
+        udp_since < 200_000,
+        "kept to TCP: {} B more over UDP after the trial began",
+        udp_since
+    );
+    assert!(
+        took < Duration::from_secs(40),
+        "{:?}, where UDP alone takes 64 s",
+        took
+    );
+    stop_receiver(r).await;
+}
+
+/// UDP that loses a share of what it carries, but still outruns TCP: the
+/// trial on a stream finds TCP slower, and the session goes back to UDP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            drop: 0.15,
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let tcp = start_tcp_forward_at(proxy.addr, r.addr, Some(500_000)).await;
+    // At 2 MB/s, a third of it lost: enough left after the first window
+    // for a trial to be worth making.
+    let size = 36_000_000;
+    let path = make_file(&src, "lossy.bin", size, 15);
+    let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(2_000_000);
+    let sender = tokio::spawn(run_sender(cfg));
+    let (udp, streamed) = (&proxy.to_target_bytes, &tcp.to_target_bytes);
+    eventually("a trial on TCP", || {
+        streamed.load(Ordering::Relaxed) > 500_000
+    })
+    .await;
+    let udp_then = udp.load(Ordering::Relaxed);
+    // The trial takes ten seconds.
+    eventually_within(
+        "the session going back to UDP",
+        Duration::from_secs(30),
+        || udp.load(Ordering::Relaxed) > udp_then + 4_000_000,
+    )
+    .await;
+    // And stays there. (That the file arrives whole across such moves is
+    // `a_transfer_moves_to_tcp_when_udp_stops_and_back_when_it_returns`'s.)
+    let streamed_then = streamed.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let more = streamed.load(Ordering::Relaxed) - streamed_then;
+    assert!(more < 100_000, "{} B more over TCP once back on UDP", more);
+    assert!(!sender.is_finished(), "the file is longer than this");
+    sender.abort();
     stop_receiver(r).await;
 }
 

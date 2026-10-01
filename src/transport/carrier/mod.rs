@@ -18,7 +18,10 @@
 //! quiet in the middle of a transfer ([`dial`]). A stream counts as a path
 //! that is not direct, as a relay's port does: while the session runs on
 //! one, the engine keeps asking the receiver's UDP addresses whether they
-//! answer again, and goes back to UDP as soon as one does.
+//! answer again, and goes back to UDP as soon as one does. UDP that answers
+//! but is held back — policed to a trickle, or dropped in part — is found
+//! out by a trial on a stream, and left for a while if TCP does better
+//! ([`throttle`]).
 //!
 //! **How fast.** A stream is reliable and has congestion control of its
 //! own; a session that ran its own over it as well would have both resend
@@ -32,6 +35,7 @@ pub mod frame;
 pub mod link;
 pub mod listen;
 pub mod shim;
+pub mod throttle;
 
 pub use frame::MAX_DATAGRAM;
 pub use link::{Link, StreamStats};

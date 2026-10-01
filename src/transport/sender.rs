@@ -1737,6 +1737,8 @@ struct Engine {
     /// window is the stream's room, not the congestion window).
     carriers: Carriers,
     stream: Option<Arc<crate::transport::carrier::StreamStats>>,
+    /// Whether UDP, answering, is held back (see `carrier::throttle`).
+    throttle: crate::transport::carrier::throttle::Throttle,
     /// When the next such question goes out, and how many rounds have.
     next_direct_probe: Instant,
     direct_probes: u32,
@@ -1929,6 +1931,7 @@ impl Engine {
             relayed: std::collections::HashSet::new(),
             carriers: Carriers::none(),
             stream: None,
+            throttle: crate::transport::carrier::throttle::Throttle::new(now),
             next_direct_probe: now,
             direct_probes: 0,
             probes_sent: 0,
@@ -3331,9 +3334,16 @@ impl Engine {
                         // The path the session runs on has gone quiet: ask
                         // the receiver over the stream now, rather than once
                         // the stall rules start trying everything.
-                        let quiet = Instant::now().saturating_duration_since(self.last_rx);
+                        let now = Instant::now();
+                        let quiet = now.saturating_duration_since(self.last_rx);
                         if quiet >= Duration::from_secs(1) && self.fin_verdict.is_none() {
                             self.send_initiation_to(self.reach.native(shim))?;
+                        } else if self.throttle.wants_stream() {
+                            // UDP answers, but is held back: the stream
+                            // dialled for the trial.
+                            if let Some(to) = self.reach.native(shim) {
+                                self.ask_stream_path(to, now);
+                            }
                         }
                     }
                 }
@@ -4396,7 +4406,17 @@ impl Engine {
     /// Whether `to` is passed over for now: a relay's or a TURN server's
     /// address while the session runs directly and the receiver was heard
     /// from there lately (see [`crate::transport::path::DIRECT_GRACE`]).
+    ///
+    /// With UDP held back (see `carrier::throttle`) a stream is where the
+    /// session goes, under a trial, and stays, while one holds it there.
     fn keeps_direct(&self, to: SocketAddr, now: Instant) -> bool {
+        let to_stream = self.carriers.shims.contains(crate::address::canonical(to));
+        if to_stream && self.throttle.wants_stream() {
+            return false;
+        }
+        if !to_stream && self.stream.is_some() && self.throttle.holds_stream(now) {
+            return true;
+        }
         crate::transport::path::keeps_direct(
             self.is_relayed(to),
             self.is_relayed(self.peer),
@@ -4467,6 +4487,87 @@ impl Engine {
         self.candidates.push(addr);
     }
 
+    /// A stream to the receiver that is up: its address, if there is one.
+    fn live_stream(&self) -> Option<SocketAddr> {
+        self.candidates
+            .iter()
+            .copied()
+            .find(|c| self.carriers.shims.stats(*c).is_some_and(|s| s.alive()))
+    }
+
+    /// Proves the stream at `to` as a path for the session, asking on our
+    /// own (see `PathProbe::ask`): the receiver answers a challenge where it
+    /// came from, and the answer moves the session there.
+    fn ask_stream_path(&mut self, to: SocketAddr, now: Instant) {
+        if let Some(c) = self.path.ask(to, now) {
+            let _ = self.send_frame_to(
+                c.to,
+                0,
+                &Message::PathChallenge(wire::PathChallenge { data: c.nonce }),
+            );
+        }
+    }
+
+    /// Whether UDP, though it answers, is held back (see
+    /// `carrier::throttle`): a trial on a stream when it looks so, and the
+    /// stream kept when TCP does better.
+    fn watch_throttle(&mut self, now: Instant) {
+        use crate::transport::carrier::throttle::{Sample, Verdict};
+        if self.carriers.dial.is_none()
+            || self.secure.is_none()
+            || self.fin_verdict.is_some()
+            || self.stalled
+        {
+            return;
+        }
+        let verdict = self.throttle.tick(Sample {
+            now,
+            sent: self.bytes_sent,
+            resent: self.retransmitted_bytes,
+            delivered: self.received_bytes,
+            left: self.size.saturating_sub(self.received_bytes),
+            on_stream: self.stream.is_some(),
+        });
+        let mbit = |rate: f64| rate * 8.0 / 1e6;
+        match verdict {
+            Verdict::Nothing => {}
+            Verdict::Try { loss, rate } => {
+                let why = format!(
+                    "UDP carries {:.1} Mbit/s, {:.0}% of it sent again",
+                    mbit(rate),
+                    loss * 100.0
+                );
+                match self.live_stream() {
+                    Some(to) => {
+                        tracing::info!("{}; trying the stream to the receiver", why);
+                        self.ask_stream_path(to, now);
+                    }
+                    None => {
+                        self.carriers.asked_at = None;
+                        self.ask_for_streams(now, &why);
+                    }
+                }
+            }
+            Verdict::Keep { udp, tcp, hold } => tracing::info!(
+                "TCP carries {:.1} Mbit/s where UDP carried {:.1}: UDP is held back; \
+                 keeping to TCP for {:?}",
+                mbit(tcp),
+                mbit(udp),
+                hold
+            ),
+            Verdict::Back { udp, tcp, hold } => tracing::info!(
+                "TCP carries {:.1} Mbit/s where UDP carried {:.1}: back to UDP, \
+                 and no trial for {:?}",
+                mbit(tcp),
+                mbit(udp),
+                hold
+            ),
+            Verdict::GaveUp { hold } => {
+                tracing::info!("no stream to measure UDP against; no trial for {:?}", hold)
+            }
+        }
+    }
+
     /// Takes the streams that came up since the last look.
     fn take_new_streams(&mut self) -> bool {
         let mut any = false;
@@ -4531,7 +4632,11 @@ impl Engine {
         const BRISK_ROUNDS: u32 = 30;
         const BRISK: Duration = Duration::from_secs(1);
         const SLOW: Duration = Duration::from_secs(4);
-        if self.secure.is_none() || now < self.next_direct_probe || !self.is_relayed(self.peer) {
+        if self.secure.is_none()
+            || now < self.next_direct_probe
+            || !self.is_relayed(self.peer)
+            || self.throttle.holds_stream(now)
+        {
             return;
         }
         self.direct_probes += 1;
@@ -4664,8 +4769,14 @@ impl Engine {
         }
         // Repeat unanswered address challenges, or give claims up. Paced by
         // the round trip itself, not by a timeout that an outage may have
-        // backed off to half a minute.
-        for c in self.path.poll(now, self.rtt.pto()) {
+        // backed off to half a minute. On a stream the round trip includes
+        // the stream's buffers, which say nothing of how soon a datagram
+        // path answers: from the shortest wait there.
+        let pace = match self.stream {
+            Some(_) => Duration::ZERO,
+            None => self.rtt.pto(),
+        };
+        for c in self.path.poll(now, pace) {
             let _ = self.send_frame_to(
                 c.to,
                 0,
@@ -4693,6 +4804,7 @@ impl Engine {
                 m.cancel();
             }
         }
+        self.watch_throttle(now);
         self.probe_direct(now);
         self.maybe_send_tail_probe(now)?;
         // Retransmission timeout. On a stream it only has to notice one that
