@@ -422,7 +422,16 @@ pub async fn hold(
         }) => (Some((again, told, answers)), Some(hints), Some(nudge)),
         None => (None, None, None),
     };
-    let mut watch_hints = hints.as_ref().is_some_and(|h| !h.borrow().is_known());
+    // What the tests found between the introduction and now counts as a
+    // change too: `told` is what the introduction said. (Asked whether they
+    // were done only now, a sender whose IPv6 test finished in between was
+    // never told again, and a receiver behind an IPv6 firewall that lets
+    // in only what it has sent to never learned where to send: no direct
+    // path in 30 s, on a slow CI runner.)
+    if let Some(h) = hints.as_mut() {
+        h.mark_changed();
+    }
+    let mut watch_hints = hints.is_some();
     // The request out, the nonce its answers carry, until when they are
     // taken, and the rounds left.
     let mut pending: Option<([u8; NONCE_LEN], Instant, u32)> = None;
@@ -487,7 +496,7 @@ pub async fn hold(
                 }
             }
             changed = async { hints.as_mut().expect("guarded").changed().await }, if watch_hints => {
-                let (Some((a, told, _)), Some(h)) = (again.as_mut(), hints.as_ref()) else {
+                let (Some((a, told, _)), Some(h)) = (again.as_mut(), hints.as_mut()) else {
                     watch_hints = false;
                     continue;
                 };
@@ -495,7 +504,7 @@ pub async fn hold(
                     watch_hints = false;
                     continue;
                 }
-                let mine = *h.borrow();
+                let mine = *h.borrow_and_update();
                 let now_told = Hints::told_to(&mine, a.relay);
                 if now_told != *told {
                     tracing::info!(
@@ -1271,6 +1280,71 @@ mod tests {
             .unwrap();
         assert_eq!(i.peer, Some(now_at));
         assert!(answers.try_recv().is_err(), "the forged one is not");
+        cancel.cancel();
+        holding.await.unwrap();
+    }
+
+    /// The tests finished between the introduction and the hold: what
+    /// they found is told at once, not only what they find later. (A
+    /// sender so was never told again, on a slow runner, and a receiver
+    /// behind an IPv6 firewall never learned where to send.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_was_found_before_the_hold_is_told_at_once() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_at = relay.local_addr().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_tx, mut rx) = mpsc::channel(8);
+        let (_nudge_tx, nudge_rx) = tokio::sync::watch::channel(0u64);
+        let (answers_tx, _answers) = mpsc::unbounded_channel();
+        let (hints_tx, hints_rx) =
+            tokio::sync::watch::channel(crate::nat::card::FamilyHints::unknown());
+        let told = Hints::told_to(&crate::nat::card::FamilyHints::unknown(), relay_at);
+        let mut mine = crate::nat::card::FamilyHints::unknown();
+        mine.v4.mapping = 1;
+        mine.v4.filtering = 3;
+        hints_tx.send(mine).unwrap();
+        let cancel = CancellationToken::new();
+        let holding = {
+            let (socket, cancel) = (socket.clone(), cancel.clone());
+            tokio::spawn(async move {
+                hold(
+                    socket,
+                    "127.0.0.1:9".parse().unwrap(),
+                    [1; TOKEN_LEN],
+                    &mut rx,
+                    &cancel,
+                    Some(Refresh {
+                        again: Again {
+                            relay: relay_at,
+                            target: Identity::generate().id(),
+                            token: [7; TOKEN_LEN],
+                            identify: None,
+                        },
+                        hints: hints_rx,
+                        told,
+                        nudge: nudge_rx,
+                        answers: answers_tx,
+                    }),
+                )
+                .await
+            })
+        };
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), relay.recv_from(&mut buf))
+            .await
+            .expect("the relay is told at once")
+            .unwrap();
+        match Message::decode(&buf[..n]) {
+            Some(Message::Connect { hints, .. }) => {
+                assert_eq!(hints, Hints::told_to(&mine, relay_at))
+            }
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(
+            heard(&relay, Duration::from_millis(300)).await,
+            0,
+            "and once"
+        );
         cancel.cancel();
         holding.await.unwrap();
     }

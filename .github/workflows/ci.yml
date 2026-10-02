@@ -206,6 +206,21 @@ jobs:
               python3 scripts/natlab/natlab.py lan --v6
               python3 scripts/natlab/natlab.py samenat
               python3 scripts/natlab/natlab.py timeout
+          - name: a change of network in the middle; two behind one carrier's NAT; NAT66; DS-Lite
+            run: |
+              python3 scripts/natlab/natlab.py mobility
+              python3 scripts/natlab/natlab.py samecgn
+              python3 scripts/natlab/natlab.py nat66
+              python3 scripts/natlab/natlab.py dslite
+          - name: speed directly, through a relay, through TURN
+            # What each kind of path carries on a runner (ROADMAP E6), in
+            # the job's summary; the relay's has to stay on UDP.
+            run: |
+              set -o pipefail
+              rc=0
+              python3 scripts/natlab/natlab.py speed --mb 100 | tee speed.out || rc=$?
+              { echo '### Speed (release build, one runner)'; echo '```'; grep -E '^(path|direct|relay|TURN) ' speed.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+              exit $rc
           - name: carriers - UDP blocked, cut, policed; only TCP to 443; TLS opened on the way; both families
             # scripts/carrierlab: the same namespaces and nftables, tc's
             # netem for the round trips (without it, the cells run on none),

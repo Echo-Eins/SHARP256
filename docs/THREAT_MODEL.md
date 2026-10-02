@@ -618,6 +618,17 @@ ID получателя); вопрос сообщает, кого ищет от�
 600 МиБ` в худшем случае. Прежде граница была лишь посессионной: 16
 передач могли вместе удерживать около 2 ГиБ.
 
+**Замеры на одной машине** (выпускная сборка, `--ignored`; ROADMAP D1).
+Ретранслятор с поднятыми пределами на клиента принимает 20 000 личностей,
+каждая со своим вызовом и доказательством, за 2,1 с — 9 400 в секунду
+(управляющий порт обслуживает одна задача), и держит на каждую около
+400 байт (`registrations_by_the_thousand`). Получатель, которому один
+клиент шлёт 3 000 инициаций (6 000 датаграмм) за 23 мс, отвечает
+рукопожатием на 40, cookie на 125, остальные остаются без ответа и без
+работы с открытым ключом (`a_flood_of_handshakes`). Чего замеры не
+говорят: предела на отдельной машине, многих клиентов с разных адресов,
+медленных клиентов, давления на память — это работа для стенда.
+
 **Разбор недоверенного ввода.** Всё, что приходит от других — транспортные
 кадры, рукопожатие, целые датаграммы, опись каталога, сообщения
 ретранслятора, STUN, PCP/NAT-PMP, UPnP (HTTP и XML с устройства в сети),
@@ -1091,7 +1102,7 @@ Tor или аналогичные сети.
 | Стороны сходятся на одном рукопожатии при нескольких попытках | `the_newest_handshake_wins_on_both_sides` |
 | Опубликованный адрес разбирается обратно | `the_published_address_parses_back`, `parses_a_list_of_candidate_addresses` |
 | Передача проходит через ретранслятор, когда прямого пути нет | `a_relay_carries_the_transfer_when_no_direct_path_works` |
-| Сторона привязывается билетом с любого адреса; чужой трафик не несётся | `each_side_binds_itself_with_its_ticket_from_wherever_it_is` |
+| Сторона привязывается билетом с любого адреса; чужой трафик не несётся; пачка датаграмм, которую система отдаёт одним приёмом (GRO), несётся вся | `each_side_binds_itself_with_its_ticket_from_wherever_it_is` |
 | Ретранслятор не отвечает на то, что не является его сообщением | `rubbish_on_the_control_port_is_not_answered` |
 | Токен ретранслятора доказывает один адрес и никакой другой | `a_token_proves_one_address_and_no_other` |
 | Личность регистрирует только владелец; доказательство покрывает всё сообщение | `an_identity_can_only_be_registered_by_its_owner`, `a_registration_proof_is_the_owners_alone` |
@@ -1148,6 +1159,7 @@ Tor или аналогичные сети.
 | За «забывчивым» NAT получатель с поддержанием достижим, без него — нет, при редких обновлениях — учащает их | `keepalives_keep_a_receiver_behind_a_forgetful_nat_reachable` |
 | Ретранслятор со списками: регистрирует только перечисленных, соединяет только перечисленных отправителей, доказавших личность | `a_relay_with_a_list_registers_only_those_on_it`, `a_relay_with_a_list_of_senders_wants_to_know_who_asks`, `a_relay_puts_through_only_the_senders_it_lists` |
 | Квоты ретранслятора: скорость клиента, часовой объём, общий предел; отказ ничего не стоит | `a_client_is_carried_at_its_rate`, `an_hourly_quota_runs_out_and_comes_back`, `the_total_limit_counts_everybody_and_refusals_cost_nothing`, `without_limits_nothing_is_tracked`, `a_relay_carries_a_client_at_its_rate_and_no_faster` |
+| Пришедшее по потоку сверх квоты ретранслятора или в полный поток на ту сторону ждёт (до 50 мс), а не сбрасывается: отправитель по потоку не шлёт файл снова и снова (было 66 МБ по потоку за файл в 4 МБ) | `a_relay_holds_a_stream_to_its_rate_rather_than_drop`, `a_client_is_carried_at_its_rate` |
 | Маска заголовка ChaCha20 совпадает с RFC 9001 A.5; счётчик на последнем блоке не роняет узел | `chacha20_header_mask_matches_rfc9001`, `a_tag_naming_the_last_block_does_not_take_the_endpoint_down` |
 | Подсказки и адрес другого семейства ретранслятор передаёт, только если они могут быть правдой; принимающий проверяет ещё раз | `hints_ride_along_and_invalid_ones_are_refused`, `only_a_believable_other_address_is_passed_on`, `an_alternative_address_is_passed_on_only_if_it_can_be_true`, `each_side_is_told_what_the_others_nat_does`, `the_other_family_is_named_from_the_way_the_relay_is_reached` |
 | Куда целиться в каждом семействе; IPv6-адрес известен до NAT-тестов | `a_peer_is_told_where_to_aim_in_each_family`, `the_hosts_own_global_ipv6_address_is_where_to_aim_before_any_test` |
@@ -1185,7 +1197,7 @@ Tor или аналогичные сети.
 | Имена в одной форме Юникода (NFC): два имени, отличающиеся только формой, — одно имя и столкновение, как два, отличающиеся регистром, на нечувствительной к регистру файловой системе | `names_that_differ_only_in_unicode_form_collide`, `local_names_are_composed`, `sanitize_strips_paths_and_bad_chars` |
 | Через символическую ссылку на месте частичного файла не пишется; файл, подменённый под своим именем, не переносится | `writer_does_not_write_through_a_link`, `a_file_replaced_under_its_name_is_found_out` |
 | Результат, перенесённый до подтверждения отправителя, не принимается второй раз; изменённый с тех пор не трогается (Р22) | `a_file_stored_before_the_sender_knew_is_not_received_twice`, `a_directory_stored_before_the_sender_knew_is_not_received_twice` |
-| Полисер UDP распознаётся по скорости доставки, и темп ограничивается ею: отправитель отдаёт полисеру в 1,03 раза больше, чем тот пропускает (без распознавателя — в 3,6); подтверждается снова, исчезнувший отпускается ступенями | `a_policer_is_not_overrun`, `a_policer_is_found_at_its_rate_and_held_to`, `a_policer_still_there_is_found_again_at_the_first_step`, `a_policer_gone_is_left_behind_a_step_at_a_time`, `losses_at_rising_rates_are_no_policer`, `steady_random_loss_is_checked_and_let_go_of` |
+| Полисер UDP распознаётся по скорости доставки, и темп ограничивается ею: отправитель отдаёт полисеру в 1,03 раза больше, чем тот пропускает (без распознавателя — в 3,6); подтверждается снова, исчезнувший отпускается ступенями; проверка считает только отправленное после её начала (на медленной машине иначе отпускала полисер как случайные потери) | `a_policer_is_not_overrun`, `a_policer_is_found_at_its_rate_and_held_to`, `a_policer_still_there_is_found_again_at_the_first_step`, `a_policer_gone_is_left_behind_a_step_at_a_time`, `losses_at_rising_rates_are_no_policer`, `steady_random_loss_is_checked_and_let_go_of` |
 | Перестановка пакетов вскоре перестаёт считаться потерей: окно RACK расширяется, когда «потерянное» оказывается доставленным | `reordering_is_soon_no_longer_taken_for_loss` |
 | Версия 4 принимает первый пришедший ответ на рукопожатие, а не только на новейшую попытку | `a_slow_answer_is_taken_though_another_address_was_tried_since` |
 | Отправитель с часами, переведёнными назад, проходит по сохранённой отметке; без неё получатель молча отказывает (Р4) | `a_sender_whose_clock_went_back_gets_through_by_its_stamp` |
@@ -1193,6 +1205,7 @@ Tor или аналогичные сети.
 | Смещения за 4 ГиБ пишутся и читаются там, где сказано | `offsets_past_four_gibibytes_are_written_and_read_where_they_say` |
 | Адрес отправителя меняется четыре раза в секунду всю передачу: получатель каждый раз доказывает новый, передача идёт без замедления (Н6) | `a_sender_whose_port_changes_four_times_a_second_is_followed` |
 | Что бы сторона ни сказала о своём NAT, пробивание не превышает бюджета и идёт только на адрес, где её видели (Н6: ложные подсказки) | `whatever_a_peer_says_of_its_nat_costs_no_more_than_the_budget` |
+| Найденное тестами NAT между знакомством и удержанием пары сообщается ретранслятору сразу (иначе получатель за файрволом IPv6 не узнавал, куда слать) | `what_was_found_before_the_hold_is_told_at_once`, `the_relay_is_told_again_once_the_nat_tests_are_done` |
 | Лживый получатель (ACK больше файла, лавина пропусков, «всё получено» без FIN) не ломает отправителя и не держит его бесконечно (Н6) | `a_lying_receiver_cannot_break_the_sender` |
 | Путь уже 1280 байт (туннель) прозондирован до размера управляющей датаграммы, а не уполовинен | `a_path_below_1280_bytes_is_probed_down_to_what_the_handshake_took` |
 

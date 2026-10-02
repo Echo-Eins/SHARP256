@@ -47,8 +47,12 @@ const STAMP_MEMORY: Duration = Duration::from_secs(2 * 120);
 /// Socket buffers for the control port and for each carried pair.
 const CONTROL_BUFFER: usize = 1 << 20;
 const PAIR_BUFFER: usize = 2 << 20;
-/// Datagram buffer: enough for a jumbo frame.
-const BUF_LEN: usize = 9216;
+/// Receive buffer: room for a whole run of datagrams the system hands over
+/// together (UDP GRO, which the sockets ask for). One a jumbo frame long
+/// took the first six of a run and lost the rest: the relay dropped more
+/// than half of what it carried, at a few Mbit/s, wherever the network
+/// coalesced.
+const BUF_LEN: usize = crate::transport::io::RECV_BUF_LEN;
 
 #[derive(Clone)]
 pub struct Config {
@@ -470,6 +474,28 @@ impl Meter {
             b.tokens -= n;
         }
         true
+    }
+
+    /// How long until `bytes` more from `from` would be allowed, as the
+    /// buckets stand (they were refilled by the `allow` just refused); None
+    /// if never — more than a bucket holds.
+    pub(crate) fn wait_for(&self, from: SocketAddr, bytes: usize) -> Option<Duration> {
+        let n = bytes as f64;
+        let mut buckets: Vec<&Bucket> = self.total.iter().collect();
+        if let Some(c) = self.clients.get(&client_key(from)) {
+            buckets.extend(c.rate.iter());
+            buckets.extend(c.hourly.iter());
+        }
+        let mut wait = 0f64;
+        for b in buckets {
+            if n > b.cap {
+                return None;
+            }
+            if b.tokens < n {
+                wait = wait.max((n - b.tokens) / b.rate);
+            }
+        }
+        Some(Duration::from_secs_f64(wait))
     }
 }
 
@@ -1393,6 +1419,10 @@ const INTRODUCE_TIMES: u32 = 8;
 /// unconnected UDP socket when an ICMP port-unreachable comes back, so a
 /// single peer going quiet would otherwise kill the pair.
 const MAX_ERRORS: u32 = 16;
+/// The longest a datagram that came on a stream waits for the quota, the
+/// whole pair with it: a rate limit's next datagram is a fraction of a
+/// millisecond off; an hourly allowance spent is not worth waiting for.
+const MAX_HOLD: Duration = Duration::from_millis(50);
 
 /// What one pair carried, and what it was refused, told when it ends.
 struct Tally {
@@ -1540,11 +1570,11 @@ async fn carry(c: Carried) {
         };
         // A run of datagrams off the socket, or one from a side over a
         // stream: from where, how long, how cut, to which of our addresses.
-        let (len, stride, from, dst) = tokio::select! {
+        let (len, stride, from, dst, streamed_in) = tokio::select! {
             r = sock.recv(&mut buf) => match r {
                 Ok(got) => {
                     errors = 0;
-                    (got.len, got.stride, got.from, got.dst)
+                    (got.len, got.stride, got.from, got.dst, false)
                 }
                 Err(_) => {
                     errors += 1;
@@ -1557,7 +1587,7 @@ async fn carry(c: Carried) {
             Some((pkt, from)) = streamed.recv() => {
                 let n = pkt.len().min(buf.len());
                 buf[..n].copy_from_slice(&pkt[..n]);
-                (n, n, from, None)
+                (n, n, from, None, true)
             }
             _ = tokio::time::sleep(wake) => {
                 let now = Instant::now();
@@ -1654,11 +1684,29 @@ async fn carry(c: Carried) {
                 // Within the client's and the relay's limits, or not carried
                 // at all: a policed datagram is lost like any other, and the
                 // transfer's own congestion control slows it to what the
-                // relay will carry.
-                if !meter.lock().allow(from, n, now) {
+                // relay will carry. Except one that came on a stream, when
+                // the quota is back soon: that waits for it, and the stream
+                // behind it with it — nothing more is read off it meanwhile,
+                // and TCP slows the sender down. Dropped instead, it was
+                // sent again over the stream, and again: thirty times the
+                // file, in the laboratory, through a relay that took
+                // 100 Mbit/s.
+                let mut allowed = meter.lock().allow(from, n, now);
+                if !allowed && streamed_in {
+                    let wait = meter.lock().wait_for(from, n);
+                    if let Some(wait) = wait.filter(|w| *w <= MAX_HOLD) {
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = cancel.cancelled() => return,
+                        }
+                        allowed = meter.lock().allow(from, n, Instant::now());
+                    }
+                }
+                if !allowed {
                     tally.refused += 1;
                     continue;
                 }
+                let now = Instant::now();
                 tally.carried += n as u64;
                 if pair_bytes > 0 && tally.carried > pair_bytes {
                     tracing::info!(
@@ -1669,8 +1717,20 @@ async fn carry(c: Carried) {
                     return;
                 }
                 last = now;
-                if tunnels.send(to, port, pkt).is_none() {
-                    let _ = sock.send(to, to_via, pkt).await;
+                match tunnels.link(to) {
+                    // Into a stream whose queue is full: dropped, as a full
+                    // buffer drops — unless it came on a stream too, which
+                    // would only send it again. That waits for room, and
+                    // its stream with it, as for the quota.
+                    Some(link) if streamed_in => {
+                        let _ = link.send_within(port, pkt, MAX_HOLD).await;
+                    }
+                    Some(link) => {
+                        let _ = link.send(port, pkt);
+                    }
+                    None => {
+                        let _ = sock.send(to, to_via, pkt).await;
+                    }
                 }
             }
         }
@@ -2238,6 +2298,48 @@ mod wire_tests {
             .expect("and the other way")
             .unwrap();
         assert_eq!(&buf[..n], b"and back");
+
+        // A run of datagrams sent in one segmented send, as the engine
+        // sends, arrives at the relay as one coalesced receive where the
+        // system can: each of them is carried, not just as many as fit a
+        // jumbo frame.
+        let state = quinn_udp::UdpSocketState::new((&sd).into()).unwrap();
+        let run: Vec<u8> = (0..20u8).flat_map(|i| [i; 1000]).collect();
+        let segment = (state.max_gso_segments() > 1).then_some(1000);
+        let mut sent = 0;
+        while sent < run.len() {
+            let end = if segment.is_some() {
+                run.len()
+            } else {
+                sent + 1000
+            };
+            sd.writable().await.unwrap();
+            let r = sd.try_io(tokio::io::Interest::WRITABLE, || {
+                let transmit = quinn_udp::Transmit {
+                    destination: allocated_addr,
+                    ecn: None,
+                    contents: &run[sent..end],
+                    segment_size: segment,
+                    src_ip: None,
+                };
+                state.try_send((&sd).into(), &transmit)
+            });
+            if r.is_ok() {
+                sent = end;
+            }
+        }
+        let mut got = Vec::new();
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(500), rd.recv_from(&mut buf)).await
+        {
+            assert_eq!(n, 1000);
+            got.push(buf[0]);
+        }
+        assert_eq!(
+            got,
+            (0..20u8).collect::<Vec<_>>(),
+            "the whole run, in order"
+        );
 
         // Knowing the port is not enough to join in: without a ticket,
         // nothing of yours is carried.
@@ -3382,6 +3484,16 @@ mod wire_tests {
         // is the same client.
         assert!(!m.allow("198.51.100.1:2000".parse().unwrap(), 1000, at(t0, 100)));
         assert!(m.refused >= 2);
+        // What a refused datagram would wait for: its bytes at the rate,
+        // and none for a client with room; never for more than a bucket.
+        let wait = m.wait_for(a, 1000).unwrap();
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_millis(1),
+            "{wait:?}"
+        );
+        assert!(m.allow(a, 1000, at(t0, 100) + wait));
+        assert_eq!(m.wait_for(b, 1000), Some(Duration::ZERO));
+        assert_eq!(m.wait_for(a, 300_000), None);
     }
 
     /// The hourly quota is a bucket of the whole hour's allowance.
@@ -3597,7 +3709,11 @@ mod wire_tests {
             })
             .collect();
         let made = made.elapsed();
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Room for a chunk's answers, which come while the chunk is still
+        // being sent: in a socket of the default size, an answer takes a
+        // kilobyte, and the last thirty-five of each chunk were lost here.
+        let sock =
+            crate::transport::socket::bind_udp("127.0.0.1:0".parse().unwrap(), 4 << 20).unwrap();
         let nonce_of = |i: usize| {
             let mut nonce = [0u8; 16];
             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());

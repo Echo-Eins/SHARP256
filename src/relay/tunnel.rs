@@ -446,6 +446,14 @@ impl Tunnels {
         Some(link.send(port, datagram))
     }
 
+    /// The stream `to` holds, if it holds one.
+    pub fn link(&self, to: SocketAddr) -> Option<Link> {
+        if !self.active.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.links.read().get(&canonical(to)).cloned()
+    }
+
     /// Whether `addr` reaches the relay over a stream.
     pub fn contains(&self, addr: SocketAddr) -> bool {
         self.active.load(Ordering::Relaxed) && self.links.read().contains_key(&canonical(addr))

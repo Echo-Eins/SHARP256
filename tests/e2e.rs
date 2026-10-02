@@ -5726,14 +5726,18 @@ async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
 // carriers: a relay over TCP
 // ---------------------------------------------------------------------------
 
-/// A relay on loopback: its address and identity, and what stops it.
+/// A relay on loopback, carrying under `quotas`: its address and identity,
+/// and what stops it.
 #[cfg(feature = "nat-traversal")]
-async fn start_relay() -> (SocketAddr, SharpId, CancellationToken) {
+async fn start_relay_with(
+    quotas: sharp256::relay::server::Quotas,
+) -> (SocketAddr, SharpId, CancellationToken) {
     use sharp256::relay::server::{Config, Relay};
     let cancel = CancellationToken::new();
     let relay = Relay::bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            quotas,
             ..Config::default()
         },
         cancel.clone(),
@@ -5775,9 +5779,25 @@ async fn wait_registered(rx: &mut mpsc::UnboundedReceiver<TransferEvent>, within
 /// at the address given — over TCP only, or not.
 #[cfg(feature = "nat-traversal")]
 async fn through_the_relay(sender_udp_blocked: bool, receiver_udp_blocked: bool) {
+    through_the_relay_at(sender_udp_blocked, receiver_udp_blocked, None, 2_000_000).await;
+}
+
+/// The same, with a relay that carries each client at `rate` bytes a
+/// second, if given, and a file `size` bytes long.
+#[cfg(feature = "nat-traversal")]
+async fn through_the_relay_at(
+    sender_udp_blocked: bool,
+    receiver_udp_blocked: bool,
+    rate: Option<u64>,
+    size: usize,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
-    let (relay, relay_id, relay_cancel) = start_relay().await;
+    let mut quotas = sharp256::relay::server::Quotas::default();
+    if let Some(rate) = rate {
+        quotas.client_rate = rate;
+    }
+    let (relay, relay_id, relay_cancel) = start_relay_with(quotas).await;
     let (r_proxy, r_tcp) = relay_over_tcp_only(relay).await;
     let (s_proxy, s_tcp) = relay_over_tcp_only(relay).await;
     let receiver_sees = if receiver_udp_blocked {
@@ -5797,7 +5817,6 @@ async fn through_the_relay(sender_udp_blocked: bool, receiver_udp_blocked: bool)
     })
     .await;
     wait_registered(&mut r.events, Duration::from_secs(30)).await;
-    let size = 2_000_000;
     let path = make_file(&src, "relayed.bin", size, 13);
     let mut cfg = sender_cfg(&path, "0.0.0.0:0".parse().unwrap(), r.id, &state);
     cfg.relays = vec![format!("{}@{}", relay_id, sender_sees)];
@@ -5812,10 +5831,19 @@ async fn through_the_relay(sender_udp_blocked: bool, receiver_udp_blocked: bool)
         panic!("unexpected event");
     }
     if sender_udp_blocked {
+        let streamed = s_tcp.to_target_bytes.load(Ordering::Relaxed);
         assert!(
-            s_tcp.to_target_bytes.load(Ordering::Relaxed) >= size as u64,
+            streamed >= size as u64,
             "the sender's side carried over TCP"
         );
+        if rate.is_some() {
+            // What the relay would not carry yet was held, the stream with
+            // it, and not dropped to be sent again.
+            assert!(
+                streamed < size as u64 * 3 / 2,
+                "{streamed} bytes over the stream for a file of {size}"
+            );
+        }
     }
     if receiver_udp_blocked {
         assert!(
@@ -5848,6 +5876,16 @@ async fn a_receiver_whose_udp_is_blocked_registers_with_its_relay_over_tcp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_carries_between_two_streams() {
     through_the_relay(true, true).await;
+}
+
+/// A relay that carries a client at 16 Mbit/s holds what comes faster on a
+/// stream until it may carry it, and the stream slows the sender down. A
+/// stream is not paced by loss, so what was dropped here was sent again and
+/// again: thirty times the file, through a relay that took 100 Mbit/s.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_holds_a_stream_to_its_rate_rather_than_drop() {
+    through_the_relay_at(true, false, Some(2_000_000), 4_000_000).await;
 }
 
 // ---------------------------------------------------------------------------

@@ -60,8 +60,8 @@ client.
     scripts/natlab/natlab.py probe --v6 --wait 12   # ... over IPv6, for every pair of firewalls
     scripts/natlab/natlab.py probe --all --addr --wait 45   # ... with addresses swapped instead of cards
 
-NATLAB_LOG sets the binaries' log level (default info); NATLAB_KEEP keeps a
-mobility case's laboratory directory, logs and all.
+NATLAB_LOG sets the binaries' log level (default info); NATLAB_KEEP keeps
+each transfer's laboratory directory, logs and all.
 """
 
 import argparse
@@ -880,8 +880,10 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
     `during(lab, topo)`, if given, is called every fifth of a second while
     the transfer runs: what a scenario does to the network in the middle of
     one.
+    NATLAB_KEEP keeps the laboratory's directory, logs and all, whatever
+    `keep` says.
     Returns (ok, path, seconds, detail)."""
-    lab = Lab(keep=keep)
+    lab = Lab(keep=keep or bool(os.environ.get("NATLAB_KEEP")))
     try:
         topo = Topo(lab, a_nat, b_nat, a_cgn, b_cgn, v6=v6, v4=v4, isolate=isolate)
         if prepare:
@@ -2912,6 +2914,8 @@ def cmd_speed(args):
     ok_all = True
     print(f"{'path':8} {'carried by':16} result")
     for name, a, b, via, isolate in SPEED_PATHS:
+        if args.only and name not in args.only:
+            continue
         ok, path, took, detail = transfer(a, b, timeout=args.timeout, via=via, isolate=isolate, verbose=True)
         m = re.search(r"Done: \S+ \S+ in ([\d.]+)(m?s) \(([\d.]+) (k|M|G)bit/s avg\)", detail)
         if m:
@@ -2920,7 +2924,11 @@ def cmd_speed(args):
             said = f"{rate:.1f} Mbit/s ({args.mb} MB in {secs:.1f} s)"
         else:
             said = f"no summary ({took:.1f} s)"
-        wanted = {"direct": is_direct, "relay": lambda p: p.startswith("relay"), "TURN": lambda p: p.startswith("turn")}
+        # Through the relay over UDP: one that loses so much that the
+        # session leaves for a stream (as one did, its buffers a datagram
+        # long against the system's runs of them) is a failure here.
+        wanted = {"direct": is_direct, "relay": lambda p: p.split(" ")[0] == "relay",
+                  "TURN": lambda p: p.startswith("turn")}
         good = ok and m is not None and wanted[name](path)
         ok_all &= good
         print(f"{name:8} {path:16} {'ok  ' if good else 'FAIL'} {said}", flush=True)
@@ -3055,6 +3063,7 @@ def main():
     sc.add_argument("-v", "--verbose", action="store_true")
     sp = sub.add_parser("speed")
     sp.add_argument("--mb", type=int, default=100, help="the file's size in megabytes")
+    sp.add_argument("--only", nargs="*", help="only these paths: direct relay TURN")
     sp.add_argument("--timeout", type=int, default=300)
     sp.add_argument("-v", "--verbose", action="store_true")
     mob = sub.add_parser("mobility")

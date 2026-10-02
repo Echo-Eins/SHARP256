@@ -3969,6 +3969,7 @@ impl Engine {
             self.inflight_bytes += len;
             self.bytes_sent += len;
             self.round_sent += len;
+            self.policer.on_sent(len);
             self.retransmitted_bytes += e.min(self.highest_sent).saturating_sub(s);
             self.highest_sent = self.highest_sent.max(e);
         }
@@ -4536,6 +4537,11 @@ impl Engine {
                 .is_empty();
         self.pending.remove(0, ack.contiguous_upto);
         let mut acked: u64 = 0;
+        // What was sent since a policer check began, delivered and lost:
+        // all the check is told of.
+        let checking = self.policer.checking_since();
+        let since_check = |sent_at: Instant| checking.is_some_and(|c| sent_at >= c);
+        let (mut acked_checked, mut lost_checked) = (0u64, 0u64);
         let mut newest_delivered: Option<Instant> = None;
         let mut note_delivered = |t: Instant| {
             newest_delivered = Some(newest_delivered.map_or(t, |n: Instant| n.max(t)));
@@ -4555,6 +4561,9 @@ impl Engine {
                 break;
             }
             acked += end - off;
+            if since_check(sent_at) {
+                acked_checked += end - off;
+            }
             note_delivered(sent_at);
             spurious |= retx && now.saturating_duration_since(sent_at) < too_soon;
             self.remove_inflight(off);
@@ -4584,6 +4593,9 @@ impl Engine {
             for (k, end, sent_at, retx) in keys {
                 if received.contains(k, end) {
                     acked += end - k;
+                    if since_check(sent_at) {
+                        acked_checked += end - k;
+                    }
                     note_delivered(sent_at);
                     spurious |= retx && now.saturating_duration_since(sent_at) < too_soon;
                     self.remove_inflight(k);
@@ -4640,6 +4652,9 @@ impl Engine {
                     if by_order || by_time {
                         self.remove_inflight(k);
                         lost.push((k, end));
+                        if since_check(sent_at) {
+                            lost_checked += end - k;
+                        }
                     }
                 }
             }
@@ -4702,10 +4717,12 @@ impl Engine {
         let lost_bytes: u64 = lost.iter().map(|&(s, e)| e - s).sum();
         if self.stream.is_none() {
             let was = self.policer.found();
-            if let Some(rate) = self
-                .policer
-                .on_ack(now, self.rtt.round(), acked, lost_bytes)
-            {
+            let (delivered, gone) = if checking.is_some() {
+                (acked_checked, lost_checked)
+            } else {
+                (acked, lost_bytes)
+            };
+            if let Some(rate) = self.policer.on_ack(now, self.rtt.round(), delivered, gone) {
                 if !was {
                     tracing::info!(
                         "the path lets {:.2} Mbit/s through and drops the rest, as a policer \

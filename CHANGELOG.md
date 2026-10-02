@@ -193,6 +193,38 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   more about its addresses, it asks again with the same token, and the
   receiver, told of the same introduction with other addresses, punches
   towards them too.
+- The relay received into a buffer a jumbo frame long, while its sockets
+  ask the system for runs of datagrams in one receive (UDP GRO): it
+  carried the first six of a run and lost the rest — more than half of
+  what it carried wherever the network coalesced. Through a relay limited
+  to 100 Mbit/s a client got 7 and left for TCP; now 93 to 96, on UDP.
+  Found by the speed measurement; a run in one segmented send now crosses
+  the relay whole in a test.
+- A relay limited by its quota dropped what came faster on a stream; a
+  stream is not paced by loss, so the sender sent it again, and again: 6
+  GiB for a file of 200 MB in the laboratory. What comes on a stream now
+  waits for the quota, and for room in the stream on the other side, up to
+  50 ms, and TCP slows the sender down (`a_relay_holds_a_stream_to_its_
+  rate_rather_than_drop`: 1.5 times the file at most; 16.5 before).
+- The policer's check counted what had gone out faster before it began
+  and was answered during it: on CI's slower runner the sender seemed to
+  send at one and a half times the rate it was held to, lost a third, and
+  a 250 kB/s policer was let go of as random loss (87 per cent sent
+  again). A check now counts only what was sent since it began, by what
+  was sent, and waits for 32 KiB of answers.
+- What a sender's NAT tests found between the relay's introduction and
+  the hold on the relay's port is told to the relay at once. It was
+  waited for only if the tests were not done by then: on CI's runner the
+  IPv6 test finished in between, the receiver — behind an IPv6 firewall
+  that lets in only what it has sent to — never learnt where the sender
+  was, and no direct path opened.
+- Tests: the relay's fuzzing harness counts only what this input's relay
+  sent (on macOS the last input's answer could arrive after it); the
+  state store's test no longer cleans up "older than no time" across a
+  turn of the clock's second (Windows); the bench's ceilings of data sent
+  again fit a release build, whose short transfers are mostly slow start;
+  the registration measurement's socket has room for a chunk's answers
+  (its own buffer lost the last thirty-five of every 256).
 - `SECURITY.md`: how to report a vulnerability, privately.
 
 ### Laboratories and measurements
@@ -215,8 +247,13 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   carrier's AFTR, with the tunnel's MTU), `natlab.py speed` (directly,
   through a relay, through TURN).
 - Measurements under `--ignored`: registrations a relay takes a second and
-  the memory each holds (`registrations_by_the_thousand`), and what a
-  flood of handshakes gets from a receiver (`a_flood_of_handshakes`).
+  the memory each holds (`registrations_by_the_thousand`: 9 400 a second,
+  about 400 bytes each), and what a flood of handshakes gets from a
+  receiver (`a_flood_of_handshakes`: of 3 000 initiations in 23 ms from
+  one client, 40 answered with a handshake and 125 with a cookie).
+- `natlab.py speed` in CI, with the scenarios of a change of network, two
+  subscribers behind one CGN, NAT66 and DS-Lite; through the relay the
+  session has to stay on UDP.
 - CI's speed job (`.github/workflows/speed.yml`): the link-profile bench in
   a release build against floors (`tests/bench_floors.tsv`).
 - Tests: a sender whose port changes four times a second, false NAT hints

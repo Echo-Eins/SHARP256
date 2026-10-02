@@ -724,13 +724,21 @@ queueing it, so the RTT never rises, and on a short path even a window of
 two chunks a round trip is far more than it passes. Sampling starts at a
 loss; an interval lasts at least 4 rounds and 50 ms and ends on a loss. Two
 intervals in a row that each lost at least a fifth of what they delivered,
-at delivery rates within an eighth of each other, are a policer, at the
-mean of the two rates. The pacing rate is capped there for 48 rounds and
-2 s at least (a lower rate found meanwhile replaces it); then the cap rises
-by 1.25 every 4 rounds and 200 ms, and is lifted at 16 times the rate
-found. A policer still in place is found again at the first step, losing
-what a quarter over its rate loses; an interval of 16 rounds and 200 ms
-without that much loss starts the sampling over. Only datagram paths are
+at delivery rates within an eighth of each other, make a policer suspected,
+at the mean of the two rates; an interval of 16 rounds and 200 ms without
+that much loss starts the sampling over. Random loss of a fifth looks the
+same, so the suspicion is **checked**: the sender is paced at the rate for
+4 rounds, 50 ms and 32 KiB answered at least, counting only what it sent
+since the check began (what went out faster before is still being answered
+then). Losing less than a tenth of that, having sent at seven tenths of the
+rate or more, it is a policer; losing more, the check is made again at four
+fifths of the rate, and losing as much there, it is random loss, and
+nothing is suspected for 30 s (doubled for each such false alarm in a row,
+up to 600 s). A check at which the sender did not come up to the rate says
+nothing, and sampling starts over. A policer found caps the pacing rate for
+48 rounds and 2 s at least; then the cap rises by 1.25 every 4 rounds and
+200 ms, and is lifted at 16 times the rate found. A policer still in place
+is suspected again at the first step and checked. Only datagram paths are
 sampled, and a change of path forgets it. A recognised policer also makes
 UDP suspect for the trial on a stream ("Carriers other than UDP").
 
@@ -1458,7 +1466,11 @@ IPv4 address or an IPv6 /64; 100 Mbit/s by default), a volume per client per
 hour, a total rate for the relay, and a volume per pair after which its port
 is closed. The rates are token buckets holding a quarter of a second of
 their rate (at least 64 KiB); a datagram over any limit is dropped, which the transfer's
-congestion control answers by slowing down to what is allowed. The table of
+congestion control answers by slowing down to what is allowed. One that
+came on a stream instead waits for the quota, up to 50 ms, and so does one
+for a stream whose queue is full: the stream is not read meanwhile, and TCP
+slows the sender, which on a stream leaves loss recovery to TCP and would
+send a dropped datagram again and again. The table of
 clients is bounded and forgets only clients whose allowance has fully
 recovered, so being pushed out of it never refills an allowance.
 

@@ -5,6 +5,7 @@ use super::frame::{self, Frame, MAX_DATAGRAM};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -80,6 +81,23 @@ impl Link {
             return false;
         }
         self.queue(Out::Datagram(port, data.to_vec()))
+    }
+
+    /// Queues a datagram as `send` does, waiting up to `within` for room
+    /// when the queue is full.
+    pub async fn send_within(&self, port: u16, data: &[u8], within: Duration) -> bool {
+        if data.len() > MAX_DATAGRAM || data.is_empty() {
+            return false;
+        }
+        let Ok(Ok(permit)) = tokio::time::timeout(within, self.tx.reserve()).await else {
+            return false;
+        };
+        let out = Out::Datagram(port, data.to_vec());
+        self.stats
+            .queued
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
+        permit.send(out);
+        true
     }
 
     /// Queues a frame of the carrier's own.
@@ -303,7 +321,7 @@ mod tests {
         assert_eq!(la.stats().queued(), 0);
         // Closing one end ends both.
         la.close();
-        tokio::time::timeout(std::time::Duration::from_secs(5), lb.closed())
+        tokio::time::timeout(Duration::from_secs(5), lb.closed())
             .await
             .expect("the other end sees the stream end");
         assert!(!lb.stats().alive());

@@ -467,12 +467,21 @@ impl Cubic {
 /// The difference is what holding to the rate does: through a policer,
 /// sending no faster than it lets through loses next to nothing; random
 /// loss goes on as before. So the sender is paced at the mean of the two
-/// rates for a check, as long as a sampling interval, and if it still loses
-/// [`CHECK_LOSS`] or more, at four fifths of it for another (the mean may
-/// sit a little above the policer's rate, the bucket's first burst counted
-/// in). Losing little at either, it is a policer, held to at that rate;
-/// losing as much at both, it is not, and nothing is suspected again for
-/// [`QUIET`] (twice as long after each such false alarm in a row).
+/// rates for a check, as long as a sampling interval and [`CHECK_MIN_BYTES`]
+/// sent, and if it still loses [`CHECK_LOSS`] or more, at four fifths of it
+/// for another (the mean may sit a little above the policer's rate, the
+/// bucket's first burst counted in). Losing little at either, it is a
+/// policer, held to at that rate; losing as much at both, it is not, and
+/// nothing is suspected again for [`QUIET`] (twice as long after each such
+/// false alarm in a row). A check counts only what was sent since it began
+/// (the sender reports that to [`Policer::on_ack`] while
+/// [`Policer::checking_since`] says so, and what it sends to
+/// [`Policer::on_sent`]): what went out faster before is still being
+/// answered, lost for the most part, when the check begins. On a slow
+/// machine, it was most of what a check of fifty milliseconds saw — the
+/// sender looked as if it had sent at one and a half times the rate it
+/// was held to, and lost a third of it, and a policer of 250 kB/s was let
+/// go of as random loss.
 ///
 /// **Held**: [`LT_HOLD_ROUNDS`] round trips and [`LT_HOLD_TIME`] at least.
 ///
@@ -502,8 +511,8 @@ enum PolicerState {
     #[default]
     Free,
     /// Paced at `rate` since `since`, round `round`, to see what is lost
-    /// at it: `delivered` and `lost` since; `lowered` once it is four fifths
-    /// of the rate suspected.
+    /// at it: `sent` since, and `delivered` and `lost` of that; `lowered`
+    /// once it is four fifths of the rate suspected.
     Checking {
         rate: f64,
         lowered: bool,
@@ -511,6 +520,7 @@ enum PolicerState {
         round: u64,
         delivered: u64,
         lost: u64,
+        sent: u64,
     },
     /// Paced at `rate` since `since`, round `round`.
     Held {
@@ -538,6 +548,9 @@ pub const CHECK_LOSS: f64 = 0.1;
 /// What a check has to have sent at, as a share of the rate checked, to say
 /// anything.
 pub const CHECK_REACH: f64 = 0.7;
+/// What a check has to have seen answered, delivered or lost, to say
+/// anything: two dozen full datagrams.
+pub const CHECK_MIN_BYTES: u64 = 32 * 1024;
 pub const LT_HOLD_ROUNDS: u64 = 48;
 pub const LT_HOLD_TIME: Duration = Duration::from_secs(2);
 pub const PROBE_GAIN: f64 = 1.25;
@@ -597,6 +610,7 @@ impl Policer {
                     round,
                     delivered: 0,
                     lost: 0,
+                    sent: 0,
                 };
                 None
             }
@@ -617,15 +631,16 @@ impl Policer {
             round: from,
             delivered,
             lost,
+            sent,
         } = self.state
         else {
             return None;
         };
         let (delivered, lost) = (delivered + got, lost + gone);
-        // Long enough for what went out before the pace changed to be
-        // answered, and to say something.
+        // Long enough to say something.
         if round < from + LT_MIN_ROUNDS
             || now.saturating_duration_since(since) < LT_MIN_TIME
+            || delivered + lost < CHECK_MIN_BYTES
             || delivered == 0
         {
             self.state = PolicerState::Checking {
@@ -635,6 +650,7 @@ impl Policer {
                 round: from,
                 delivered,
                 lost,
+                sent,
             };
             return None;
         }
@@ -643,8 +659,7 @@ impl Policer {
         // does at it: little lost then is no policer's doing, and a cap it
         // does not reach is no use. (A window shrunk by random loss was
         // taken for a policer's verdict so.)
-        let offered =
-            (delivered + lost) as f64 / now.saturating_duration_since(since).as_secs_f64();
+        let offered = sent as f64 / now.saturating_duration_since(since).as_secs_f64();
         if offered < CHECK_REACH * rate {
             self.state = PolicerState::Free;
             return None;
@@ -668,6 +683,7 @@ impl Policer {
                 round,
                 delivered: 0,
                 lost: 0,
+                sent: 0,
             };
             return None;
         }
@@ -724,6 +740,22 @@ impl Policer {
                     };
                 }
             }
+        }
+    }
+
+    /// Takes what the sender sent, in bytes: a check measures how fast.
+    pub fn on_sent(&mut self, bytes: u64) {
+        if let PolicerState::Checking { sent, .. } = &mut self.state {
+            *sent += bytes;
+        }
+    }
+
+    /// When the check under way began, if one is: [`on_ack`](Self::on_ack)
+    /// is then to be told only of what was sent since.
+    pub fn checking_since(&self) -> Option<Instant> {
+        match self.state {
+            PolicerState::Checking { since, .. } => Some(since),
+            _ => None,
         }
     }
 
@@ -1052,6 +1084,7 @@ mod tests {
             let cap = p.rate().unwrap_or(f64::MAX).min(offered);
             let sent = cap / 1000.0;
             let got = sent.min(rate / 1000.0);
+            p.on_sent(sent as u64);
             p.on_ack(*t, *round, got as u64, (sent - got) as u64);
         }
     }
@@ -1134,6 +1167,7 @@ mod tests {
             t += Duration::from_millis(1);
             round += 1;
             let sent = p.rate().unwrap_or(f64::MAX).min(4e6) / 1000.0;
+            p.on_sent(sent as u64);
             p.on_ack(t, round, (sent * 0.8) as u64, (sent * 0.2) as u64);
             capped_ms += p.rate().is_some() as u32;
         }

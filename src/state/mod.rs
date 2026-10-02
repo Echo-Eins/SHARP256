@@ -477,7 +477,13 @@ mod tests {
             parse_hex16(&hex16(&[0xab; 16]).to_uppercase()),
             Some([0xab; 16])
         );
-        assert_eq!(store.cleanup_older_than(Duration::from_secs(0)).unwrap(), 0);
+        // Just saved: not old enough to be cleaned up. (Not "older than no
+        // time at all": the clock's second can turn between the two, and
+        // on a slow Windows runner it did.)
+        assert_eq!(
+            store.cleanup_older_than(Duration::from_secs(3600)).unwrap(),
+            0
+        );
         store.remove_sender(Path::new("/tmp/x.bin"), 5, "10.0.0.1:5555");
         assert!(store
             .load_sender(Path::new("/tmp/x.bin"), 5, "10.0.0.1:5555")

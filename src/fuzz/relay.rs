@@ -90,6 +90,8 @@ struct Run<'w> {
     stamps: [u64; 3],
     nonce: [u8; NONCE_LEN],
     sides: Vec<Side>,
+    /// Every pair's port this run's relay told of.
+    ports: std::collections::HashSet<u16>,
     log: Vec<Vec<u8>>,
 }
 
@@ -121,6 +123,7 @@ impl<'w> Run<'w> {
             stamps: [1; 3],
             nonce: g.array(),
             sides: Vec::new(),
+            ports: Default::default(),
             log: Vec::new(),
         };
         // What the last input's pairs sent after it ended is not ours.
@@ -145,6 +148,17 @@ impl<'w> Run<'w> {
         let mut buf = [0u8; 2048];
         for (p, s) in w.peers.iter().enumerate() {
             while let Ok((n, from)) = s.recv_from(&mut buf) {
+                // Only what this run's relay sent counts — from its control
+                // port, or a pair's port it told of. An earlier input's
+                // relay is another one, and what it sent can still be on
+                // its way: macOS hands loopback datagrams over later, and
+                // its answer to the last input's last step came in here as
+                // sent to an address that had sent nothing.
+                if from.ip() != self.relay.ip()
+                    || (from.port() != self.relay.port() && !self.ports.contains(&from.port()))
+                {
+                    continue;
+                }
                 self.sent[p] += n as u64;
                 match Message::decode(&buf[..n]) {
                     Some(Message::Challenge { token, .. }) if from == self.relay => {
@@ -153,13 +167,16 @@ impl<'w> Run<'w> {
                     Some(
                         Message::Allocated { port, ticket, .. }
                         | Message::Incoming { port, ticket, .. },
-                    ) if from == self.relay && self.sides.len() < KEPT => {
-                        self.sides.push(Side {
-                            peer: p,
-                            port,
-                            ticket,
-                            proof: None,
-                        });
+                    ) if from == self.relay => {
+                        self.ports.insert(port);
+                        if self.sides.len() < KEPT {
+                            self.sides.push(Side {
+                                peer: p,
+                                port,
+                                ticket,
+                                proof: None,
+                            });
+                        }
                     }
                     Some(Message::Confirm { proof }) => {
                         if let Some(side) = self

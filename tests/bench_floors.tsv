@@ -1,12 +1,15 @@
 # The link-profile bench's floors (tests/e2e.rs, bench_link_profiles), as
 # CI's speed regression job enforces them (.github/workflows/speed.yml):
 # profile, least Mbit/s, most per cent of the file sent again.
-# A third or so of what a debug build does on a laptop: a release build on
-# a CI runner does several times more, so these catch a collapse — the
-# congestion control taking random loss for a policer, say — and not a few
-# per cent. Raise them as CI's own numbers come in.
-clean, rtt 20 ms	50	2
-0.1% loss, rtt 100 ms	30	1.5
-1% loss, rtt 20 ms	30	3
-5% loss, rtt 20 ms	25	10
-1% loss, rtt 20 ms, cap 100 Mbit/s	20	3
+# Wide on purpose: they catch a collapse — the congestion control taking
+# random loss for a policer, pacing gone, the file sent twice — not a few
+# per cent, which a shared runner's speed varies by more. The release build
+# CI runs reaches 300 to 650 Mbit/s on the clean profile, and a transfer of
+# a second or two is mostly its start: what the slow start sends beyond the
+# test proxy's buffers is resent (8 per cent clean on CI, 6 at 0.1 per cent
+# loss, 17 at 5 per cent, here). Raise them as CI's own numbers come in.
+clean, rtt 20 ms	50	25
+0.1% loss, rtt 100 ms	30	20
+1% loss, rtt 20 ms	30	20
+5% loss, rtt 20 ms	25	40
+1% loss, rtt 20 ms, cap 100 Mbit/s	20	10
