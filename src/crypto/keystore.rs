@@ -443,3 +443,60 @@ mod dpapi {
         Err(none())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each store's name, as an identity file writes it, reads back as the
+    /// store; what names none is none.
+    #[test]
+    fn a_store_is_named_and_read_back() {
+        for (backend, name) in [
+            (Backend::SecretService, "secret-service"),
+            (Backend::Keychain, "keychain"),
+            (Backend::Dpapi, "dpapi"),
+        ] {
+            assert_eq!(backend.name(), name);
+            assert_eq!(Backend::from_name(name), Some(backend));
+        }
+        assert_eq!(Backend::from_name("Keychain"), None);
+        assert_eq!(Backend::from_name(""), None);
+    }
+
+    /// What the user is told the key is kept by.
+    #[test]
+    fn a_store_says_what_it_is() {
+        assert_eq!(Backend::SecretService.to_string(), "the Secret Service");
+        assert_eq!(Backend::Keychain.to_string(), "the Keychain");
+        assert_eq!(Backend::Dpapi.to_string(), "Windows (DPAPI)");
+    }
+
+    /// This system's store is the one its platform has.
+    #[test]
+    fn this_systems_store() {
+        let expected = if cfg!(windows) {
+            Some(Backend::Dpapi)
+        } else if cfg!(target_os = "macos") {
+            Some(Backend::Keychain)
+        } else if cfg!(unix) {
+            Some(Backend::SecretService)
+        } else {
+            None
+        };
+        assert_eq!(Backend::of_this_system(), expected);
+    }
+
+    /// The entry a key is kept under names its identity, and a key kept as
+    /// hex reads back only when it is hex.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_names_its_identity_and_holds_hex() {
+        let id = crate::crypto::Identity::generate();
+        assert_eq!(account(id.public()), format!("identity {}", id.id()));
+        let hex: String = (0..32).map(|i| format!("{:02x}", i * 7)).collect();
+        let key = key_from_hex(hex.as_bytes()).expect("a key");
+        assert_eq!(key.expose()[1], 7);
+        assert!(key_from_hex(b"not hex at all, and not 64 characters either").is_none());
+    }
+}

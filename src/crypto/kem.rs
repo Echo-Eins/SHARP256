@@ -57,6 +57,21 @@ impl KemSecret {
     pub fn generate() -> Self {
         let mut rng = rand::rngs::OsRng;
         let (dk, ek) = MlKem768::generate(&mut rng);
+        Self::holding(dk, ek)
+    }
+
+    /// The key pair of FIPS 203's seed `d || z` (`ML-KEM.KeyGen_internal`):
+    /// the test vectors' (`crypto::vectors`).
+    #[cfg(test)]
+    pub fn from_seed(seed: &[u8; 64]) -> Self {
+        let (mut d, mut z) = (ml_kem::B32::default(), ml_kem::B32::default());
+        d.copy_from_slice(&seed[..32]);
+        z.copy_from_slice(&seed[32..]);
+        let (dk, ek) = MlKem768::generate_deterministic(&d, &z);
+        Self::holding(dk, ek)
+    }
+
+    fn holding(dk: DecapsulationKey, ek: EncapsulationKey) -> Self {
         let mut public = Box::new([0u8; EK_LEN]);
         public.copy_from_slice(ek.as_bytes().as_slice());
         let mut held = Locked::new(Held::default());
@@ -92,20 +107,46 @@ impl KemSecret {
 pub fn encapsulate(
     ek: &[u8; EK_LEN],
 ) -> Result<([u8; CT_LEN], Zeroizing<[u8; SS_LEN]>), CryptoError> {
+    let (ct, shared) = checked(ek)?
+        .encapsulate(&mut rand::rngs::OsRng)
+        .map_err(|_| CryptoError::Malformed)?;
+    Ok(taken(ct, shared))
+}
+
+/// [`encapsulate`] with FIPS 203's `m` given (`ML-KEM.Encaps_internal`):
+/// the test vectors'.
+#[cfg(test)]
+pub fn encapsulate_deterministic(
+    ek: &[u8; EK_LEN],
+    m: &[u8; 32],
+) -> Result<([u8; CT_LEN], Zeroizing<[u8; SS_LEN]>), CryptoError> {
+    use ml_kem::EncapsulateDeterministic;
+    let (ct, shared) = checked(ek)?
+        .encapsulate_deterministic(&ml_kem::B32::from(*m))
+        .map_err(|_| CryptoError::Malformed)?;
+    Ok(taken(ct, shared))
+}
+
+/// The key, if FIPS 203 allows it (see [`is_reduced`]).
+fn checked(ek: &[u8; EK_LEN]) -> Result<EncapsulationKey, CryptoError> {
     if !is_reduced(ek) {
         return Err(CryptoError::Malformed);
     }
     let encoded = ml_kem::Encoded::<EncapsulationKey>::try_from(&ek[..]).expect("a key's length");
-    let key = EncapsulationKey::from_bytes(&encoded);
-    let (ct, mut shared) = key
-        .encapsulate(&mut rand::rngs::OsRng)
-        .map_err(|_| CryptoError::Malformed)?;
+    Ok(EncapsulationKey::from_bytes(&encoded))
+}
+
+/// The ciphertext, and the secret moved where it is wiped.
+fn taken(
+    ct: ml_kem::Ciphertext<MlKem768>,
+    mut shared: ml_kem::SharedKey<MlKem768>,
+) -> ([u8; CT_LEN], Zeroizing<[u8; SS_LEN]>) {
     let mut out = [0u8; CT_LEN];
     out.copy_from_slice(ct.as_slice());
     let mut secret = Zeroizing::new([0u8; SS_LEN]);
     secret.copy_from_slice(shared.as_slice());
     shared.as_mut_slice().zeroize();
-    Ok((out, secret))
+    (out, secret)
 }
 
 /// FIPS 203, section 7.2, "modulus check": the key's coefficients, twelve
@@ -154,10 +195,24 @@ mod tests {
             second[2] = (value >> 4) as u8;
             assert_eq!(encapsulate(&second).is_ok(), allowed, "{}", value);
         }
+        // The last two coefficients, just before the seed, are checked
+        // like the first.
+        let mut last = good;
+        last[EK_LEN - 32 - 1] = 0xff;
+        last[EK_LEN - 32 - 2] |= 0xf0;
+        assert!(encapsulate(&last).is_err());
         // The seed at the end is any 32 bytes.
         let mut seed = good;
         seed[EK_LEN - 1] = 0xff;
         assert!(encapsulate(&seed).is_ok());
+    }
+
+    /// A key pair is wiped when it goes: what holds it lets go of it.
+    #[test]
+    fn a_key_pair_held_is_let_go_of() {
+        let mut held = Held(Some(MlKem768::generate(&mut rand::rngs::OsRng).0));
+        held.zeroize();
+        assert!(held.0.is_none());
     }
 
     /// The accumulated vectors of Go's `crypto/mlkem` (`TestAccumulated`,

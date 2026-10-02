@@ -252,24 +252,40 @@ static STATE: AtomicU8 = AtomicU8::new(0);
 
 /// What has happened to requests to lock keys in memory so far.
 pub fn locking() -> Locking {
-    match STATE.load(Ordering::Relaxed) {
-        0 => Locking::Unused,
-        1 => Locking::Locked,
-        2 => Locking::Refused,
-        _ => Locking::Unsupported,
+    Locking::from_code(STATE.load(Ordering::Relaxed))
+}
+
+impl Locking {
+    /// In order of how bad it is: the state only ever moves up.
+    fn code(self) -> u8 {
+        match self {
+            Locking::Unused => 0,
+            Locking::Locked => 1,
+            Locking::Refused => 2,
+            Locking::Unsupported => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Locking::Unused,
+            1 => Locking::Locked,
+            2 => Locking::Refused,
+            _ => Locking::Unsupported,
+        }
     }
 }
 
+/// Whether the state moving from `before` to `code` is the first failure:
+/// refused and unsupported are sticky, and told once.
+fn first_failure(code: u8, before: u8) -> bool {
+    code >= Locking::Refused.code() && before < Locking::Refused.code()
+}
+
 fn note(outcome: Locking, why: impl FnOnce() -> String) {
-    let code = match outcome {
-        Locking::Unused => 0,
-        Locking::Locked => 1,
-        Locking::Refused => 2,
-        Locking::Unsupported => 3,
-    };
-    // Refused and unsupported are sticky, and told once.
+    let code = outcome.code();
     let before = STATE.fetch_max(code, Ordering::Relaxed);
-    if code >= 2 && before < 2 {
+    if first_failure(code, before) {
         tracing::warn!("{}", why());
     }
 }
@@ -581,6 +597,78 @@ mod tests {
             derived.expose(),
             &blake3::derive_key("sharp256 test", b"xy")
         );
+    }
+
+    /// What the locking state is reads back as itself, and a failure to
+    /// lock is told the first time only.
+    #[test]
+    fn the_locking_state_reads_back_and_a_failure_is_told_once() {
+        use Locking::*;
+        for l in [Unused, Locked, Refused, Unsupported] {
+            assert_eq!(Locking::from_code(l.code()), l);
+        }
+        let told = |now: Locking, before: Locking| first_failure(now.code(), before.code());
+        assert!(told(Refused, Unused) && told(Refused, Locked) && told(Unsupported, Locked));
+        assert!(!told(Locked, Unused) && !told(Refused, Refused) && !told(Unsupported, Refused));
+        assert!(!told(Refused, Unsupported) && !told(Unsupported, Unsupported));
+    }
+
+    /// A key is never shown, whatever it is.
+    #[test]
+    fn a_key_is_never_shown() {
+        let key = SecretKey::from_bytes(&[0x41; 32]);
+        assert_eq!(format!("{:?}", key), "SecretKey(..)");
+    }
+
+    /// While a key is on a page, the kernel keeps the page locked and out
+    /// of core dumps; when the last key on it goes, both are undone — and
+    /// not when the first of two goes. Read from the kernel (the page's
+    /// mapping's flags in /proc/self/smaps: `lo` locked, `dd` not dumped).
+    /// The buffer is a mapping of its own, with no other test's keys on it.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_page_is_locked_and_kept_out_of_dumps_while_a_key_is_on_it() {
+        let flags = |addr: usize| -> Vec<String> {
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let mut inside = false;
+            for line in smaps.lines() {
+                let range = line.split_whitespace().next().and_then(|r| {
+                    let (a, b) = r.split_once('-')?;
+                    Some((
+                        usize::from_str_radix(a, 16).ok()?,
+                        usize::from_str_radix(b, 16).ok()?,
+                    ))
+                });
+                if let Some((start, end)) = range {
+                    inside = (start..end).contains(&addr);
+                } else if let (true, Some(f)) = (inside, line.strip_prefix("VmFlags:")) {
+                    return f.split_whitespace().map(str::to_string).collect();
+                }
+            }
+            panic!("no mapping holds {:#x}", addr)
+        };
+        let buf = vec![0u8; 1 << 20];
+        let size = os::page_size().unwrap();
+        let page = (buf.as_ptr() as usize + 2 * size) & !(size - 1);
+        // Whether this process may lock memory at all (sanitizers and small
+        // limits refuse it): a page of the buffer no key goes on.
+        let lockable = os::lock(page + 4 * size, size).is_ok();
+        os::unlock(page + 4 * size, size);
+        let has = |f: &[String], flag: &str| f.iter().any(|x| x == flag);
+        let (first, second) = ((page + 8, 32), (page + 200, 32));
+        pages::acquire(first);
+        pages::acquire(second);
+        let f = flags(page);
+        assert!(has(&f, "dd"), "{:?}", f);
+        assert_eq!(has(&f, "lo"), lockable, "{:?}", f);
+        pages::release(first);
+        let f = flags(page);
+        assert!(has(&f, "dd"), "{:?}", f);
+        assert_eq!(has(&f, "lo"), lockable, "{:?}", f);
+        pages::release(second);
+        let f = flags(page);
+        assert!(!has(&f, "dd") && !has(&f, "lo"), "{:?}", f);
+        drop(buf);
     }
 
     #[test]

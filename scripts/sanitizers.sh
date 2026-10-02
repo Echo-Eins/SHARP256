@@ -34,7 +34,7 @@ export CARGO_PROFILE_DEV_OPT_LEVEL=1
 
 # The sanitizers intercept mlock and do nothing (their shadow memory would
 # be locked too), so the kernel reports no locked pages.
-SKIP_LIB="--skip keys_are_locked_here"
+SKIP_LIB="--skip keys_are_locked_here --skip a_page_is_locked_and_kept_out_of_dumps"
 SKIP_E2E=""
 
 run() {

@@ -1,0 +1,22 @@
+{
+  "description": "The key line of an identity file sealed with a passphrase (PROTOCOL.md section 1): XChaCha20-Poly1305 under Argon2id(passphrase, salt) with the parameters on the line, the fields before the nonce joined by single spaces as associated data. The case is cheap — the line says what it costs; defaults is the cost a new file is sealed with.",
+  "defaults": {
+    "lanes": 1,
+    "memory_kib": 262144,
+    "passes": 3
+  },
+  "cases": [
+    {
+      "secret_key": "47e8cf7dc4c26e8e1bda3559f002ea05b97d3c8e2b60858a9b3e8840c29edd34",
+      "public_key": "28cac8ce1363efc50088186c65979c3fb953983c3700d3c2ab248821cd9f590b",
+      "passphrase": "a passphrase",
+      "memory_kib": 64,
+      "passes": 1,
+      "lanes": 1,
+      "salt": "4147e42bae5a66871892c5ef20e116f9",
+      "nonce": "2121c21ea91d7084a6828b228add9d9a86ae4cde50fc21dc",
+      "associated_data": "sharp256-identity-2 28cac8ce1363efc50088186c65979c3fb953983c3700d3c2ab248821cd9f590b passphrase argon2id 64 1 1 4147e42bae5a66871892c5ef20e116f9",
+      "line": "sharp256-identity-2 28cac8ce1363efc50088186c65979c3fb953983c3700d3c2ab248821cd9f590b passphrase argon2id 64 1 1 4147e42bae5a66871892c5ef20e116f9 2121c21ea91d7084a6828b228add9d9a86ae4cde50fc21dc fc039b1931062a111d39189f1c0e98cbda3127ef3fda2fe176cad7798e67d2601b0f4743255852788ab905197437a56c"
+    }
+  ]
+}

@@ -61,6 +61,13 @@ ANSI-последовательности из пришедших данных �
 `memmap2` 0.9.11 под `blake3` (RUSTSEC-2026-0186), `event-listener`
 5.4.2 в GUI (RUSTSEC-2026-0221). Все обновления — в пределах Rust 1.82.
 
+Вне сборок программ — генератор тестовых векторов `scripts/vectors` на Go
+(отдельный модуль, только для проверки): `golang.org/x/crypto` 0.57.0 и
+`golang.org/x/sys` 0.48.0, версии и хеши — в его `go.mod` и `go.sum`, Go
+сверяет их с базой контрольных сумм `sum.golang.org` при скачивании. Своя
+реализация BLAKE3 в нём проверяется официальными векторами BLAKE3
+(`testdata/blake3_test_vectors.json`, тег 1.8.2, sha256 `dcb91ea8…f624`).
+
 ## Проверки
 
 `scripts/supply-chain.sh` делает то же, что задача «Supply chain» в CI

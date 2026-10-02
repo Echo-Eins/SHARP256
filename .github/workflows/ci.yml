@@ -114,6 +114,24 @@ jobs:
       - name: The GUI on 1.85
         run: cargo +1.85 check --all-features --all-targets
 
+  vectors:
+    name: Test vectors, from a second implementation (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Go 1.26 for crypto/mlkem/mlkemtest (ML-KEM with its randomness given).
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: scripts/vectors/go.sum
+      - name: Its BLAKE3 and Noise against third parties' vectors; docs/vectors as it computes them
+        working-directory: scripts/vectors
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+          go run .
+
   netns:
     name: Network namespace tests (Linux)
     runs-on: ubuntu-latest

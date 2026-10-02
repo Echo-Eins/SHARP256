@@ -1,0 +1,20 @@
+{
+  "description": "SHARP IDs (PROTOCOL.md section 1): the public key and its text forms, version 3 (sh-) and version 4 (sh4-).",
+  "cases": [
+    {
+      "public_key": "d3a2747845dca96a39c210bea0ea083abcd06fac478e40388aac007584ca1b23",
+      "id_v3": "sh-2orhi6cf3suwuooccc7kb2qihk6na35mi6heaoekvqahlbgkdmrvhtea",
+      "id_v4": "sh4-2orhi6cf3suwuooccc7kb2qihk6na35mi6heaoekvqahlbgkdmr3lap4"
+    },
+    {
+      "public_key": "1573810615bf353a09a90657545f24e5856aaf7b955abad80c61b31405370e4a",
+      "id_v3": "sh-cvzycbqvx42tucnjazlvixze4wcwvl33svnlvwammgzribjxbzfflrba",
+      "id_v4": "sh4-cvzycbqvx42tucnjazlvixze4wcwvl33svnlvwammgzribjxbzfgxxsj"
+    },
+    {
+      "public_key": "9a56a4946564baef96aa271cb6071041b9f941affd16d8dda87bb9241576023b",
+      "id_v3": "sh-tjlkjfdfms5o7fvke4olmbyqig47sqnp7ulnrxnipo4siflwai53zo6r",
+      "id_v4": "sh4-tjlkjfdfms5o7fvke4olmbyqig47sqnp7ulnrxnipo4siflwai57grpd"
+    }
+  ]
+}

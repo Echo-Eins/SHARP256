@@ -1,0 +1,13 @@
+{
+  "description": "A cookie reply (PROTOCOL.md section 2, admission control): sender_cid | nonce | the cookie sealed with XChaCha20-Poly1305 under the receiver's cookie key, the answered datagram's mac1 as associated data | tag.",
+  "cases": [
+    {
+      "receiver_public_key": "9cd425bd35cb969c4c852b15d129e80d6a39b0af299786078d0f2fdc92135368",
+      "sender_cid": "07e7f2dd4541e13b",
+      "mac1": "d0d962540abc8674cf544d9e8219ac13",
+      "nonce": "2537cfae02a68d8a84733f7619fc9779e92bc1cf29cbe0a6",
+      "cookie": "967e9cf3f89618b1efd8a39bf2e6dbeb",
+      "reply": "07e7f2dd4541e13b2537cfae02a68d8a84733f7619fc9779e92bc1cf29cbe0a67614ac84adbe518b5827b337cc8870922f6d3b17e45421b98f965c262b21b9bf"
+    }
+  ]
+}

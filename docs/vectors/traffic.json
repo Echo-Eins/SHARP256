@@ -1,0 +1,38 @@
+{
+  "description": "Traffic keys (PROTOCOL.md section 2, traffic keys): a direction's secret from a split key and the handshake hash, its IV, its header protection key, and the AEAD key of epochs (2^22 packets each).",
+  "cases": [
+    {
+      "split_key": "1a78f2e05a6b40f501ca9a56ed0dffd14242e6c8127b8bfa07461140c3039692",
+      "handshake_hash": "e8f84610d4ef60c6ee7f577ac9ad4badff9fc84737ae719d2e79ecf3bc6a5b94",
+      "traffic_secret": "53c728ee5f2b4e674d3459a8732a2d2267d9c5e1ff1d5edba6e535fcdf918032",
+      "iv": "be25abd68d5b5b3813f9a5f1",
+      "header_protection_key": "c542a4059953eb0c62df959e1087d70a2df2669da680b4b8882a97ac5dd267a7",
+      "aead_keys": [
+        {
+          "epoch": 0,
+          "key": "8fe3c29cc806e3163e0db550616872528fcc4974f39209548bd99cf1600dfe87"
+        },
+        {
+          "epoch": 1,
+          "key": "0e2f2f11ea63cd6aac732de2f4ceee27e5054444c957986fa625bf89135f0d6f"
+        },
+        {
+          "epoch": 2,
+          "key": "bf867bfbf065247e774bc78903bfc4dc5f95ef280f998f3ac331aa66e8b3565d"
+        },
+        {
+          "epoch": 255,
+          "key": "eb9d01b79bc88c66962800179f046c209730fda248125e295e99d6728cbb57d0"
+        },
+        {
+          "epoch": 1048576,
+          "key": "57fef3c05f3e6569137897d43d63f306ff3a82180d03a8cb5bd0435954e90449"
+        },
+        {
+          "epoch": 4398046511103,
+          "key": "cc701c6f88ae873d6849041ced205bbc8051f506ea187aae010ec666f686ace5"
+        }
+      ]
+    }
+  ]
+}

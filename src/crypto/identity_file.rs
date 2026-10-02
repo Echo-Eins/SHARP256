@@ -702,6 +702,15 @@ pub fn protect(
     how: ProtectAs,
     from: &PassphraseFrom,
 ) -> Result<String, IdentityError> {
+    protect_with_cost(path, how, from, Cost::DEFAULT)
+}
+
+fn protect_with_cost(
+    path: &Path,
+    how: ProtectAs,
+    from: &PassphraseFrom,
+    cost: Cost,
+) -> Result<String, IdentityError> {
     let before = IdentityFile::read(path).ok().map(|f| f.protection());
     let identity = open_or_create(path, from)?;
     let id = identity.id();
@@ -723,7 +732,7 @@ pub fn protect(
             })?)
         }
     };
-    save(path, &identity, &protection)?;
+    save_with_cost(path, &identity, &protection, cost)?;
     let now = IdentityFile::read(path)?.protection();
     Ok(format!("identity {} ({}) is {}", id, path.display(), now))
 }
@@ -828,6 +837,116 @@ mod tests {
 
     /// A file sealed, unsealed and sealed again keeps its identity; the
     /// replacement leaves no temporary file behind.
+    /// A line that names the sealed form but stops before saying how it is
+    /// sealed is refused, not read past its end.
+    #[test]
+    fn a_sealed_line_cut_short_is_refused() {
+        let public = hex_of(Identity::generate().public());
+        for line in [
+            TAG.to_string(),
+            format!("{} {}", TAG, public),
+            format!("{} {} passphrase", TAG, public),
+            format!("{} {} passphrase argon2id", TAG, public),
+        ] {
+            assert!(IdentityFile::parse(line.as_bytes()).is_err(), "{}", line);
+        }
+    }
+
+    /// The ID of the identity at a path, made there if there is none.
+    #[test]
+    fn the_id_of_a_path_where_there_is_none_is_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let id = id_of(&path).unwrap();
+        assert_eq!(IdentityFile::read(&path).unwrap().id(), id);
+        assert_eq!(id_of(&path).unwrap(), id);
+    }
+
+    /// A new passphrase from a file is taken as it is, but not an empty one
+    /// (no terminal is asked: there is none in a test).
+    #[test]
+    fn a_new_passphrase_comes_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::generate().id();
+        let pw = dir.path().join("pw");
+        fs::write(&pw, "new one\n").unwrap();
+        let from = PassphraseFrom {
+            file: Some(&pw),
+            ask: false,
+        };
+        assert_eq!(from.new_passphrase(&id).unwrap().as_str(), "new one");
+        fs::write(&pw, "\n").unwrap();
+        assert!(from.new_passphrase(&id).is_err());
+    }
+
+    /// `sharp-* --protect-identity`: what it does, and what it says it did.
+    #[test]
+    fn protecting_says_what_the_file_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let none = PassphraseFrom::default();
+        let said = protect_with_cost(&path, ProtectAs::None, &none, CHEAP).unwrap();
+        let id = IdentityFile::read(&path).unwrap().id();
+        assert_eq!(
+            said,
+            format!(
+                "identity {} ({}) is not sealed (the file's permissions alone)",
+                id,
+                path.display()
+            )
+        );
+        // An unsealed file sealed with a passphrase from a file.
+        let pw = dir.path().join("pw");
+        fs::write(&pw, "sealed now").unwrap();
+        let from = PassphraseFrom {
+            file: Some(&pw),
+            ask: false,
+        };
+        let said = protect_with_cost(&path, ProtectAs::Passphrase, &from, CHEAP).unwrap();
+        assert!(said.ends_with("is sealed with a passphrase"), "{}", said);
+        let file = IdentityFile::read(&path).unwrap();
+        assert_eq!(file.protection(), Protection::Passphrase);
+        assert_eq!(file.open(Some("sealed now")).unwrap().id(), id);
+    }
+
+    /// A key file other users can read draws a warning when it is read;
+    /// one only its owner can read does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_others_can_read_is_warned_of() {
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        Identity::load_or_create(&path).unwrap();
+        let warned = |mode: u32| {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let sink = Sink(Default::default());
+            let writer = sink.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || IdentityFile::read(&path).unwrap());
+            let log = String::from_utf8(sink.0.lock().clone()).unwrap();
+            log.contains("readable by other users")
+        };
+        assert!(!warned(0o600));
+        assert!(!warned(0o400));
+        assert!(warned(0o640));
+        assert!(warned(0o604));
+    }
+
     #[test]
     fn protection_changes_and_the_identity_stays() {
         let dir = tempfile::tempdir().unwrap();

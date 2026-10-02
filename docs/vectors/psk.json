@@ -1,0 +1,29 @@
+{
+  "description": "Pre-shared keys from a shared passphrase (PROTOCOL.md section 1): Argon2id, salt \"sharp256 v3 psk \" || receiver public key, 32 bytes. The first case is the protocol's cost (64 MiB, 3 passes, 1 lane); the others are cheap, to check the construction quickly.",
+  "cases": [
+    {
+      "passphrase": "correct horse battery staple",
+      "receiver_public_key": "ff1202f89803ea4d51c6939fb3e15ff1dba8a3a947b9c65a333152557d61a54e",
+      "memory_kib": 65536,
+      "passes": 3,
+      "lanes": 1,
+      "psk": "114ee14e3e8b730d7673522525c6d6a9ae2cd4c9a9691934b161e9010662d91f"
+    },
+    {
+      "passphrase": "correct horse battery staple",
+      "receiver_public_key": "ff1202f89803ea4d51c6939fb3e15ff1dba8a3a947b9c65a333152557d61a54e",
+      "memory_kib": 8,
+      "passes": 1,
+      "lanes": 1,
+      "psk": "b627b6a2efdcdd98c06409508ef77ac9a66579087ff8b7a8f10873d018fc7f55"
+    },
+    {
+      "passphrase": "пароль с пробелами и ё",
+      "receiver_public_key": "ff1202f89803ea4d51c6939fb3e15ff1dba8a3a947b9c65a333152557d61a54e",
+      "memory_kib": 8,
+      "passes": 1,
+      "lanes": 1,
+      "psk": "c0dd59269279e6db1a56eb7d1a0dd107cd4d4144995c6f29443356a37cbd9472"
+    }
+  ]
+}

@@ -46,12 +46,14 @@ const SIGMA: [[usize; 16]; 10] = [
     [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
 ];
 
-/// An unkeyed BLAKE2s hasher with 32 bytes of output.
+/// An unkeyed BLAKE2s hasher with 32 bytes of output. What it has taken in
+/// — the chaining value and the block being filled — is wiped when it is
+/// dropped, by the types it is held in.
 pub(crate) struct Blake2s {
-    h: [u32; 8],
+    h: Zeroizing<[u32; 8]>,
     /// Bytes compressed so far.
     t: u64,
-    buf: [u8; BLOCK_LEN],
+    buf: Zeroizing<[u8; BLOCK_LEN]>,
     /// Bytes in `buf`. A full block stays there until more input arrives,
     /// since the last block, full or not, is compressed differently.
     len: usize,
@@ -63,9 +65,9 @@ impl Blake2s {
         // Parameter block: digest length 32, no key, fanout 1, depth 1.
         h[0] ^= 0x0101_0000 ^ HASH_LEN as u32;
         Self {
-            h,
+            h: Zeroizing::new(h),
             t: 0,
-            buf: [0; BLOCK_LEN],
+            buf: Zeroizing::new([0; BLOCK_LEN]),
             len: 0,
         }
     }
@@ -90,19 +92,10 @@ impl Blake2s {
         self.buf[self.len..].fill(0);
         compress(&mut self.h, &self.buf, self.t, true);
         let mut out = Zeroizing::new([0u8; HASH_LEN]);
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.h) {
+        for (chunk, word) in out.chunks_exact_mut(4).zip(self.h.iter()) {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
         out
-    }
-}
-
-impl Drop for Blake2s {
-    fn drop(&mut self) {
-        self.h.zeroize();
-        self.t.zeroize();
-        self.buf.zeroize();
-        self.len.zeroize();
     }
 }
 

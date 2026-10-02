@@ -242,9 +242,23 @@ impl Identity {
                         crate::file::durable::sync_dir(&crate::file::durable::parent_of(path))?;
                         Ok(id)
                     }
-                    // Another process created it first: use theirs.
+                    // Another process created it first: use theirs. Read
+                    // once more, and no more than that: something there
+                    // that reads as nothing — a link to a file that is
+                    // gone — sent this round and round until the stack ran
+                    // out, and the program aborted.
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        Self::load_or_create(path)
+                        match IdentityFile::read(path) {
+                            Ok(file) => Ok(file.open(None)?),
+                            Err(IdentityError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                                Err(io::Error::other(format!(
+                                    "{} is in the way: something is there, but no identity \
+                                     can be read from it (a link to a file that is gone?)",
+                                    path.display()
+                                )))
+                            }
+                            Err(e) => Err(e.into()),
+                        }
                     }
                     Err(e) => Err(e),
                 }
@@ -380,6 +394,76 @@ pub(crate) fn base32_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Something at the identity's path that names nothing — a link to a
+    /// file that is gone — is neither read nor written over, and says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_in_place_of_the_identity_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &path).unwrap();
+        let e = Identity::load_or_create(&path).unwrap_err();
+        assert!(e.to_string().contains("is in the way"), "{}", e);
+        assert!(!dir.path().join("gone").exists());
+    }
+
+    /// An identity already stored is the one used, not written over.
+    #[test]
+    fn a_stored_identity_is_the_one_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let first = Identity::load_or_create(&path).unwrap();
+        assert_eq!(Identity::load_or_create(&path).unwrap().id(), first.id());
+    }
+
+    /// Anything at the path that cannot be read as an identity — here a
+    /// directory — is an error, not a reason to make another identity.
+    #[test]
+    fn what_cannot_be_read_is_not_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Identity::load_or_create(dir.path()).is_err());
+    }
+
+    /// Where an identity is kept by default: the per-user data directory.
+    #[test]
+    fn the_identity_is_kept_in_the_user_data_directory() {
+        let path = Identity::default_path().expect("a per-user data directory");
+        assert!(
+            path.ends_with("sharp-256/identity.key"),
+            "{}",
+            path.display()
+        );
+    }
+
+    /// The short form is the prefix and the first eight characters.
+    #[test]
+    fn the_short_form_of_an_id() {
+        let id = Identity::generate().id();
+        let full = id.to_string();
+        assert_eq!(id.short(), format!("{}…", &full[..11]));
+    }
+
+    /// Two digits that are no digits do not make one that is: each wrong
+    /// digit counts, in every position.
+    #[test]
+    fn hex_with_wrong_digits_is_refused() {
+        let mut out = [0u8; 2];
+        for bad in ["zz00", "00zz", "z000", "0g00", "000G", "  00"] {
+            assert!(!hex_decode(bad.as_bytes(), &mut out), "{}", bad);
+        }
+        assert!(hex_decode(b"0aF9", &mut out));
+        assert_eq!(out, [0x0a, 0xf9]);
+    }
+
+    /// Base32 that does not end on a whole byte, or ends on one with bits
+    /// left over, is not an encoding of anything.
+    #[test]
+    fn base32_with_bits_left_over_is_refused() {
+        assert_eq!(base32_decode("a"), None);
+        assert_eq!(base32_decode("ab"), None);
+        assert_eq!(base32_decode("aa"), Some(vec![0]));
+    }
 
     #[test]
     fn base32_roundtrip() {

@@ -18,6 +18,8 @@ pub mod noise;
 pub mod replay;
 pub mod secret;
 pub mod transport;
+#[cfg(test)]
+mod vectors;
 
 pub use identity::{Identity, SharpId};
 pub use secret::SecretKey;

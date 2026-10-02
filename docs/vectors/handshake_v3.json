@@ -1,0 +1,88 @@
+{
+  "description": "Version 3 handshakes (PROTOCOL.md section 2): Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s with the prologue \"SHARP-256 v3\", every random value given; the initiation and response datagrams, the split and the handshake hash, the traffic secrets, and the first transport packet each way under them.",
+  "cases": [
+    {
+      "name": "v3 plain",
+      "prologue": "SHARP-256 v3",
+      "initiator_static_secret": "cb18bb64daf8808166b1cd2018e70db4e14dcead8a42cbc9058e064fca3080ad",
+      "responder_static_secret": "c4eca7fe92c823114d0291d0c2c639e145911549f72274bb8d2dd7e9af2dcf0c",
+      "initiator_static_public": "ba41db4fcf0243dc6b5d6a54937eaf65384fb921f510628a11634ed00f3aff34",
+      "responder_static_public": "7153ab18ba2f15d779608598be0492baa0226a5847abb629e5f5508035e1427a",
+      "psk": "0000000000000000000000000000000000000000000000000000000000000000",
+      "initiator_ephemeral_secret": "40d2ce7ef0c8c8158145128690b0f3a630e8c906fa801c9037b47dec5d908ff3",
+      "responder_ephemeral_secret": "6ad56cf7084723017a3246f864e401eb9180c7876f154e021f249709e18e3046",
+      "sender_cid": "6e7eaa9db0eb26f5",
+      "receiver_cid": "6c1b2db24b526ef1",
+      "initiation_payload": "fca1e20be5bed9a34d784c01209991cb2b0fccfaa689a08468dc38386218094dc703ca0e5d41d911815282696cd5587bc6fef964523d7ed5d1c6e78f651dde",
+      "response_payload": "2e93119892432750526128de722009aa0d283f965b5e5c15860dab492bc16a97e6b36e5f1412cf7317",
+      "noise_message_1": "e741b4b05a48211a01b39f5119810da6eedb4832a84e62e6f9aaee0e953333147e0c7a22e4edfbf5ac8043458c0624dfa2ecf8c93420a252319c024f96eeced07b230911bb387b536035cc34756a27d70bc15fa4661ec508c8225af9ac6c4a45d9dfe688e17d5504613cc073361ba91a5456d4f08de4bb02b7e10c8c654bb3ab375beb59cd1a661aeadc566134c75dfdaa75b93c2ecb1fa2f79a0f5d6a48bcb3502bb52af8277d",
+      "noise_message_2": "aa1c1982a11c1fa4d7f323006976fd1ebce1a93957f6697dd6c8decd15636902746064345e944809380d00f93e98a4f5ba5245db88cfd8d27d23584a5e35a8e29e275b8087aa40e51e0e5dc84057614749543f528dc1ba239f0a7480bbb7bbaba9",
+      "initiation_datagrams": [
+        "6e7eaa9db0eb26f5e741b4b05a48211a01b39f5119810da6eedb4832a84e62e6f9aaee0e953333147e0c7a22e4edfbf5ac8043458c0624dfa2ecf8c93420a252319c024f96eeced07b230911bb387b536035cc34756a27d70bc15fa4661ec508c8225af9ac6c4a45d9dfe688e17d5504613cc073361ba91a5456d4f08de4bb02b7e10c8c654bb3ab375beb59cd1a661aeadc566134c75dfdaa75b93c2ecb1fa2f79a0f5d6a48bcb3502bb52af8277dc3b7eecaebb15e003ae6e62f19e35f8500000000000000000000000000000000"
+      ],
+      "response_datagram": "6e7eaa9db0eb26f56c1b2db24b526ef1aa1c1982a11c1fa4d7f323006976fd1ebce1a93957f6697dd6c8decd15636902746064345e944809380d00f93e98a4f5ba5245db88cfd8d27d23584a5e35a8e29e275b8087aa40e51e0e5dc84057614749543f528dc1ba239f0a7480bbb7bbaba9bd8ad4abe152b1ca3c25d87e0b0507c200000000000000000000000000000000",
+      "handshake_hash": "0a3b3426f86c432332153b33a5cdcdcad80fba232d9d64a62194ffd6a9f100a1",
+      "split_initiator_to_responder": "4020266afef4127c504c11080be5288d46c9fe68c677c0c14ac08614c4bdeeba",
+      "split_responder_to_initiator": "182ed4eedfadd3393dd841f2c23216e85e3159baa0dd9742eeb36132651dce2b",
+      "traffic_secret_initiator_to_responder": "4d4c0adee4852f149d73ee0bc371f80474fc647be400b9fefdd1df3eb35db9a3",
+      "traffic_secret_responder_to_initiator": "b6e3cb8ed32d5fd7c87c935183a269ec6891925546a6761ab3d7174a11341afd",
+      "suite": "ChaCha20-Poly1305",
+      "first_packet_initiator_to_responder": {
+        "dcid": "6c1b2db24b526ef1",
+        "type": 1,
+        "packet_number": 0,
+        "body": "34aeef195314f9dc8af84258a8feaa61eb9b6691028e7c3d734ddd03a82365e44509a5e4d4baa6af8c5fae1f31702c9a",
+        "packet": "6c1b2db24b526ef197631bfd0e60bc516ed334eec22ab41ef87938f059b980217e2cb89048dc20eb953931ffcafd029553c177aea7a02b9e57d894645b7e082daa4acf5bc5e36969db9aca7e6348ddc1d3"
+      },
+      "first_packet_responder_to_initiator": {
+        "dcid": "6e7eaa9db0eb26f5",
+        "type": 2,
+        "packet_number": 0,
+        "body": "876d8f0b702f077c19ea2a1c25fdc3b0d22bf845f50211e2731e4414fc2849bd95eb73f4b5bc21b559add3b3232da201",
+        "packet": "6e7eaa9db0eb26f5c4b6e424d132179054061f68411e1520c171a3dc07530504ae627f02347260a7ab60f4b6ae4718baa9418493ec34a892459c9f073dc6aaa87422653551e8fd972949017615cfdadfe2"
+      }
+    },
+    {
+      "name": "v3 psk cookie",
+      "prologue": "SHARP-256 v3",
+      "initiator_static_secret": "e9fbc632c95c8e795812f6dade3f728333b8018d2aa17ee1834a0e07b20bbfb2",
+      "responder_static_secret": "3469547bfee842296940215dd459a719a66ff878deeeed9f5274b9400f1d516d",
+      "initiator_static_public": "f017d7d9be9a904bc1f94f2f7e6678b8536ad2d8c118ddf67fb0f3e3089d8a3e",
+      "responder_static_public": "ebcec270813664e704cd9be65d62dbbe54621974a4aa4b25da5201df01ba9a6a",
+      "psk": "af150f2dd72453edadd42f66d823869c1fb731fae6e507f3e8166520654a40ad",
+      "initiator_ephemeral_secret": "b697aa227a7bf3937b35da601e04bb220099da2991bcdf92cc690add4f76aee6",
+      "responder_ephemeral_secret": "403f2548351170bf6df99eae0aab22e84ad6b70826dba1a4c19f7bd7176dc22c",
+      "sender_cid": "ce491db1d204cf59",
+      "receiver_cid": "9c90ce5e5a58d13d",
+      "cookie": "51bdf979748a1a5cc3e730d52393bcc9",
+      "initiation_payload": "98f6ce7c2d827c49d9e91e75ebc9b16f9f6e37a9b85d1568ef077f3dba38238d7ceacd870f0721253d7b79c6b6aa9906f9236d834b453fe896379e9059f7f1",
+      "response_payload": "5def817a290809db5fb01b25a6f3a57bb91bd00397fd0e31e39c4eb48be705454f225cc6fa3b772bf5",
+      "noise_message_1": "387b04aed71bff77aa462cf7226aef2a6d10ce803d2e75988ae983e436ae0c143b791bf2fd24adc9d7607996e4d217822f9f0ba8d4b071cb2f060ae74b605c0fce4d72625838e9d63f39d87c6e6e098041121534662a4af5061e07bfd73763bb9d100f81dd23b3f7cdefc8d9c695091755e6cb9eeb3776e191cbf790ba85824dc1983f44bdac372f3fa25b010ec84dd8e5aedaaba423a084996bab6f85bb04ac08bc98fb280025",
+      "noise_message_2": "89b2c08c214e25749c843cfff92e7d4ebb96a13dc2304e695c9b4ce044cda91cdc88be5eb8334488da5aba5a4ebc49cb2d23ea65cb94a416d9e30e3d643c752d72a61adb11f2bacf95ca58efe7534ebfd0423b0f0bc5949c492257175defe103b0",
+      "initiation_datagrams": [
+        "ce491db1d204cf59387b04aed71bff77aa462cf7226aef2a6d10ce803d2e75988ae983e436ae0c143b791bf2fd24adc9d7607996e4d217822f9f0ba8d4b071cb2f060ae74b605c0fce4d72625838e9d63f39d87c6e6e098041121534662a4af5061e07bfd73763bb9d100f81dd23b3f7cdefc8d9c695091755e6cb9eeb3776e191cbf790ba85824dc1983f44bdac372f3fa25b010ec84dd8e5aedaaba423a084996bab6f85bb04ac08bc98fb280025a5f11cc567d15f685e88032ac986f5981da86a00c90706cd50b6153d33e69ea6"
+      ],
+      "response_datagram": "ce491db1d204cf599c90ce5e5a58d13d89b2c08c214e25749c843cfff92e7d4ebb96a13dc2304e695c9b4ce044cda91cdc88be5eb8334488da5aba5a4ebc49cb2d23ea65cb94a416d9e30e3d643c752d72a61adb11f2bacf95ca58efe7534ebfd0423b0f0bc5949c492257175defe103b07608ba00bc63694cb3185c4d25097aff00000000000000000000000000000000",
+      "handshake_hash": "3aa90e102c3fc2ed1efee5354fb6c0e15f0b5db904ad9a0f2f917ea68041290a",
+      "split_initiator_to_responder": "df4b915e8e56d52aed2ed11a3b888686667eb3b42e6675bc001d2d4c0570ec44",
+      "split_responder_to_initiator": "19059dda51500ab2a7f530826435a9ae1bb58fd41309e1418362f9a41391d2da",
+      "traffic_secret_initiator_to_responder": "e80e75bb5e5246a53fa8938624f8352aaa5d62b65ddf6377cd3b4fa6ca365493",
+      "traffic_secret_responder_to_initiator": "3fb78396339af98dbc87b200ebb0953128c7425a35e26f9078016e7152ba9b90",
+      "suite": "AES-256-GCM",
+      "first_packet_initiator_to_responder": {
+        "dcid": "9c90ce5e5a58d13d",
+        "type": 1,
+        "packet_number": 0,
+        "body": "c1843213ed5a3c24640a026c0eb427b0bfbf97a7317c30112ff7d2ad0996691d9fc8bd768deda82ad8995a3a19cd181f",
+        "packet": "9c90ce5e5a58d13d8341f8f0c6629fb72207131c9c5f699fd308d81bcc1b6fad8f32d0e112f6bae7fd1d3f900d6381fafd1cd7387ca4d32914f415f2d2b0904b9a003c33f1e1642672f846d6e0f0d592de"
+      },
+      "first_packet_responder_to_initiator": {
+        "dcid": "ce491db1d204cf59",
+        "type": 2,
+        "packet_number": 0,
+        "body": "d0457aa5960ab88fe7e64b5e6eecbcce55a6b4cf7a5fb6aee3f644a1e614901a6679b4f65d83724c32c73645ff8dce38",
+        "packet": "ce491db1d204cf59eeb7bbe85dc0b921c65db253cef33d6f645ae91397f6dd74c6b600fa66baa24b486903568f4b9112b16a431541087d69c71acbce8f89ed1cc77f50023a7fa7f47f96ba12184963927e"
+      }
+    }
+  ]
+}

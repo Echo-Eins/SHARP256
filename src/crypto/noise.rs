@@ -331,6 +331,10 @@ pub struct Initiator {
     hybrid: bool,
     e1: Option<KemSecret>,
     finished: bool,
+    /// The ephemeral keys of the next message 1, when a test gives them
+    /// (see [`Initiator::fix`]).
+    #[cfg(test)]
+    fixed: Option<(SecretKey, Option<KemSecret>)>,
 }
 
 impl Initiator {
@@ -349,6 +353,8 @@ impl Initiator {
             hybrid: false,
             e1: None,
             finished: false,
+            #[cfg(test)]
+            fixed: None,
         }
     }
 
@@ -369,12 +375,26 @@ impl Initiator {
     /// Message 1, `-> e, es, s, ss` (or `-> e, es, e1, s, ss`), carrying
     /// `payload`.
     pub fn write_initiation(&mut self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.write_initiation_with(SecretKey::random(), payload)
+        #[cfg(test)]
+        if let Some((e, e1)) = self.fixed.take() {
+            return self.write_initiation_with(e, e1, payload);
+        }
+        let e1 = self.hybrid.then(KemSecret::generate);
+        self.write_initiation_with(SecretKey::random(), e1, payload)
+    }
+
+    /// The ephemeral keys the next message 1 is written with — `e`, and in
+    /// the hybrid handshake `e1` — instead of fresh ones: the test vectors'
+    /// (`crypto::vectors`).
+    #[cfg(test)]
+    pub(crate) fn fix(&mut self, e: SecretKey, e1: Option<KemSecret>) {
+        self.fixed = Some((e, e1));
     }
 
     fn write_initiation_with(
         &mut self,
         e: SecretKey,
+        e1: Option<KemSecret>,
         payload: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
         if self.e.is_some() {
@@ -386,7 +406,7 @@ impl Initiator {
         mix_ephemeral(&mut self.state, &e_pub);
         self.state.mix_key(&dh(e.expose(), &self.rs)?[..]); // es
         if self.hybrid {
-            let e1 = KemSecret::generate();
+            let e1 = e1.ok_or_else(|| failed("a hybrid handshake without e1"))?;
             self.state.encrypt_and_hash(e1.public(), &mut out)?; // e1
             self.e1 = Some(e1);
         }
@@ -457,6 +477,10 @@ pub struct Responder {
     psk: SecretKey,
     /// The initiator's `e1`, in the hybrid handshake.
     re1: Option<Box<[u8; EK_LEN]>>,
+    /// The ephemeral key and the encapsulation's randomness message 2 is
+    /// written with, when a test gives them (see [`Responder::fix`]).
+    #[cfg(test)]
+    fixed: Option<(SecretKey, Option<[u8; 32]>)>,
 }
 
 /// What message 1 said: who sent it, and its payload.
@@ -530,6 +554,8 @@ impl Responder {
                 rs,
                 psk: psk.clone(),
                 re1,
+                #[cfg(test)]
+                fixed: None,
             },
             initiator_static: rs,
             payload,
@@ -539,7 +565,20 @@ impl Responder {
     /// Message 2, `<- e, ee, se, psk` (or `<- e, ee, ekem1, se, psk`),
     /// carrying `payload`, and the keys.
     pub fn write_response(self, payload: &[u8]) -> Result<(Vec<u8>, Split), CryptoError> {
+        #[cfg(test)]
+        if let Some((e, _)) = &self.fixed {
+            let e = e.clone();
+            return self.write_response_with(e, payload);
+        }
         self.write_response_with(SecretKey::random(), payload)
+    }
+
+    /// The ephemeral key message 2 is written with, and in the hybrid
+    /// handshake FIPS 203's `m` for the encapsulation, instead of fresh
+    /// ones: the test vectors' (`crypto::vectors`).
+    #[cfg(test)]
+    pub(crate) fn fix(&mut self, e: SecretKey, m: Option<[u8; 32]>) {
+        self.fixed = Some((e, m));
     }
 
     fn write_response_with(
@@ -553,6 +592,12 @@ impl Responder {
         mix_ephemeral(&mut self.state, &e_pub);
         self.state.mix_key(&dh(e.expose(), &self.re)?[..]); // ee
         if let Some(re1) = &self.re1 {
+            #[cfg(test)]
+            let (ct, shared) = match self.fixed.as_ref().and_then(|f| f.1) {
+                Some(m) => kem::encapsulate_deterministic(re1, &m)?,
+                None => kem::encapsulate(re1)?,
+            };
+            #[cfg(not(test))]
             let (ct, shared) = kem::encapsulate(re1)?;
             self.state.encrypt_and_hash(&ct, &mut out)?; // ekem1
             self.state.mix_key(&shared[..]);
@@ -617,6 +662,7 @@ mod tests {
         let m1 = initiator
             .write_initiation_with(
                 SecretKey::from_bytes(&key(s("init_ephemeral"))),
+                None,
                 &msg(0, "payload"),
             )
             .unwrap();
@@ -692,7 +738,7 @@ mod tests {
             let mut ours =
                 Initiator::new(&init, resp.public(), &SecretKey::from_bytes(&psk), prologue);
             let m1 = ours
-                .write_initiation_with(SecretKey::from_bytes(&ie), &p1)
+                .write_initiation_with(SecretKey::from_bytes(&ie), None, &p1)
                 .unwrap();
             let mut snow_i = snow_builder(prologue)
                 .local_private_key(init.secret())
@@ -789,6 +835,23 @@ mod tests {
                 (a, b)
             );
         }
+    }
+
+    /// What a handshake keeps its keys in wipes them: the chaining key, the
+    /// hash, and the cipher's key and count.
+    #[test]
+    fn the_handshake_state_is_wiped() {
+        let mut state = SymmetricState {
+            ck: [1; 32],
+            h: [2; 32],
+            cipher: CipherState::default(),
+        };
+        state.cipher.set(&[3; 32]);
+        state.cipher.n = 9;
+        state.zeroize();
+        assert_eq!((state.ck, state.h), ([0; 32], [0; 32]));
+        let c = &state.cipher;
+        assert_eq!((c.k, c.has_key, c.n), ([0; 32], false, 0));
     }
 
     /// A message that fails leaves the initiator as it was: the real

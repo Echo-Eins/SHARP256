@@ -89,21 +89,21 @@ pub const COOKIE_REPLY_LEN: usize = CID_LEN + 24 + 16 + AEAD_TAG;
 /// How long a cookie secret is used before it is replaced.
 pub const COOKIE_LIFETIME: Duration = Duration::from_secs(120);
 
-fn mac1_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
+pub(super) fn mac1_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v3 mac1", public)
 }
 
 /// Version 4's `mac1` key: a receiver of either version tells the two apart
 /// by it, and one of version 3 hears nothing it knows in a fragment.
-fn mac1_key_v4(public: &[u8; KEY_LEN]) -> [u8; 32] {
+pub(super) fn mac1_key_v4(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v4 mac1", public)
 }
 
-fn cookie_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
+pub(super) fn cookie_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v3 cookie", public)
 }
 
-fn mac2_key(cookie: &[u8; MAC_LEN]) -> Zeroizing<[u8; 32]> {
+pub(super) fn mac2_key(cookie: &[u8; MAC_LEN]) -> Zeroizing<[u8; 32]> {
     derive_secret("sharp256 v3 mac2", &[cookie])
 }
 
@@ -262,6 +262,16 @@ impl Initiator {
         self.version
     }
 
+    /// The connection id and ephemeral keys of this attempt — in version 4
+    /// the ML-KEM key pair of FIPS 203's seed `d || z` too — instead of
+    /// fresh ones: the test vectors' (`crypto::vectors`).
+    #[cfg(test)]
+    pub(crate) fn fix(&mut self, cid: u64, e: SecretKey, kem_seed: Option<&[u8; 64]>) {
+        self.cid = cid;
+        self.noise
+            .fix(e, kem_seed.map(crate::crypto::kem::KemSecret::from_seed));
+    }
+
     /// The sender's connection id for this attempt: responses and transport
     /// packets from the receiver are addressed to it.
     pub fn cid(&self) -> u64 {
@@ -416,7 +426,7 @@ impl Initiator {
 
 /// The cookie in a reply to a datagram of `cid`, sealed with a receiver's
 /// cookie `key` to the mac1 of the datagram it answers: any of `sent`.
-fn open_cookie(
+pub(super) fn open_cookie(
     key: &[u8; 32],
     sent: &[[u8; MAC_LEN]],
     cid: u64,
@@ -639,6 +649,14 @@ impl Responder {
 }
 
 impl Incoming {
+    /// The ephemeral key the response is written with — and in version 4
+    /// FIPS 203's `m` for the encapsulation — instead of fresh ones: the
+    /// test vectors' (`crypto::vectors`).
+    #[cfg(test)]
+    pub(crate) fn fix(&mut self, e: SecretKey, kem_random: Option<[u8; 32]>) {
+        self.noise.fix(e, kem_random);
+    }
+
     /// Writes the response and completes the handshake.
     pub fn respond(
         self,
@@ -1289,6 +1307,125 @@ mod tests {
             l.allow(SocketAddr::new(ip.into(), 9), now);
         }
         assert!(l.per_ip.len() <= MAX_LIMITED_CLIENTS);
+    }
+
+    /// The load threshold is a number of initiations a second that is not
+    /// yet load; the one past it is.
+    #[test]
+    fn load_begins_past_the_threshold() {
+        let mut l = HandshakeLimiter::new(10.0, 20.0, 5);
+        // The first window starts when the limiter is made.
+        let now = Instant::now();
+        for i in 1..=5 {
+            assert!(!l.note_initiation(now), "initiation {} of 5", i);
+        }
+        assert!(l.note_initiation(now));
+        assert!(!l.note_initiation(now + Duration::from_secs(1)));
+    }
+
+    /// A full limiter table makes room only from clients whose buckets have
+    /// filled again — no sooner, and as soon as it may (every 250 ms) — and
+    /// a client it already holds is served however full it is. Two tokens a
+    /// second and a burst of twenty: a client that took one is full again
+    /// half a second later.
+    #[test]
+    fn a_full_limiter_table_makes_room_from_full_buckets_only() {
+        let mut l = HandshakeLimiter::new(2.0, 20.0, 5);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let client = |i: u32| SocketAddr::new(std::net::Ipv4Addr::from(0x0A00_0000 + i).into(), 9);
+        for i in 0..MAX_LIMITED_CLIENTS as u32 {
+            assert!(l.allow(client(i), t0));
+        }
+        let newcomer = client(MAX_LIMITED_CLIENTS as u32);
+        // Nobody full yet (19 + 0.26 × 2 tokens): no room.
+        assert!(!l.allow(newcomer, at(260)));
+        // One the table holds is served, full table or not.
+        assert!(l.allow(client(5), at(270)));
+        // Everyone else full again (19 + 0.52 × 2), and 260 ms since the
+        // last look: room.
+        assert!(l.allow(newcomer, at(520)));
+    }
+
+    /// The smallest initiation there is — no payload — is one: recognised,
+    /// answered with a cookie under load, and let in with the cookie's mac2.
+    #[test]
+    fn the_smallest_initiation_is_one() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), psk());
+        let mut jar = CookieJar::new(&r.id());
+        let (from, now) = (addr("192.0.2.9:4000"), Instant::now());
+        let mut init = Initiator::new(&s, &r.id(), &psk()).unwrap();
+        let pkt = init.initiation(b"", None).unwrap();
+        assert_eq!(pkt.len(), INITIATION_OVERHEAD);
+        assert!(responder.is_initiation(&pkt));
+        assert!(responder.read_initiation(&pkt).is_ok());
+        let reply = jar.reply(&pkt, from, now).expect("a cookie reply");
+        let cookie = init.read_cookie_reply(&reply).unwrap();
+        let mut retry = Initiator::new(&s, &r.id(), &psk()).unwrap();
+        let pkt = retry.initiation(b"", Some(&cookie)).unwrap();
+        assert!(jar.mac2_ok(&pkt, from, now));
+        // One byte short of it is nothing.
+        assert!(!responder.is_initiation(&pkt[..pkt.len() - 1]));
+        assert!(jar.reply(&pkt[..pkt.len() - 1], from, now).is_none());
+        assert!(!jar.mac2_ok(&pkt[..pkt.len() - 1], from, now));
+    }
+
+    /// An initiation whose sealed payload is too short to hold the sender's
+    /// connection id is refused, not read past its end.
+    #[test]
+    fn a_sealed_payload_shorter_than_a_connection_id_is_refused() {
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), psk());
+        for sealed in [&b""[..], b"\x00\x00\x00\x01", b"seven b"] {
+            let msg = noise::Initiator::new(&s, r.public(), &psk(), PROLOGUE)
+                .write_initiation(sealed)
+                .unwrap();
+            let body = [&7u64.to_be_bytes()[..], &msg].concat();
+            let (pkt, _) = forge::stamp(&r.id(), Version::V3, &body, None);
+            assert!(matches!(
+                responder.read_initiation(&pkt),
+                Err(CryptoError::Malformed)
+            ));
+        }
+    }
+
+    /// A version 4 initiation takes as many fragments as its length needs,
+    /// up to four, each of them within a control datagram; the receiver
+    /// puts every count together; and one too long for four is refused.
+    #[test]
+    fn every_fragment_fits_a_datagram_up_to_four() {
+        use crate::protocol::constants::MAX_CONTROL_DATAGRAM;
+        let (s, r) = pair();
+        let responder = Responder::new(r.clone(), psk());
+        // What four fragments can carry of the payload, the sealed
+        // connection id taken out.
+        let most = MAX_FRAGMENTS * FRAGMENT_CHUNK - noise::HFS_INITIATION_LEN - CID_LEN;
+        let mut counts = std::collections::BTreeSet::new();
+        for len in (0..=most).step_by(97).chain([most]) {
+            let payload = vec![0x5a; len];
+            let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+            let frags = init.initiation_datagrams(&payload, None).unwrap();
+            counts.insert(frags.len());
+            assert!(frags.len() <= MAX_FRAGMENTS);
+            let mut table = Fragments::default();
+            let mut whole = None;
+            for f in &frags {
+                assert!(f.len() <= MAX_CONTROL_DATAGRAM, "{} bytes of payload", len);
+                let fragment = responder.fragment(f).expect("a fragment");
+                assert_eq!(fragment.count, frags.len());
+                whole = table.add(f, fragment, addr("198.51.100.9:4000"), Instant::now());
+                assert_eq!(table.is_empty(), whole.is_some());
+            }
+            let whole = whole.expect("put together");
+            let incoming = responder
+                .read_initiation_v4(whole.sender_cid, &whole.msg)
+                .unwrap();
+            assert_eq!(incoming.payload, payload);
+        }
+        assert_eq!(counts.into_iter().collect::<Vec<_>>(), [2, 3, 4]);
+        let mut init = Initiator::new_v4(&s, &r.id(), &psk()).unwrap();
+        assert!(init.initiation_datagrams(&vec![0; most + 1], None).is_err());
     }
 
     fn addr(s: &str) -> SocketAddr {

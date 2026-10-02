@@ -27,7 +27,7 @@ use crate::sync::{AtomicU64, Ordering, RwLock};
 use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Connection id length.
 pub const CID_LEN: usize = 8;
@@ -238,6 +238,30 @@ impl Zeroize for HeaderKey {
     }
 }
 
+/// A direction's traffic secret: from a key of the handshake's split and
+/// the handshake hash (PROTOCOL.md section 2, "Traffic keys"), as the
+/// derivations below.
+pub(super) fn traffic_secret(k: &[u8; 32], hash: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    derive_secret("sharp256 v3 traffic secret", &[k, hash])
+}
+
+/// A direction's IV.
+pub(super) fn iv_of(secret: &[u8; 32]) -> [u8; 12] {
+    let mut iv = [0u8; 12];
+    iv.copy_from_slice(&derive_secret("sharp256 v3 aead iv", &[secret])[..12]);
+    iv
+}
+
+/// A direction's header protection key.
+pub(super) fn header_key_of(secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    derive_secret("sharp256 v3 header protection", &[secret])
+}
+
+/// A direction's AEAD key for an epoch of 2^22 packets.
+pub(super) fn aead_key_of(secret: &[u8; 32], epoch: u64) -> Zeroizing<[u8; 32]> {
+    derive_secret("sharp256 v3 aead key", &[secret, &epoch.to_be_bytes()])
+}
+
 /// The key of one epoch: which epoch, and its AEAD.
 #[derive(Default)]
 struct Slot {
@@ -311,9 +335,8 @@ impl DirectionKeys {
         crate::crypto::secret::keylog::note(secret);
         let keys = Locked::with(|k: &mut Secrets| {
             k.secret = *secret;
-            let iv = derive_secret("sharp256 v3 aead iv", &[secret]);
-            k.iv.copy_from_slice(&iv[..12]);
-            let hp = derive_secret("sharp256 v3 header protection", &[secret]);
+            k.iv = iv_of(secret);
+            let hp = header_key_of(secret);
             #[cfg(test)]
             crate::crypto::secret::keylog::note(&hp[..]);
             k.hp.set(suite, &hp);
@@ -334,7 +357,7 @@ impl DirectionKeys {
     }
 
     fn fill(slot: &mut Slot, suite: Suite, secret: &[u8; 32], epoch: u64) {
-        let key = derive_secret("sharp256 v3 aead key", &[secret, &epoch.to_be_bytes()]);
+        let key = aead_key_of(secret, epoch);
         #[cfg(test)]
         crate::crypto::secret::keylog::note(&key[..]);
         slot.epoch = epoch;
@@ -469,10 +492,7 @@ impl DirectionKeys {
             if bool::from(ahead & !kept) {
                 #[cfg(test)]
                 tests::LOOKAHEAD_KEYS.with(|n| n.set(n.get() + 1));
-                let key = derive_secret(
-                    "sharp256 v3 aead key",
-                    &[&self.keys.secret, &epoch.to_be_bytes()],
-                );
+                let key = aead_key_of(&self.keys.secret, epoch);
                 Locked::new(Aead::new(self.suite, &key)).open(&nonce, head, body, tag)?;
             } else {
                 let index = u64::conditional_select(&newest, &chosen, kept);
@@ -497,9 +517,8 @@ impl SessionKeys {
     /// Derives the session keys from the handshake's split. The initiator
     /// sends with the first key and the responder with the second.
     pub fn derive(split: &crate::crypto::handshake::Split, initiator: bool, suite: Suite) -> Self {
-        let secret = |k: &[u8; 32]| derive_secret("sharp256 v3 traffic secret", &[k, &split.hash]);
-        let i2r = secret(&split.initiator_to_responder);
-        let r2i = secret(&split.responder_to_initiator);
+        let i2r = traffic_secret(&split.initiator_to_responder, &split.hash);
+        let r2i = traffic_secret(&split.responder_to_initiator, &split.hash);
         let (send, recv) = if initiator { (i2r, r2i) } else { (r2i, i2r) };
         Self {
             suite,
@@ -824,6 +843,41 @@ mod tests {
         assert_eq!(Suite::choose(0, true), None);
         if Suite::hardware_aes() {
             assert_eq!(Suite::choose(Suite::ALL_BITS, true), Some(Suite::Aes256Gcm));
+        }
+    }
+
+    /// Whether this machine accelerates AES-GCM is what its processor says
+    /// of itself (on Linux, in /proc/cpuinfo): AES and carry-less
+    /// multiplication instructions both.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn hardware_aes_is_what_the_processor_says() {
+        let info = std::fs::read_to_string("/proc/cpuinfo").unwrap();
+        let flags = info
+            .lines()
+            .find(|l| l.starts_with("flags") || l.starts_with("Features"))
+            .expect("a line of the processor's features");
+        let has = |f: &str| flags.split_whitespace().any(|w| w == f);
+        let multiply = if cfg!(target_arch = "x86_64") {
+            "pclmulqdq"
+        } else {
+            "pmull"
+        };
+        assert_eq!(Suite::hardware_aes(), has("aes") && has(multiply));
+    }
+
+    /// A header protection key is wiped: its holder lets go of it, the
+    /// ChaCha20 key's bytes zeroed first.
+    #[test]
+    fn a_header_key_is_wiped() {
+        for suite in [Suite::Aes256Gcm, Suite::ChaCha20Poly1305] {
+            let mut hp = HeaderKey::new(suite, &[9; 32]);
+            assert!(!matches!(hp, HeaderKey::None));
+            hp.zeroize();
+            assert!(matches!(hp, HeaderKey::None));
         }
     }
 

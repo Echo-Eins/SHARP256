@@ -1,0 +1,25 @@
+{
+  "description": "MAC keys (PROTOCOL.md section 2): mac1's of a public key for versions 3 and 4, the cookie key of a receiver, and mac2's of a cookie. A MAC is BLAKE3-keyed(key, data)[0..16].",
+  "cases": {
+    "cookies": [
+      {
+        "cookie": "60cee2a137e231c5d295a6d4ca9775c2",
+        "mac2_key": "5c0d6c1adabbdda8906225aed9728529b83fa0731470cf66de15b85e3ecf5084"
+      }
+    ],
+    "public_keys": [
+      {
+        "public_key": "886687dd2ae4c6c95eacd71c8c0594329a5425ab9e3557b40c5003b434881e46",
+        "mac1_key_v3": "60be0bf448515d73e2504c58e82f523acb12a827419e8391f0b4941b753428d0",
+        "mac1_key_v4": "7af1a1f86b8c8a030336f6ef474964ab94c82dc771658fef3d840b53e7acaea2",
+        "cookie_key": "66e0d6ac7ed4c0c02a12e17549222b5e9ae584016d597a08123029c2bde69e9e"
+      },
+      {
+        "public_key": "d8ee4f12ed8be82509dbc26861d3e037a92a797b2436716b95af1eac022df438",
+        "mac1_key_v3": "3119d732727ebb8519b874534fc0c652932e1320d1f725b8a20c2d5bb630c2ca",
+        "mac1_key_v4": "36ac3ac41aede73b96c004a9291fb837436ecbdacc3aaaff28438c80460d45c4",
+        "cookie_key": "49e3e25152f9e2306470393d739ff383454ae80de1ffb6d620301e288eee1ba7"
+      }
+    ]
+  }
+}

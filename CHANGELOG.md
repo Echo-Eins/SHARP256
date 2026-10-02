@@ -275,6 +275,37 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   (its own buffer lost the last thirty-five of every 256).
 - `SECURITY.md`: how to report a vulnerability, privately.
 
+### Test vectors, from a second implementation
+- `docs/vectors`: known-answer vectors for every key derivation and format
+  of the cryptographic layer — IDs (`sh-`, `sh4-`), the PSK, a sealed
+  identity file, the MAC and cookie keys, a cookie reply, whole handshakes
+  of versions 3 and 4 (every random value given, message 1 of version 4 in
+  fragments), traffic keys of every kind, and transport packets of both
+  suites across epochs. `scripts/vectors` computes them: PROTOCOL.md
+  written again in Go, sharing no code with the crate (its own BLAKE3 and
+  Noise, checked against the official BLAKE3 vectors and cacophony's;
+  Go's X25519, AES-GCM and ML-KEM). The crate checks itself against the
+  files (`crypto::vectors`, its randomness given through test-only hooks),
+  and CI checks that the Go program still computes them.
+- Why: the first full mutation run (71.4 % caught) showed the crate's
+  cryptography held only by its two ends agreeing with each other — an
+  AEAD nonce of zeros, a constant `mac1` or cookie key, another ID
+  checksum passed every test. Each is caught now. Every surviving mutant
+  of `src/crypto/` has a test or a written reason (docs/MUTANTS.md): tests
+  of fragment and initiation bounds, the handshake limiter's full table,
+  wiping, the identity file's paths, and, read from the kernel, that a
+  key's page is locked and kept out of core dumps exactly while a key is
+  on it.
+- Found on the way: a dangling symbolic link in place of the identity file
+  made creating one recurse until the stack ran out — the programs
+  aborted at start. Now it is read once more and, failing that, an error
+  says what is in the way.
+- PROTOCOL.md says what the second implementation had to guess: the
+  sealed connection id leads message 1's payload in version 4 too, how
+  message 1 is cut into fragments, that version 4 keeps version 3's
+  labels for `mac2`, cookies and traffic keys, the identity file's default
+  lane and its associated data exactly, and the relay magic by name.
+
 ### Laboratories and measurements
 - `scripts/netemlab/`: real transfers through the kernel's netem — loss up
   to 30 per cent, losses in bursts, jitter, reordering, duplication, a

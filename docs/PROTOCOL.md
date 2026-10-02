@@ -56,13 +56,15 @@ sharp256-identity-2 <public> keystore dpapi <blob> <nonce[24]> <sealed[48]>
 
 (every value in hex). `sealed` is the private key encrypted with
 XChaCha20-Poly1305 under a key that is either `Argon2id(passphrase, salt)`
-with the parameters written before it (256 MiB and 3 passes by default) or
+(version 0x13, 32 bytes) with the parameters written before it (256 MiB, 3
+passes and 1 lane by default) or
 a random 32-byte key the operating system keeps for the user: in the
 Secret Service (attributes `application=sharp-256`, `identity=<ID>`), in
 the Keychain (service `sharp-256`, account `identity <ID>`), or sealed by
 DPAPI to the Windows account, with `"sharp256 identity " || public` as its
 entropy, and carried in the file as `blob`. The associated data is the
-line up to the nonce, with single spaces; the key that comes out must have
+fields before the nonce joined by single spaces (none after the last); the
+key that comes out must have
 `public` as its public key. A file is always replaced whole: written next
 to the old one, flushed, renamed over it, and the directory flushed.
 
@@ -121,7 +123,7 @@ cookie      R → S   sender_cid[8] | nonce[24] | enc(cookie)[16] | tag[16]
   *receives* with them: the sender chooses `sender_cid` per attempt, the
   receiver `receiver_cid` per session. Every later datagram starts with the
   id of its recipient, which is all the receiver needs to find the session.
-  Zero, the relay magic (section 8) and any id whose second four bytes are
+  Zero, the relay magic `SHRELAY1` (section 8) and any id whose second four bytes are
   the STUN magic cookie `0x2112A442` are never chosen, so a transport packet
   can never be mistaken for a relay control message or for STUN on a socket
   that carries both.
@@ -310,7 +312,11 @@ ML-KEM alike; authentication is version 3's (the static X25519 keys and the
 PSK).
 
 Message 1 is about 1300 bytes, too long for a control datagram, and goes in
-up to four **fragments** of about equal size (two in practice):
+up to four **fragments** of about equal size (two in practice): as many as
+1159 bytes of message each need (1200 less the fragment's own 41), every
+one ⌈length / count⌉ bytes of it but the last, numbered from 0. The
+receiver needs only the numbers; the cut is the sender's, this one is what
+the test vectors (`docs/vectors`) show:
 
 ```
 fragment    S → R   sender_cid[8] | index:4 count:4 | chunk | mac1[16] | mac2[16]
@@ -333,9 +339,13 @@ receiver's connection id (only the sealed one ever counted) and no `mac2`
 (always zero in an answer); its `mac1` is keyed with the sender's key under
 the version 4 label. It is shorter than the fragments together.
 
-The payload of message 1 is `timestamp:u64 suites:u8 hardware_aes:u8` —
-no HELLO; the response's is `suite:u8 reason:u8`, the suite chosen or 0 and
-why the handshake is refused (the allow-list, no suite in common, busy).
+The payload of message 1 is `sender_cid[8] timestamp:u64 suites:u8
+hardware_aes:u8` — the sealed copy of the connection id as in version 3,
+and no HELLO; the response's is `receiver_cid[8] suite:u8 reason:u8`, the
+suite chosen or 0 and why the handshake is refused (the allow-list, no
+suite in common, busy). The rest of this section is version 3's, labels
+included: `mac2` and its key, cookies, the traffic keys
+(`"sharp256 v3 …"` in both versions).
 What the receiver makes of the transfer is said later, in answer to the
 HELLO.
 
