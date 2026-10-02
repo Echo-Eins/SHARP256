@@ -52,7 +52,9 @@ struct Args {
     #[arg(long, default_value_t = 128)]
     registrations_per_client: usize,
 
-    /// Pairs one client may have carried at once.
+    /// Pairs one client may have carried at once. A client that holds
+    /// them all gets the one of its own that has carried nothing longest,
+    /// if for 10 s, made room with.
     #[arg(long, default_value_t = 16)]
     pairs_per_client: usize,
 

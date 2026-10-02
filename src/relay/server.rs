@@ -35,6 +35,12 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
 /// How long an allocation survives with nothing flowing through it.
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(60);
+/// How long a client's allocation has to have carried nothing before it
+/// makes room for the same client's next one, when the client holds its
+/// whole share (or the relay its whole limit): long enough for a pair to be
+/// introduced and bound (eight introductions 400 ms apart), and for any
+/// transfer it carries to have said something.
+const RECLAIM_QUIET: Duration = Duration::from_secs(10);
 /// How often the token secret is replaced. Two are kept, so a token is good
 /// for between one and two of these — measured on the clock, whether or not
 /// anyone asks for a token in between.
@@ -549,6 +555,47 @@ struct Allocation {
     disclose: bool,
     sender_ticket: [u8; TOKEN_LEN],
     receiver_ticket: [u8; TOKEN_LEN],
+    /// When it last carried something (see [`Heard`]).
+    heard: Arc<Heard>,
+    /// Ends it: the relay stopping, or the same client needing the room.
+    /// One ended this way counts against no limit while its task ends.
+    release: CancellationToken,
+}
+
+impl Allocation {
+    /// Whether it still holds its port.
+    fn live(&self) -> bool {
+        !self.task.is_finished() && !self.release.is_cancelled()
+    }
+}
+
+/// When a pair last carried something (or had a side bind), for the
+/// relay's control loop to see: the pair's own clock is its task's.
+struct Heard {
+    made: Instant,
+    /// Milliseconds after `made`.
+    after: std::sync::atomic::AtomicU64,
+}
+
+impl Heard {
+    fn new(made: Instant) -> Self {
+        Self {
+            made,
+            after: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn note(&self, now: Instant) {
+        let after = now.saturating_duration_since(self.made).as_millis() as u64;
+        self.after
+            .store(after, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How long it has carried nothing, as of `now`.
+    fn quiet(&self, now: Instant) -> Duration {
+        let after = self.after.load(std::sync::atomic::Ordering::Relaxed);
+        now.saturating_duration_since(self.made + Duration::from_millis(after))
+    }
 }
 
 /// What one side is told about the other: the address, or nothing at all
@@ -1144,14 +1191,12 @@ impl Relay {
                 let mine = self
                     .allocations
                     .iter()
-                    .filter(|a| a.requested_by == client && !a.task.is_finished())
+                    .filter(|a| a.requested_by == client && a.live())
                     .count();
-                let live = self
-                    .allocations
-                    .iter()
-                    .filter(|a| !a.task.is_finished())
-                    .count();
-                if live >= self.cfg.max_allocations || mine >= share {
+                let live = self.allocations.iter().filter(|a| a.live()).count();
+                if (live >= self.cfg.max_allocations || mine >= share)
+                    && !self.make_room(client, Instant::now())
+                {
                     if mine >= share {
                         tracing::info!("relay: {} already holds {} ports", client, mine);
                     }
@@ -1243,12 +1288,38 @@ impl Relay {
         self.allocations
             .iter()
             .find(|a| {
-                a.sender == sender
-                    && a.receiver == receiver
-                    && a.disclose == disclose
-                    && !a.task.is_finished()
+                a.sender == sender && a.receiver == receiver && a.disclose == disclose && a.live()
             })
             .map(|a| (a.port, a.sender_ticket, a.receiver_ticket))
+    }
+
+    /// Makes room for `client`'s next pair with its own that has carried
+    /// nothing longest, if for [`RECLAIM_QUIET`] at least (or half the idle
+    /// limit, if that is shorter); whether it did. A client sending one
+    /// file after another through the relay left a pair behind for each,
+    /// carrying nothing until it went idle a minute later, and was refused
+    /// once it held its share of them. Other clients' pairs make no room
+    /// for it.
+    fn make_room(&self, client: std::net::IpAddr, now: Instant) -> bool {
+        let enough = RECLAIM_QUIET.min(self.cfg.idle / 2);
+        let quietest = self
+            .allocations
+            .iter()
+            .filter(|a| a.requested_by == client && a.live())
+            .map(|a| (a, a.heard.quiet(now)))
+            .filter(|(_, quiet)| *quiet >= enough)
+            .max_by_key(|(_, quiet)| *quiet);
+        let Some((a, quiet)) = quietest else {
+            return false;
+        };
+        tracing::info!(
+            "relay: port {} carried nothing for {:.1?}; released for {}'s next pair",
+            a.port,
+            quiet,
+            client
+        );
+        a.release.cancel();
+        true
     }
 
     /// Sets a port aside for one pair and starts carrying it.
@@ -1279,6 +1350,8 @@ impl Relay {
         let port = sock.local_addr().ok()?.port();
         let sender_ticket = random_token();
         let receiver_ticket = random_token();
+        let heard = Arc::new(Heard::new(Instant::now()));
+        let release = self.cancel.child_token();
         self.ports.lock().insert(port);
         let streamed = self.tunnels.open_pair(port);
         let task = tokio::spawn(carry(Carried {
@@ -1298,7 +1371,8 @@ impl Relay {
             idle: self.cfg.idle,
             meter: self.meter.clone(),
             pair_bytes: self.cfg.quotas.pair_bytes,
-            cancel: self.cancel.clone(),
+            heard: heard.clone(),
+            cancel: release.clone(),
         }));
         self.allocations.push(Allocation {
             port,
@@ -1309,6 +1383,8 @@ impl Relay {
             disclose,
             sender_ticket,
             receiver_ticket,
+            heard,
+            release,
         });
         Some((port, sender_ticket, receiver_ticket))
     }
@@ -1405,6 +1481,10 @@ struct Carried {
     /// in all (0: no limit).
     meter: Arc<parking_lot::Mutex<Meter>>,
     pair_bytes: u64,
+    /// Where the relay's control loop sees how long it has been quiet.
+    heard: Arc<Heard>,
+    /// Ends the pair: the relay stopping, or its port wanted back (see
+    /// `Relay::make_room`).
     cancel: CancellationToken,
 }
 
@@ -1459,9 +1539,11 @@ impl RelayHarness {
         self.0.handle(pkt, from, now).await;
     }
 
-    /// Registrations and allocations held.
+    /// Registrations, and allocations that hold their ports (not those
+    /// ended to make room, whose tasks are on their way out).
     pub fn counts(&self) -> (usize, usize) {
-        (self.0.registrations.len(), self.0.allocations.len())
+        let live = self.0.allocations.iter().filter(|a| a.live()).count();
+        (self.0.registrations.len(), live)
     }
 
     /// Ends every pair, and passes on the panic of any that panicked.
@@ -1520,6 +1602,7 @@ async fn carry(c: Carried) {
         idle,
         meter,
         pair_bytes,
+        heard,
         cancel,
     } = c;
     // Said once, when the pair ends, however it ends.
@@ -1670,6 +1753,7 @@ async fn carry(c: Carried) {
                         via_b = dst;
                     }
                     last = Instant::now();
+                    heard.note(last);
                 }
                 continue;
             }
@@ -1719,6 +1803,7 @@ async fn carry(c: Carried) {
                     return;
                 }
                 last = now;
+                heard.note(now);
                 match tunnels.link(to) {
                     // Into a stream whose queue is full: dropped, as a full
                     // buffer drops — unless it came on a stream too, which
@@ -2968,6 +3053,75 @@ mod wire_tests {
             panic!("a sender was refused the port it holds: {:?}", again);
         };
         assert_eq!((again_port, again_ticket), (port, ticket));
+        cancel.cancel();
+    }
+
+    /// A client that holds its whole share is not refused while one of its
+    /// pairs has carried nothing for a while: one sending file after file
+    /// through the relay left a pair behind for each, quiet until it went
+    /// idle, and was refused once it held its share of them. The quietest
+    /// makes room, and is no longer handed back as the pair's port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clients_quiet_pair_makes_room_for_its_next() {
+        let (relay, relay_id, cancel) = start_relay_with(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            // Quiet for half of it makes room: 2 s.
+            idle: Duration::from_secs(4),
+            max_allocations: 8,
+            allocations_per_client: 2,
+            ..Config::default()
+        })
+        .await;
+        let owner = Identity::generate();
+        let id = owner.id();
+        let rc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            register(&rc, relay, &relay_id, &owner, 0).await,
+            Some(Message::Registered { .. })
+        ));
+        async fn connect(sock: &UdpSocket, relay: SocketAddr, id: SharpId) -> Option<Message> {
+            with_token(sock, relay, |token| Message::Connect {
+                hints: Hints::none(),
+                target: id,
+                token,
+                nonce: [0x5a; 16],
+            })
+            .await
+        }
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let third = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let Some(Message::Allocated { port, .. }) = connect(&first, relay, id).await else {
+            panic!("the first sender got no port");
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(matches!(
+            connect(&second, relay, id).await,
+            Some(Message::Allocated { .. })
+        ));
+        // Neither has carried anything for long: the share holds.
+        assert!(matches!(
+            connect(&third, relay, id).await,
+            Some(Message::Error {
+                code: Refusal::Busy,
+                ..
+            })
+        ));
+        // Quiet for longer than 2 s, and still short of the idle limit.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let Some(Message::Allocated {
+            port: third_port, ..
+        }) = connect(&third, relay, id).await
+        else {
+            panic!("the client's quiet pair made no room");
+        };
+        assert_ne!(third_port, port);
+        // The first, the quietest, was let go of: asking again makes a
+        // new pair, which the second, quiet as long, makes room for.
+        let Some(Message::Allocated { port: again, .. }) = connect(&first, relay, id).await else {
+            panic!("the first sender was refused");
+        };
+        assert_ne!(again, port, "a released port was handed back");
         cancel.cancel();
     }
 

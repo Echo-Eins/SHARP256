@@ -5678,6 +5678,17 @@ impl Engine {
             // receiver (which lost the session keys) resumes from its saved
             // state.
             if since_rx >= self.quiet_for_alternatives() && self.fin_verdict.is_none() {
+                // A receiver silent this long may have changed networks,
+                // and only the relays know where it is now: they are asked
+                // again (at most every `REINTRODUCE_SPACING`), which also
+                // introduces us anew from where we are. They were asked
+                // only once the session was on a server's port, or for a
+                // session carried; a direct one whose ends both moved at
+                // once — the pair the relays made for the sender's new
+                // address introduced to where the receiver had been — got
+                // neither, and stalled for good.
+                #[cfg(feature = "nat-traversal")]
+                self.reintroduce(now, "the receiver has gone quiet");
                 self.send_initiation()?;
             }
         }

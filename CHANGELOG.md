@@ -244,8 +244,28 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   receiver's sessions was refused as busy until they ran out at
   `session_ttl` (ten minutes). When its share is full, or every session
   taken, its own transfer silent longest, if silent for `stall_timeout`,
-  now lets go for the next one, suspended for resume. Both found by the soak laboratory: senders
-  killed a moment after they began, and sent again.
+  now lets go for the next one, suspended for resume. Both found by the
+  soak laboratory: senders killed a moment after they began, and sent
+  again.
+- A relay held a sender's pair for 60 s after its transfer ended (nothing
+  tells it the transfer is over), and a client — an IPv4 address or an
+  IPv6 /64 — may hold 16: a sender sending file after file through it was
+  refused from the seventeenth in a minute on, and so were people behind
+  one carrier's NAT. A client that holds its share, or finds every port
+  taken, now gets the one of its own pairs that has carried nothing
+  longest, if for 10 s (or half the idle limit), made room with; other
+  clients' pairs are never ended for it. In the soak laboratory, all of
+  whose senders are on one host, two transfers in three through the relay
+  had been refused.
+- A transfer whose two ends changed networks at about the same moment
+  could stall for good: the sender asked the relays for a new pair from
+  where it was now, the relay introduced it to where the receiver had
+  been, and the receiver, registered again from its new network a few
+  seconds later, never heard of it. The sender asked the relays again only
+  once its session was on a server's port, or while carried — and that
+  pair never carried anything. It now asks them again whenever the
+  receiver has been silent for 3 s, every 5 s at most. Found by the NAT
+  laboratory on CI (`mobility`, both ends moving).
 - Tests: the relay's fuzzing harness counts only what this input's relay
   sent (on macOS the last input's answer could arrive after it); the
   state store's test no longer cleans up "older than no time" across a

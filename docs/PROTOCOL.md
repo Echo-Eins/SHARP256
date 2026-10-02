@@ -1500,7 +1500,11 @@ that address, so no table of pending registrations exists to fill up; its
 secret is replaced every 120 s on the clock, and a token is good for at
 most two such periods however long the relay goes unasked. Registrations,
 ports and the request rate each have a share per client — an IPv4 address
-or an IPv6 /64 — an idle pair is reclaimed, and a receiver says goodbye on
+or an IPv6 /64 — an idle pair is reclaimed (after 60 s; and a client that
+holds its whole share, or finds every port taken, gets the one of its own
+pairs that has carried nothing longest, if for 10 s, made room with: one
+sending file after file through the relay left a pair behind for each),
+and a receiver says goodbye on
 the way out so that senders are not sent to a dead address for the rest of
 the lease (a goodbye whose token went stale draws a fresh one and is sent
 again). The relay's sockets ignore ICMP errors, and its control loop waits
