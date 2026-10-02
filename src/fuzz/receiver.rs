@@ -196,20 +196,52 @@ impl<'w> Run<'w> {
         let mut buf = [0u8; 2048];
         for (p, s) in w.peers.iter().enumerate() {
             while let Ok((n, _)) = s.recv_from(&mut buf) {
-                self.sent[p] += n as u64;
-                if self.inbox[p].len() < KEPT {
-                    self.inbox[p].push(buf[..n].to_vec());
-                }
-                if n == hs::COOKIE_REPLY_LEN {
-                    let d = &buf[..n];
-                    if let Some(c) = self
-                        .stamped
-                        .iter()
-                        .filter(|(q, _, _)| *q == p)
-                        .find_map(|(_, cid, m1)| forge::open_cookie_reply(&w.id, *cid, m1, d))
-                    {
-                        self.cookies[p] = Some(c);
+                self.take(p, &buf[..n]);
+            }
+        }
+    }
+
+    /// One datagram the receiver sent to address `p`.
+    fn take(&mut self, p: usize, d: &[u8]) {
+        let w = self.w;
+        self.sent[p] += d.len() as u64;
+        if self.inbox[p].len() < KEPT {
+            self.inbox[p].push(d.to_vec());
+        }
+        if d.len() == hs::COOKIE_REPLY_LEN {
+            if let Some(c) = self
+                .stamped
+                .iter()
+                .filter(|(q, _, _)| *q == p)
+                .find_map(|(_, cid, m1)| forge::open_cookie_reply(&w.id, *cid, m1, d))
+            {
+                self.cookies[p] = Some(c);
+            }
+        }
+    }
+
+    /// Everything the receiver sent during the input, counted to it: a
+    /// mark sent last to each address, and that address read until the mark
+    /// is there. Without it, what arrived late on macOS was counted to the
+    /// next input, at an address that had sent nothing in that one.
+    fn fence(&mut self) {
+        const MARK: &[u8] = b"sharp256 fuzz: all that came before has arrived";
+        let w = self.w;
+        let mut buf = [0u8; 2048];
+        for p in 0..PEERS {
+            if self.h.fence(w.addrs[p], MARK).is_err() {
+                continue;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match w.peers[p].recv_from(&mut buf) {
+                    Ok((n, _)) if &buf[..n] == MARK => break,
+                    Ok((n, _)) => {
+                        let d = buf[..n].to_vec();
+                        self.take(p, &d);
                     }
+                    Err(_) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+                    Err(_) => panic!("the fence to address {} never arrived", p),
                 }
             }
         }
@@ -485,9 +517,12 @@ impl<'w> Run<'w> {
         }
     }
 
-    /// Ends the input: every session ended (its panic, if it had one,
-    /// passed on), and nothing written where it should not be.
-    fn finish(self) {
+    /// Ends the input: everything sent counted to it and the bound checked
+    /// once more, every session ended (its panic, if it had one, passed
+    /// on), and nothing written where it should not be.
+    fn finish(mut self) {
+        self.fence();
+        self.check();
         let Run { w, h, .. } = self;
         w.rt.block_on(h.finish());
         let stray: Vec<_> = std::fs::read_dir(&w.root)

@@ -1683,6 +1683,14 @@ impl DispatcherHarness {
         self.d.flush();
     }
 
+    /// Sends `mark` to `to` from the receiver's socket, after everything
+    /// the receiver sent there before it: once it arrives, so has the rest
+    /// (a datagram on loopback is readable at once on Linux, a moment later
+    /// on macOS).
+    pub fn fence(&self, to: SocketAddr, mark: &[u8]) -> io::Result<()> {
+        self.d.shared.socket.try_send(to, mark)
+    }
+
     /// Sessions, version 4 handshakes waiting for their HELLO, fragments
     /// held.
     pub fn counts(&self) -> (usize, usize, usize) {
