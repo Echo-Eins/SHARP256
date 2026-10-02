@@ -785,8 +785,15 @@ pub fn sanitize_file_name(name: &str) -> Option<String> {
 /// Returns `dir/name` or, if it exists, `dir/name (n).ext` with the smallest
 /// free `n`.
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    unique_path_besides(dir, name, |_| false)
+}
+
+/// [`unique_path`], also passing over the names `taken` says are taken
+/// (by a file not there yet).
+pub fn unique_path_besides(dir: &Path, name: &str, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    let free = |p: &Path| !p.exists() && !taken(p);
     let candidate = dir.join(name);
-    if !candidate.exists() {
+    if free(&candidate) {
         return candidate;
     }
     let (stem, ext) = match name.rfind('.') {
@@ -795,7 +802,7 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
     };
     for n in 1..10_000 {
         let p = dir.join(format!("{} ({}){}", stem, n, ext));
-        if !p.exists() {
+        if free(&p) {
             return p;
         }
     }

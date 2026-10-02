@@ -865,6 +865,25 @@ docs/evidence/crash).
   failure.
 * On shutdown every transfer in progress is suspended the same way; a
   transfer that was already verified is reported complete (unconfirmed).
+* One partial file has one session. A transfer that would continue resume
+  state another session of the same sender holds — the sender was
+  restarted without its own resume state, and sends the file as a new
+  transfer while the old one's session still waits for it — first asks
+  that session to let go, and waits for it up to 10 s; if it has not let go
+  by then, the transfer is refused as busy. A session that lets go keeps
+  what the transfer that continues needs: one in progress is suspended,
+  its partial file and state kept (dropped if no data came, as at
+  `handshake_timeout`); one being verified finishes verifying; one whose
+  result is in place leaves its state as it is, and the new transfer
+  confirms the result from there. The old transfer is reported as a
+  failure that says why. Nor is a fresh partial file given a name that
+  another session has chosen and not created yet.
+* A sender whose share of the sessions (`max_sessions_per_sender`) is
+  full, or that finds every session taken, makes room with its own
+  transfer silent longest, if that one has been silent for
+  `stall_timeout`: it lets go the same way, and resumes when the sender
+  sends it again. Other senders' sessions make no room for it. A session
+  asked to let go counts against no limit while it ends.
 
 ### Completion
 
@@ -2054,7 +2073,7 @@ firewall pinholes"). The plan beyond the wire format is in
 | `writer_capacity_bytes` | 64 MiB | receiver write buffer (source of `rwnd`) |
 | `session_ttl` | 10 min | silence after which a receiver session is suspended |
 | `max_sessions` | 16 | concurrent transfers per receiver |
-| `max_sessions_per_sender` | 8 | concurrent transfers one sender identity may hold |
+| `max_sessions_per_sender` | 8 | concurrent transfers one sender identity may hold; when they (or all sessions) are taken, its own transfer silent longest, for `stall_timeout` at least, lets go for its next |
 | `memory_budget` | 512 MiB | data not yet on disk, all transfers together (¼ queued datagrams, ¾ unwritten data) |
 | `handshake_rate` / `handshake_burst` | 20/s / 40 | handshakes per client (IPv4 address or IPv6 /64) |
 | `handshake_load_threshold` | 200/s | handshakes (all sources) beyond which cookies are required |

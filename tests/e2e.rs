@@ -1793,6 +1793,236 @@ async fn vanished_sender_is_reported_and_resumable() {
     stop_receiver(r).await;
 }
 
+/// The id of the next transfer the receiver starts.
+async fn wait_started(
+    rx: &mut mpsc::UnboundedReceiver<TransferEvent>,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(TransferEvent::Started { transfer_id, .. })) => return transfer_id,
+            Ok(Some(TransferEvent::Failed { error, .. })) => panic!("receiver failed: {}", error),
+            Ok(Some(_)) => {}
+            _ => panic!("no transfer started within {:?}", timeout),
+        }
+    }
+}
+
+/// Names in a directory, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A sender cut off without a word and run again without its resume state
+/// (another state directory: another account, a reinstall) sends the file
+/// as a new transfer, which continues the partial file that the old
+/// transfer's session — waiting for its sender still — holds. The old
+/// session lets go of it at once, rather than at `session_ttl` (or, had no
+/// data come, by removing the file the new transfer writes), and the new
+/// transfer finishes the one file, with nothing beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_restarted_without_its_state_continues_its_partial_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 4 * 1024 * 1024;
+    let path = make_file(&src, "again.bin", size, 71);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+
+    let mut cfg = sender_cfg(&path, r.addr, r.id, &tmp.path().join("first-state"));
+    cfg.transport.max_rate_bytes = Some(2_000_000);
+    let task = tokio::spawn(run_sender(cfg));
+    let first = wait_started(&mut r.events, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    task.abort(); // no ABORT reaches the receiver
+    let _ = task.await;
+
+    let again = Instant::now();
+    let second = tokio::spawn(run_sender(sender_cfg(
+        &path,
+        r.addr,
+        r.id,
+        &tmp.path().join("second-state"),
+    )));
+    let (mut let_go, mut completed) = (None, None);
+    let deadline = again + Duration::from_secs(30);
+    while let_go.is_none() || completed.is_none() {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            r.events.recv(),
+        )
+        .await
+        {
+            Ok(Some(TransferEvent::Failed {
+                transfer_id, error, ..
+            })) => {
+                assert_eq!(transfer_id, first, "the new transfer failed: {}", error);
+                let_go = Some((error, again.elapsed()));
+            }
+            Ok(Some(TransferEvent::Completed {
+                transfer_id,
+                path: Some(p),
+                ..
+            })) => {
+                assert_ne!(transfer_id, first);
+                completed = Some(p);
+            }
+            Ok(Some(_)) => {}
+            _ => panic!(
+                "the old transfer let go: {:?}; the new one completed: {:?}",
+                let_go, completed
+            ),
+        }
+    }
+    let (error, after) = let_go.unwrap();
+    assert!(error.contains("the new one continues it"), "{}", error);
+    assert!(
+        after < Duration::from_secs(5),
+        "let go of after {:?}",
+        after
+    );
+    let summary = second.await.unwrap().expect("the new transfer");
+    assert!(
+        summary.resumed_from > 0,
+        "the new transfer did not continue the partial file"
+    );
+    assert_same(&path, Path::new(&completed.unwrap()));
+    assert_eq!(names_in(&out), ["again.bin"]);
+    assert_eq!(resume_files(&state), 0, "resume state left behind");
+    stop_receiver(r).await;
+}
+
+/// A sender cut off in the middle of as many transfers as its share of the
+/// receiver's sessions, sending another file now, is not refused as busy
+/// until they run out at `session_ttl`: the one silent longest lets go,
+/// its partial file and state kept, and resumes when it is sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_transfer_makes_room_for_the_senders_next() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 4 * 1024 * 1024;
+    let first = make_file(&src, "first.bin", size, 72);
+    let next = make_file(&src, "next.bin", 300_000, 73);
+    let mut r = start_receiver(&out, &state, |cfg| cfg.max_sessions_per_sender = 1).await;
+
+    let mut cfg = sender_cfg(&first, r.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(2_000_000);
+    let task = tokio::spawn(run_sender(cfg));
+    let first_id = wait_started(&mut r.events, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    task.abort(); // no ABORT reaches the receiver
+    let _ = task.await;
+    // Silent for longer than `stall_timeout` (0.8 s here).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    run_sender(sender_cfg(&next, r.addr, r.id, &state))
+        .await
+        .expect("the next file is let in");
+    let (mut let_go, mut completed) = (None, false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while let_go.is_none() || !completed {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            r.events.recv(),
+        )
+        .await
+        {
+            Ok(Some(TransferEvent::Failed {
+                transfer_id,
+                error,
+                resumable,
+            })) => {
+                assert_eq!(transfer_id, first_id, "{}", error);
+                assert!(resumable, "{}", error);
+                let_go = Some(error);
+            }
+            Ok(Some(TransferEvent::Completed { path: Some(p), .. })) => {
+                assert_same(&next, Path::new(&p));
+                completed = true;
+            }
+            Ok(Some(_)) => {}
+            _ => panic!("let go: {:?}; completed: {}", let_go, completed),
+        }
+    }
+    let error = let_go.unwrap();
+    assert!(error.contains("went silent"), "{}", error);
+    assert!(out.join("first.bin.sharp-part").exists());
+
+    let summary = run_sender(sender_cfg(&first, r.addr, r.id, &state))
+        .await
+        .expect("the first file, again");
+    assert!(summary.resumed_from > 0, "the first file was not resumed");
+    let done = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = done {
+        assert_same(&first, Path::new(&p));
+    }
+    assert_eq!(names_in(&out), ["first.bin", "next.bin"]);
+    stop_receiver(r).await;
+}
+
+/// Two transfers of files of the same name that wait for the user at the
+/// same time get a partial file each: the name one was given, and has not
+/// created yet, is not given to the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfers_of_one_name_waiting_together_write_files_of_their_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let (src_a, src_b) = (src.join("a"), src.join("b"));
+    std::fs::create_dir_all(&src_a).unwrap();
+    std::fs::create_dir_all(&src_b).unwrap();
+    let a = make_file(&src_a, "same.bin", 300_000, 74);
+    let b = make_file(&src_b, "same.bin", 300_000, 75);
+    // Both are asked about before either is accepted.
+    let asked: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<bool>>>> =
+        Default::default();
+    let mut r = start_receiver(&out, &state, |cfg| {
+        let asked = asked.clone();
+        cfg.accept = AcceptPolicy::Ask(Arc::new(move |_req, reply| {
+            let mut asked = asked.lock();
+            asked.push(reply);
+            if asked.len() == 2 {
+                for reply in asked.drain(..) {
+                    let _ = reply.send(true);
+                }
+            }
+        }));
+    })
+    .await;
+
+    let cfg_a = sender_cfg(&a, r.addr, r.id, &tmp.path().join("state-a"));
+    let mut cfg_b = sender_cfg(&b, r.addr, r.id, &tmp.path().join("state-b"));
+    cfg_b.identity = Some(Identity::generate());
+    let (got_a, got_b) = tokio::join!(run_sender(cfg_a), run_sender(cfg_b));
+    got_a.expect("the first sender");
+    got_b.expect("the second sender");
+    let mut stored = Vec::new();
+    while stored.len() < 2 {
+        if let TransferEvent::Completed { path: Some(p), .. } =
+            wait_completed(&mut r.events, Duration::from_secs(20)).await
+        {
+            stored.push(PathBuf::from(p));
+        }
+    }
+    let content = |p: &Path| std::fs::read(p).unwrap();
+    let mut got: Vec<Vec<u8>> = stored.iter().map(|p| content(p)).collect();
+    let mut want = vec![content(&a), content(&b)];
+    got.sort();
+    want.sort();
+    assert!(got == want, "a file came out of the other's data");
+    assert_eq!(names_in(&out), ["same (1).bin", "same.bin"]);
+    stop_receiver(r).await;
+}
+
 // ---------------------------------------------------------------------------
 // Security
 // ---------------------------------------------------------------------------
@@ -2932,6 +3162,9 @@ async fn one_sender_cannot_take_every_session_slot() {
         cfg.speak_v3 = true;
         cfg.max_sessions = 6;
         cfg.max_sessions_per_sender = 2;
+        // Its sessions hear nothing after the handshake; silent for this
+        // long, one would make room for the next (see below).
+        cfg.transport.stall_timeout = Duration::from_secs(60);
     })
     .await;
 
@@ -2954,6 +3187,53 @@ async fn one_sender_cannot_take_every_session_slot() {
     assert_eq!(
         answer.ack.status, HELLO_ACCEPTED,
         "a greedy sender locked out an unrelated one"
+    );
+    held.push(sock);
+
+    drop(held);
+    stop_receiver(r).await;
+}
+
+/// A sender's transfer silent for `stall_timeout` makes room for its next
+/// one also when every session is taken, by other senders' too; theirs
+/// make no room for it, silent or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_senders_own_silent_transfer_makes_room_for_it() {
+    use sharp256::protocol::constants::{HELLO_ACCEPTED, HELLO_REJECTED, REASON_BUSY};
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let r = start_receiver(&out, &state, |cfg| {
+        cfg.speak_v3 = true;
+        cfg.max_sessions = 2;
+        cfg.max_sessions_per_sender = 2;
+    })
+    .await;
+
+    let (other, cut, third) = (
+        Identity::generate(),
+        Identity::generate(),
+        Identity::generate(),
+    );
+    let mut held = Vec::new();
+    for (who, tid, name) in [(&other, [1u8; 16], "other.bin"), (&cut, [2; 16], "cut.bin")] {
+        let (sock, answer) = handshake_as(&r, who, tid, name).await;
+        assert_eq!(answer.ack.status, HELLO_ACCEPTED, "{} refused", name);
+        held.push(sock);
+    }
+    // Both fall silent for longer than `stall_timeout` (0.8 s here), and
+    // every session is taken.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (sock, answer) = handshake_as(&r, &cut, [3; 16], "next.bin").await;
+    assert_eq!(
+        answer.ack.status, HELLO_ACCEPTED,
+        "the sender's own silent transfer made no room"
+    );
+    held.push(sock);
+    let (sock, answer) = handshake_as(&r, &third, [4; 16], "third.bin").await;
+    assert_eq!(
+        (answer.ack.status, answer.ack.reason),
+        (HELLO_REJECTED, REASON_BUSY),
+        "another sender's silent transfer made room"
     );
     held.push(sock);
 

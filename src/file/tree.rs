@@ -1329,7 +1329,13 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 /// `dir/name`, or `dir/name (n)` with the smallest free `n`, for a directory
 /// that must not replace anything.
 pub fn unique_dir_path(dir: &Path, name: &str) -> PathBuf {
-    let free = |p: &Path| fs::symlink_metadata(p).is_err();
+    unique_dir_path_besides(dir, name, |_| false)
+}
+
+/// [`unique_dir_path`], also passing over the names `taken` says are taken
+/// (by a directory not there yet).
+pub fn unique_dir_path_besides(dir: &Path, name: &str, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    let free = |p: &Path| fs::symlink_metadata(p).is_err() && !taken(p);
     let candidate = dir.join(name);
     if free(&candidate) {
         return candidate;

@@ -41,7 +41,7 @@ use crate::crypto::{Identity, SharpId};
 use crate::file::tree::{self, Manifest};
 use crate::file::{
     available_space, hash_file, hash_to_hex, part_path_for, rename_with_retry, sanitize_file_name,
-    unique_path, FileWriter,
+    unique_path, unique_path_besides, FileWriter,
 };
 use crate::progress::{emit, DirectoryInfo, EventCallback, TransferEvent, TransferStats};
 use crate::protocol::constants::*;
@@ -195,6 +195,11 @@ struct SessionHandle {
     /// The session's current connection id.
     cid: u64,
     task: tokio::task::JoinHandle<()>,
+    /// When something from its sender last came for it.
+    heard: Instant,
+    /// Asks it to let go of its transfer; once asked, it is on its way out
+    /// and no longer counts against the limits on sessions.
+    release: Release,
 }
 
 struct Shared {
@@ -216,6 +221,10 @@ struct Shared {
     /// claimed or published it (see [`Unwritten`]); held to three quarters
     /// of the budget.
     unwritten_total: Budget,
+    /// Which session holds which partial data (see [`Holder`]), and how
+    /// many sessions there have been: each one's number among them.
+    holders: parking_lot::Mutex<Vec<Holder>>,
+    sessions_made: AtomicU64,
     /// Senders reached over a stream rather than the socket (see
     /// `transport::carrier`): what goes to them goes on their stream.
     streams: Arc<crate::transport::carrier::Streams>,
@@ -571,6 +580,180 @@ impl Drop for Receiving {
     }
 }
 
+/// Asks a session to let go of its transfer (see [`Session::let_go`]), and
+/// says why.
+#[derive(Clone, Default)]
+struct Release {
+    asked: CancellationToken,
+    why: Arc<std::sync::OnceLock<&'static str>>,
+}
+
+impl Release {
+    fn ask(&self, why: &'static str) {
+        let _ = self.why.set(why);
+        self.asked.cancel();
+    }
+
+    fn is_asked(&self) -> bool {
+        self.asked.is_cancelled()
+    }
+
+    fn why(&self) -> &'static str {
+        self.why.get().copied().unwrap_or(LET_GO_QUIET)
+    }
+}
+
+/// Why a session lets go of its transfer.
+const LET_GO_CONTINUED: &str =
+    "the sender started the transfer again, and the new one continues it";
+const LET_GO_QUIET: &str = "the sender went silent, and its next transfer takes the place";
+
+/// How long a session waits for another to let go of the partial data it
+/// continues (see [`Session::let_go_first`]).
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// A session's hold on partial data, among [`Shared::holders`]: the
+/// transfers whose resume state is its to keep — its own, and that of an
+/// earlier transfer of the same sender whose partial file it continues —
+/// and the partial file (or staging directory) it writes.
+///
+/// One partial file has one session. A sender restarted without its resume
+/// state starts the transfer of the same file anew, and the new transfer
+/// continues the partial file that the old one's session — waiting for its
+/// sender still, up to `session_ttl` — holds: the new session asks the old
+/// one to let go first (see [`Session::let_go_first`]). They used to share
+/// the file until the old session, having heard nothing, removed it (no
+/// data had come) or, at `session_ttl`, left a second resume state for it.
+/// Nor is a fresh partial file given a name that another session has
+/// chosen and not created yet.
+struct Holder {
+    session: u64,
+    sender: SharpId,
+    transfers: Vec<[u8; 16]>,
+    part: Option<PathBuf>,
+    release: Release,
+    /// Cancelled once the session has let go: when it ends.
+    released: CancellationToken,
+}
+
+/// Who, besides a session, holds a transfer's resume state.
+enum Held {
+    /// No other session.
+    Free,
+    /// Another session of the same sender.
+    Elsewhere(Other),
+    /// Its partial file is another sender's session's: the state is stale.
+    Stale,
+}
+
+/// Another session of the same sender that holds resume state.
+struct Other {
+    transfer: [u8; 16],
+    release: Release,
+    released: CancellationToken,
+}
+
+/// A session's entry among [`Shared::holders`], taken out when it ends.
+struct Holding {
+    shared: Arc<Shared>,
+    session: u64,
+    release: Release,
+    released: CancellationToken,
+}
+
+impl Holding {
+    fn new(shared: &Arc<Shared>, (sender, transfer): TransferKey, release: Release) -> Self {
+        let session = shared.sessions_made.fetch_add(1, Ordering::Relaxed);
+        let released = CancellationToken::new();
+        shared.holders.lock().push(Holder {
+            session,
+            sender,
+            transfers: vec![transfer],
+            part: None,
+            release: release.clone(),
+            released: released.clone(),
+        });
+        Self {
+            shared: shared.clone(),
+            session,
+            release,
+            released,
+        }
+    }
+
+    fn find(&self, holders: &[Holder], state: &ReceiverState) -> Held {
+        let transfer = crate::state::parse_hex16(&state.transfer_id);
+        let holder = holders.iter().find(|h| {
+            h.session != self.session
+                && (transfer.is_some_and(|t| h.transfers.contains(&t))
+                    && h.sender.to_string() == state.sender
+                    || h.part.as_deref() == Some(state.data_path()))
+        });
+        match holder {
+            None => Held::Free,
+            Some(h) if h.sender.to_string() == state.sender => Held::Elsewhere(Other {
+                transfer: h.transfers[0],
+                release: h.release.clone(),
+                released: h.released.clone(),
+            }),
+            Some(_) => Held::Stale,
+        }
+    }
+
+    /// Who else holds `state`.
+    fn held(&self, state: &ReceiverState) -> Held {
+        self.find(&self.shared.holders.lock(), state)
+    }
+
+    /// Takes `state` for this session if no other holds it (then
+    /// [`Held::Free`]); who holds it otherwise.
+    fn take(&self, state: &ReceiverState) -> Held {
+        let mut holders = self.shared.holders.lock();
+        let held = self.find(&holders, state);
+        if let (Held::Free, Some(me)) = (
+            &held,
+            holders.iter_mut().find(|h| h.session == self.session),
+        ) {
+            if let Some(t) = crate::state::parse_hex16(&state.transfer_id) {
+                if !me.transfers.contains(&t) {
+                    me.transfers.push(t);
+                }
+            }
+            me.part = Some(state.part_path.clone());
+        }
+        held
+    }
+
+    /// Chooses the partial file of a transfer that continues nothing with
+    /// `choose`, which is told the names other sessions have chosen, and
+    /// takes it.
+    fn choose_part(&self, choose: impl FnOnce(&dyn Fn(&Path) -> bool) -> PathBuf) -> PathBuf {
+        let mut holders = self.shared.holders.lock();
+        let part = {
+            let theirs = |p: &Path| {
+                holders
+                    .iter()
+                    .any(|h| h.session != self.session && h.part.as_deref() == Some(p))
+            };
+            choose(&theirs)
+        };
+        if let Some(me) = holders.iter_mut().find(|h| h.session == self.session) {
+            me.part = Some(part.clone());
+        }
+        part
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        self.shared
+            .holders
+            .lock()
+            .retain(|h| h.session != self.session);
+        self.released.cancel();
+    }
+}
+
 /// How long a declined transfer is remembered, and how many are.
 const DECLINE_MEMORY: Duration = Duration::from_secs(120);
 const DECLINES_REMEMBERED: usize = 1024;
@@ -695,6 +878,8 @@ impl Receiver {
                 queued_total: Budget::new(memory_budget / 4),
                 receiving: std::sync::atomic::AtomicUsize::new(0),
                 unwritten_total: Budget::new(memory_budget / 4 * 3),
+                holders: parking_lot::Mutex::new(Vec::new()),
+                sessions_made: AtomicU64::new(0),
                 #[cfg(feature = "nat-traversal")]
                 routes,
                 #[cfg(feature = "nat-traversal")]
@@ -1200,9 +1385,10 @@ impl Dispatcher {
     fn flush(&mut self) {
         let at = self.at;
         for (key, runs) in self.outbox.drain(..) {
-            let Some(s) = self.sessions.get(&key) else {
+            let Some(s) = self.sessions.get_mut(&key) else {
                 continue;
             };
+            s.heard = at;
             let bytes: u64 = runs.iter().map(|d| d.buf.capacity() as u64).sum();
             // Within the session's own limit, and within what all sessions
             // together may have queued: sixteen sessions each at their own
@@ -1328,6 +1514,7 @@ impl Dispatcher {
         // session after an outage, or restarted): move the session over.
         if let Some(s) = self.sessions.get_mut(&key) {
             if !s.task.is_finished() {
+                s.heard = now;
                 // Routed to the new connection id only once the session
                 // has the handshake: if its queue is full, moving the
                 // routing anyway left it deaf to both ids until the next
@@ -1343,12 +1530,12 @@ impl Dispatcher {
         }
 
         self.prune();
-        if let Err(message) = self.room_for(&sender, from) {
+        if let Err(message) = self.room_for(&sender, from, now) {
             let Handshake { incoming, init, .. } = *handshake;
             self.reject(incoming, &init, (from, pkt.len()), REASON_BUSY, message);
             return;
         }
-        self.spawn_session(key, from, cid, Incoming::Handshake(handshake));
+        self.spawn_session(key, from, cid, Incoming::Handshake(handshake), now);
     }
 
     /// Whether a new session for `sender` fits: the limit on sessions, and
@@ -1356,30 +1543,67 @@ impl Dispatcher {
     /// and one authenticated sender could take every slot and lock
     /// everybody else out. Being on the allow-list does not make that
     /// acceptable.
-    fn room_for(&self, sender: &SharpId, from: SocketAddr) -> Result<(), &'static str> {
+    ///
+    /// A sender that finds its share full, or every session taken, makes
+    /// room with its own transfer that has been silent longest, if that one
+    /// has been for `stall_timeout`: it lets go (see [`Session::let_go`]),
+    /// its partial file and state kept for when the sender comes back to it.
+    /// A sender cut off in the middle of as many transfers as its share, and
+    /// sending other files now, was refused until they ran out at
+    /// `session_ttl`. Other senders' sessions are not let go of.
+    fn room_for(
+        &self,
+        sender: &SharpId,
+        from: SocketAddr,
+        now: Instant,
+    ) -> Result<(), &'static str> {
         let cfg = &self.shared.cfg;
-        if self.sessions.len() >= cfg.max_sessions {
-            return Err("too many concurrent transfers");
-        }
+        let counted = || self.sessions.iter().filter(|(_, s)| !s.release.is_asked());
+        let its = || counted().filter(|((s, _), _)| s == sender);
         let share = cfg
             .max_sessions_per_sender
             .clamp(1, cfg.max_sessions.max(1));
-        if self.sessions.keys().filter(|(s, _)| s == sender).count() >= share {
-            tracing::info!(
-                "transfer from {} ({}) refused: it already holds {} of {} sessions",
-                from,
-                sender,
-                share,
-                cfg.max_sessions
-            );
-            return Err("too many concurrent transfers from this sender");
+        let full = counted().count() >= cfg.max_sessions;
+        let spent = its().count() >= share;
+        if !full && !spent {
+            return Ok(());
         }
-        Ok(())
+        let quiet = its()
+            .filter(|(_, s)| now.saturating_duration_since(s.heard) >= cfg.transport.stall_timeout)
+            .min_by_key(|(_, s)| s.heard);
+        if let Some(((_, transfer), s)) = quiet {
+            tracing::info!(
+                "transfer {} from {} silent for {:.1?}: asked to let go, for the sender's next one",
+                hex16(transfer),
+                sender,
+                now.saturating_duration_since(s.heard)
+            );
+            s.release.ask(LET_GO_QUIET);
+            return Ok(());
+        }
+        if full {
+            return Err("too many concurrent transfers");
+        }
+        tracing::info!(
+            "transfer from {} ({}) refused: it already holds {} of {} sessions",
+            from,
+            sender,
+            share,
+            cfg.max_sessions
+        );
+        Err("too many concurrent transfers from this sender")
     }
 
     /// Starts the session for `key` at connection id `cid`, handing it
     /// `first` (its handshake).
-    fn spawn_session(&mut self, key: TransferKey, from: SocketAddr, cid: u64, first: Incoming) {
+    fn spawn_session(
+        &mut self,
+        key: TransferKey,
+        from: SocketAddr,
+        cid: u64,
+        first: Incoming,
+        now: Instant,
+    ) {
         let (tx, rx) = mpsc::channel::<Incoming>(SESSION_QUEUE);
         let _ = tx.try_send(first);
         let shared = self.shared.clone();
@@ -1387,8 +1611,17 @@ impl Dispatcher {
         let session_tx = tx.clone();
         let queued = Arc::new(AtomicU64::new(0));
         let session_queued = queued.clone();
+        let release = Release::default();
+        let session_release = release.clone();
         let task = tokio::spawn(async move {
-            let session = Session::new(shared, key, from, session_tx, session_queued);
+            let session = Session::new(
+                shared,
+                key,
+                from,
+                session_tx,
+                session_queued,
+                session_release,
+            );
             let key = session.run(rx).await;
             let _ = done_tx.send(key).await;
         });
@@ -1400,6 +1633,8 @@ impl Dispatcher {
                 queued,
                 cid,
                 task,
+                heard: now,
+                release,
             },
         );
     }
@@ -1559,6 +1794,7 @@ impl Dispatcher {
         // to it.
         if let Some(s) = self.sessions.get_mut(&key) {
             if !s.task.is_finished() {
+                s.heard = now;
                 if s.tx.try_send(Incoming::Established(established)).is_ok() {
                     self.by_cid.remove(&s.cid);
                     s.cid = cid;
@@ -1577,7 +1813,7 @@ impl Dispatcher {
         .then_some((REASON_DECLINED, "declined by user"));
         self.prune();
         let refusal = refusal.or_else(|| {
-            self.room_for(&p.sender, from)
+            self.room_for(&p.sender, from, now)
                 .err()
                 .map(|message| (REASON_BUSY, message))
         });
@@ -1597,7 +1833,7 @@ impl Dispatcher {
             tracing::info!("transfer from {} ({}) refused: {}", from, p.sender, message);
             return;
         }
-        self.spawn_session(key, p.from, cid, Incoming::Established(established));
+        self.spawn_session(key, p.from, cid, Incoming::Established(established), now);
         self.queue(key, delivery);
     }
 
@@ -1697,11 +1933,16 @@ impl DispatcherHarness {
         self.d.shared.socket.try_send(to, mark)
     }
 
-    /// Sessions, version 4 handshakes waiting for their HELLO, fragments
-    /// held.
+    /// Sessions (but those asked to let go of their transfers, which are
+    /// ending and count against no limit), version 4 handshakes waiting for
+    /// their HELLO, fragments held.
     pub fn counts(&self) -> (usize, usize, usize) {
         (
-            self.d.sessions.len(),
+            self.d
+                .sessions
+                .values()
+                .filter(|s| !s.release.is_asked())
+                .count(),
             self.d.pending.len(),
             self.d.fragments.len(),
         )
@@ -2703,6 +2944,12 @@ struct Session {
     /// Whether this session stored any new data (idle sessions expire early).
     got_data: bool,
     phase: Phase,
+    /// The earlier transfer whose resume state this one continues: removed
+    /// once this one's own is kept (see [`Session::persist_state_now`]).
+    took_over: Option<String>,
+    /// What partial data this session holds (see [`Holder`]); let go of
+    /// last, when everything else is.
+    holding: Holding,
 }
 
 impl Session {
@@ -2712,6 +2959,7 @@ impl Session {
         peer: SocketAddr,
         self_tx: mpsc::Sender<Incoming>,
         queued: Arc<AtomicU64>,
+        release: Release,
     ) -> Self {
         let now = Instant::now();
         let cfg = shared.cfg.transport.clone();
@@ -2719,6 +2967,8 @@ impl Session {
         Self {
             receiving: None,
             unwritten: Unwritten::new(&shared),
+            holding: Holding::new(&shared, key, release),
+            took_over: None,
             shared,
             cfg,
             events,
@@ -2828,8 +3078,18 @@ impl Session {
         // The session was created for its first handshake.
         let decision = loop {
             match rx.recv().await {
-                Some(Incoming::Handshake(h)) => break self.start(*h),
-                Some(Incoming::Established(e)) => break self.start_v4(*e),
+                Some(Incoming::Handshake(h)) => {
+                    if !self.let_go_first(&h.init.hello).await {
+                        return self.key();
+                    }
+                    break self.start(*h);
+                }
+                Some(Incoming::Established(e)) => {
+                    if !self.let_go_first(&e.hello).await {
+                        return self.key();
+                    }
+                    break self.start_v4(*e);
+                }
                 Some(_) => {}
                 None => return self.key(),
             }
@@ -2839,6 +3099,7 @@ impl Session {
         };
 
         let cancel = self.shared.cancel.clone();
+        let release = self.holding.release.asked.clone();
         let mut tick = tokio::time::interval(Duration::from_millis(10));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut progress = tokio::time::interval(self.cfg.progress_interval);
@@ -2893,7 +3154,83 @@ impl Session {
                     self.stop(&mut rx, "receiver shutting down").await;
                     return self.key();
                 }
+                _ = release.cancelled() => {
+                    self.let_go(&mut rx).await;
+                    return self.key();
+                }
             }
+        }
+    }
+
+    /// Before the transfer is decided on: if the partial data it would
+    /// continue is held by another session of the same sender — the one
+    /// the sender left when it was restarted without its resume state —
+    /// asks that session to let go of it (see [`Session::let_go`]), and
+    /// waits until it has, `RELEASE_WAIT` at most; [`Session::prepare`]
+    /// refuses the transfer as busy if it has not by then. False when this
+    /// session is to end instead: the receiver stops, or this session is
+    /// asked to let go itself.
+    async fn let_go_first(&mut self, hello: &Hello) -> bool {
+        let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+        loop {
+            let Some(state) = self.saved_state(hello) else {
+                return true;
+            };
+            let Held::Elsewhere(other) = self.holding.held(&state) else {
+                return true;
+            };
+            tracing::info!(
+                "transfer {} continues the partial data of transfer {} of the same sender; \
+                 asking that one to let go",
+                self.tid_hex(),
+                hex16(&other.transfer)
+            );
+            other.release.ask(LET_GO_CONTINUED);
+            tokio::select! {
+                _ = other.released.cancelled() => {}
+                _ = tokio::time::sleep_until(deadline) => return true,
+                _ = self.holding.release.asked.cancelled() => return false,
+                _ = self.shared.cancel.cancelled() => return false,
+            }
+        }
+    }
+
+    /// Lets go of the transfer when asked to (see [`Holder`]): by a session
+    /// of the same sender that continues its partial data, or by the
+    /// dispatcher, to make room for the sender's next transfer while this
+    /// one is silent (see [`Dispatcher::room_for`]). Unlike
+    /// [`Session::stop`] it leaves what the transfer that continues needs:
+    /// one in progress is suspended, its partial file and state kept (or,
+    /// if nothing came, dropped as it would be at `handshake_timeout`); one
+    /// being verified is let finish; and the state of a result in place is
+    /// left as it is — completing would forget it — for the transfer that
+    /// continues to confirm the result from (Р22).
+    async fn let_go(&mut self, rx: &mut mpsc::Receiver<Incoming>) {
+        let why = self.holding.release.why();
+        if matches!(self.phase, Phase::Verifying) {
+            while let Some(msg) = rx.recv().await {
+                if let Incoming::Verified(r) = msg {
+                    let _ = self.on_verified(r);
+                    break;
+                }
+            }
+        }
+        match &self.phase {
+            Phase::Receiving if self.got_data => self.suspend(why).await,
+            Phase::Receiving => self.abandon_idle(why).await,
+            Phase::Finishing { .. } => {
+                tracing::info!(
+                    "transfer {}: {}; {} is in place, confirmed to whoever continues it",
+                    self.tid_hex(),
+                    why,
+                    self.final_path.display()
+                );
+                self.emit_failed(format!("{}; the result is in place", why), true);
+            }
+            Phase::Pending { .. } => self.emit_failed(why.to_string(), false),
+            // A verification that failed was reported as such, a refusal
+            // when it was made.
+            Phase::Verifying | Phase::Refusing { .. } => {}
         }
     }
 
@@ -3202,6 +3539,39 @@ impl Session {
         }
     }
 
+    /// The resume state the transfer continues, if any: its own, by its
+    /// transfer id, or else the newest of the same sender's for the same
+    /// file — name, size and source modification time or, for a directory,
+    /// the hash of its listing, so that a changed source starts afresh
+    /// instead of failing the whole-transfer check at the very end. Only the
+    /// sender that started a partial transfer may continue it.
+    fn saved_state(&self, hello: &Hello) -> Option<ReceiverState> {
+        let name = sanitize_file_name(&hello.file_name)?;
+        let manifest_hex = hello
+            .tree
+            .map(|t| hash_to_hex(&t.manifest_hash))
+            .unwrap_or_default();
+        let sender = self.sender.to_string();
+        let st = self.shared.store.as_ref()?;
+        st.load_receiver(&self.tid_hex())
+            .filter(|s| {
+                s.sender == sender
+                    && s.file_size == hello.file_size
+                    && s.file_mtime == hello.file_mtime
+                    && s.manifest_hash == manifest_hex
+                    && s.data_path().exists()
+            })
+            .or_else(|| {
+                st.find_receiver_by_file(
+                    &sender,
+                    &name,
+                    hello.file_size,
+                    hello.file_mtime,
+                    &manifest_hex,
+                )
+            })
+    }
+
     /// Validates the request and resolves resume state and paths. The file
     /// itself is created by [`Session::create_file`] once accepted.
     fn prepare(&mut self, hello: &Hello) -> Result<(), (u8, String)> {
@@ -3232,37 +3602,8 @@ impl Session {
                 resume: false,
             });
         }
-        let manifest_hex = hello
-            .tree
-            .map(|t| hash_to_hex(&t.manifest_hash))
-            .unwrap_or_default();
-
-        // Resume: by transfer id first, then by file identity (name, size and
-        // source modification time or, for a directory, the hash of its
-        // listing, so that a changed source starts afresh instead of failing
-        // the whole-transfer check at the very end). Only the sender that
-        // started a partial transfer may continue it.
         let tid_hex = self.tid_hex();
-        let sender = self.sender.to_string();
-        let saved = self.shared.store.as_ref().and_then(|st| {
-            st.load_receiver(&tid_hex)
-                .filter(|s| {
-                    s.sender == sender
-                        && s.file_size == hello.file_size
-                        && s.file_mtime == hello.file_mtime
-                        && s.manifest_hash == manifest_hex
-                        && s.data_path().exists()
-                })
-                .or_else(|| {
-                    st.find_receiver_by_file(
-                        &sender,
-                        &name,
-                        hello.file_size,
-                        hello.file_mtime,
-                        &manifest_hex,
-                    )
-                })
-        });
+        let saved = self.saved_state(hello);
         let mut durable = RangeSet::new();
         if let Some(saved) = &saved {
             // Never continue through a symbolic link someone put in place
@@ -3279,6 +3620,32 @@ impl Session {
             let usable = usable
                 && (saved.placed.is_empty()
                     || placed.is_some() && saved.durable_set().total() >= hello.file_size);
+            // Nor is what another session holds (see `Holder`): one of the
+            // same sender that did not let go in time (see `let_go_first`),
+            // or one of another sender's whose partial file has the name
+            // this stale state remembers.
+            let usable = usable
+                && match self.holding.take(saved) {
+                    Held::Free => true,
+                    Held::Elsewhere(other) => {
+                        tracing::info!(
+                            "transfer {}: transfer {} of the same sender still holds the partial data",
+                            tid_hex,
+                            hex16(&other.transfer)
+                        );
+                        return Err((
+                            REASON_BUSY,
+                            "an earlier transfer of this file still holds it".into(),
+                        ));
+                    }
+                    Held::Stale => {
+                        tracing::warn!(
+                            "{} belongs to another transfer now; not resuming from it",
+                            saved.data_path().display()
+                        );
+                        false
+                    }
+                };
             if usable {
                 durable = saved.durable_set();
                 if let Some(tree) = &mut self.tree {
@@ -3333,35 +3700,38 @@ impl Session {
                         }
                     );
                 }
+                // The earlier transfer's state goes once this one's own is
+                // kept (see `persist_state_now`), not before: a transfer
+                // declined, or let go of before it is decided on, leaves the
+                // partial data as resumable as it found it.
                 if saved.transfer_id != tid_hex {
-                    if let Some(st) = &self.shared.store {
-                        st.remove_receiver(&saved.transfer_id);
-                    }
+                    self.took_over = Some(saved.transfer_id.clone());
                 }
             }
         }
         if self.part_path.as_os_str().is_empty() {
-            if self.tree.is_some() {
-                // The final name is chosen when the tree is complete.
-                self.final_path = out_dir.join(&name);
-                self.part_path = tree::unique_dir_path(
-                    &out_dir,
-                    &format!("{}{}", name, crate::file::PART_SUFFIX),
-                );
-            } else {
-                let final_path = if self.shared.cfg.overwrite {
-                    out_dir.join(&name)
-                } else {
-                    unique_path(&out_dir, &name)
-                };
-                let mut part = part_path_for(&final_path);
-                if part.exists() {
-                    // An unrelated leftover; do not clobber it.
-                    part = unique_path(&out_dir, &format!("{}{}", name, crate::file::PART_SUFFIX));
+            let (tree, overwrite) = (self.tree.is_some(), self.shared.cfg.overwrite);
+            let part_name = format!("{}{}", name, crate::file::PART_SUFFIX);
+            let mut final_path = out_dir.join(&name);
+            // A name another session has chosen for its partial file, and
+            // not created yet, is as taken as one that is there.
+            self.part_path = self.holding.choose_part(|theirs| {
+                if tree {
+                    // The final name is chosen when the tree is complete.
+                    return tree::unique_dir_path_besides(&out_dir, &part_name, theirs);
                 }
-                self.final_path = final_path;
-                self.part_path = part;
-            }
+                if !overwrite {
+                    final_path = unique_path(&out_dir, &name);
+                }
+                let part = part_path_for(&final_path);
+                if part.exists() || theirs(&part) {
+                    // An unrelated leftover, or another transfer's; do not
+                    // clobber it.
+                    return unique_path_besides(&out_dir, &part_name, theirs);
+                }
+                part
+            });
+            self.final_path = final_path;
         }
 
         let needed = hello.file_size.saturating_sub(durable.total());
@@ -4326,8 +4696,15 @@ impl Session {
     /// known to be on disk (right after open, or after the writer closed).
     fn persist_state_now(&mut self) {
         if let Some(store) = &self.shared.store {
-            if let Err(e) = store.save_receiver(&self.state(&self.received)) {
-                tracing::warn!("cannot save resume state: {}", e);
+            match store.save_receiver(&self.state(&self.received)) {
+                // The state of the transfer this one continues is this
+                // one's now (see `prepare`).
+                Ok(()) => {
+                    if let Some(earlier) = self.took_over.take() {
+                        store.remove_receiver(&earlier);
+                    }
+                }
+                Err(e) => tracing::warn!("cannot save resume state: {}", e),
             }
         }
         self.last_persist_at = Instant::now();

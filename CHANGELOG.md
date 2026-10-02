@@ -226,6 +226,26 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   now as good as that address, which the user gave; the receiver's
   address, if the relay names one on loopback, is still refused. Found by
   the soak laboratory, all of whose transfers through the relay failed.
+- A sender killed and run again without its resume state sends the file
+  as a new transfer, which continues the partial file the old transfer's
+  session holds — and that session, waiting for its sender up to
+  `session_ttl`, shared the file with it until, having heard nothing, it
+  removed the file the new one was writing (no data had come) or, at
+  `session_ttl`, left a second resume state for the same file. One
+  partial file now has one session:
+  the new one asks the old one to let go first and waits for it, 10 s at
+  most (busy otherwise); the old one is suspended with its file and state
+  for the new one to take, lets a verification finish, leaves a result in
+  place to be confirmed by the new one, and is reported failed with the
+  reason. Nor is a fresh partial file given a name another session has
+  chosen and not created yet: two transfers of one name waiting for the
+  user at once wrote into one file, and failed.
+- A sender cut off in the middle of as many transfers as its share of the
+  receiver's sessions was refused as busy until they ran out at
+  `session_ttl` (ten minutes). When its share is full, or every session
+  taken, its own transfer silent longest, if silent for `stall_timeout`,
+  now lets go for the next one, suspended for resume. Both found by the soak laboratory: senders
+  killed a moment after they began, and sent again.
 - Tests: the relay's fuzzing harness counts only what this input's relay
   sent (on macOS the last input's answer could arrive after it); the
   state store's test no longer cleans up "older than no time" across a
