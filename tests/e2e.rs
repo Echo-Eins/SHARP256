@@ -5888,6 +5888,44 @@ async fn a_relay_holds_a_stream_to_its_rate_rather_than_drop() {
     through_the_relay_at(true, false, Some(2_000_000), 4_000_000).await;
 }
 
+/// A relay on this very host, given by its loopback address, and a sender
+/// bound to every address, as the programs are by default: the port the
+/// relay carries on is at the address the relay was given, and is taken —
+/// though an address on loopback a relay names (the receiver's, here) is
+/// not, from a socket that is not on loopback itself. Every transfer
+/// through the soak laboratory's relay failed on that.
+#[cfg(feature = "nat-traversal")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_on_this_host_carries_for_a_sender_bound_to_every_address() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let (relay, relay_id, relay_cancel) =
+        start_relay_with(sharp256::relay::server::Quotas::default()).await;
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.relays = vec![format!("{}@{}", relay_id, relay)];
+        cfg.tcp = false;
+    })
+    .await;
+    wait_registered(&mut r.events, Duration::from_secs(30)).await;
+    let path = make_file(&src, "here.bin", 500_000, 21);
+    let mut cfg = sender_cfg(&path, "0.0.0.0:0".parse().unwrap(), r.id, &state);
+    cfg.bind = "0.0.0.0:0".parse().unwrap();
+    cfg.relays = vec![format!("{}@{}", relay_id, relay)];
+    cfg.carriers = false;
+    tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("send");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    if let TransferEvent::Completed { path: Some(p), .. } = ev {
+        assert_same(&path, Path::new(&p));
+    } else {
+        panic!("unexpected event");
+    }
+    stop_receiver(r).await;
+    relay_cancel.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // carriers: a relay over TLS
 // ---------------------------------------------------------------------------

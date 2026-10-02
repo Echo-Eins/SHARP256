@@ -218,6 +218,14 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   IPv6 test finished in between, the receiver — behind an IPv6 firewall
   that lets in only what it has sent to — never learnt where the sender
   was, and no direct path opened.
+- A relay on the sender's own host (`--relay 127.0.0.1:5560`) carried
+  nothing for a sender bound to every address, as the programs are by
+  default: the port it carries on is on loopback, and an address on
+  loopback a relay names is refused from a socket that is not on loopback
+  itself. A relay's port at the very address the relay was asked at is
+  now as good as that address, which the user gave; the receiver's
+  address, if the relay names one on loopback, is still refused. Found by
+  the soak laboratory, all of whose transfers through the relay failed.
 - Tests: the relay's fuzzing harness counts only what this input's relay
   sent (on macOS the last input's answer could arrive after it); the
   state store's test no longer cleans up "older than no time" across a

@@ -1419,9 +1419,11 @@ const INTRODUCE_TIMES: u32 = 8;
 /// unconnected UDP socket when an ICMP port-unreachable comes back, so a
 /// single peer going quiet would otherwise kill the pair.
 const MAX_ERRORS: u32 = 16;
-/// The longest a datagram that came on a stream waits for the quota, the
-/// whole pair with it: a rate limit's next datagram is a fraction of a
-/// millisecond off; an hourly allowance spent is not worth waiting for.
+/// The longest a datagram that came on a stream waits for the quota, or for
+/// room on the stream it goes on to, the whole pair with it: under a rate,
+/// the next datagram's turn is a fraction of a millisecond off (a few
+/// milliseconds under a modest hourly allowance); longer is not worth
+/// holding the pair still for, and the datagram is dropped.
 const MAX_HOLD: Duration = Duration::from_millis(50);
 
 /// What one pair carried, and what it was refused, told when it ends.
@@ -2305,7 +2307,7 @@ mod wire_tests {
         // jumbo frame.
         let state = quinn_udp::UdpSocketState::new((&sd).into()).unwrap();
         let run: Vec<u8> = (0..20u8).flat_map(|i| [i; 1000]).collect();
-        let segment = (state.max_gso_segments() > 1).then_some(1000);
+        let mut segment = (state.max_gso_segments() > 1).then_some(1000);
         let mut sent = 0;
         while sent < run.len() {
             let end = if segment.is_some() {
@@ -2324,8 +2326,13 @@ mod wire_tests {
                 };
                 state.try_send((&sd).into(), &transmit)
             });
-            if r.is_ok() {
-                sent = end;
+            match r {
+                Ok(()) => sent = end,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                // No segmentation here after all (a driver without it):
+                // one at a time.
+                Err(_) if segment.is_some() => segment = None,
+                Err(e) => panic!("{e}"),
             }
         }
         let mut got = Vec::new();

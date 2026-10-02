@@ -361,7 +361,12 @@ impl Sender {
                                     );
                                     let _ = found.send(Found::Relay(alt.addr));
                                 }
-                                let _ = found.send(Found::Carrier(i.relayed));
+                                let at_relay = crate::address::canonical(i.relayed).ip()
+                                    == crate::address::canonical(addr).ip();
+                                let _ = found.send(Found::Carrier {
+                                    addr: i.relayed,
+                                    at_relay,
+                                });
                                 // Push outwards at where the receiver appears
                                 // to be, aimed by what it says its NAT does,
                                 // while its own punches come the other way.
@@ -1415,8 +1420,13 @@ enum Found {
     /// A port a relay set aside for the pair: from a relay, like
     /// [`Found::Relay`], but one that carries and is not the receiver. A
     /// transfer over it is worth moving to a direct path once one opens.
+    /// `at_relay` when it is at the very address the relay was asked at —
+    /// one the user gave, or a name the user gave resolved to — and so as
+    /// good as that address: a relay on this host carries on a port of
+    /// this host, on loopback, which a relay's word alone never makes worth
+    /// sending to from a socket that is not on loopback itself.
     #[cfg_attr(not(feature = "nat-traversal"), allow(dead_code))]
-    Carrier(SocketAddr),
+    Carrier { addr: SocketAddr, at_relay: bool },
     /// From the DHT, whose nodes are anybody's: `agreed` when several of
     /// them named it. Neither is enough by itself (see `DHT_INITIATIONS`):
     /// in the real DHT one node often holds the receiver's announcement,
@@ -2606,9 +2616,16 @@ impl Engine {
     fn add_candidate(&mut self, found: Found) -> Option<SocketAddr> {
         let local = self.socket.local_addr().unwrap_or(self.peer);
         let (addr, usable) = match found {
-            Found::Relay(a) | Found::Carrier(a) | Found::Dht { addr: a, .. } => {
-                (a, crate::address::class::is_sendable_hint(a, local))
+            Found::Relay(a)
+            | Found::Carrier {
+                addr: a,
+                at_relay: false,
             }
+            | Found::Dht { addr: a, .. } => (a, crate::address::class::is_sendable_hint(a, local)),
+            Found::Carrier {
+                addr: a,
+                at_relay: true,
+            } => (a, crate::address::class::is_sendable_named(a, local)),
             Found::Named(a) => (a, crate::address::class::is_sendable_named(a, local)),
             // Only an address one of our own allocations made; anybody else's
             // loopback is what the screen above exists to refuse.
@@ -2653,7 +2670,7 @@ impl Engine {
         // What a relay carries is not where the receiver is, and is no
         // evidence of where it might turn up from: it is somewhere to be
         // carried, and a way through until a direct one opens.
-        if matches!(found, Found::Carrier(_)) {
+        if matches!(found, Found::Carrier { .. }) {
             self.relayed.insert(crate::address::canonical(addr));
         } else {
             self.peer_ips.insert(crate::address::canonical(addr).ip());
@@ -2664,7 +2681,7 @@ impl Engine {
             // pair is bound, which takes it a round trip and its own pushing
             // through its NAT (2.6 s on a slow CI runner): longer than an
             // address that is the receiver.
-            let wait = if matches!(found, Found::Carrier(_)) {
+            let wait = if matches!(found, Found::Carrier { .. }) {
                 RELAY_PAIR_WAIT
             } else {
                 crate::transport::carrier::CARRIER_DELAY
