@@ -1,0 +1,19 @@
+{
+  "description": "The DHT's rendezvous key and infohashes (PROTOCOL.md section 8, the DHT): without a secret, and with one (the 32 bytes of the PSK).",
+  "cases": [
+    {
+      "receiver_id": "b8272cc59e6c080949da5febe6fbc0577a67124c00800149107bd7504fc63e20",
+      "secret": "",
+      "key": "97d683605fe72a1b782619c9d5e95565fb8e6796e7bdc4990015bbaddba2d747",
+      "infohash_receiver": "dc8c69b32bd6cc3877a3284e458f64ab589a9f5d",
+      "infohash_sender": "f24ba3b49256bf1b0db56aa7bf75041721c48d32"
+    },
+    {
+      "receiver_id": "b8272cc59e6c080949da5febe6fbc0577a67124c00800149107bd7504fc63e20",
+      "secret": "8785066e690283812be7784457e28c13ba34de59ac5012c792af1c578f1ed607",
+      "key": "02300ae088b2d8dc16af434727702147ed0a75371541f2262af2fd8643749998",
+      "infohash_receiver": "e6ca4f6b82dc6c1079a4549dc04833ae014dc2d1",
+      "infohash_sender": "2464c6b01515199007feb7841975ee832c8d97b0"
+    }
+  ]
+}

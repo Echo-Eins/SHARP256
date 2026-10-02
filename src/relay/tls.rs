@@ -185,13 +185,31 @@ pub fn client_config() -> io::Result<Arc<rustls::ClientConfig>> {
 // Binding the session to the relay's key
 // ---------------------------------------------------------------------------
 
-/// The key the relay's proof is made with: from the two keys' exchange,
+/// The relay's proof that a TLS session is its own: a MAC over the key
+/// `exported` from the session, under a key from the two keys' exchange
 /// and everything else the ask carried.
-fn binding_key(shared: &[u8], ephemeral: &[u8; 32], relay: &SharpId, nonce: &[u8]) -> [u8; 32] {
-    *crate::crypto::derive_secret(
+pub(crate) fn binding_mac(
+    shared: &[u8],
+    ephemeral: &[u8; 32],
+    relay: &SharpId,
+    nonce: &[u8],
+    exported: &[u8; 32],
+) -> [u8; 32] {
+    let key = crate::crypto::derive_secret(
         "sharp256 relay tls binding v1",
         &[shared, ephemeral, relay.as_bytes(), nonce],
-    )
+    );
+    crate::crypto::keyed_mac(&key, &[exported])
+}
+
+/// The client's ask: its ephemeral public key and a nonce.
+pub(crate) fn ask(ephemeral: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
+    [&[ASK][..], ephemeral, nonce].concat()
+}
+
+/// The relay's answer: the MAC.
+pub(crate) fn answer(mac: &[u8; 32]) -> Vec<u8> {
+    [&[ANSWER][..], mac].concat()
 }
 
 /// What the binding is made over: a key exported from the TLS session
@@ -241,14 +259,16 @@ pub async fn bind(
         )
     })?;
     let exporter = export(stream.get_ref().1, &nonce)?;
-    let mut ask = vec![ASK];
-    ask.extend_from_slice(ephemeral.id().as_bytes());
-    ask.extend_from_slice(&nonce);
-    write_own(stream, &ask).await?;
-    let answer = read_own(stream).await?;
-    let key = binding_key(&shared[..], ephemeral.id().as_bytes(), relay, &nonce);
-    let expected: [u8; 32] = crate::crypto::keyed_mac(&key, &[&exporter]);
-    if answer.len() == 33 && answer[0] == ANSWER && bool::from(answer[1..].ct_eq(&expected)) {
+    write_own(stream, &ask(ephemeral.id().as_bytes(), &nonce)).await?;
+    let answered = read_own(stream).await?;
+    let expected = binding_mac(
+        &shared[..],
+        ephemeral.id().as_bytes(),
+        relay,
+        &nonce,
+        &exporter,
+    );
+    if answered.len() == 33 && answered[0] == ANSWER && bool::from(answered[1..].ct_eq(&expected)) {
         return Ok(());
     }
     Err(io::Error::other(Intercepted))
@@ -273,11 +293,8 @@ pub async fn prove(
         .shared_secret(&SharpId::from_public(ephemeral))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "an unusable key"))?;
     let exporter = export(stream.get_ref().1, nonce)?;
-    let key = binding_key(&shared[..], &ephemeral, &identity.id(), nonce);
-    let mac: [u8; 32] = crate::crypto::keyed_mac(&key, &[&exporter]);
-    let mut answer = vec![ANSWER];
-    answer.extend_from_slice(&mac);
-    write_own(stream, &answer).await
+    let mac = binding_mac(&shared[..], &ephemeral, &identity.id(), nonce, &exporter);
+    write_own(stream, &answer(&mac)).await
 }
 
 #[cfg(test)]

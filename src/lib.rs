@@ -12,6 +12,8 @@ pub mod protocol;
 pub mod state;
 mod sync;
 pub mod transport;
+#[cfg(test)]
+mod vectors;
 
 #[cfg(feature = "nat-traversal")]
 pub mod nat;

@@ -1,0 +1,170 @@
+{
+  "description": "The relay's control messages (PROTOCOL.md section 8): SHRELAY1, a kind byte, the body. A proof is BLAKE3-keyed(K, message up to it)[0..16] with K the registration key of the peer that sends it; a tag is either that relay key's (to a registered receiver) or the nonce of the request answered.",
+  "receiver_static_secret": "a238c71ecf7b05cc849b6bd18bb747c6185693e32f1d4139182c5e9024b7e415",
+  "sender_static_secret": "c1fdef3854859edaddf18d1f8e1099e8ef19c6618c3f7e2469213d8c69071e54",
+  "relay_static_secret": "1915cc631de040a08a1d731f55a234ae6c7d2607d4bab8275b6ad30daeb51c63",
+  "registration_key_receiver": "ee1ee59723b376c79405e3fc6f237ef361c471768ac18d6454a0859db5515457",
+  "registration_key_sender": "96c67a5f1a20235eb417a994352511436b13aeb05af56bc9fb6a7992017cb887",
+  "receiver_nonce": "88d9b3173e63874fa762375a0df8cc1f",
+  "sender_nonce": "8af45a46ca9ea48b1641ea329768dc9d",
+  "cases": [
+    {
+      "name": "register",
+      "kind": 1,
+      "id": "74f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957e",
+      "token": "c33a976406f96a42b2bf9b82cdcc0fc8",
+      "flags": 0,
+      "stamp": 1790000000123456789,
+      "hints": {
+        "nat": "010301000002",
+        "alt": {
+          "addr": "[2001:db8:7::5]:40400",
+          "nat": "040300000000"
+        }
+      },
+      "nonce": "88d9b3173e63874fa762375a0df8cc1f",
+      "proof": "6ab21cdf1c3a51c6c10fcf86a2089fdd",
+      "message": "534852454c4159310174f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957ec33a976406f96a42b2bf9b82cdcc0fc80018d75b842b4ecd15010301000002069dd020010db800070000000000000000000504030000000088d9b3173e63874fa762375a0df8cc1f6ab21cdf1c3a51c6c10fcf86a2089fdd"
+    },
+    {
+      "name": "register as private",
+      "kind": 1,
+      "id": "74f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957e",
+      "token": "c33a976406f96a42b2bf9b82cdcc0fc8",
+      "flags": 1,
+      "stamp": 1790000000123456790,
+      "hints": {
+        "nat": "000000000000",
+        "alt": null
+      },
+      "nonce": "88d9b3173e63874fa762375a0df8cc1f",
+      "proof": "a2d8365504e054cac719b87e8e83bc8d",
+      "message": "534852454c4159310174f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957ec33a976406f96a42b2bf9b82cdcc0fc80118d75b842b4ecd160000000000000088d9b3173e63874fa762375a0df8cc1fa2d8365504e054cac719b87e8e83bc8d"
+    },
+    {
+      "name": "challenge",
+      "kind": 2,
+      "token": "c33a976406f96a42b2bf9b82cdcc0fc8",
+      "tag": "88d9b3173e63874fa762375a0df8cc1f",
+      "tagged_by": "nonce",
+      "message": "534852454c41593102c33a976406f96a42b2bf9b82cdcc0fc888d9b3173e63874fa762375a0df8cc1f"
+    },
+    {
+      "name": "registered",
+      "kind": 3,
+      "lease": 120,
+      "observed": "203.0.113.7:5555",
+      "tag": "cf33e5e7998f927205b96605ce0e69ff",
+      "tagged_by": "relay key",
+      "message": "534852454c41593103000000780415b3cb007107cf33e5e7998f927205b96605ce0e69ff"
+    },
+    {
+      "name": "connect",
+      "kind": 4,
+      "target": "74f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957e",
+      "token": "c33a976406f96a42b2bf9b82cdcc0fc8",
+      "hints": {
+        "nat": "030302fffe05",
+        "alt": null
+      },
+      "nonce": "8af45a46ca9ea48b1641ea329768dc9d",
+      "message": "534852454c4159310474f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957ec33a976406f96a42b2bf9b82cdcc0fc8030302fffe05008af45a46ca9ea48b1641ea329768dc9d"
+    },
+    {
+      "name": "allocated",
+      "kind": 5,
+      "hints": {
+        "nat": "010301000002",
+        "alt": {
+          "addr": "[2001:db8:7::5]:40400",
+          "nat": "040300000000"
+        }
+      },
+      "port": 40001,
+      "peer": "203.0.113.7:5555",
+      "ticket": "880dc3158eb2da246411676178fe9dfe",
+      "tag": "8af45a46ca9ea48b1641ea329768dc9d",
+      "tagged_by": "nonce",
+      "message": "534852454c415931059c410415b3cb007107880dc3158eb2da246411676178fe9dfe010301000002069dd020010db80007000000000000000000050403000000008af45a46ca9ea48b1641ea329768dc9d"
+    },
+    {
+      "name": "incoming",
+      "kind": 6,
+      "hints": {
+        "nat": "030302fffe05",
+        "alt": null
+      },
+      "port": 40001,
+      "peer": "198.51.100.20:61001",
+      "ticket": "3d7563fd5f0540da81e507d48a621b54",
+      "tag": "1788f095567d4f39d5d3f47595684a5e",
+      "tagged_by": "relay key",
+      "message": "534852454c415931069c4104ee49c63364143d7563fd5f0540da81e507d48a621b54030302fffe05001788f095567d4f39d5d3f47595684a5e"
+    },
+    {
+      "name": "refused as stale",
+      "kind": 7,
+      "code": 4,
+      "tag": "205c13085c03029150a873b1a5f1df1c",
+      "tagged_by": "relay key",
+      "message": "534852454c4159310704205c13085c03029150a873b1a5f1df1c"
+    },
+    {
+      "name": "refused as busy",
+      "kind": 7,
+      "code": 3,
+      "tag": "8af45a46ca9ea48b1641ea329768dc9d",
+      "tagged_by": "nonce",
+      "message": "534852454c41593107038af45a46ca9ea48b1641ea329768dc9d"
+    },
+    {
+      "name": "open, asking",
+      "kind": 8,
+      "ticket": "880dc3158eb2da246411676178fe9dfe",
+      "proof": "00000000000000000000000000000000",
+      "message": "534852454c41593108880dc3158eb2da246411676178fe9dfe00000000000000000000000000000000"
+    },
+    {
+      "name": "open",
+      "kind": 8,
+      "ticket": "880dc3158eb2da246411676178fe9dfe",
+      "proof": "2fe69b06129cb6d530eec098a06d0a2b",
+      "message": "534852454c41593108880dc3158eb2da246411676178fe9dfe2fe69b06129cb6d530eec098a06d0a2b"
+    },
+    {
+      "name": "punch",
+      "kind": 9,
+      "message": "534852454c41593109"
+    },
+    {
+      "name": "bye",
+      "kind": 10,
+      "id": "74f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957e",
+      "token": "c33a976406f96a42b2bf9b82cdcc0fc8",
+      "stamp": 1790000000123456791,
+      "nonce": "88d9b3173e63874fa762375a0df8cc1f",
+      "proof": "4192ead7d317b11fa857a44c53adaef6",
+      "message": "534852454c4159310a74f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957ec33a976406f96a42b2bf9b82cdcc0fc818d75b842b4ecd1788d9b3173e63874fa762375a0df8cc1f4192ead7d317b11fa857a44c53adaef6"
+    },
+    {
+      "name": "confirm",
+      "kind": 11,
+      "proof": "2fe69b06129cb6d530eec098a06d0a2b",
+      "message": "534852454c4159310b2fe69b06129cb6d530eec098a06d0a2b"
+    },
+    {
+      "name": "connect as",
+      "kind": 12,
+      "id": "7f2bbed2b684f770cd2b8e5ce61ef6b288d007c0872da840367e09afb75e722f",
+      "target": "74f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957e",
+      "token": "c33a976406f96a42b2bf9b82cdcc0fc8",
+      "hints": {
+        "nat": "030302fffe05",
+        "alt": null
+      },
+      "nonce": "8af45a46ca9ea48b1641ea329768dc9d",
+      "proof": "24e83e40ba443ff849105fa0d971d8c9",
+      "message": "534852454c4159310c74f0b7e5037325db988ba4aa4578cc9ef9e978ebc44adca9f6219f86c5bf957ec33a976406f96a42b2bf9b82cdcc0fc8030302fffe05008af45a46ca9ea48b1641ea329768dc9d7f2bbed2b684f770cd2b8e5ce61ef6b288d007c0872da840367e09afb75e722f24e83e40ba443ff849105fa0d971d8c9"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "description": "Contact cards (PROTOCOL.md section 8): the body, and its text form shc1- and the base32 of the body followed by the first four bytes of its BLAKE3 hash. Flag bit 2 says its maker speaks version 4.",
+  "cases": [
+    {
+      "role": 2,
+      "created": 1790000000,
+      "id": "d163b53ed0806da7b1c7a4862ffcabc84ef85d5546d9390fe243ef183891f33b",
+      "version": 4,
+      "candidates": [
+        {
+          "kind": 0,
+          "addr": "192.168.1.20:5555"
+        },
+        {
+          "kind": 1,
+          "addr": "203.0.113.7:5555"
+        },
+        {
+          "kind": 2,
+          "addr": "[2001:db8:7::5]:5555"
+        },
+        {
+          "kind": 3,
+          "addr": "198.51.100.9:49152"
+        }
+      ],
+      "v4_hints": "010301000002",
+      "v6_hints": "040300000000",
+      "relays": [
+        {
+          "id": "cf713ab970b0d00796a3a7c6add788e0403aa8f03932692c335fd02dc5723f52",
+          "addr": "198.51.100.1:5560"
+        }
+      ],
+      "body": "01026ab13b80d163b53ed0806da7b1c7a4862ffcabc84ef85d5546d9390fe243ef183891f33b04000415b3c0a80114010415b3cb007107020615b320010db80007000000000000000000050304c000c63364090701030100000204030000000001cf713ab970b0d00796a3a7c6add788e0403aa8f03932692c335fd02dc5723f520415b8c6336401",
+      "text": "shc1-aebgvmj3qdiwhnj62cag3j5ry6siml74vpee56c5kvdnsoip4jb66gbyshztwbaaaqk3hqfiaekacbavwpfqa4ihaidblmzaaeg3qaahaaaaaaaaaaaaaaafamcmaagggnsasbybamaqaaacaqbqaaaaaaa464j2xfylbuahs2r2prvn26eoaqb2vdydsmtjfqzv7ubnyvzd6uqecw4mmm3eaeeyqdld"
+    },
+    {
+      "role": 1,
+      "created": 1790000100,
+      "id": "85b09999ca39130bb78f1f7f0d96f1a363f79f2d3e4ca342b673cde6e957c04e",
+      "version": 3,
+      "candidates": [
+        {
+          "kind": 1,
+          "addr": "198.51.100.20:61001"
+        }
+      ],
+      "v4_hints": "030302000105",
+      "relays": null,
+      "body": "01016ab13be485b09999ca39130bb78f1f7f0d96f1a363f79f2d3e4ca342b673cde6e957c04e010104ee49c63364140103030200010500",
+      "text": "shc1-aeawvmj34sc3bgmzzi4rgc5xr4px6dmw6grwh547fu7ezi2cwzz43zxjk7ae4aibatxetrrtmqkacaydaiaacbiafwhfj3i"
+    }
+  ]
+}

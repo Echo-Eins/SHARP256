@@ -961,7 +961,7 @@ manifest beyond 64 MiB, sizes that overflow, and trailing bytes.
 ### HELLO fields
 
 `tree = manifest_len:u64 manifest_hash[32] files:u64 dirs:u64`, with
-`manifest_hash = BLAKE3(manifest)`. The receiver can show "12 files in 3
+`manifest_hash = BLAKE3(manifest)` and `dirs` not counting the root. The receiver can show "12 files in 3
 folders, 4.2 GiB" before accepting, and it checks every one of these values
 against the manifest.
 
@@ -1549,7 +1549,7 @@ handshake demands a private key for).
     version:u8 (1)  role:u8 (1 sender, 2 receiver)  created:u32 (seconds)
     id[32]
     n:u8 (≤ 16)  n × ( kind:u8  addr )
-    flags:u8 (bit 0: IPv4 hints follow, bit 1: IPv6 hints follow)
+    flags:u8 (bit 0: IPv4 hints follow, bit 1: IPv6 hints follow, bit 2: version 4)
     hints[6] per family present
     m:u8 (≤ 4)   m × ( id[32]  addr )          the relays it can be reached through
 
@@ -1659,7 +1659,8 @@ tells it whom the sender is looking for.
 
 With `--dht` the two ends use the Mainline DHT (BEP 5) as a meeting place.
 Both derive `key = BLAKE3-derive_key("sharp256 dht rendezvous v1", receiver_id
-|| secret)` (the secret, if any, being the 32 bytes `--secret` stands for)
+|| secret)` (the secret, if any, being the 32-byte PSK `--secret` stands for,
+section 1; nothing without one)
 and the infohashes `BLAKE3-keyed(key, "receiver")[..20]` and
 `BLAKE3-keyed(key, "sender")[..20]`. The receiver announces the first and
 asks for the second, the sender the reverse; `announce_peer` carries the port
@@ -1904,7 +1905,7 @@ Ed25519 one it makes at start-up, and a client takes any certificate whose
 key signed the handshake. What a client checks instead is that the session
 is the relay's own and not one a TLS-inspecting proxy opened on the way:
 after the preambles it sends, in a frame of its own, `1 | ephemeral X25519
-key (32) | nonce (16)`; the relay answers `2 | MAC (32)`, a keyed BLAKE3
+public key (32) | nonce (16)`; the relay answers `2 | MAC (32)`, a keyed BLAKE3
 MAC under `derive_secret("sharp256 relay tls binding v1", [DH(ephemeral,
 relay key), ephemeral key, relay ID, nonce])` over a key both ends export
 from the TLS session (RFC 8446 section 7.5, label

@@ -89,21 +89,21 @@ pub const COOKIE_REPLY_LEN: usize = CID_LEN + 24 + 16 + AEAD_TAG;
 /// How long a cookie secret is used before it is replaced.
 pub const COOKIE_LIFETIME: Duration = Duration::from_secs(120);
 
-pub(super) fn mac1_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
+pub(crate) fn mac1_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v3 mac1", public)
 }
 
 /// Version 4's `mac1` key: a receiver of either version tells the two apart
 /// by it, and one of version 3 hears nothing it knows in a fragment.
-pub(super) fn mac1_key_v4(public: &[u8; KEY_LEN]) -> [u8; 32] {
+pub(crate) fn mac1_key_v4(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v4 mac1", public)
 }
 
-pub(super) fn cookie_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
+pub(crate) fn cookie_key(public: &[u8; KEY_LEN]) -> [u8; 32] {
     blake3::derive_key("sharp256 v3 cookie", public)
 }
 
-pub(super) fn mac2_key(cookie: &[u8; MAC_LEN]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn mac2_key(cookie: &[u8; MAC_LEN]) -> Zeroizing<[u8; 32]> {
     derive_secret("sharp256 v3 mac2", &[cookie])
 }
 
@@ -426,7 +426,7 @@ impl Initiator {
 
 /// The cookie in a reply to a datagram of `cid`, sealed with a receiver's
 /// cookie `key` to the mac1 of the datagram it answers: any of `sent`.
-pub(super) fn open_cookie(
+pub(crate) fn open_cookie(
     key: &[u8; 32],
     sent: &[[u8; MAC_LEN]],
     cid: u64,

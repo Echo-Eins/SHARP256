@@ -277,11 +277,13 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ### Test vectors, from a second implementation
 - `docs/vectors`: known-answer vectors for every key derivation and format
-  of the cryptographic layer — IDs (`sh-`, `sh4-`), the PSK, a sealed
-  identity file, the MAC and cookie keys, a cookie reply, whole handshakes
-  of versions 3 and 4 (every random value given, message 1 of version 4 in
-  fragments), traffic keys of every kind, and transport packets of both
-  suites across epochs. `scripts/vectors` computes them: PROTOCOL.md
+  of the protocol — IDs (`sh-`, `sh4-`), the PSK, a sealed identity file,
+  the MAC and cookie keys, a cookie reply, whole handshakes of versions 3
+  and 4 (every random value given, message 1 of version 4 in fragments),
+  traffic keys of every kind, transport packets of both suites across
+  epochs, every frame and the handshakes' payloads, a directory's
+  manifest, every relay message with its proof or tag, contact cards, the
+  DHT's keys, and the carriers' framing and TLS binding. `scripts/vectors` computes them: PROTOCOL.md
   written again in Go, sharing no code with the crate (its own BLAKE3 and
   Noise, checked against the official BLAKE3 vectors and cacophony's;
   Go's X25519, AES-GCM and ML-KEM). The crate checks itself against the
@@ -304,7 +306,9 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   sealed connection id leads message 1's payload in version 4 too, how
   message 1 is cut into fragments, that version 4 keeps version 3's
   labels for `mac2`, cookies and traffic keys, the identity file's default
-  lane and its associated data exactly, and the relay magic by name.
+  lane and its associated data exactly, the relay magic by name, a card's
+  version flag, what the DHT's secret is, that the TLS ask carries the
+  ephemeral public key, and that HELLO's `dirs` does not count the root.
 
 ### Laboratories and measurements
 - `scripts/netemlab/`: real transfers through the kernel's netem — loss up

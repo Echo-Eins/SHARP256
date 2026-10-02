@@ -377,6 +377,12 @@ func all() map[string]any {
 		"packets.json":       packets(),
 		"handshake_v3.json":  handshakesV3(),
 		"handshake_v4.json":  handshakesV4(),
+		"relay.json":         relayMessages(),
+		"cards.json":         cards(),
+		"dht.json":           dht(),
+		"carriers.json":      carriers(),
+		"frames.json":        frames(),
+		"manifest.json":      manifests(),
 	}
 }
 

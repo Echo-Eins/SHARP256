@@ -1,0 +1,64 @@
+{
+  "description": "A directory's manifest (PROTOCOL.md section 6): entries in the order they are written, parent 0 for the root and otherwise one plus the index of the directory entry it is in; siblings in byte order of their names. files and dirs are what HELLO's tree says (dirs not counting the root).",
+  "root": {
+    "parent": 0,
+    "dir": true,
+    "name": "",
+    "size": 0,
+    "mode": 493,
+    "mtime_seconds": 1790000000,
+    "mtime_nanoseconds": 123456789
+  },
+  "entries": [
+    {
+      "parent": 0,
+      "dir": true,
+      "name": "a",
+      "size": 0,
+      "mode": 488,
+      "mtime_seconds": null,
+      "mtime_nanoseconds": null
+    },
+    {
+      "parent": 1,
+      "dir": false,
+      "name": "b.txt",
+      "size": 5,
+      "mode": 416,
+      "mtime_seconds": 1790000001,
+      "mtime_nanoseconds": 0
+    },
+    {
+      "parent": 1,
+      "dir": false,
+      "name": "c.bin",
+      "size": 0,
+      "mode": null,
+      "mtime_seconds": null,
+      "mtime_nanoseconds": null
+    },
+    {
+      "parent": 0,
+      "dir": true,
+      "name": "empty",
+      "size": 0,
+      "mode": null,
+      "mtime_seconds": null,
+      "mtime_nanoseconds": null
+    },
+    {
+      "parent": 0,
+      "dir": false,
+      "name": "отчёт.txt",
+      "size": 70000,
+      "mode": null,
+      "mtime_seconds": -1,
+      "mtime_nanoseconds": 999999999
+    }
+  ],
+  "files": 3,
+  "dirs": 2,
+  "data_len": 70005,
+  "manifest": "010007ed0380ee89ab0d959aef3a0503000161e803060105622e74787405a00382ee89ab0d00000105632e62696e00010005656d70747904000ed0bed182d187d191d1822e747874f0a20401ff93ebdc03",
+  "manifest_hash": "43d07e87e26b54021f0d65982a43d219bfe29c90a52bc360df8180a15282d614"
+}

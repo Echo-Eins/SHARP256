@@ -241,24 +241,24 @@ impl Zeroize for HeaderKey {
 /// A direction's traffic secret: from a key of the handshake's split and
 /// the handshake hash (PROTOCOL.md section 2, "Traffic keys"), as the
 /// derivations below.
-pub(super) fn traffic_secret(k: &[u8; 32], hash: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn traffic_secret(k: &[u8; 32], hash: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     derive_secret("sharp256 v3 traffic secret", &[k, hash])
 }
 
 /// A direction's IV.
-pub(super) fn iv_of(secret: &[u8; 32]) -> [u8; 12] {
+pub(crate) fn iv_of(secret: &[u8; 32]) -> [u8; 12] {
     let mut iv = [0u8; 12];
     iv.copy_from_slice(&derive_secret("sharp256 v3 aead iv", &[secret])[..12]);
     iv
 }
 
 /// A direction's header protection key.
-pub(super) fn header_key_of(secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn header_key_of(secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     derive_secret("sharp256 v3 header protection", &[secret])
 }
 
 /// A direction's AEAD key for an epoch of 2^22 packets.
-pub(super) fn aead_key_of(secret: &[u8; 32], epoch: u64) -> Zeroizing<[u8; 32]> {
+pub(crate) fn aead_key_of(secret: &[u8; 32], epoch: u64) -> Zeroizing<[u8; 32]> {
     derive_secret("sharp256 v3 aead key", &[secret, &epoch.to_be_bytes()])
 }
 
