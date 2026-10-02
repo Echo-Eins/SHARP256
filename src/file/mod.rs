@@ -294,13 +294,17 @@ impl FileWriter {
     /// writer thread. `capacity_bytes` bounds the amount of queued,
     /// not-yet-written data.
     pub fn open(path: &Path, size: u64, capacity_bytes: u64) -> io::Result<Self> {
-        let existed = path.exists();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let existed = std::fs::symlink_metadata(path).is_ok();
+        let file = durable::no_follow(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )
+        .open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path.display(), e)))?;
+        let file = durable::not_a_link(file, path)?;
         if file.metadata()?.len() != size {
             file.set_len(size)?;
         }
@@ -755,8 +759,9 @@ pub fn available_space(dir: &Path) -> io::Result<Option<u64>> {
 /// Reduces a file name received from the network to a plain base name that
 /// is safe to join onto the output directory on every platform.
 pub fn sanitize_file_name(name: &str) -> Option<String> {
-    // Keep only the last path component, whatever separator the peer used.
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    // Keep only the last path component, whatever separator the peer used,
+    // in Unicode's composed form (see `tree::local_name`).
+    let base = tree::nfc(name.rsplit(['/', '\\']).next().unwrap_or("")).into_owned();
     let cleaned: String = base
         .chars()
         .map(|c| match c {
@@ -812,7 +817,7 @@ pub fn part_path_for(final_path: &Path) -> PathBuf {
 /// Renames with a few retries on "permission denied" (on Windows, antivirus
 /// scanners and indexers briefly hold freshly written files open).
 pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
-    retry_denied(|| std::fs::rename(from, to))
+    retry_denied(|| durable::rename(from, to))
 }
 
 fn retry_denied(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
@@ -939,23 +944,11 @@ fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)] // MoveFileExW (docs/UNSAFE.md)
 fn system_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
-    use std::os::windows::ffi::OsStrExt;
-    let wide = |p: &Path| -> Vec<u16> {
-        p.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    };
-    let (f, t) = (wide(from), wide(to));
-    // SAFETY: two NUL-terminated wide paths, alive for the call. (Without
-    // MOVEFILE_REPLACE_EXISTING an existing target is refused.)
-    let ok = unsafe { winapi::um::winbase::MoveFileExW(f.as_ptr(), t.as_ptr(), 0) };
-    if ok != 0 {
+    // Without MOVEFILE_REPLACE_EXISTING an existing target is refused.
+    let Err(e) = durable::move_file(from, to, 0) else {
         return Some(Ok(()));
-    }
-    let e = io::Error::last_os_error();
+    };
     // Something in the way can come back as "access denied" rather than
     // "already exists" (a directory, say); either way it stays.
     Some(
@@ -1004,6 +997,11 @@ mod tests {
     #[test]
     fn sanitize_strips_paths_and_bad_chars() {
         assert_eq!(sanitize_file_name("report.bin"), Some("report.bin".into()));
+        // In Unicode's composed form, whatever form the sender's system used.
+        assert_eq!(
+            sanitize_file_name("dir/e\u{301}te\u{301}.txt"),
+            Some("\u{e9}t\u{e9}.txt".into())
+        );
         assert_eq!(
             sanitize_file_name("../../etc/passwd"),
             Some("passwd".into())
@@ -1094,6 +1092,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_does_not_write_through_a_link() {
+        // Someone who can write the output directory puts a link where the
+        // partial file is to be: the writer refuses it, and the file the
+        // link names is left as it was.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("someone-elses");
+        std::fs::write(&victim, b"precious").unwrap();
+        let part = dir.path().join("f.bin.sharp-part");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &part).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&victim, &part).is_err() {
+            return; // creating links takes a privilege this account lacks
+        }
+        assert!(FileWriter::open(&part, 4096, 1 << 20).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    }
+
+    #[tokio::test]
     async fn writer_coalesces_and_flushes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.bin");
@@ -1114,6 +1131,38 @@ mod tests {
         assert!(data[..5000].iter().all(|&b| b == 1));
         assert!(data[5000..].iter().all(|&b| b == 2));
         assert_eq!(hash_file(&path).unwrap(), *blake3::hash(&data).as_bytes());
+    }
+
+    /// Offsets past 4 GiB, and a write across that boundary, go where they
+    /// say in a file larger than 32 bits can count, and are read back from
+    /// there. (A sparse file: nothing in between is written. On Unix only:
+    /// NTFS fills what lies before a write with zeros, all of it.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offsets_past_four_gibibytes_are_written_and_read_where_they_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let size = (5u64 << 30) + 12_345;
+        let writer = FileWriter::open(&path, size, 1 << 20).unwrap();
+        let across = (4u64 << 30) - 700;
+        let far = (4u64 << 30) + (1 << 29) + 3;
+        writer.enqueue(across, vec![0xa5; 1400]).unwrap();
+        writer.enqueue(far, vec![0x5a; 1000]).unwrap();
+        writer.enqueue(size - 345, vec![0x77; 345]).unwrap();
+        writer.flush().await.unwrap().unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+        let r = FileReader::open(&path).unwrap();
+        let mut buf = vec![0u8; 1402];
+        r.read_at(across - 1, &mut buf).unwrap();
+        assert_eq!((buf[0], buf[1], buf[1400], buf[1401]), (0, 0xa5, 0xa5, 0));
+        let mut buf = vec![0u8; 1000];
+        r.read_at(far, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x5a));
+        let mut buf = vec![0u8; 345];
+        r.read_at(size - 345, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x77));
+        assert!(r.read_at(size - 1, &mut [0u8; 2]).is_err());
     }
 
     #[tokio::test]

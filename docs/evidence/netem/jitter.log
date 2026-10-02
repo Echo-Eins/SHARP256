@@ -1,0 +1,9 @@
+# jitter: 80 ms round trip, ±20 ms each way: packets overtake each other
+# to the receiver: delay 40ms 20ms distribution normal rate 50mbit limit 2000
+# back: delay 40ms 20ms distribution normal
+# 40.5 Mbit/s of 50 (81%), 0.0% sent again, 3.3 s
+
+## sender
+2026-10-02T04:25:00.615147Z  INFO sharp256::transport::sender: transfer b73e1d76dba068c3856be0da8709e8fe accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 16777216 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 16.00 MiB in 3.31s (40.6 Mbit/s avg), 0 B retransmitted, 0 loss events, BLAKE3 1e9297cf3227a1ca66fb4c4823aa31bad48a39b2f831b8f2ee301a33617ea037

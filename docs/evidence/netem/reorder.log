@@ -1,0 +1,9 @@
+# reorder: a tenth of the packets 20 ms ahead of the rest, behind a 50 Mbit/s bottleneck
+# to the receiver: tbf 50mbit 1000 | delay 20ms reorder 10% 50%
+# back: delay 20ms
+# 35.4 Mbit/s of 50 (71%), 6.6% sent again, 3.8 s — more than 5% sent again
+
+## sender
+2026-10-02T04:25:04.917107Z  INFO sharp256::transport::sender: transfer a062d66d31cb0dc85c93d5a91ea81a6e accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 16777216 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 16.00 MiB in 3.79s (35.4 Mbit/s avg), 1.06 MiB retransmitted, 4 loss events, BLAKE3 6e40753e1830630c5704d247a0f028f3336406ab7e944d44da25a0fb0dc66a0e

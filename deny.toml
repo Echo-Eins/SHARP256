@@ -7,23 +7,20 @@
 #   cargo deny --no-default-features --features nat-traversal check bans
 #                                       duplicates in the build without the GUI
 #
-# Every exception names the crate it is for and why. All but one are the
-# GUI's (egui 0.24), and go when it is updated.
+# Every exception names the crate it is for and why. All but two are the
+# GUI's (egui 0.32, rfd 0.15).
 
 [advisories]
 # Vulnerabilities, unsound code, unmaintained and yanked crates are all
 # errors, in every crate of the graph (unsound code is checked only in the
 # crates named in Cargo.toml by default: memmap2 under blake3 had some),
-# except eframe 0.24's own dependencies, which have no fixed version it
+# except some of egui's own dependencies, which have no fixed version it
 # can take:
 unsound = "all"
 ignore = [
-    { id = "RUSTSEC-2026-0257", reason = "webbrowser 0.8 (egui-winit 0.24): webbrowser::open runs only for a link the GUI outputs, and it outputs none; clippy.toml keeps it so" },
-    { id = "RUSTSEC-2024-0388", reason = "derivative, unmaintained (accesskit_unix, atspi: the GUI's screen reader support)" },
-    { id = "RUSTSEC-2024-0384", reason = "instant, unmaintained (fastrand 1 under accesskit_unix)" },
-    { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained (the GUI's macOS and accesskit crates)" },
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, unmaintained (epaint's font rendering)" },
-    { id = "RUSTSEC-2026-0186", reason = "memmap2 0.5 (winit 0.28's Wayland crates): neither sctk-adwaita nor smithay-client-toolkit calls the functions it is about; the 0.9 of blake3 is the fixed 0.9.11" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, unmaintained (epaint's font rendering, through ab_glyph): reads only the fonts built into the GUI" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36 (zbus_xml under zbus-lockstep, under atspi-common): parses AT-SPI's own interface files, in atspi-common's tests only; nothing is parsed at run time. The zbus_xml without it needs Rust 1.87" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36, as RUSTSEC-2026-0194" },
 ]
 
 [licenses]
@@ -45,7 +42,7 @@ exceptions = [
     # their source public on crates.io.
     { allow = ["MPL-2.0"], crate = "option-ext" },
     # The fonts built into the GUI.
-    { allow = ["OFL-1.1", "LicenseRef-UFL-1.0"], crate = "epaint" },
+    { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
 ]
 
 [bans]
@@ -53,10 +50,14 @@ exceptions = [
 multiple-versions = "deny"
 wildcards = "deny"
 skip-tree = [
-    # egui 0.24's graph has some thirty; skipping it skips every version it
-    # uses anywhere, which is why the build without the GUI is checked on
-    # its own as well.
-    { crate = "eframe", reason = "egui 0.24's dependency graph: its duplicates go when the GUI is updated" },
+    # egui 0.32's graph has some twenty (two generations of rand, syn,
+    # thiserror, bitflags and objc2 among them); skipping it skips every
+    # version it uses anywhere, which is why the build without the GUI is
+    # checked on its own as well.
+    { crate = "eframe", reason = "egui 0.32's dependency graph" },
+    # The GUI's file dialogs through the desktop portal: rand 0.9 beside
+    # this crate's 0.8.
+    { crate = "rfd", reason = "the GUI's file dialogs (ashpd)" },
     # Generated bindings to the Windows API, without code of their own; the
     # crates that need them move to newer ones at their own pace.
     { crate = "windows-sys", reason = "generated Windows API bindings" },

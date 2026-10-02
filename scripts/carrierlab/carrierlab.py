@@ -37,6 +37,10 @@ Shares the namespace plumbing with scripts/natlab.
 
     scripts/carrierlab/carrierlab.py matrix [--markdown FILE] [--logs DIR] [-v]
     scripts/carrierlab/carrierlab.py one udp_policed --side receiver --family 6 -v
+
+CARRIERLAB_LOG sets the binaries' log level; CARRIERLAB_SENDER_ARGS adds
+options to the sender's command line (`--no-tcp`, to see UDP alone under a
+policer).
 """
 
 import argparse
@@ -244,7 +248,7 @@ def outcome(slog, rlog, net):
 def excerpt(text, limit=120):
     """The lines of a log that say which way things went."""
     keep = re.compile(
-        r"relay|TCP|TLS|UDP|session runs|proven|claims|registered|held back|trial|refus|"
+        r"relay|TCP|TLS|UDP|session runs|proven|claims|registered|held back|trial|refus|polic|"
         r"not the relay's own|Connected|whole-file|error|Error|failed|warn|WARN"
     )
     lines = [l for l in text.splitlines() if keep.search(l) and "progress" not in l]
@@ -300,6 +304,9 @@ def cell(side, blocking, family, verbose=False, logs=None, keep=False):
                 "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("CARRIERLAB_LOG", "info")]
         if rate:
             args += ["--max-rate", rate]
+        # More of the sender's options, for a measurement of one's own
+        # (`--no-tcp`, say); the expectations are the cells' as they are.
+        args += os.environ.get("CARRIERLAB_SENDER_ARGS", "").split()
         start = time.time()
         sender = lab.spawn("A", args, "sender.log")
         cut = False

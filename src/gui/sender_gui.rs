@@ -211,7 +211,7 @@ impl eframe::App for SenderApp {
                     ui.horizontal(|ui| {
                         ui.label(format!("This sender: {}", id.id()));
                         if ui.small_button("Copy").clicked() {
-                            ui.output_mut(|o| o.copied_text = id.id().to_string());
+                            ui.ctx().copy_text(id.id().to_string());
                         }
                     });
                 }

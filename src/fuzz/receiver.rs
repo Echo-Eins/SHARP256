@@ -80,6 +80,9 @@ impl World {
         cfg.handshake_load_threshold = 3;
         cfg.nat_traversal = false;
         cfg.speak_v4 = true;
+        // Version 3 is fuzzed too, as long as a receiver may be asked to
+        // answer it.
+        cfg.speak_v3 = true;
         let answer = accept.clone();
         cfg.accept = AcceptPolicy::Ask(Arc::new(
             move |_: crate::IncomingRequest, tx: tokio::sync::oneshot::Sender<bool>| {

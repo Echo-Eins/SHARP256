@@ -1,0 +1,10 @@
+# mtu_1240: a path MTU of 1240 bytes: below what IPv6 promises, above what the handshake needs
+# to the receiver: delay 10ms rate 50mbit limit 1000
+# back: delay 10ms
+# 44.4 Mbit/s of 50 (89%), 0.0% sent again, 1.5 s
+
+## sender
+2026-10-02T04:25:56.324066Z  INFO sharp256::transport::sender: transfer 5a643804244da69878f2d9222853d5d1 accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 8388608 B to send
+2026-10-02T04:25:57.555256Z  INFO sharp256::transport::sender: path MTU probe: using 1155 byte chunks
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1155 B)
+Done: 8.00 MiB in 1.51s (44.4 Mbit/s avg), 0 B retransmitted, 0 loss events, BLAKE3 30b95c2d70b12fcad633e8b078bf463c192a33a11473625e4e2594d702a36cb9

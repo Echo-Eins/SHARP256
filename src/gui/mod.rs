@@ -22,7 +22,7 @@ pub fn run_sender_gui(file: Option<PathBuf>, receiver: Option<String>) -> Result
     eframe::run_native(
         "SHARP-256 Sender",
         options,
-        Box::new(move |_cc| Box::new(SenderApp::new(file, receiver))),
+        Box::new(move |_cc| Ok(Box::new(SenderApp::new(file, receiver)))),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }
@@ -39,7 +39,7 @@ pub fn run_receiver_gui(cfg: crate::config::ReceiverConfig, identity_path: PathB
     eframe::run_native(
         "SHARP-256 Receiver",
         options,
-        Box::new(move |_cc| Box::new(ReceiverApp::new(cfg, identity_path))),
+        Box::new(move |_cc| Ok(Box::new(ReceiverApp::new(cfg, identity_path)))),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }

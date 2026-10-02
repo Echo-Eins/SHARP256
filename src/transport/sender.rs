@@ -38,7 +38,7 @@ use crate::protocol::wire::{
 };
 use crate::protocol::RangeSet;
 use crate::state::{hex16, parse_hex16, SenderState, StateStore};
-use crate::transport::congestion::{burst_for_rate, Cubic, Pacer, RttEstimator};
+use crate::transport::congestion::{burst_for_rate, Cubic, Pacer, Policer, RttEstimator};
 use crate::transport::io::{
     is_no_buffer_error, recv_buffers, BatchSocket, Received, MAX_SEND_BYTES,
 };
@@ -95,6 +95,12 @@ pub struct TransferSummary {
     pub retransmitted_bytes: u64,
     pub loss_events: u64,
     pub rto_events: u64,
+    /// Handshake initiations sent, to every address tried and for every
+    /// re-handshake.
+    pub initiations: u64,
+    /// Times a policer was recognised on the path (see
+    /// `congestion::Policer`).
+    pub policer_detections: u64,
     pub chunk_size: u16,
     pub elapsed: Duration,
     pub avg_rate_bps: f64,
@@ -229,6 +235,7 @@ impl Sender {
         found_tx: mpsc::UnboundedSender<Found>,
         puncher: Arc<crate::nat::punch::Puncher>,
         cancel: CancellationToken,
+        nudge: tokio::sync::watch::Receiver<u64>,
     ) -> RelayInboxes {
         let inboxes: RelayInboxes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let reach = crate::address::Reach::of(&self.socket.udp());
@@ -253,16 +260,19 @@ impl Sender {
             let inboxes = inboxes.clone();
             let identity = self.identity.clone();
             let puncher = puncher.clone();
+            let nudge = nudge.clone();
             tokio::spawn(async move {
                 // Only for a relay that asks, and only if we know its
                 // identity to prove ours against.
                 let auth = relay_id.map(|r| (&identity, r));
                 // What our own NAT does is worth telling the relay — and
                 // through it the receiver, who aims its punches by it — but
-                // not worth holding the introduction up for long: the tests
-                // take a round trip or two, and without them the receiver
-                // simply treats our NAT as an easy one.
-                let ours = puncher.hints_when_known().await;
+                // not worth holding the introduction up for: what is known
+                // goes now, and the rest once the tests are done, while the
+                // pair is held (see `relay::client::Refresh`). Waiting cost a
+                // second and a half over IPv6, in which a relay's stream got
+                // ahead of its port.
+                let ours = puncher.mine();
                 // A name is resolved like the receiver's own: as a hint.
                 let resolved = tokio::select! {
                     r = tokio::time::timeout(
@@ -304,20 +314,21 @@ impl Sender {
                             list.retain(|(_, t)| !t.same_channel(&tx));
                             list.push((addr, tx.clone()));
                         }
-                        match crate::relay::client::connect(
+                        // Told in the family this relay is reached over,
+                        // with where we can be aimed at in the other.
+                        let told = crate::relay::Hints::told_to(&ours, addr);
+                        match crate::relay::client::connect_with(
                             socket.clone(),
                             addr,
                             target,
                             &mut rx,
                             &cancel,
                             auth,
-                            // Told in the family this relay is reached over,
-                            // with where we can be aimed at in the other.
-                            crate::relay::Hints::told_to(&ours, addr),
+                            told,
                         )
                         .await
                         {
-                            Ok(i) => {
+                            Ok((i, again)) => {
                                 match i.peer {
                                     Some(peer) => tracing::info!(
                                         "relay {} says the receiver is at {}, and will carry the \
@@ -369,11 +380,50 @@ impl Sender {
                                         puncher.run(peer, nat, &cancel).await;
                                     });
                                 }
+                                // Where the relay says the receiver is when
+                                // it is asked again (see `Refresh`): found,
+                                // and pushed at, like the first time.
+                                let (answers, mut answered) =
+                                    mpsc::unbounded_channel::<crate::relay::client::Introduction>();
+                                {
+                                    let (found, puncher, cancel) =
+                                        (found.clone(), puncher.clone(), cancel.clone());
+                                    tokio::spawn(async move {
+                                        while let Some(i) = answered.recv().await {
+                                            let Some(peer) = i.peer.and_then(|p| reach.native(p))
+                                            else {
+                                                continue;
+                                            };
+                                            tracing::info!(
+                                                "relay says the receiver is at {} now",
+                                                peer
+                                            );
+                                            let _ = found.send(Found::Relay(peer));
+                                            let (puncher, cancel) =
+                                                (puncher.clone(), cancel.clone());
+                                            tokio::spawn(async move {
+                                                puncher.run(peer, i.peer_hints, &cancel).await;
+                                            });
+                                        }
+                                    });
+                                }
                                 // And bind our side of the relay's port, which
                                 // takes a round trip to it: until then it carries
                                 // nothing of ours.
+                                let refresh = crate::relay::client::Refresh {
+                                    again,
+                                    hints: puncher.subscribe(),
+                                    told,
+                                    nudge,
+                                    answers,
+                                };
                                 crate::relay::client::hold(
-                                    socket, i.relayed, i.ticket, &mut rx, &cancel,
+                                    socket,
+                                    i.relayed,
+                                    i.ticket,
+                                    &mut rx,
+                                    &cancel,
+                                    Some(refresh),
                                 )
                                 .await;
                                 return;
@@ -680,6 +730,9 @@ impl Sender {
         #[cfg(feature = "nat-traversal")]
         let (hints_tx, hints_rx) =
             tokio::sync::watch::channel(crate::nat::card::FamilyHints::unknown());
+        // Kept to test the NAT again from (see `Engine::test_nat_again`).
+        #[cfg(feature = "nat-traversal")]
+        let hints_tx = Arc::new(hints_tx);
         #[cfg(feature = "nat-traversal")]
         let (hits_tx, hits_rx) = mpsc::unbounded_channel();
         // Stops what the NAT machinery started — the router's forward, the
@@ -744,6 +797,8 @@ impl Sender {
             )
         };
         #[cfg(feature = "nat-traversal")]
+        let mut nat_again = None;
+        #[cfg(feature = "nat-traversal")]
         let nat_task = if self.cfg.nat_traversal
             && (!self.cfg.relays.is_empty() || wants_card || self.cfg.dht)
         {
@@ -758,12 +813,18 @@ impl Sender {
             if !self.cfg.stun_servers.is_empty() {
                 c.stun_servers = self.cfg.stun_servers.clone();
             }
+            nat_again = Some(NatAgain {
+                servers: c.stun_servers.clone(),
+                hints: hints_tx.clone(),
+                cancel: nat_cancel.clone(),
+                last: None,
+            });
             let reports = reports.clone();
             crate::nat::spawn_discovery(
                 self.socket.udp(),
                 c,
                 Default::default(),
-                hints_tx,
+                hints_tx.clone(),
                 nat_cancel.clone(),
                 // Only when there is a card to give: relays alone want the
                 // hints, not a card nobody asked for.
@@ -836,9 +897,17 @@ impl Sender {
                 meet(a);
             }
         }
+        // Bumped by the engine to have every relay asked again (see
+        // `Engine::reintroduce`).
         #[cfg(feature = "nat-traversal")]
-        let relay_inboxes =
-            self.spawn_relay_introductions(found_tx.clone(), puncher.clone(), nat_cancel.clone());
+        let (reintroduce, nudge) = tokio::sync::watch::channel(0u64);
+        #[cfg(feature = "nat-traversal")]
+        let relay_inboxes = self.spawn_relay_introductions(
+            found_tx.clone(),
+            puncher.clone(),
+            nat_cancel.clone(),
+            nudge,
+        );
         #[cfg(not(feature = "nat-traversal"))]
         let relay_inboxes = RelayInboxes::default();
         let unresolved = self.spawn_name_resolution(reach, found_tx.clone(), meet);
@@ -1004,6 +1073,8 @@ impl Sender {
             engine.turns = turns;
             engine.meeting = Some(meeting_cancel);
             engine.puncher = Some(puncher.clone());
+            engine.reintroduce = Some(reintroduce);
+            engine.nat_again = nat_again;
             // The addresses on the receiver's card that are on a TURN
             // server: where the transfer is carried, not where it is.
             if let Some(card) = &self.cfg.peer_card {
@@ -1115,6 +1186,8 @@ struct Inflight {
     end: u64,
     sent_at: Instant,
     seq: u64,
+    /// Sent before, and taken for lost.
+    retx: bool,
 }
 
 enum SendBlock {
@@ -1153,8 +1226,43 @@ const FIN_LINGER_BASE: Duration = Duration::from_millis(1000);
 const FIN_LINGER_MAX: Duration = Duration::from_secs(3);
 /// ACK summaries kept for diagnostics.
 const ACK_LOG_LEN: usize = 24;
-/// Losses in one round beyond this rate always count as congestion.
-const LOSS_CEILING: f64 = 0.20;
+/// The reordering window's largest multiple of `min_rtt / 4` (it is never
+/// more than SRTT either), and the rounds without a packet wrongly taken for
+/// lost after which it narrows a step.
+const REO_MULT_MAX: u32 = 8;
+const REO_DECAY_ROUNDS: u64 = 16;
+/// Losses over the last rounds beyond this rate always count as congestion.
+/// Below it, what is lost beyond the path's background rate does (see
+/// `loss_is_congestive`), and a path that holds to a rate without a queue —
+/// a policer, a shallow buffer overdriven — is found by the rate it lets
+/// through (`congestion::Policer`). At a fifth, a path that loses a fifth
+/// at random was taken for congested in every round, and its window kept
+/// at its least: 2 per cent of a 50 Mbit/s path.
+const LOSS_CEILING: f64 = 0.35;
+/// The relays are asked again for the receiver every this many rounds of
+/// asking its other addresses while carried, and never sooner than
+/// [`REINTRODUCE_SPACING`] after the last time.
+/// The slowest a receiver is taken to check its copy at, bytes a second (a
+/// slow disk read through BLAKE3): how long the sender waits for the
+/// verdict once everything is acknowledged, on top of `give_up_timeout`.
+const VERIFY_FLOOR: f64 = 20e6;
+#[cfg(feature = "nat-traversal")]
+const REINTRODUCE_ROUNDS: u32 = 5;
+#[cfg(feature = "nat-traversal")]
+const REINTRODUCE_SPACING: Duration = Duration::from_secs(5);
+/// The NAT is tested again at most this often (see `test_nat_again`).
+#[cfg(feature = "nat-traversal")]
+const NAT_AGAIN_SPACING: Duration = Duration::from_secs(30);
+
+/// What testing this host's NAT again takes: the STUN servers, where what
+/// is found goes, and what stops it with the transfer.
+#[cfg(feature = "nat-traversal")]
+struct NatAgain {
+    servers: Vec<String>,
+    hints: Arc<tokio::sync::watch::Sender<crate::nat::card::FamilyHints>>,
+    cancel: CancellationToken,
+    last: Option<Instant>,
+}
 /// Weight the background-loss counters keep per completed round (a memory
 /// of about ten rounds).
 const BG_DECAY: f64 = 0.9;
@@ -1495,7 +1603,7 @@ async fn relay_over_stream(
         }
     }
     tokio::select! {
-        _ = crate::relay::client::hold(tunnel.via(), i.relayed, i.ticket, &mut rx, cancel) => {}
+        _ = crate::relay::client::hold(tunnel.via(), i.relayed, i.ticket, &mut rx, cancel, None) => {}
         _ = tunnel.link().closed() => {}
     }
 }
@@ -1644,6 +1752,11 @@ const STREAM_RTO: Duration = Duration::from_secs(10);
 const STREAM_PACE: f64 = 5e9;
 /// How long to wait when a stream's queue would take no more.
 const STREAM_FULL_BACKOFF: Duration = Duration::from_millis(1);
+/// How long a relay's port, once the relay has named it over UDP, has the
+/// handshake to itself before a stream may make its attempt moot: the
+/// relay answered over UDP, so UDP to it works, and what is left is the
+/// receiver binding its side of the pair.
+const RELAY_PAIR_WAIT: Duration = Duration::from_secs(4);
 /// How often a carried session asks about a stream straight to the
 /// receiver, and after how many rounds of asking UDP in vain one is dialled.
 const DIRECT_STREAM_ASK: Duration = Duration::from_secs(2);
@@ -1704,6 +1817,15 @@ struct Engine {
     /// Where NAT discovery's STUN answers go, while it runs.
     #[cfg(feature = "nat-traversal")]
     stun_inbox: Option<mpsc::Sender<crate::nat::stun::Incoming>>,
+    /// Bumped to have the relays asked again for the receiver (see
+    /// `relay::client::Refresh`), and when it was last.
+    #[cfg(feature = "nat-traversal")]
+    reintroduce: Option<tokio::sync::watch::Sender<u64>>,
+    #[cfg(feature = "nat-traversal")]
+    reintroduced_at: Option<Instant>,
+    /// What testing the NAT again takes (see `test_nat_again`).
+    #[cfg(feature = "nat-traversal")]
+    nat_again: Option<NatAgain>,
     /// Sockets a birthday meeting was made at (see `nat::birthday`): the
     /// receiver's packets can only be received at one of those.
     hits: Option<mpsc::UnboundedReceiver<Hit>>,
@@ -1767,6 +1889,10 @@ struct Engine {
     /// When the session, on a relay's stream, last asked about a stream
     /// straight to the receiver (see `prefer_direct_stream`).
     direct_stream_asked_at: Instant,
+    /// When the small packet that asks whether the receiver is there at
+    /// all went out, at a retransmission timeout with nothing acknowledged
+    /// (see the MTU black hole in `housekeeping`).
+    mtu_ping_at: Option<Instant>,
     /// Until when a datagram path learned during the handshake — a relay's
     /// port, an address a name resolved to — has the handshake to itself:
     /// a stream that comes up meanwhile waits its turn round the ring
@@ -1799,6 +1925,9 @@ struct Engine {
 
     rtt: RttEstimator,
     cc: Cubic,
+    /// A policer on the path, once its rate is known: the pacing rate's cap
+    /// (see `congestion::Policer`).
+    policer: Policer,
     pacer: Pacer,
     rwnd: u64,
 
@@ -1814,6 +1943,12 @@ struct Engine {
     /// (RACK, RFC 8985): anything sent noticeably earlier and still missing
     /// is lost.
     rack_sent_at: Option<Instant>,
+    /// The reordering window as a multiple of a quarter of `min_rtt` (RFC
+    /// 8985, 6.2), widened when a packet taken for lost turns out to have
+    /// arrived, narrowed again after rounds without; and the round of the
+    /// last change.
+    reo_mult: u32,
+    reo_round: u64,
 
     // Loss classification: bytes sent and declared lost in the current round
     // (about one RTT), and the smoothed loss rate of completed rounds.
@@ -1829,6 +1964,10 @@ struct Engine {
     /// converges within a few rounds.
     bg_sent: f64,
     bg_lost: f64,
+    /// Bytes sent and lost in the last rounds, halved per round (a memory
+    /// of about two): what the loss ceiling is judged by.
+    recent_sent: f64,
+    recent_lost: f64,
     /// Whether the current round already saw a congestion signal.
     round_congestive: bool,
     random_loss_events: u64,
@@ -1859,12 +1998,16 @@ struct Engine {
     retransmitted_bytes: u64,
     healed_bytes: u64,
     rto_events: u64,
+    initiations: u64,
     last_progress_at: Instant,
     last_progress_bytes: u64,
 
     my_hash: Option<[u8; 32]>,
     pending_fin: Option<[u8; 32]>,
     fin_verdict: Option<(u8, Instant, [u8; 32])>,
+    /// Since when the receiver has said it holds everything, while its
+    /// verdict has not come (see `VERIFY_FLOOR`).
+    all_acked_at: Option<Instant>,
     /// The receiver confirmed that it got the verdict (FIN_DONE).
     fin_confirmed: bool,
 
@@ -1944,6 +2087,12 @@ impl Engine {
             relay_inboxes,
             #[cfg(feature = "nat-traversal")]
             stun_inbox: None,
+            #[cfg(feature = "nat-traversal")]
+            reintroduce: None,
+            #[cfg(feature = "nat-traversal")]
+            reintroduced_at: None,
+            #[cfg(feature = "nat-traversal")]
+            nat_again: None,
             hits: None,
             #[cfg(feature = "nat-traversal")]
             aux: None,
@@ -1968,6 +2117,7 @@ impl Engine {
             stream: None,
             throttle: crate::transport::carrier::throttle::Throttle::new(now),
             direct_stream_asked_at: now,
+            mtu_ping_at: None,
             fresh_datagram_until: now,
             next_direct_probe: now,
             direct_probes: 0,
@@ -1985,6 +2135,7 @@ impl Engine {
             highest_sent: 0,
             rtt,
             cc,
+            policer: Policer::default(),
             pacer,
             rwnd: u64::MAX,
             received_bytes: 0,
@@ -1994,12 +2145,16 @@ impl Engine {
             ack_log: VecDeque::new(),
             last_ack_progress: now,
             rack_sent_at: None,
+            reo_mult: 1,
+            reo_round: 0,
             round_start: now,
             round_sent: 0,
             round_lost: 0,
             loss_rate: 0.0,
             bg_sent: 0.0,
             bg_lost: 0.0,
+            recent_sent: 0.0,
+            recent_lost: 0.0,
             round_congestive: false,
             random_loss_events: 0,
             peak_inflight: 0,
@@ -2020,11 +2175,13 @@ impl Engine {
             retransmitted_bytes: 0,
             healed_bytes: 0,
             rto_events: 0,
+            initiations: 0,
             last_progress_at: now,
             last_progress_bytes: 0,
             my_hash: None,
             pending_fin: None,
             fin_verdict: None,
+            all_acked_at: None,
             fin_confirmed: false,
             cache_start: 0,
             cache: Vec::new(),
@@ -2234,11 +2391,20 @@ impl Engine {
         // Round the ring, however short. A single address used not to move
         // it, so it counted as untried for ever and the handshake never
         // started backing off. Past what has had all it may.
+        // A stream waits while a datagram path just learned has the
+        // handshake to itself (see `fresh_datagram_until`), unless there is
+        // nothing else to try.
         let len = self.candidates.len();
+        let streams_wait = Instant::now() < self.fresh_datagram_until
+            && self
+                .candidates
+                .iter()
+                .any(|c| !self.carriers.shims.contains(*c) && !self.dht_spent(*c));
         for _ in 0..len {
             let target = self.candidates[self.next_candidate % len];
             self.next_candidate = self.next_candidate.wrapping_add(1);
-            if !self.dht_spent(target) {
+            let waits = streams_wait && self.carriers.shims.contains(target);
+            if !self.dht_spent(target) && !waits {
                 return Some(target);
             }
         }
@@ -2494,7 +2660,16 @@ impl Engine {
         }
         self.candidates.push(addr);
         if self.secure.is_none() && !self.carriers.shims.contains(addr) {
-            self.fresh_datagram_until = Instant::now() + crate::transport::carrier::CARRIER_DELAY;
+            // A relay's port answers only once the receiver's side of the
+            // pair is bound, which takes it a round trip and its own pushing
+            // through its NAT (2.6 s on a slow CI runner): longer than an
+            // address that is the receiver.
+            let wait = if matches!(found, Found::Carrier(_)) {
+                RELAY_PAIR_WAIT
+            } else {
+                crate::transport::carrier::CARRIER_DELAY
+            };
+            self.fresh_datagram_until = self.fresh_datagram_until.max(Instant::now() + wait);
         }
         Some(addr)
     }
@@ -2724,6 +2899,7 @@ impl Engine {
             self.attempts.pop_front();
         }
         self.attempts.push_back((attempt, now, to));
+        self.initiations += 1;
         self.probes_sent += 1;
         tracing::debug!(
             "handshake initiation sent to {} ({})",
@@ -2798,20 +2974,26 @@ impl Engine {
         // how long the next attempt must at least wait (see `handshake`).
         self.rtt.on_sample(now.saturating_duration_since(sent_at));
         let (attempt, _, _) = self.attempts.remove(idx).expect("index in range");
-        // Only the newest attempt may be adopted, and that is not a detail:
-        // when several initiations are outstanding, both ends have to agree
-        // on which one won. The receiver's replay guard already decides it —
-        // initiation timestamps must increase, so an older one arriving late
-        // is refused and the receiver keeps the newest it saw. Adopting an
-        // older response here would leave the two sides holding different
-        // keys and connection ids, and the transfer would stall until the
-        // next re-handshake.
+        // In version 3 only the newest attempt may be adopted, and that is
+        // not a detail: when several initiations are outstanding, both ends
+        // have to agree on which one won. The receiver's replay guard
+        // decides it — initiation timestamps must increase, so an older one
+        // arriving late is refused, and the receiver makes the session of
+        // the newest it saw. Adopting an older response here would leave
+        // the two sides holding different keys and connection ids, and the
+        // transfer would stall until the next re-handshake.
         //
         // A superseded answer is not wasted, though: it proves that address
         // answers, so the next initiation goes straight back to it instead
         // of carrying on round the candidates — and not before its round
         // trip has had time to complete.
-        if idx < self.attempts.len() {
+        //
+        // Version 4's receiver keeps each handshake apart until a HELLO
+        // under its keys picks one (`PendingV4` there), so the first answer
+        // to come back is taken, whichever attempt it is: the fastest of the
+        // paths tried wins, instead of costing a round trip more each time
+        // the next address in the rotation was tried before it answered.
+        if idx < self.attempts.len() && attempt.version() == hs::Version::V3 {
             if self.answered_at != Some(target) {
                 tracing::debug!("{} answered a superseded attempt; trying it again", target);
                 self.answered_at = Some(target);
@@ -2871,7 +3053,7 @@ impl Engine {
             keys: Arc::new(SessionKeys::derive(&split, true, suite)),
             local_cid: cid,
             peer_cid: receiver_cid,
-            next_pn: 0,
+            next_pn: self.cfg.first_packet_number,
             replay: ReplayWindow::new(),
             auth_failures: 0,
         });
@@ -3015,6 +3197,13 @@ impl Engine {
                             .into(),
                     )
                 } else {
+                    if self.auth.version == hs::Version::V3 {
+                        tracing::warn!(
+                            "the receiver was named by its ID in the old form (sh-…): a receiver \
+                             of this version answers that only when started with --accept-v3; \
+                             ask for its sh4- ID"
+                        );
+                    }
                     SendError::HandshakeTimeout
                 });
             }
@@ -3237,9 +3426,12 @@ impl Engine {
             self.pacer.set_burst(burst);
             return;
         }
-        let rate = self
+        let mut rate = self
             .cc
             .pacing_rate(self.rtt.srtt(), self.cfg.max_rate_bytes);
+        if let Some(policed) = self.policer.rate() {
+            rate = rate.min(policed);
+        }
         self.pacer.set_rate(rate);
         self.pacer.set_burst(burst_for_rate(rate, self.chunk));
     }
@@ -3251,10 +3443,18 @@ impl Engine {
             return Ok(());
         }
         // 1500 bytes over IPv4, then 1500 over IPv6 — which is also 1492
-        // over IPv4, the PPPoE links DSL runs on — then what every path
-        // carries.
-        let mut candidates: Vec<u16> =
-            vec![self.chunk, DEFAULT_CHUNK, DEFAULT_CHUNK_V6, SAFE_CHUNK];
+        // over IPv4, the PPPoE links DSL runs on — then IPv4 in a DS-Lite
+        // tunnel, then what every IPv6 path carries, and what the
+        // handshake's datagrams took (an IPv4 path below 1260 bytes: a
+        // tunnel, a VPN).
+        let mut candidates: Vec<u16> = vec![
+            self.chunk,
+            DEFAULT_CHUNK,
+            DEFAULT_CHUNK_V6,
+            DSLITE_CHUNK,
+            SAFE_CHUNK,
+            BASE_CHUNK,
+        ];
         // Through a TURN server the way is longer by the server's framing,
         // and the loopback the engine sends to says nothing of it: only the
         // size every path carries is known to fit.
@@ -3539,6 +3739,8 @@ impl Engine {
                 retransmitted_bytes: self.retransmitted_bytes,
                 loss_events: self.cc.loss_events(),
                 rto_events: self.rto_events,
+                initiations: self.initiations,
+                policer_detections: self.policer.detections(),
                 chunk_size: self.chunk,
                 elapsed,
                 avg_rate_bps: if elapsed.as_secs_f64() > 0.0 {
@@ -3760,6 +3962,7 @@ impl Engine {
                     end: e,
                     sent_at: now,
                     seq: self.seq,
+                    retx: s < self.highest_sent,
                 },
             );
             self.send_log.push_back((now, s, self.seq));
@@ -3956,8 +4159,14 @@ impl Engine {
     fn step_down_chunk(&mut self, why: &str) -> bool {
         let smaller = if self.chunk == DEFAULT_CHUNK {
             DEFAULT_CHUNK_V6
+        } else if self.chunk > DSLITE_CHUNK {
+            DSLITE_CHUNK
         } else if self.chunk > SAFE_CHUNK {
             SAFE_CHUNK
+        } else if self.chunk > BASE_CHUNK {
+            // What the handshake's own datagrams got through: halving from
+            // here left a path of 1240 bytes at half the size it carries.
+            BASE_CHUNK
         } else {
             (self.chunk / 2).max(MIN_CHUNK)
         };
@@ -4315,7 +4524,16 @@ impl Engine {
         }
 
         // Anything the receiver confirms must not be sent again, even if it
-        // was queued for retransmission before the original arrived late.
+        // was queued for retransmission before the original arrived late —
+        // which says it was taken for lost too soon: the reordering window
+        // is widened (RFC 8985 does it on a DSACK; this is the same news,
+        // earlier). Data never sent is never acknowledged, so what is
+        // queued and acknowledged was sent and taken for lost.
+        let mut spurious = self.highest_sent > 0
+            && !self
+                .pending
+                .intersecting(0, ack.contiguous_upto.min(self.highest_sent))
+                .is_empty();
         self.pending.remove(0, ack.contiguous_upto);
         let mut acked: u64 = 0;
         let mut newest_delivered: Option<Instant> = None;
@@ -4323,17 +4541,22 @@ impl Engine {
             newest_delivered = Some(newest_delivered.map_or(t, |n: Instant| n.max(t)));
         };
         // Cumulative part.
-        while let Some((off, end, sent_at)) = self
+        // A resend acknowledged sooner after it went than any round trip
+        // could bring its own acknowledgement back was not needed: what
+        // arrived was the first copy (Eifel, RFC 3522, by the clock).
+        let too_soon = self.rtt.min_rtt() / 2;
+        while let Some((off, end, sent_at, retx)) = self
             .inflight
             .iter()
             .next()
-            .map(|(&k, inf)| (k, inf.end, inf.sent_at))
+            .map(|(&k, inf)| (k, inf.end, inf.sent_at, inf.retx))
         {
             if end > ack.contiguous_upto {
                 break;
             }
             acked += end - off;
             note_delivered(sent_at);
+            spurious |= retx && now.saturating_duration_since(sent_at) < too_soon;
             self.remove_inflight(off);
         }
 
@@ -4347,23 +4570,43 @@ impl Engine {
                 received.remove(s, e);
             }
             for (s, e) in received.iter() {
+                spurious |= !self
+                    .pending
+                    .intersecting(s, e.min(self.highest_sent))
+                    .is_empty();
                 self.pending.remove(s, e);
             }
-            let keys: Vec<(u64, u64, Instant)> = self
+            let keys: Vec<(u64, u64, Instant, bool)> = self
                 .inflight
                 .range(ack.contiguous_upto..ack.highest)
-                .map(|(&k, inf)| (k, inf.end, inf.sent_at))
+                .map(|(&k, inf)| (k, inf.end, inf.sent_at, inf.retx))
                 .collect();
-            for (k, end, sent_at) in keys {
+            for (k, end, sent_at, retx) in keys {
                 if received.contains(k, end) {
                     acked += end - k;
                     note_delivered(sent_at);
+                    spurious |= retx && now.saturating_duration_since(sent_at) < too_soon;
                     self.remove_inflight(k);
                 }
             }
         }
         if let Some(t) = newest_delivered {
             self.rack_sent_at = Some(self.rack_sent_at.map_or(t, |r| r.max(t)));
+        }
+        // Once a round at most, up to the round trip itself; back a step
+        // after REO_DECAY_ROUNDS without (RFC 8985 resets after sixteen
+        // recoveries).
+        let round = self.rtt.round();
+        if spurious && round > self.reo_round && self.reo_mult < REO_MULT_MAX {
+            self.reo_mult += 1;
+            self.reo_round = round;
+            tracing::debug!(
+                "packets taken for lost arrived after all: reordering window {} x min_rtt/4",
+                self.reo_mult
+            );
+        } else if !spurious && self.reo_mult > 1 && round >= self.reo_round + REO_DECAY_ROUNDS {
+            self.reo_mult -= 1;
+            self.reo_round = round;
         }
 
         let mut lost: Vec<(u64, u64)> = Vec::new();
@@ -4373,7 +4616,8 @@ impl Engine {
             // has been outstanding longer than an RTT plus the reordering
             // window. Send order, not file offset, decides, so a fresh
             // retransmission is not condemned by ACKs that predate it.
-            let reo_wnd = (self.rtt.min_rtt() / 4)
+            let reo_wnd = (self.rtt.min_rtt() / 4 * self.reo_mult)
+                .min(self.rtt.srtt())
                 .clamp(Duration::from_millis(1), Duration::from_millis(250));
             let time_threshold = self.rtt.srtt().max(self.rtt.latest()) + reo_wnd;
             let rack = self.rack_sent_at;
@@ -4453,9 +4697,27 @@ impl Engine {
             self.last_ack_progress = now;
             self.tail_probes = 0;
             self.mtu_suspect = 0;
+            self.mtu_ping_at = None;
+        }
+        let lost_bytes: u64 = lost.iter().map(|&(s, e)| e - s).sum();
+        if self.stream.is_none() {
+            let was = self.policer.found();
+            if let Some(rate) = self
+                .policer
+                .on_ack(now, self.rtt.round(), acked, lost_bytes)
+            {
+                if !was {
+                    tracing::info!(
+                        "the path lets {:.2} Mbit/s through and drops the rest, as a policer \
+                         does; sending at that rate",
+                        rate * 8.0 / 1e6
+                    );
+                } else {
+                    tracing::debug!("policer still there, at {:.2} Mbit/s", rate * 8.0 / 1e6);
+                }
+            }
         }
         if !lost.is_empty() {
-            let lost_bytes: u64 = lost.iter().map(|&(s, e)| e - s).sum();
             self.round_lost += lost_bytes;
             self.end_round_if_due(now);
             if self.loss_is_congestive() {
@@ -4488,17 +4750,36 @@ impl Engine {
         if self.round_sent >= 16 * self.chunk as u64 {
             let rate = (self.round_lost as f64 / self.round_sent as f64).min(1.0);
             self.loss_rate = 0.5 * self.loss_rate + 0.5 * rate;
-            if !self.round_congestive {
+            // The background is what is lost with no queue on the path:
+            // every such round counts, however many it lost — and no round
+            // with a queue does, whose losses may be the queue's. Counting
+            // the rounds whose losses were not taken for congestion biased
+            // it low and kept it there: with nothing learnt yet, five
+            // losses in a round are "too many", and a round of a fast path
+            // losing 5 per cent at random has more than that.
+            if self.rtt.standing_queue() < self.queue_threshold() {
                 self.bg_sent = self.bg_sent * BG_DECAY + self.round_sent as f64;
                 self.bg_lost = self.bg_lost * BG_DECAY + self.round_lost as f64;
             }
         }
+        // Every round, however small: kept to rounds of 16 packets and more,
+        // the pool froze once the window had shrunk below that, at the rate
+        // that had shrunk it — and every loss after was over the ceiling,
+        // down to a window of two packets (2 per cent of a 50 Mbit/s path
+        // that loses a fifth at random).
+        self.recent_sent = self.recent_sent * 0.5 + self.round_sent as f64;
+        self.recent_lost = self.recent_lost * 0.5 + self.round_lost as f64;
         self.round_start = now;
         self.round_sent = 0;
         self.round_lost = 0;
         self.round_congestive = false;
         self.prev_peak_inflight = self.peak_inflight;
         self.peak_inflight = self.inflight_bytes;
+    }
+
+    /// A standing queue at least this long says the path is congested.
+    fn queue_threshold(&self) -> Duration {
+        (self.rtt.min_rtt() / 4).max(Duration::from_millis(2))
     }
 
     /// Background (non-congestive) loss rate of the path.
@@ -4526,22 +4807,28 @@ impl Engine {
     /// like). Losses at the background level on an otherwise empty path
     /// (radio links, noisy lines) are repaired without slowing down.
     fn loss_is_congestive(&self) -> bool {
-        let min_rtt = self.rtt.min_rtt();
-        let queue_threshold = (min_rtt / 4).max(Duration::from_millis(2));
-        if self.rtt.standing_queue() >= queue_threshold {
+        if self.rtt.standing_queue() >= self.queue_threshold() {
             return true;
         }
         let chunk = self.chunk.max(1) as f64;
-        let sent = self.round_sent as f64 / chunk;
-        let lost = self.round_lost as f64 / chunk;
-        if sent >= 20.0 && lost / sent >= LOSS_CEILING {
+        // Over the last rounds pooled (60 packets at least): in one round of
+        // twenty-odd packets, a path that loses 5 per cent at random loses
+        // a fifth now and then — every second or so on a fast path, each
+        // time taken for congestion (a third of its speed in the laboratory
+        // of bad networks).
+        let pooled_sent = (self.recent_sent + self.round_sent as f64) / chunk;
+        let pooled_lost = (self.recent_lost + self.round_lost as f64) / chunk;
+        if pooled_sent >= 60.0 && pooled_lost / pooled_sent >= LOSS_CEILING {
             return true;
         }
-        // More losses in this round than the background rate explains, by a
-        // clear margin (about three standard deviations of a Poisson count):
-        // one or two stray losses in a small round never qualify.
-        let expected = self.base_loss_rate() * sent;
-        lost > expected + 3.0 * (expected + 1.0).sqrt() + 1.0
+        // More lost than the background rate explains, by a clear margin
+        // (about three standard deviations of a Poisson count): one or two
+        // stray losses never qualify. Pooled too: the losses found now are
+        // those of packets sent a round ago, and set against a round only
+        // begun — six of them against ten packets sent so far — they made
+        // a loss rate of 60 per cent out of 5.
+        let expected = self.base_loss_rate() * pooled_sent;
+        pooled_lost > expected + 3.0 * (expected + 1.0).sqrt() + 1.0
     }
 
     /// Whether `to` is passed over for now: a worse path than the one the
@@ -4720,6 +5007,7 @@ impl Engine {
             left: self.size.saturating_sub(self.received_bytes),
             on_stream: self.stream.is_some(),
             quiet: now.saturating_duration_since(self.last_rx),
+            policed: self.policer.found(),
         });
         let mbit = |rate: f64| rate * 8.0 / 1e6;
         match verdict {
@@ -4777,6 +5065,20 @@ impl Engine {
     /// window is its own. What was in flight on a path that had gone quiet
     /// is lost, and goes again now rather than when a timer says.
     fn peer_moved(&mut self, old: SocketAddr, old_heard: Instant, now: Instant) {
+        // Another path, another policer or none.
+        self.policer.reset();
+        // From a direct path to a server's: what a change of network does,
+        // ours or the receiver's (see `reintroduce`).
+        #[cfg(feature = "nat-traversal")]
+        {
+            use crate::transport::path::Standing;
+            if matches!(self.standing(old), Standing::Direct | Standing::Stream)
+                && self.is_relayed(self.peer)
+            {
+                self.test_nat_again(now);
+                self.reintroduce(now, "the session fell back from a direct path to a server");
+            }
+        }
         let was_stream = self.stream.is_some();
         self.stream = self.carriers.shims.stats(self.peer);
         if was_stream == self.stream.is_some() {
@@ -4845,8 +5147,14 @@ impl Engine {
         // better place too (see `path::Standing`).
         let on_relay_stream =
             self.standing(self.peer) == crate::transport::path::Standing::ServerStream;
-        #[cfg_attr(not(feature = "nat-traversal"), allow(unused_mut))]
-        let mut asked: Vec<SocketAddr> = self
+        // What the relays said since the handshake: the receiver's address
+        // after it changed networks, when asked again (see `reintroduce`).
+        self.take_new_candidates();
+        // A few a round, in turn: an address found while carried — the
+        // receiver's own after it changed networks, which the relay says
+        // when asked again — comes after all the others, and taking the
+        // first few every round never got to it.
+        let others: Vec<SocketAddr> = self
             .candidates
             .iter()
             .copied()
@@ -4855,7 +5163,19 @@ impl Engine {
                     && !self.carriers.shims.contains(*a)
                     && (on_relay_stream || !self.is_relayed(*a))
             })
-            .take(ADDRESSES)
+            .collect();
+        let from = if others.is_empty() {
+            0
+        } else {
+            (self.direct_probes as usize - 1) * ADDRESSES % others.len()
+        };
+        #[cfg_attr(not(feature = "nat-traversal"), allow(unused_mut))]
+        let mut asked: Vec<SocketAddr> = others
+            .iter()
+            .cycle()
+            .skip(from)
+            .take(ADDRESSES.min(others.len()))
+            .copied()
             .collect();
         // The address of a meeting being proven is asked whatever else is
         // being: it is the one that has been shown to lead somewhere.
@@ -4874,6 +5194,12 @@ impl Engine {
                 self.peer
             );
         }
+        // Where the receiver is may have changed since we were introduced,
+        // and where we are: the relay is asked again now and then.
+        #[cfg(feature = "nat-traversal")]
+        if self.direct_probes % REINTRODUCE_ROUNDS == 0 {
+            self.reintroduce(now, "carried, and no direct path for a while");
+        }
         for a in asked {
             self.send_unproven_ping(a);
         }
@@ -4883,6 +5209,59 @@ impl Engine {
         if self.direct_probes >= DIRECT_ROUNDS_BEFORE_TCP && self.live_direct_stream().is_none() {
             self.ask_for_streams(now, "no direct path over UDP while carried");
         }
+    }
+
+    /// Tests this host's NAT again: a session that fell back from a direct
+    /// path may have done so because this host changed networks, and what
+    /// the relays tell the receiver of it, and how its punches and ours are
+    /// aimed, would describe the network it left (a symmetric NAT on the
+    /// new one, where the old one kept a port, is never got through by
+    /// aiming at one port). STUN only, at most every [`NAT_AGAIN_SPACING`],
+    /// never while tests run; what it finds goes to the relays with the
+    /// next time they are asked again.
+    #[cfg(feature = "nat-traversal")]
+    fn test_nat_again(&mut self, now: Instant) {
+        let Some(n) = &mut self.nat_again else {
+            return;
+        };
+        if self.stun_inbox.as_ref().is_some_and(|tx| !tx.is_closed())
+            || n.last
+                .is_some_and(|t| now.saturating_duration_since(t) < NAT_AGAIN_SPACING)
+        {
+            return;
+        }
+        n.last = Some(now);
+        if let Some(t) = crate::nat::spawn_retest(
+            self.socket.udp(),
+            n.servers.clone(),
+            n.hints.clone(),
+            n.cancel.clone(),
+        ) {
+            tracing::info!("testing this host's NAT again: the network may have changed");
+            self.stun_inbox = Some(t.stun_responses);
+        }
+    }
+
+    /// Has every relay asked again for the receiver, from where this host is
+    /// now: the relay introduces us anew — the receiver punches at where we
+    /// are, not where we were before a change of network — and says where
+    /// the receiver is now, which joins the candidates and is punched at
+    /// (see `relay::client::Refresh`). One request to each relay, at most
+    /// every [`REINTRODUCE_SPACING`].
+    #[cfg(feature = "nat-traversal")]
+    fn reintroduce(&mut self, now: Instant, why: &str) {
+        let Some(tx) = &self.reintroduce else {
+            return;
+        };
+        if self
+            .reintroduced_at
+            .is_some_and(|t| now.saturating_duration_since(t) < REINTRODUCE_SPACING)
+        {
+            return;
+        }
+        self.reintroduced_at = Some(now);
+        tracing::info!("{}: asking the relays to introduce us again", why);
+        tx.send_modify(|n| *n += 1);
     }
 
     /// Tail loss probe: when data is in flight but nothing was sent and no
@@ -5076,9 +5455,20 @@ impl Engine {
             // whose MTU shrank looks like once ICMP is not believed: every
             // full-size packet vanishes and nothing else does. Step down,
             // and try the old size again later with an acknowledged PROBE.
-            let heard =
-                now.saturating_duration_since(self.last_rx) < self.cfg.stall_timeout.max(rto * 3);
+            // Heard: the small packet sent at the last such timeout was
+            // answered. Asked outright, as RFC 8899 asks with a probe, since
+            // what is in flight then is the big packets that vanish: a path
+            // that went quiet altogether — a cut, an outage — answers no
+            // small packet either, and was taken for a black hole while what
+            // had come in before the cut still counted (in the laboratory,
+            // two steps down, 1427 to 1187, for nothing).
+            let heard = self.mtu_ping_at.is_some_and(|t| self.last_rx > t);
             let stuck = now.saturating_duration_since(self.last_ack_progress) >= rto;
+            if stuck {
+                let ts = self.clock.now_us().max(1);
+                let _ = self.send_frame(0, &Message::Ping(Ping { timestamp: ts }));
+                self.mtu_ping_at = Some(now);
+            }
             if heard && stuck {
                 self.mtu_suspect += 1;
                 if self.mtu_suspect >= MTU_BLACKHOLE_RTOS {
@@ -5087,6 +5477,9 @@ impl Engine {
                         "full-size packets are lost while small ones get through (MTU black hole?)",
                     );
                 }
+            } else {
+                // In a row (RFC 8899, 4.3), not all told.
+                self.mtu_suspect = 0;
             }
         }
         // Try the size we stepped down from again: one PROBE, which only an
@@ -5187,6 +5580,39 @@ impl Engine {
                     since: since_rx,
                 },
             );
+        }
+        // Everything acknowledged and no verdict: the receiver is checking
+        // its copy, which takes time in proportion to the file, and is
+        // bounded — an honest receiver hashes faster than `VERIFY_FLOOR`. A
+        // receiver that answers every ping but never says FIN (a lying one,
+        // THREAT_MODEL Н6) does not keep the sender for ever: liveness alone
+        // never ended it.
+        if self.fin_verdict.is_none()
+            && self.pending.is_empty()
+            && self.inflight.is_empty()
+            && self.received_bytes >= self.size
+        {
+            let since = *self.all_acked_at.get_or_insert(now);
+            let patience =
+                self.cfg.give_up_timeout + Duration::from_secs_f64(self.size as f64 / VERIFY_FLOOR);
+            let waited = now.saturating_duration_since(since);
+            if waited >= patience {
+                let why = format!(
+                    "the receiver says it holds everything but has not confirmed the file in {:?}",
+                    waited
+                );
+                emit(
+                    &self.events,
+                    TransferEvent::Failed {
+                        transfer_id: self.tid_hex(),
+                        error: why.clone(),
+                        resumable: true,
+                    },
+                );
+                return Err(SendError::Protocol(why));
+            }
+        } else {
+            self.all_acked_at = None;
         }
         if self.stalled && since_rx >= self.cfg.give_up_timeout {
             emit(

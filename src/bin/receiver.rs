@@ -58,6 +58,14 @@ struct Args {
     #[arg(long, value_name = "PORT", default_value_t = 443)]
     relay_tls_port: u16,
 
+    /// Also answer senders that were given this receiver's ID in the old
+    /// form (sh-…, from before protocol version 4). They talk version 3: no
+    /// post-quantum key exchange, and the transfer's name and size in the
+    /// first message. Only while old IDs are still in use; this receiver
+    /// prints the sh4- form, which senders should be given instead.
+    #[arg(long)]
+    accept_v3: bool,
+
     /// Do not publish this host's addresses on the local network (private
     /// IPv4, unique-local IPv6), only those the internet routes. Senders on
     /// the same network then come in through the router, or not at all;
@@ -248,6 +256,7 @@ async fn main() -> Result<()> {
     cfg.relay_private = args.relay_private;
     cfg.tcp = !args.no_tcp;
     cfg.relay_tls_port = args.relay_tls_port;
+    cfg.speak_v3 = args.accept_v3;
     cfg.publish_lan_addresses = !args.no_lan_addresses;
     cfg.announce_lan = args.announce_lan && cfg!(feature = "nat-traversal");
     cfg.nat_keepalive = std::time::Duration::from_secs(args.keepalive.clamp(1, 3600));

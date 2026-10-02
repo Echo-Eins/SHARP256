@@ -230,6 +230,8 @@ struct Proxy {
     target: Arc<parking_lot::Mutex<SocketAddr>>,
     blackhole: Arc<AtomicBool>,
     to_target_bytes: Arc<AtomicU64>,
+    /// What the client sent towards the target, before any impairment.
+    offered_bytes: Arc<AtomicU64>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -240,8 +242,10 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
     let target = Arc::new(parking_lot::Mutex::new(target));
     let blackhole = Arc::new(AtomicBool::new(false));
     let to_target_bytes = Arc::new(AtomicU64::new(0));
+    let offered_bytes = Arc::new(AtomicU64::new(0));
 
     let (t_target, t_black, t_bytes) = (target.clone(), blackhole.clone(), to_target_bytes.clone());
+    let t_offered = offered_bytes.clone();
     let task = tokio::spawn(async move {
         let started = Instant::now();
         let mut rng = Rng(imp.seed | 1);
@@ -257,6 +261,7 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
                 r = a.recv_from(&mut buf_a) => {
                     let Ok((n, from)) = r else { continue };
                     client = Some(from);
+                    t_offered.fetch_add(n as u64, Ordering::Relaxed);
                     (buf_a[..n].to_vec(), true)
                 }
                 r = b.recv_from(&mut buf_b) => {
@@ -349,6 +354,7 @@ async fn start_proxy(target: SocketAddr, imp: Impairment) -> Proxy {
         target,
         blackhole,
         to_target_bytes,
+        offered_bytes,
         _task: task,
     }
 }
@@ -876,6 +882,377 @@ async fn existing_file_is_not_overwritten_by_default() {
     stop_receiver(r).await;
 }
 
+/// The receiver stopped between moving a file into place and hearing that
+/// the sender knows (Р22): its resume state says the file is stored, with
+/// its hash. Sent again, the transfer finishes from the file in place —
+/// no second copy beside it as `name (1)`. And a stored file that has
+/// changed since is its owner's: left as it is, and the next attempt
+/// receives the transfer anew beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_stored_before_the_sender_knew_is_not_received_twice() {
+    use sharp256::state::{ReceiverState, StateStore, STATE_FORMAT_VERSION};
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = (
+        tmp.path().join("src"),
+        tmp.path().join("out"),
+        tmp.path().join("state"),
+    );
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    let path = make_file(&src, "once.bin", 300_000, 9);
+    let stored = out.join("once.bin");
+    std::fs::copy(&path, &stored).unwrap();
+    let hash = sharp256::file::hash_file(&stored).unwrap();
+    let placed = |sender: &str| ReceiverState {
+        format: STATE_FORMAT_VERSION,
+        transfer_id: "00112233445566778899aabbccddeeff".into(),
+        file_name: "once.bin".into(),
+        file_size: 300_000,
+        file_mtime: sharp256::file::FileReader::open(&path)
+            .unwrap()
+            .mtime_unix(),
+        part_path: out.join("once.bin.sharp-part"),
+        final_path: stored.clone(),
+        peer: "127.0.0.1:1".into(),
+        sender: sender.into(),
+        manifest_hash: String::new(),
+        manifest_len: 0,
+        durable: vec![(0, 300_000)],
+        updated_unix: 0,
+        placed: sharp256::file::hash_to_hex(&hash),
+    };
+    let store = StateStore::open(Some(state.clone())).unwrap();
+    store
+        .save_receiver(&placed(&sender_identity().id().to_string()))
+        .unwrap();
+
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let summary = run_sender(sender_cfg(&path, r.addr, r.id, &state))
+        .await
+        .expect("send");
+    assert_eq!(summary.resumed_from, 300_000, "nothing sent again");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    let TransferEvent::Completed { path: Some(p), .. } = ev else {
+        panic!("{:?}", ev)
+    };
+    assert_eq!(PathBuf::from(&p), stored);
+    assert_same(&path, &stored);
+    let names = |dir: &Path| {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&out), vec!["once.bin"]);
+
+    // Changed since it was stored: not touched, and not finished from.
+    let mut edited = std::fs::read(&stored).unwrap();
+    edited[0] ^= 0xff;
+    std::fs::write(&stored, &edited).unwrap();
+    store
+        .save_receiver(&placed(&sender_identity().id().to_string()))
+        .unwrap();
+    let _ = run_sender(sender_cfg(&path, r.addr, r.id, &state)).await;
+    assert_eq!(std::fs::read(&stored).unwrap(), edited, "left as it is");
+    run_sender(sender_cfg(&path, r.addr, r.id, &state))
+        .await
+        .expect("received anew");
+    assert_same(&path, &out.join("once (1).bin"));
+    assert_eq!(std::fs::read(&stored).unwrap(), edited);
+    stop_receiver(r).await;
+}
+
+/// The same for a directory, which is finished from its kept listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_stored_before_the_sender_knew_is_not_received_twice() {
+    use sharp256::file::tree::TreeSource;
+    use sharp256::state::{ReceiverState, StateStore, STATE_FORMAT_VERSION};
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let root = src.join("proj");
+    for (dir, name, size, seed) in [
+        ("proj", "a.txt", 5_000, 1),
+        ("proj/sub", "b.bin", 200_000, 2),
+    ] {
+        std::fs::create_dir_all(src.join(dir)).unwrap();
+        make_file(&src.join(dir), name, size, seed);
+        std::fs::create_dir_all(out.join(dir)).unwrap();
+        std::fs::copy(src.join(dir).join(name), out.join(dir).join(name)).unwrap();
+    }
+    let tree = TreeSource::open(&root).unwrap();
+    let info = tree.info();
+    let tid = "ffeeddccbbaa99887766554433221100";
+    let store = StateStore::open(Some(state.clone())).unwrap();
+    std::fs::write(store.manifest_path(tid), tree.manifest().encode()).unwrap();
+    store
+        .save_receiver(&ReceiverState {
+            format: STATE_FORMAT_VERSION,
+            transfer_id: tid.into(),
+            file_name: "proj".into(),
+            file_size: tree.size(),
+            file_mtime: 0,
+            part_path: out.join("proj.sharp-part"),
+            final_path: out.join("proj"),
+            peer: "127.0.0.1:1".into(),
+            sender: sender_identity().id().to_string(),
+            manifest_hash: sharp256::file::hash_to_hex(&info.manifest_hash),
+            manifest_len: info.manifest_len,
+            durable: vec![(0, tree.size())],
+            updated_unix: 0,
+            placed: sharp256::file::hash_to_hex(&tree.hash().unwrap()),
+        })
+        .unwrap();
+
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let summary = run_sender(sender_cfg(&root, r.addr, r.id, &state))
+        .await
+        .expect("send");
+    assert_eq!(summary.resumed_from, tree.size(), "nothing sent again");
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    let TransferEvent::Completed { path: Some(p), .. } = ev else {
+        panic!("{:?}", ev)
+    };
+    assert_eq!(PathBuf::from(&p), out.join("proj"));
+    let names: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec!["proj"]);
+    assert_eq!(
+        resume_files(&state),
+        0,
+        "the listing kept goes with the state"
+    );
+    stop_receiver(r).await;
+}
+
+/// A sender's clock set back (THREAT_MODEL Р4): the receiver refuses, in
+/// silence as for any replay, an initiation no newer than the last it took
+/// from that sender — so a sender restarted with its clock behind its last
+/// run would be refused until the clock caught up, but for the newest
+/// timestamp it keeps beside its state. Runs the sender's binary three
+/// times, each a fresh process with no memory but that file: the first as
+/// if its clock were an hour ahead (its file says so), the second with the
+/// file it left, the third with that file gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_whose_clock_went_back_gets_through_by_its_stamp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let sst = tmp.path().join("sender-state");
+    std::fs::create_dir_all(&sst).unwrap();
+    let mut r = start_receiver(&out, &state, |cfg| cfg.tcp = false).await;
+    let path = make_file(&src, "clock.bin", 10_000, 18);
+    let send = |wait: Duration| {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sharp-sender"))
+            .arg(&path)
+            .arg(format!(
+                "{}@{}",
+                r.id.text(sharp256::crypto::handshake::Version::V4),
+                r.addr
+            ))
+            .args(["--headless", "--no-nat", "--no-tcp", "--log-level", "warn"])
+            .arg("--identity")
+            .arg(tmp.path().join("sender.key"))
+            .arg("--state-dir")
+            .arg(&sst)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let end = Instant::now() + wait;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.success();
+            }
+            if Instant::now() >= end {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let stamp = sst.join("initiation.stamp");
+    std::fs::write(&stamp, (now_ns + 3_600_000_000_000).to_string()).unwrap();
+    assert!(send(Duration::from_secs(30)), "the first run");
+    wait_completed(&mut r.events, Duration::from_secs(10)).await;
+    assert!(send(Duration::from_secs(30)), "with the stamp it left");
+    wait_completed(&mut r.events, Duration::from_secs(10)).await;
+    std::fs::remove_file(&stamp).unwrap();
+    assert!(
+        !send(Duration::from_secs(5)),
+        "without the stamp, a clock an hour behind its last initiation is refused"
+    );
+    stop_receiver(r).await;
+}
+
+/// Keys move on every 2^22 packets (an epoch), on both sides, each from
+/// the packets themselves — some six gigabytes of data at full size. The
+/// sender begins a session 1500 packets short of the end of the first
+/// epoch, the receiver (which sends an ACK for every few packets) 100
+/// short, so a transfer of a few megabytes, through loss, duplication and
+/// reordering that put packets of both epochs in flight at once, crosses
+/// into the second both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_move_on_to_the_next_epoch_in_the_middle_of_a_transfer() {
+    let epoch = 1u64 << sharp256::crypto::transport::EPOCH_BITS;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |cfg| {
+        cfg.transport.first_packet_number = epoch - 100;
+    })
+    .await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            drop: 0.02,
+            dup: 0.01,
+            reorder: 0.02,
+            reorder_delay: Duration::from_millis(3),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let size = 6_000_000;
+    let path = make_file(&src, "epochs.bin", size, 19);
+    let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
+    cfg.transport.first_packet_number = epoch - 1500;
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("send");
+    assert!(
+        summary.bytes_sent / 1500 > 1500,
+        "{} B sent: not across the epoch",
+        summary.bytes_sent
+    );
+    let ev = wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    let TransferEvent::Completed { path: Some(p), .. } = ev else {
+        panic!("{:?}", ev)
+    };
+    assert_same(&path, Path::new(&p));
+    stop_receiver(r).await;
+}
+
+/// What a flood of handshakes does to a receiver (ROADMAP D1): `FLOOD`
+/// version 4 initiations (default 3000), each from an identity of its own
+/// and made before anything is measured, sent from one address as fast as
+/// the socket takes them; what is said is how many the receiver answered
+/// with a handshake and how many with a cookie, and in how long. Past 200
+/// a second (`handshake_load_threshold`) only an initiation with a cookie's
+/// mac2 is worked on. A measurement, not a check: run it in a release
+/// build, `cargo test --release --test e2e -- --ignored a_flood_of_handshakes --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement (ROADMAP D1)"]
+async fn a_flood_of_handshakes() {
+    use sharp256::crypto::handshake::{initiation_timestamp, Initiator, COOKIE_REPLY_LEN};
+    use sharp256::crypto::{no_psk, Suite};
+    use sharp256::protocol::wire;
+    let n: usize = std::env::var("FLOOD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let r = start_receiver(&out, &state, |cfg| cfg.tcp = false).await;
+    let made = Instant::now();
+    let floods: Vec<Vec<Vec<u8>>> = (0..n)
+        .map(|_| {
+            let mut init = Initiator::new_v4(&Identity::generate(), &r.id, &no_psk()).unwrap();
+            let payload = wire::encode_initiation_v4(&wire::InitiationV4 {
+                timestamp: initiation_timestamp(),
+                suites: Suite::ALL_BITS,
+                hardware_aes: false,
+            });
+            init.initiation_datagrams(&payload, None).unwrap()
+        })
+        .collect();
+    let made = made.elapsed();
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let (answers, cookies) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let counting = {
+        let (sock, answers, cookies) = (sock.clone(), answers.clone(), cookies.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((len, _)) = sock.recv_from(&mut buf).await {
+                if len == COOKIE_REPLY_LEN {
+                    cookies.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    answers.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let start = Instant::now();
+    for datagrams in &floods {
+        for d in datagrams {
+            let _ = sock.send_to(d, r.addr).await;
+        }
+    }
+    let sent = start.elapsed();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    counting.abort();
+    let (a, c) = (
+        answers.load(Ordering::Relaxed),
+        cookies.load(Ordering::Relaxed),
+    );
+    println!(
+        "{} initiations ({} datagrams) sent in {:.2?} ({:.0} a second; {:.2?} to make them): \
+         {} answered with a handshake, {} with a cookie, {} not at all",
+        n,
+        floods.iter().map(Vec::len).sum::<usize>(),
+        sent,
+        n as f64 / sent.as_secs_f64(),
+        made,
+        a,
+        c,
+        (n as u64).saturating_sub(a + c)
+    );
+    stop_receiver(r).await;
+}
+
+/// A tenth of the packets held back 12 ms on a path of 20 ms (a link that
+/// spreads one flow over two routes): taken for lost at first, sent again
+/// for nothing, until the sender sees the copies it sent again were not
+/// needed — acknowledged sooner than a round trip after they went — and
+/// widens its reordering window (RFC 8985, 6.2). 9.6 per cent of the file
+/// went twice before; about one now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reordering_is_soon_no_longer_taken_for_loss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            reorder: 0.1,
+            reorder_delay: Duration::from_millis(12),
+            reverse_delay: Duration::from_millis(20),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let size = 8 << 20;
+    let path = make_file(&src, "reorder.bin", size, 21);
+    let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(5_000_000);
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("send");
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    assert_same(&path, &out.join("reorder.bin"));
+    let resent = summary.retransmitted_bytes as f64 / size as f64;
+    assert!(resent < 0.03, "{:.1}% sent again", resent * 100.0);
+    stop_receiver(r).await;
+}
+
 /// A burst loss that leaves far more holes than one ACK can list must not make
 /// the sender treat unlisted holes as delivered (regression: this used to
 /// stall until the receiver's session expired).
@@ -968,16 +1345,43 @@ async fn bench_profile(name: &str, size: usize, imp: Impairment, cap: Option<u64
     if let TransferEvent::Completed { path: Some(p), .. } = ev {
         assert_same(&path, Path::new(&p));
     }
+    let rate = size as f64 * 8.0 / secs / 1e6;
+    let resent = summary.retransmitted_bytes as f64 * 100.0 / size as f64;
     println!(
         "BENCH {:<34} {:>7.1} Mbit/s  ({:.2} s, retx {:.1}%, loss events {}, rto {})",
-        name,
-        size as f64 * 8.0 / secs / 1e6,
-        secs,
-        summary.retransmitted_bytes as f64 * 100.0 / size as f64,
-        summary.loss_events,
-        summary.rto_events
+        name, rate, secs, resent, summary.loss_events, summary.rto_events
     );
     stop_receiver(r).await;
+    // SHARP_BENCH_FLOORS names a file of "profile <tab> least Mbit/s <tab>
+    // most % sent again" lines: a profile that does worse fails (CI's
+    // speed regression job, `.github/workflows/speed.yml`).
+    if let Ok(floors) = std::env::var("SHARP_BENCH_FLOORS") {
+        let text = std::fs::read_to_string(&floors).expect("the floors file");
+        for line in text
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f[0] != name {
+                continue;
+            }
+            let (least, most): (f64, f64) = (f[1].parse().unwrap(), f[2].parse().unwrap());
+            assert!(
+                rate >= least,
+                "{}: {:.1} Mbit/s, below the floor of {}",
+                name,
+                rate,
+                least
+            );
+            assert!(
+                resent <= most,
+                "{}: {:.1}% sent again, above the ceiling of {}",
+                name,
+                resent,
+                most
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1173,7 +1577,7 @@ async fn a_sender_cannot_shatter_the_receivers_bookkeeping() {
 
     let tmp = tempfile::tempdir().unwrap();
     let (_src, out, state) = dirs(&tmp);
-    let r = start_receiver(&out, &state, |_| {}).await;
+    let r = start_receiver(&out, &state, |c| c.speak_v3 = true).await;
     let hello = sharp256::protocol::wire::Hello {
         file_size: 4 * PIECES,
         ..fake_hello(rand::random(), "shards.bin")
@@ -1304,6 +1708,8 @@ async fn idle_session_after_handshake_is_dropped() {
     let tmp = tempfile::tempdir().unwrap();
     let (out, state) = (tmp.path().join("out"), tmp.path().join("state"));
     let mut r = start_receiver(&out, &state, |cfg| {
+        // Its handshakes are made by hand, in version 3.
+        cfg.speak_v3 = true;
         cfg.transport.handshake_timeout = Duration::from_secs(2);
     })
     .await;
@@ -1329,7 +1735,7 @@ async fn abort_before_data_releases_the_session_at_once() {
     use sharp256::protocol::wire::{Abort, Message};
     let tmp = tempfile::tempdir().unwrap();
     let (out, state) = (tmp.path().join("out"), tmp.path().join("state"));
-    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let mut r = start_receiver(&out, &state, |c| c.speak_v3 = true).await;
     let (mut sender, _) = FakeSender::connect(&r, [0x6b; 16], "early.bin").await;
     let part = out.join("early.bin.sharp-part");
     assert!(part.exists());
@@ -1537,6 +1943,8 @@ async fn cookie_challenge_under_load() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
     let mut r = start_receiver(&out, &state, |cfg| {
+        // Its handshakes are made by hand, in version 3.
+        cfg.speak_v3 = true;
         cfg.handshake_load_threshold = 0; // permanently "under load"
     })
     .await;
@@ -1566,7 +1974,7 @@ async fn cookie_challenge_under_load() {
 async fn replayed_initiation_is_ignored() {
     let tmp = tempfile::tempdir().unwrap();
     let (_src, out, state) = dirs(&tmp);
-    let r = start_receiver(&out, &state, |_| {}).await;
+    let r = start_receiver(&out, &state, |c| c.speak_v3 = true).await;
     let (_init, pkt) = fake_initiation(r.id, [0x88; 16], "replay.bin");
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sock.send_to(&pkt, r.addr).await.unwrap();
@@ -2016,7 +2424,7 @@ async fn send_listing(
 async fn hostile_directory_listings_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let (_src, out, state) = dirs(&tmp);
-    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let mut r = start_receiver(&out, &state, |c| c.speak_v3 = true).await;
     // version, reserved, root head (directory), one entry: a file named
     // "..", "/etc/x" or "a\0b" of five bytes.
     for name in [&b".."[..], b"/etc/x", b"a\0b", b"."] {
@@ -2181,7 +2589,10 @@ async fn copier(version: sharp256::crypto::handshake::Version) {
     let (src, out, state) = dirs(&tmp);
     let size = 3 << 20;
     let file = make_file(&src, "copied.bin", size, 0xC0B1);
-    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let mut r = start_receiver(&out, &state, |c| {
+        c.speak_v3 = version == sharp256::crypto::handshake::Version::V3
+    })
+    .await;
 
     let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -2353,7 +2764,7 @@ async fn a_session_begun_by_a_copied_initiation_sends_nothing_more_there() {
     let (src, out, state) = dirs(&tmp);
     let size = 2 << 20;
     let file = make_file(&src, "begun.bin", size, 0xB3C0);
-    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let mut r = start_receiver(&out, &state, |c| c.speak_v3 = true).await;
 
     let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -2406,7 +2817,7 @@ async fn a_session_begun_by_a_copied_initiation_sends_nothing_more_there() {
         }
     });
 
-    let summary = run_sender(sender_cfg(&file, relay_addr, r.id, &state))
+    let summary = run_sender(v3(sender_cfg(&file, relay_addr, r.id, &state)))
         .await
         .expect("the transfer completes once the real address is proven");
     assert_eq!(summary.file_size, size as u64);
@@ -2517,6 +2928,8 @@ async fn one_sender_cannot_take_every_session_slot() {
     let tmp = tempfile::tempdir().unwrap();
     let (_src, out, state) = dirs(&tmp);
     let r = start_receiver(&out, &state, |cfg| {
+        // Its handshakes are made by hand, in version 3.
+        cfg.speak_v3 = true;
         cfg.max_sessions = 6;
         cfg.max_sessions_per_sender = 2;
     })
@@ -3486,6 +3899,87 @@ async fn a_path_that_silently_stops_carrying_full_packets_is_stepped_down_from()
     stop_receiver(r).await;
 }
 
+/// A path narrower than every IPv6 path is (an IPv4 tunnel: no datagram
+/// longer than 1210 bytes gets through, from the start, without a word):
+/// the probes of 1500 and 1280 bytes go unanswered, the one of a control
+/// datagram's size (1200 bytes, what the handshake took) is answered, and
+/// the transfer runs at that — where halving from 1280 left it at half the
+/// size the path carries, a quarter of its speed in the laboratory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_below_1280_bytes_is_probed_down_to_what_the_handshake_took() {
+    use sharp256::protocol::constants::BASE_CHUNK;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 2 << 20;
+    let file = make_file(&src, "narrow.bin", size, 0x1210);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            mtu_after: Some((Duration::ZERO, 1210)),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let summary = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_sender(sender_cfg(&file, proxy.addr, r.id, &state)),
+    )
+    .await
+    .expect("finished in time")
+    .expect("the transfer completes");
+    assert_eq!(summary.chunk_size, BASE_CHUNK);
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("narrow.bin"));
+    stop_receiver(r).await;
+}
+
+/// A path that goes quiet altogether for a few seconds — every packet lost,
+/// not only the big ones — is no MTU black hole: the transfer carries on at
+/// the size it had (in the laboratory a cut was taken for one, and the size
+/// stepped down twice).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outage_is_not_taken_for_an_mtu_black_hole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 12 << 20;
+    let file = make_file(&src, "outage.bin", size, 0x0D7A);
+    let mut r = start_receiver(&out, &state, |_| {}).await;
+    // The size a transfer on this path ends with, untouched.
+    let clean = make_file(&src, "clean.bin", 2 << 20, 0x0D7B);
+    let proxy = start_proxy(r.addr, Impairment::none()).await;
+    let mut cfg = sender_cfg(&clean, proxy.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(2 << 20);
+    let untouched = run_sender(cfg)
+        .await
+        .expect("the clean transfer")
+        .chunk_size;
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+
+    let mut cfg = sender_cfg(&file, proxy.addr, r.id, &state);
+    cfg.transport.max_rate_bytes = Some(2 << 20);
+    let sender = tokio::spawn(run_sender(cfg));
+    eventually("the transfer under way", || {
+        proxy.to_target_bytes.load(Ordering::Relaxed) > (2 << 20) + (2 << 20)
+    })
+    .await;
+    proxy.blackhole.store(true, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    proxy.blackhole.store(false, Ordering::Relaxed);
+    let summary = tokio::time::timeout(Duration::from_secs(60), sender)
+        .await
+        .expect("finished in time")
+        .unwrap()
+        .expect("the transfer completes after the outage");
+    assert_eq!(
+        summary.chunk_size, untouched,
+        "the size stepped down after an outage"
+    );
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("outage.bin"));
+    stop_receiver(r).await;
+}
+
 /// A NAT in front of the sender, `one_way` of delay each way, that gives
 /// the sender a new outside port at `rebind_at` and drops the old mapping.
 async fn rebinding_nat(
@@ -3566,6 +4060,255 @@ async fn a_rebinding_nat_is_followed_on_a_slow_path() {
     assert_same(&file, &out.join("rebind.bin"));
     task.abort();
     stop_receiver(r).await;
+}
+
+/// A NAT in front of the sender that gives it a new outside port every
+/// `every`, as one short of ports or under attack does, and lets replies
+/// through to the last few of them. Returns its inside address, how many
+/// ports it has given out, and its task.
+async fn churning_nat(
+    target: SocketAddr,
+    every: Duration,
+) -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    let inside = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = inside.local_addr().unwrap();
+    let ports = Arc::new(AtomicU64::new(0));
+    let counted = ports.clone();
+    let task = tokio::spawn(async move {
+        let (back_tx, mut back_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut outside: std::collections::VecDeque<(Arc<UdpSocket>, tokio::task::JoinHandle<()>)> =
+            Default::default();
+        let mut client = None;
+        let mut next = Instant::now();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            if Instant::now() >= next || outside.is_empty() {
+                let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                counted.fetch_add(1, Ordering::Relaxed);
+                let reader = {
+                    let (s, back) = (s.clone(), back_tx.clone());
+                    tokio::spawn(async move {
+                        let mut b = vec![0u8; 65536];
+                        while let Ok((n, _)) = s.recv_from(&mut b).await {
+                            let _ = back.send(b[..n].to_vec());
+                        }
+                    })
+                };
+                outside.push_back((s, reader));
+                // The last four mappings answer; older ones are gone.
+                while outside.len() > 4 {
+                    if let Some((_, reader)) = outside.pop_front() {
+                        reader.abort();
+                    }
+                }
+                next = Instant::now() + every;
+            }
+            let wait = next.saturating_duration_since(Instant::now());
+            tokio::select! {
+                r = inside.recv_from(&mut buf) => {
+                    let Ok((n, from)) = r else { continue };
+                    client = Some(from);
+                    let (s, _) = outside.back().unwrap();
+                    let _ = s.send_to(&buf[..n], target).await;
+                }
+                Some(pkt) = back_rx.recv() => {
+                    if let Some(c) = client {
+                        let _ = inside.send_to(&pkt, c).await;
+                    }
+                }
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    });
+    (addr, ports, task)
+}
+
+/// The sender's address changes four times a second all through a
+/// transfer (a NAT short of ports, or one rebinding under load): the
+/// receiver proves each new one before it sends there, the transfer keeps
+/// going and finishes whole (THREAT_MODEL Н6: fast address changes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_whose_port_changes_four_times_a_second_is_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let size = 3 << 20;
+    let file = make_file(&src, "churn.bin", size, 0xC4A2);
+    let mut r = start_receiver(&out, &state, |cfg| cfg.tcp = false).await;
+    let (nat, ports, task) = churning_nat(r.addr, Duration::from_millis(250)).await;
+    let mut cfg = sender_cfg(&file, nat, r.id, &state);
+    cfg.carriers = false;
+    cfg.transport.max_rate_bytes = Some(1 << 20);
+    let started = Instant::now();
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("the transfer completes");
+    let took = started.elapsed();
+    assert_eq!(summary.file_size, size as u64);
+    let given = ports.load(Ordering::Relaxed);
+    assert!(given >= 8, "only {} ports given out in {:?}", given, took);
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("churn.bin"));
+    assert!(
+        took < Duration::from_secs(20),
+        "{:?} for 3 MB at 1 MB/s through {} ports",
+        took,
+        given
+    );
+    task.abort();
+    stop_receiver(r).await;
+}
+
+/// A receiver that lies (THREAT_MODEL Н6: a dishonest receiver): it takes
+/// the handshake honestly, then answers the data with ACKs no receiver
+/// could send — more received than the file holds, a hole for every few
+/// bytes, everything received — and never a FIN. The sender is to come to
+/// no harm: no panic, no work without end, no transfer it calls done
+/// without the receiver's hash; it gives up when its patience runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lying_receiver_cannot_break_the_sender() {
+    use sharp256::crypto::handshake::Responder;
+    use sharp256::crypto::transport::begin_packet;
+    use sharp256::crypto::{no_psk, SessionKeys, Suite};
+    use sharp256::protocol::constants::{CAP_NONE, HELLO_ACCEPTED};
+    use sharp256::protocol::wire::{self, Ack, HelloAck, Message};
+    init_test_logging();
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, _out, state) = dirs(&tmp);
+    let size = 1 << 20;
+    let file = make_file(&src, "lied-to.bin", size, 0x11E5);
+    let identity = Identity::generate();
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let at = sock.local_addr().unwrap();
+    let lies_told = Arc::new(AtomicU64::new(0));
+    let liar = {
+        let (sock, identity, told) = (sock.clone(), identity.clone(), lies_told.clone());
+        tokio::spawn(async move {
+            let responder = Responder::new(identity, no_psk());
+            let mut buf = vec![0u8; 65536];
+            let mut session: Option<(SessionKeys, u64, SocketAddr)> = None;
+            let mut pn = 0u64;
+            let mut round = 0u64;
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                if session.is_none() {
+                    let Ok(incoming) = responder.read_initiation(&buf[..n]) else {
+                        continue;
+                    };
+                    let Ok(init) = wire::decode_initiation(&incoming.payload) else {
+                        continue;
+                    };
+                    let suite = Suite::choose(init.suites, false).unwrap();
+                    let payload = wire::encode_response(&wire::Response {
+                        suite: suite as u8,
+                        ack_flags: 0,
+                        ack: HelloAck {
+                            status: HELLO_ACCEPTED,
+                            reason: 0,
+                            max_chunk: 1200,
+                            capabilities: CAP_NONE,
+                            echo_ts: init.hello.timestamp,
+                            max_ack_delay_us: 20_000,
+                            rwnd: 1 << 20,
+                            resume_upto: 0,
+                            known_end: 0,
+                            holes: vec![],
+                            message: String::new(),
+                        },
+                    });
+                    let peer_cid = incoming.sender_cid;
+                    let Ok((pkt, split)) = incoming.respond(0x5eed, &payload) else {
+                        continue;
+                    };
+                    let _ = sock.send_to(&pkt, from).await;
+                    session = Some((SessionKeys::derive(&split, false, suite), peer_cid, from));
+                    continue;
+                }
+                let (keys, peer_cid, to) = session.as_ref().unwrap();
+                round += 1;
+                // Whatever came, a lie back: one kind after another.
+                let lie = match round % 4 {
+                    0 => Ack {
+                        contiguous_upto: 0,
+                        highest: u64::MAX / 2,
+                        received_bytes: u64::MAX / 2,
+                        echo_ts: 0,
+                        ack_delay_us: 0,
+                        rwnd: u64::MAX,
+                        holes: vec![],
+                    },
+                    1 => Ack {
+                        contiguous_upto: 0,
+                        highest: size as u64,
+                        received_bytes: (size / 2) as u64,
+                        echo_ts: 0,
+                        ack_delay_us: u32::MAX,
+                        rwnd: 1,
+                        holes: (0..60)
+                            .map(|i| {
+                                let at = (round * 977 + i * 4099) % (size as u64 - 2);
+                                (at, at + 1)
+                            })
+                            .collect(),
+                    },
+                    2 => Ack {
+                        contiguous_upto: size as u64,
+                        highest: size as u64,
+                        received_bytes: size as u64,
+                        echo_ts: u32::MAX,
+                        ack_delay_us: 0,
+                        rwnd: 0,
+                        holes: vec![],
+                    },
+                    _ => Ack {
+                        contiguous_upto: 7,
+                        highest: 9,
+                        received_bytes: 3,
+                        echo_ts: 1,
+                        ack_delay_us: 1,
+                        rwnd: 1 << 30,
+                        holes: vec![(8, 9)],
+                    },
+                };
+                let mut out = Vec::new();
+                begin_packet(
+                    &mut out,
+                    *peer_cid,
+                    wire::type_byte(wire::MsgType::Ack, 0),
+                    pn,
+                );
+                pn += 1;
+                wire::encode_body(&Message::Ack(lie), &mut out, usize::MAX);
+                if keys.send.seal(&mut out).is_ok() {
+                    let _ = sock.send_to(&out, to).await;
+                    told.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let mut cfg = v3(sender_cfg(&file, at, identity.id(), &state));
+    cfg.carriers = false;
+    cfg.transport.give_up_timeout = Duration::from_secs(8);
+    cfg.transport.stall_timeout = Duration::from_secs(3);
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("the sender ends, lied to as it is");
+    let err = result.expect_err("done without the receiver's hash");
+    // It took the lie that everything had arrived (which no sender can
+    // check: optimistic ACKs, THREAT_MODEL §7) and waited for the verdict —
+    // for as long as a receiver may take to check a file of this size, and
+    // no longer, though the liar answered every ping.
+    assert!(
+        err.to_string().contains("has not confirmed the file"),
+        "{}",
+        err
+    );
+    assert!(lies_told.load(Ordering::Relaxed) > 3);
+    assert!(started.elapsed() < Duration::from_secs(30));
+    liar.abort();
 }
 
 /// A receiver restarts in the middle of a transfer, and its new instance
@@ -3655,6 +4398,8 @@ async fn transfers_share_one_memory_budget() {
     let (_src, out, state) = dirs(&tmp);
     let budget: u64 = 8 << 20;
     let r = start_receiver(&out, &state, move |cfg| {
+        // Its handshakes are made by hand, in version 3.
+        cfg.speak_v3 = true;
         cfg.memory_budget = budget;
     })
     .await;
@@ -4432,7 +5177,11 @@ async fn version_4_carries_a_file_and_a_directory() {
 async fn a_version_4_sender_does_not_step_down_to_version_3() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
-    let mut r = start_receiver(&out, &state, |c| c.speak_v4 = false).await;
+    let mut r = start_receiver(&out, &state, |c| {
+        c.speak_v4 = false;
+        c.speak_v3 = true;
+    })
+    .await;
     let file = make_file(&src, "old.bin", 100_000, 0x46);
     let mut cfg = v4(sender_cfg(&file, r.addr, r.id, &state));
     cfg.transport.handshake_timeout = Duration::from_secs(3);
@@ -4441,9 +5190,42 @@ async fn a_version_4_sender_does_not_step_down_to_version_3() {
         other => panic!("expected no answer, got {:?}", other.map(|_| ())),
     }
     assert!(!out.join("old.bin").exists());
-    run_sender(sender_cfg(&file, r.addr, r.id, &state))
+    run_sender(v3(sender_cfg(&file, r.addr, r.id, &state)))
         .await
         .expect("version 3 is answered");
+    wait_completed(&mut r.events, Duration::from_secs(20)).await;
+    assert_same(&file, &out.join("old.bin"));
+    stop_receiver(r).await;
+}
+
+fn v3(mut cfg: SenderConfig) -> SenderConfig {
+    cfg.receiver_version = sharp256::crypto::handshake::Version::V3;
+    cfg
+}
+
+/// A receiver of this version answers version 3 — what a sender given its
+/// ID in the old form speaks — only when told to (`--accept-v3`): else
+/// whoever had the old form would talk to it without ML-KEM
+/// (docs/THREAT_MODEL.md, Р25).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_answers_version_3_only_when_told_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let file = make_file(&src, "old.bin", 100_000, 0x47);
+    let r = start_receiver(&out, &state, |_| {}).await;
+    let mut cfg = v3(sender_cfg(&file, r.addr, r.id, &state));
+    cfg.transport.handshake_timeout = Duration::from_secs(3);
+    match run_sender(cfg).await {
+        Err(SendError::HandshakeTimeout) => {}
+        other => panic!("expected no answer, got {:?}", other.map(|_| ())),
+    }
+    assert!(!out.join("old.bin").exists());
+    stop_receiver(r).await;
+
+    let mut r = start_receiver(&out, &state, |c| c.speak_v3 = true).await;
+    run_sender(v3(sender_cfg(&file, r.addr, r.id, &state)))
+        .await
+        .expect("version 3 is answered when asked to be");
     wait_completed(&mut r.events, Duration::from_secs(20)).await;
     assert_same(&file, &out.join("old.bin"));
     stop_receiver(r).await;
@@ -4569,16 +5351,16 @@ struct TcpForward {
 }
 
 /// Forwards streams accepted at `at` — the address of a UDP proxy, so that
-/// a sender given it finds the receiver there over both — to `target`.
-async fn start_tcp_forward(at: SocketAddr, target: SocketAddr) -> TcpForward {
-    start_tcp_forward_at(at, target, None).await
-}
-
-/// [`start_tcp_forward`], passing at most `rate` bytes a second towards
-/// `target` when given: a path where TCP is slow too.
-async fn start_tcp_forward_at(at: SocketAddr, target: SocketAddr, rate: Option<u64>) -> TcpForward {
+/// a sender given it finds the receiver there over both — to `target`,
+/// passing at most `rate` bytes a second towards it when given: a path
+/// where TCP is slow too. None when a TCP socket has that port already.
+async fn try_tcp_forward(
+    at: SocketAddr,
+    target: SocketAddr,
+    rate: Option<u64>,
+) -> Option<TcpForward> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind(at).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(at).await.ok()?;
     let to_target_bytes = Arc::new(AtomicU64::new(0));
     let counted = to_target_bytes.clone();
     let task = tokio::spawn(async move {
@@ -4614,10 +5396,30 @@ async fn start_tcp_forward_at(at: SocketAddr, target: SocketAddr, rate: Option<u
             });
         }
     });
-    TcpForward {
+    Some(TcpForward {
         to_target_bytes,
         _task: task,
+    })
+}
+
+/// A UDP proxy to `target`, and at its address a TCP forward to
+/// `tcp_target` (see [`try_tcp_forward`]): on another port when the
+/// proxy's number is already a TCP socket's — another test's ephemeral
+/// connection, now and then, under parallel load (a test failed so).
+async fn proxy_with_tcp(
+    target: SocketAddr,
+    imp: Impairment,
+    tcp_target: SocketAddr,
+    rate: Option<u64>,
+) -> (Proxy, TcpForward) {
+    for _ in 0..50 {
+        let proxy = start_proxy(target, imp).await;
+        if let Some(tcp) = try_tcp_forward(proxy.addr, tcp_target, rate).await {
+            return (proxy, tcp);
+        }
+        proxy._task.abort();
     }
+    panic!("no port was free for both UDP and TCP");
 }
 
 /// A sender whose network lets no UDP through reaches the receiver over
@@ -4629,9 +5431,8 @@ async fn a_sender_whose_udp_is_blocked_reaches_the_receiver_over_tcp() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
     let mut r = start_receiver(&out, &state, |_| {}).await;
-    let proxy = start_proxy(r.addr, Impairment::none()).await;
+    let (proxy, tcp) = proxy_with_tcp(r.addr, Impairment::none(), r.addr, None).await;
     proxy.blackhole.store(true, Ordering::Relaxed);
-    let tcp = start_tcp_forward(proxy.addr, r.addr).await;
     let size = 3_000_000;
     let path = make_file(&src, "over-tcp.bin", size, 11);
     let summary = tokio::time::timeout(
@@ -4670,8 +5471,7 @@ async fn a_transfer_moves_to_tcp_when_udp_stops_and_back_when_it_returns() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
     let mut r = start_receiver(&out, &state, |_| {}).await;
-    let proxy = start_proxy(r.addr, Impairment::none()).await;
-    let tcp = start_tcp_forward(proxy.addr, r.addr).await;
+    let (proxy, tcp) = proxy_with_tcp(r.addr, Impairment::none(), r.addr, None).await;
     // Slow enough to be caught in the middle: about twelve seconds.
     let size = 24_000_000;
     let path = make_file(&src, "moves.bin", size, 12);
@@ -4729,15 +5529,16 @@ async fn a_transfer_leaves_udp_that_is_held_back_for_tcp() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
     let mut r = start_receiver(&out, &state, |_| {}).await;
-    let proxy = start_proxy(
+    let (proxy, tcp) = proxy_with_tcp(
         r.addr,
         Impairment {
             police: Some(250_000),
             ..Impairment::none()
         },
+        r.addr,
+        Some(1_000_000),
     )
     .await;
-    let tcp = start_tcp_forward_at(proxy.addr, r.addr, Some(1_000_000)).await;
     // A minute and more over UDP alone; a quarter of that over TCP, which
     // the trial, over in fifteen seconds, leaves time to settle on.
     let size = 16_000_000;
@@ -4777,6 +5578,102 @@ async fn a_transfer_leaves_udp_that_is_held_back_for_tcp() {
     stop_receiver(r).await;
 }
 
+/// UDP policed to 250 kB/s, and no stream to leave it for (`--no-tcp`):
+/// the sender settles at the policer's rate instead of sending most of
+/// what it sends twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policer_is_not_overrun() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |cfg| cfg.tcp = false).await;
+    let proxy = start_proxy(
+        r.addr,
+        Impairment {
+            police: Some(250_000),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    // Twelve seconds at the policer's rate.
+    let size = 3_000_000;
+    let path = make_file(&src, "policed.bin", size, 16);
+    let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
+    cfg.carriers = false;
+    let started = Instant::now();
+    let sender = tokio::spawn(run_sender(cfg));
+    // What the sender offers the policer, against what it lets through,
+    // once the first seconds are behind: until the policer is found, the
+    // sender runs at whatever its window allows.
+    let (offered, passed) = (&proxy.offered_bytes, &proxy.to_target_bytes);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (offered_then, passed_then) = (
+        offered.load(Ordering::Relaxed),
+        passed.load(Ordering::Relaxed),
+    );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let over = (offered.load(Ordering::Relaxed) - offered_then) as f64
+        / (passed.load(Ordering::Relaxed) - passed_then) as f64;
+    let summary = tokio::time::timeout(Duration::from_secs(90), sender)
+        .await
+        .expect("finished in time")
+        .unwrap()
+        .expect("send");
+    let took = started.elapsed();
+    wait_completed(&mut r.events, Duration::from_secs(30)).await;
+    let resent = summary.retransmitted_bytes as f64 / size as f64;
+    eprintln!(
+        "policed: {:?}, {:.0} kB/s, {:.0}% sent again, offered {:.2} times what passed",
+        took,
+        size as f64 / took.as_secs_f64() / 1000.0,
+        resent * 100.0,
+        over
+    );
+    // Paced without regard to the policer: offered 3.6 times what passed,
+    // 2.7 times the file sent again.
+    assert!(summary.policer_detections >= 1);
+    assert!(
+        over < 1.15,
+        "offered {:.2} times what the policer passed",
+        over
+    );
+    assert!(resent < 0.6, "{:.0}% sent again", resent * 100.0);
+    stop_receiver(r).await;
+}
+
+/// Two addresses for the receiver: one answers after 400 ms, the other
+/// never. The handshake tries the second while the first is still on its
+/// way; the first one's answer, older than that attempt, is taken
+/// (version 4), instead of the first address being asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |cfg| cfg.tcp = false).await;
+    let slow = start_proxy(
+        r.addr,
+        Impairment {
+            reverse_delay: Duration::from_millis(400),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let path = make_file(&src, "slow.bin", 20_000, 17);
+    let mut cfg = sender_cfg(&path, slow.addr, r.id, &state);
+    cfg.alternate_peers = vec![dead.local_addr().unwrap()];
+    cfg.carriers = false;
+    let summary = tokio::time::timeout(Duration::from_secs(30), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("send");
+    wait_completed(&mut r.events, Duration::from_secs(10)).await;
+    // One to each: with only the newest attempt adopted, as version 3
+    // must, the slow address is asked again once its answer is in, and the
+    // transfer takes a round trip longer (2.5 s here, rather than 2.0).
+    assert_eq!(summary.initiations, 2, "{} sent", summary.initiations);
+    stop_receiver(r).await;
+}
+
 /// UDP that loses a share of what it carries, but still outruns TCP: the
 /// trial on a stream finds TCP slower, and the session goes back to UDP.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4784,15 +5681,16 @@ async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
     let r = start_receiver(&out, &state, |_| {}).await;
-    let proxy = start_proxy(
+    let (proxy, tcp) = proxy_with_tcp(
         r.addr,
         Impairment {
             drop: 0.15,
             ..Impairment::none()
         },
+        r.addr,
+        Some(500_000),
     )
     .await;
-    let tcp = start_tcp_forward_at(proxy.addr, r.addr, Some(500_000)).await;
     // At 2 MB/s, a third of it lost: enough left after the first window
     // for a trial to be worth making.
     let size = 36_000_000;
@@ -4853,9 +5751,8 @@ async fn start_relay() -> (SocketAddr, SharpId, CancellationToken) {
 /// address, over TCP only.
 #[cfg(feature = "nat-traversal")]
 async fn relay_over_tcp_only(relay: SocketAddr) -> (Proxy, TcpForward) {
-    let proxy = start_proxy(relay, Impairment::none()).await;
+    let (proxy, tcp) = proxy_with_tcp(relay, Impairment::none(), relay, None).await;
     proxy.blackhole.store(true, Ordering::Relaxed);
-    let tcp = start_tcp_forward(proxy.addr, relay).await;
     (proxy, tcp)
 }
 

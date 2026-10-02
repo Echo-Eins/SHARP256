@@ -1,0 +1,9 @@
+# clean: 20 ms round trip, 50 Mbit/s, a queue of a round trip and more
+# to the receiver: delay 10ms rate 50mbit limit 1000
+# back: delay 10ms
+# 46.4 Mbit/s of 50 (93%), 0.0% sent again, 4.3 s
+
+## sender
+2026-10-02T04:23:53.819597Z  INFO sharp256::transport::sender: transfer 60d84cc40603701140fde05c189a6217 accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 25165824 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 24.00 MiB in 4.34s (46.4 Mbit/s avg), 0 B retransmitted, 0 loss events, BLAKE3 e45a14f837c5071b5fab302417f3b986371f0e7d45c11082ceeec57ebf4340e7

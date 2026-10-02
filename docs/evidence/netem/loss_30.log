@@ -1,0 +1,9 @@
+# loss_30: 30 % lost towards the receiver, 10 % of the ACKs
+# to the receiver: delay 10ms rate 50mbit limit 1000 loss 30%
+# back: delay 10ms loss 10%
+# 2.6 Mbit/s of 50 (5%), 45.2% sent again, 19.3 s — below 8% of the bottleneck
+
+## sender
+2026-10-02T04:24:26.391982Z  INFO sharp256::transport::sender: transfer de5a08b0aa3c115c52ad5c7389f2e941 accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 6291456 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 6.00 MiB in 19.33s (2.6 Mbit/s avg), 2.71 MiB retransmitted, 80 loss events, BLAKE3 5314a67109c971f526569db3188a8809516e50684053b2264d703b2b5408de70

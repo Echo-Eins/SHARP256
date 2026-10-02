@@ -44,7 +44,7 @@ jobs:
 
   reproducible:
     # Nothing it depends on changes by itself (the image is pinned by digest,
-    # Debian's snapshot and crates.io do not change): not on the daily run.
+    # crates.io does not change): not on the daily run.
     if: github.event_name != 'schedule'
     name: Reproducible build (${{ matrix.variant }})
     runs-on: ubuntu-latest

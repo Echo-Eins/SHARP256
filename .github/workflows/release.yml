@@ -31,10 +31,10 @@ jobs:
     strategy:
       matrix:
         include:
-          # Servers: every binary, no GUI (so no GTK needed to run them).
+          # Servers: every binary, no GUI.
           - variant: headless
             suffix: ""
-          # sharp-sender and sharp-receiver with the GUI (GTK 3).
+          # sharp-sender and sharp-receiver with the GUI.
           - variant: gui
             suffix: "-gui"
     steps:

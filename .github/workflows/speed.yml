@@ -1,0 +1,54 @@
+# Speed regressions (ROADMAP C5): the link-profile bench (tests/e2e.rs,
+# bench_link_profiles) in a release build, on every change. Each profile —
+# a round trip, random loss, a rate cap — has to reach the floor in
+# tests/bench_floors.tsv and stay under its ceiling of data sent again. The
+# floors catch a collapse (the congestion control taking random loss for a
+# policer, a pacing bug), not a few per cent: a shared runner's speed varies
+# more than that. What each profile did goes into the job's summary.
+#
+# Actions are pinned by commit.
+name: Speed
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Link profiles, release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: speed-${{ hashFiles('Cargo.lock') }}
+      - name: Bench, against the floors
+        env:
+          SHARP_BENCH_FLOORS: tests/bench_floors.tsv
+        run: |
+          set -o pipefail
+          cargo test --release --no-default-features --features nat-traversal --test e2e \
+            -- --ignored bench_link_profiles --nocapture 2>&1 | tee bench.out
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Link profiles (release build)'
+            echo '```'
+            grep '^BENCH' bench.out || echo 'no results'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

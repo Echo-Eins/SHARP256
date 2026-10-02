@@ -60,7 +60,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1169,6 +1169,12 @@ impl Dispatcher {
         // Not for a known connection: an initiation by someone who knows our
         // ID, or nothing we ever answer.
         if self.responder.is_initiation(pkt) {
+            // A version 3 initiation, answered only when asked to (see
+            // `ReceiverConfig::speak_v3`); otherwise as silent as to a
+            // stranger.
+            if !self.shared.cfg.speak_v3 {
+                return;
+            }
             // Deliver what arrived before it first, keeping the order.
             self.flush();
             self.on_initiation(pkt, from, now);
@@ -2329,6 +2335,7 @@ async fn finish_file(
     final_path: PathBuf,
     overwrite: bool,
     all_on_disk: impl FnOnce() + Send + 'static,
+    placed: impl FnOnce(&Path, &[u8; 32]) + Send + 'static,
 ) -> Result<([u8; 32], PathBuf), String> {
     writer
         .close()
@@ -2336,11 +2343,19 @@ async fn finish_file(
         .map_err(|e| format!("cannot finish writing file: {}", e))?;
     all_on_disk();
     let p = part.clone();
-    let hash = tokio::task::spawn_blocking(move || hash_file(&p))
-        .await
-        .map_err(|e| format!("hash task failed: {}", e))?
-        .map_err(|e| format!("cannot hash file: {}", e))?;
+    // The file hashed is the one moved into place: a regular file, still the
+    // same one at the moment of the move (see `durable::no_follow`).
+    let (hash, id) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+        let id = crate::file::durable::file_id(&p)?;
+        let hash = hash_file(&p)?;
+        crate::file::durable::still_the_same(&p, id)?;
+        Ok((hash, id))
+    })
+    .await
+    .map_err(|e| format!("hash task failed: {}", e))?
+    .map_err(|e| format!("cannot hash file: {}", e))?;
     let target = tokio::task::spawn_blocking(move || -> io::Result<PathBuf> {
+        crate::file::durable::still_the_same(&part, id)?;
         let dir = crate::file::durable::parent_of(&final_path);
         if overwrite {
             // A rename replaces what is there in one step (on Windows as
@@ -2350,6 +2365,7 @@ async fn finish_file(
             // The rename is on disk before the sender is told the file is
             // stored (FIN follows this).
             crate::file::durable::sync_dir(&dir)?;
+            placed(&final_path, &hash);
             return Ok(final_path);
         }
         let name = final_path
@@ -2360,6 +2376,7 @@ async fn finish_file(
         // name was chosen.
         let target = crate::file::move_into_free_name(&part, &dir, &name, unique_path)?;
         crate::file::durable::sync_dir(&dir)?;
+        placed(&target, &hash);
         Ok(target)
     })
     .await
@@ -2378,6 +2395,7 @@ async fn finish_tree(
     plan: Arc<Manifest>,
     manifest: Arc<Vec<u8>>,
     all_on_disk: impl FnOnce() + Send + 'static,
+    placed: impl FnOnce(&Path, &[u8; 32]) + Send + 'static,
 ) -> Result<([u8; 32], PathBuf), String> {
     writer
         .finish()
@@ -2417,6 +2435,7 @@ async fn finish_tree(
         // `apply_root_metadata`).
         crate::file::durable::sync_dir(&dir)
             .map_err(|e| format!("cannot flush {}: {}", dir.display(), e))?;
+        placed(&target, &hash);
         Ok((hash, target))
     })
     .await
@@ -2653,6 +2672,9 @@ struct Session {
     received: RangeSet,
     highest: u64,
     resumed_from: u64,
+    /// The result is under `final_path` already, with this hash, and only
+    /// the sender's confirmation is missing (Р22).
+    placed: Option<[u8; 32]>,
 
     pkts_since_ack: u32,
     last_ack_at: Instant,
@@ -2724,6 +2746,7 @@ impl Session {
             received: RangeSet::new(),
             highest: 0,
             resumed_from: 0,
+            placed: None,
             pkts_since_ack: 0,
             last_ack_at: now,
             immediate_ack_at: None,
@@ -3071,7 +3094,7 @@ impl Session {
             generation,
             local_cid: e.cid,
             peer_cid: e.peer_cid,
-            next_pn: 0,
+            next_pn: self.cfg.first_packet_number,
             replay: ReplayWindow::new(),
             auth_failures: 0,
         });
@@ -3228,7 +3251,7 @@ impl Session {
                         && s.file_size == hello.file_size
                         && s.file_mtime == hello.file_mtime
                         && s.manifest_hash == manifest_hex
-                        && s.part_path.exists()
+                        && s.data_path().exists()
                 })
                 .or_else(|| {
                     st.find_receiver_by_file(
@@ -3244,11 +3267,18 @@ impl Session {
         if let Some(saved) = &saved {
             // Never continue through a symbolic link someone put in place
             // of the partial data.
-            let usable = match std::fs::symlink_metadata(&saved.part_path) {
+            let usable = match std::fs::symlink_metadata(saved.data_path()) {
                 Ok(m) if self.tree.is_some() => m.is_dir(),
                 Ok(m) => m.is_file() && m.len() == hello.file_size,
                 Err(_) => false,
             };
+            // A result already in place is finished from there; it needs
+            // all of its bytes on record (and a directory its listing, kept
+            // below), or it is left alone and the transfer starts afresh.
+            let placed = saved.placed_hash();
+            let usable = usable
+                && (saved.placed.is_empty()
+                    || placed.is_some() && saved.durable_set().total() >= hello.file_size);
             if usable {
                 durable = saved.durable_set();
                 if let Some(tree) = &mut self.tree {
@@ -3275,19 +3305,39 @@ impl Session {
                     }
                     tree.resume = true;
                 }
-                self.part_path = saved.part_path.clone();
-                self.final_path = saved.final_path.clone();
+                if placed.is_some() && durable.total() < hello.file_size {
+                    // A directory in place whose listing was not kept: not
+                    // to be written into again.
+                    tracing::info!(
+                        "{} is in place already, but its listing was not kept; receiving it anew",
+                        saved.final_path.display()
+                    );
+                    durable = RangeSet::new();
+                    if let Some(tree) = &mut self.tree {
+                        tree.plan = None;
+                        tree.resume = false;
+                    }
+                } else {
+                    self.placed = placed;
+                    self.part_path = saved.part_path.clone();
+                    self.final_path = saved.final_path.clone();
+                    tracing::info!(
+                        "resuming {}: {} of {} bytes already on disk{}",
+                        name,
+                        durable.total(),
+                        hello.file_size,
+                        if placed.is_some() {
+                            ", stored and awaiting the sender's confirmation"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 if saved.transfer_id != tid_hex {
                     if let Some(st) = &self.shared.store {
                         st.remove_receiver(&saved.transfer_id);
                     }
                 }
-                tracing::info!(
-                    "resuming {}: {} of {} bytes already on disk",
-                    name,
-                    durable.total(),
-                    hello.file_size
-                );
             }
         }
         if self.part_path.as_os_str().is_empty() {
@@ -3338,6 +3388,12 @@ impl Session {
     /// Opens (creates or reopens) the partial file, or the staging
     /// directory of a directory transfer.
     fn create_file(&mut self) -> Result<(), String> {
+        if self.placed.is_some() {
+            // Nothing to write: the result is in place. Its state is kept
+            // under this transfer's id (it may have been another's).
+            self.persist_state_now();
+            return Ok(());
+        }
         if let Some(tree) = &self.tree {
             if !tree.resume {
                 // Its name flushed with the output directory's, before any
@@ -3508,7 +3564,7 @@ impl Session {
                     generation,
                     local_cid: h.cid,
                     peer_cid: sender_cid,
-                    next_pn: 0,
+                    next_pn: self.cfg.first_packet_number,
                     replay: ReplayWindow::new(),
                     auth_failures: 0,
                 });
@@ -4262,6 +4318,7 @@ impl Session {
             manifest_len: self.tree.as_ref().map_or(0, |t| t.info.manifest_len),
             durable: durable.to_vec(),
             updated_unix: 0,
+            placed: self.placed.map(|h| hash_to_hex(&h)).unwrap_or_default(),
         }
     }
 
@@ -4466,6 +4523,10 @@ impl Session {
         if !matches!(self.phase, Phase::Receiving) {
             return;
         }
+        if let Some(hash) = self.placed {
+            self.check_placed(hash);
+            return;
+        }
         let Some(writer) = self.writer.take() else {
             return;
         };
@@ -4485,6 +4546,7 @@ impl Session {
         // resumes with every byte already there, instead of from the last
         // state kept during the transfer.
         let (shared, state) = (self.shared.clone(), self.state(&self.received));
+        let (keep, mut stored) = (shared.clone(), state.clone());
         let all_on_disk = move || {
             if let Some(store) = &shared.store {
                 if let Err(e) = store.save_receiver(&state) {
@@ -4492,13 +4554,64 @@ impl Session {
                 }
             }
         };
+        // And once the result is in place, that it is, with its hash: a
+        // crash or a lost connection before the sender confirms it then
+        // finishes from there (Р22).
+        let placed = move |target: &Path, hash: &[u8; 32]| {
+            if let Some(store) = &keep.store {
+                stored.final_path = target.to_path_buf();
+                stored.placed = hash_to_hex(hash);
+                if let Err(e) = store.save_receiver(&stored) {
+                    tracing::warn!("cannot save resume state: {}", e);
+                }
+            }
+        };
         tokio::spawn(async move {
             let result = match plan {
                 Some((plan, bytes)) => {
-                    finish_tree(writer, part, final_path, plan, bytes, all_on_disk).await
+                    finish_tree(writer, part, final_path, plan, bytes, all_on_disk, placed).await
                 }
-                None => finish_file(writer, part, final_path, overwrite, all_on_disk).await,
+                None => finish_file(writer, part, final_path, overwrite, all_on_disk, placed).await,
             };
+            let _ = tx.send(Incoming::Verified(result)).await;
+        });
+    }
+
+    /// Finishes a transfer whose result was in place before: if it is still
+    /// what was stored, the sender is told so as if it had just been;
+    /// otherwise — changed since, by its owner most likely — it is left
+    /// alone and the transfer is forgotten, to start afresh when the sender
+    /// tries again.
+    fn check_placed(&mut self, hash: [u8; 32]) {
+        self.phase = Phase::Verifying;
+        tracing::info!(
+            "transfer {}: {} is in place already; checking it is still what was stored",
+            self.tid_hex(),
+            self.final_path.display()
+        );
+        let path = self.final_path.clone();
+        let plan = self.tree.as_ref().and_then(|t| t.plan.clone());
+        let (shared, tid, tx) = (self.shared.clone(), self.tid_hex(), self.self_tx.clone());
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let now = match &plan {
+                    Some((plan, bytes)) => tree::hash_tree(&path, plan, bytes),
+                    None => hash_file(&path),
+                };
+                if now.as_ref().is_ok_and(|h| *h == hash) {
+                    return Ok((hash, path));
+                }
+                if let Some(store) = &shared.store {
+                    store.remove_receiver(&tid);
+                }
+                Err(format!(
+                    "{} changed after it was stored; it is left as it is, and sending again \
+                     receives the transfer anew",
+                    path.display()
+                ))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("hash task failed: {}", e)));
             let _ = tx.send(Incoming::Verified(result)).await;
         });
     }
@@ -4510,6 +4623,7 @@ impl Session {
         match result {
             Ok((hash, path)) => {
                 self.final_path = path;
+                self.placed = Some(hash);
                 let now = Instant::now();
                 tracing::info!(
                     "transfer {} stored as {} (BLAKE3 {}); confirming with sender",

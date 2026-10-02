@@ -1,0 +1,9 @@
+# burst_loss: losses in bursts (Gilbert–Elliott: 1 % into a bad state that loses 70 %)
+# to the receiver: delay 10ms rate 50mbit limit 1000 loss gemodel 1% 10% 70% 0.1%
+# back: delay 10ms
+# 10.4 Mbit/s of 50 (21%), 6.2% sent again, 12.9 s — below 40% of the bottleneck
+
+## sender
+2026-10-02T04:24:46.721836Z  INFO sharp256::transport::sender: transfer 9ef796bbfebfe18c1bfc206a5ea2dc07 accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 16777216 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 16.00 MiB in 12.87s (10.4 Mbit/s avg), 1.00 MiB retransmitted, 44 loss events, BLAKE3 99ecccd8865c8e4f03d34512463a2f4892e22023178707354359d328a107b234

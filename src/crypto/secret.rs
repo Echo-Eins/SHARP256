@@ -199,17 +199,29 @@ pub fn secret_text(s: &str) -> Result<SecretText, std::convert::Infallible> {
 /// For the tests only: every key made while recording is on, so that a
 /// test can look for each of them where none may be (the log;
 /// `transport::log_hygiene`). Keys made outside [`SecretKey`] note
-/// themselves here too.
+/// themselves here too. Only on the threads that test marked as its own:
+/// the other tests of the process make keys of their own meanwhile —
+/// tens of thousands, some runs — and looking for each of them in the log
+/// took minutes, without saying anything of the transfers it is about.
 #[cfg(test)]
 pub(crate) mod keylog {
     use parking_lot::Mutex;
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static ON: AtomicBool = AtomicBool::new(false);
     static KEYS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    thread_local! {
+        static MINE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Marks the calling thread as one whose keys are noted.
+    pub(crate) fn this_thread() {
+        MINE.with(|m| m.set(true));
+    }
 
     pub(crate) fn note(key: &[u8]) {
-        if ON.load(Ordering::Relaxed) {
+        if ON.load(Ordering::Relaxed) && MINE.with(Cell::get) {
             KEYS.lock().push(key.to_vec());
         }
     }

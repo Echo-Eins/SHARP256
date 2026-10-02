@@ -1,0 +1,9 @@
+# asymmetric: 50 Mbit/s down, 0.5 Mbit/s back: the ACKs' way is narrow
+# to the receiver: delay 15ms rate 50mbit limit 1000
+# back: delay 15ms rate 512kbit limit 100
+# 45.2 Mbit/s of 50 (90%), 0.0% sent again, 3.0 s
+
+## sender
+2026-10-02T04:25:28.426388Z  INFO sharp256::transport::sender: transfer 7dbd3667fe3357e9d9cf5f75249c0b4a accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 16777216 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 16.00 MiB in 2.97s (45.2 Mbit/s avg), 0 B retransmitted, 0 loss events, BLAKE3 7d99c89986fe39c482fae5bb5837a7b206b97bb2596fc844302afc9ce061a0e2

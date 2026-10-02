@@ -1,30 +1,31 @@
 # sender's network: udp_blocked; IPv4; 10.2 s; TCP
 
 ## sender
-2026-10-01T23:48:20.386757Z  INFO sharp256::transport::sender: no answer over UDP yet; trying the receiver over TCP as well
-2026-10-01T23:48:20.386844Z  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [11.32.0.2:5555]
-2026-10-01T23:48:20.427299Z  INFO sharp256::transport::carrier::dial: the receiver answers over TCP at 11.32.0.2:5555; carried from 127.0.0.1:34273
-2026-10-01T23:48:20.427415Z  INFO sharp256::transport::sender: relay 11.33.0.2:5560 reached over TCP at 11.33.0.2:5560
-2026-10-01T23:48:20.452329Z  INFO sharp256::transport::sender: the session runs over TCP now ([::ffff:11.32.0.2]:5555 -> [::ffff:127.0.0.1]:34273)
-2026-10-01T23:48:20.468156Z  INFO sharp256::transport::sender: relay 11.33.0.2:5560 will carry the transfer on its port 56045, over TCP; carried from 127.0.0.1:53847
-Connected to [::ffff:127.0.0.1]:34273 (encrypted, AES-256-GCM; chunk 1427 B)
-2026-10-01T23:48:22.894764Z  INFO sharp256::transport::sender: relay [::ffff:11.33.0.2]:5560: the relay [::ffff:11.33.0.2]:5560 did not answer
-2026-10-01T23:48:26.901117Z  INFO sharp256::transport::sender: relay [::ffff:11.33.0.2]:5560: the relay [::ffff:11.33.0.2]:5560 did not answer
-2026-10-01T23:48:28.900104Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
+2026-10-02T04:27:06.188556Z  INFO sharp256::transport::sender: no answer over UDP yet; trying the receiver over TCP as well
+2026-10-02T04:27:06.188661Z  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [11.32.0.2:5555]
+2026-10-02T04:27:06.229103Z  INFO sharp256::transport::carrier::dial: the receiver answers over TCP at 11.32.0.2:5555; carried from 127.0.0.1:55640
+2026-10-02T04:27:06.229211Z  INFO sharp256::transport::sender: relay 11.33.0.2:5560 reached over TCP at 11.33.0.2:5560
+2026-10-02T04:27:06.254199Z  INFO sharp256::transport::sender: the session fell back from a direct path to a server: asking the relays to introduce us again
+2026-10-02T04:27:06.254205Z  INFO sharp256::transport::sender: the session runs over TCP now ([::ffff:11.32.0.2]:5555 -> [::ffff:127.0.0.1]:55640)
+2026-10-02T04:27:06.270095Z  INFO sharp256::transport::sender: relay 11.33.0.2:5560 will carry the transfer on its port 51747, over TCP; carried from 127.0.0.1:48042
+Connected to [::ffff:127.0.0.1]:55640 (encrypted, AES-256-GCM; chunk 1427 B)
+2026-10-02T04:27:07.691542Z  INFO sharp256::transport::sender: relay [::ffff:11.33.0.2]:5560: the relay [::ffff:11.33.0.2]:5560 did not answer
+2026-10-02T04:27:11.697208Z  INFO sharp256::transport::sender: relay [::ffff:11.33.0.2]:5560: the relay [::ffff:11.33.0.2]:5560 did not answer
+2026-10-02T04:27:14.701726Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
 
 ## receiver
-2026-10-01T23:48:18.632241Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at 0.0.0.0:5555
-2026-10-01T23:48:18.693473Z  INFO sharp256::relay::client: relay 11.33.0.2:5560 reached; it sees us at 11.32.0.2:5555
-2026-10-01T23:48:18.693495Z  INFO sharp256::transport::receiver: registered with the relay at 11.33.0.2:5560 (it sees us at 11.32.0.2:5555); senders reach us through it with --relay 11.33.0.2:5560
+2026-10-02T04:27:04.439349Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at 0.0.0.0:5555
+2026-10-02T04:27:04.500806Z  INFO sharp256::relay::client: relay 11.33.0.2:5560 reached; it sees us at 11.32.0.2:5555
+2026-10-02T04:27:04.500832Z  INFO sharp256::transport::receiver: registered with the relay at 11.33.0.2:5560 (it sees us at 11.32.0.2:5555); senders reach us through it with --relay 11.33.0.2:5560
 Relay:       registered with 11.33.0.2:5560; senders can add --relay 11.33.0.2:5560
-2026-10-01T23:48:20.468064Z  INFO sharp256::relay::client: relay 11.33.0.2:5560 is introducing 0.0.0.0:0
+2026-10-02T04:27:06.269942Z  INFO sharp256::relay::client: relay 11.33.0.2:5560 is introducing 0.0.0.0:0
 
 ## relay
-Receivers: --relay sh-lfbacdcdprea4snensgvs6iqirfysaqcsdxnai2tovbyuuvsljql2xj4@<this host>:5560
+Receivers: --relay sh-xvres57ffdk7sjupwdkgg2eyfkh4qknqwmxuhn2higmjyy2qaej3rx57@<this host>:5560
 Senders:   --relay <this host>:5560
 Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
-2026-10-01T23:48:18.430736Z  INFO sharp256::relay::server: relay listening on 0.0.0.0:5560
-2026-10-01T23:48:18.430746Z  INFO sharp256::relay::server: relay takes clients over TCP at 0.0.0.0:5560
-2026-10-01T23:48:18.430753Z  INFO sharp256::relay::server: relay takes clients over TLS at 0.0.0.0:443
-2026-10-01T23:48:18.683285Z  INFO sharp256::relay::server: relay: sh-bpofm347… registered at 11.32.0.2:5555
-2026-10-01T23:48:20.457985Z  INFO sharp256::relay::server: relay: port 56045 carries 11.31.0.2:41870 <-> 11.32.0.2:5555 (sh-bpofm347…)
+2026-10-02T04:27:04.237081Z  INFO sharp256::relay::server: relay listening on 0.0.0.0:5560
+2026-10-02T04:27:04.237091Z  INFO sharp256::relay::server: relay takes clients over TCP at 0.0.0.0:5560
+2026-10-02T04:27:04.237098Z  INFO sharp256::relay::server: relay takes clients over TLS at 0.0.0.0:443
+2026-10-02T04:27:04.490577Z  INFO sharp256::relay::server: relay: sh-gnocqz2e… registered at 11.32.0.2:5555
+2026-10-02T04:27:06.259843Z  INFO sharp256::relay::server: relay: port 51747 carries 11.31.0.2:35734 <-> 11.32.0.2:5555 (sh-gnocqz2e…)

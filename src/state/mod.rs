@@ -71,9 +71,36 @@ pub struct ReceiverState {
     /// Byte ranges that are written and fsynced.
     pub durable: Vec<(u64, u64)>,
     pub updated_unix: u64,
+    /// BLAKE3 (hex) of the result once it is under `final_path` but not yet
+    /// confirmed by the sender; empty before. A transfer cut off in that
+    /// moment is finished from the result in place, not received a second
+    /// time beside it as `name (1)` (Р22).
+    #[serde(default)]
+    pub placed: String,
 }
 
 impl ReceiverState {
+    /// Where the transfer's data is: the result in place once it is
+    /// [`placed`](Self::placed), the partial file or staging directory
+    /// before.
+    pub fn data_path(&self) -> &Path {
+        if self.placed.is_empty() {
+            &self.part_path
+        } else {
+            &self.final_path
+        }
+    }
+
+    /// [`placed`](Self::placed) as bytes, if it is set and well formed.
+    pub fn placed_hash(&self) -> Option<[u8; 32]> {
+        let (hi, lo) = self.placed.split_at_checked(32)?;
+        let (hi, lo) = (parse_hex16(hi)?, parse_hex16(lo)?);
+        let mut h = [0u8; 32];
+        h[..16].copy_from_slice(&hi);
+        h[16..].copy_from_slice(&lo);
+        Some(h)
+    }
+
     pub fn durable_set(&self) -> RangeSet {
         RangeSet::from_ranges(self.durable.iter().copied())
     }
@@ -209,7 +236,7 @@ impl StateStore {
                 || st.file_size != file_size
                 || st.file_mtime != file_mtime
                 || st.manifest_hash != manifest_hash
-                || !st.part_path.exists()
+                || !st.data_path().exists()
             {
                 continue;
             }
@@ -334,6 +361,7 @@ mod tests {
             manifest_len: 0,
             durable: vec![(0, 100), (200, 300)],
             updated_unix: 0,
+            placed: String::new(),
         };
         store.save_receiver(&st).unwrap();
         let loaded = store.load_receiver(&st.transfer_id).unwrap();
@@ -397,6 +425,7 @@ mod tests {
                 manifest_len: 0,
                 durable: vec![(0, 7)],
                 updated_unix: 1, // long ago
+                placed: String::new(),
             };
             let json = serde_json::to_string(&st).unwrap();
             fs::write(store.receiver_path(&st.transfer_id), json).unwrap();

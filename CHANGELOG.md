@@ -110,7 +110,167 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   initiations of five minutes went there: an address only the nodes vouch
   for now gets eight until a punch backs it.
 
+### Correctness: what CI and the laboratories found
+- Version 4 only, by default: a receiver answers version 3 — what a sender
+  given its ID in the old form `sh-` speaks, without ML-KEM — only when
+  started with `--accept-v3` (`ReceiverConfig::speak_v3`); the library's
+  sender speaks version 4 unless told otherwise; a sender with an old ID
+  that gets no answer says to ask for the `sh4-` one (THREAT_MODEL Р25).
+- An outage was taken for an MTU black hole (two steps down for nothing).
+  Whether the receiver's small packets still arrive is now asked outright:
+  a `Ping` at each retransmission timeout with nothing acknowledged, the
+  next one counting only if something came back after it; and the two
+  timeouts have to be in a row.
+- A relay's port that the relay names during the handshake has 4 s to
+  itself (other late addresses 1.5 s) before a stream, in the rotation or
+  as it comes up, may make its attempt moot: the relay answered over UDP,
+  so UDP to it works, and what is left is the receiver binding its side
+  (CI's IPv6 cell between isolated networks went over TCP otherwise).
+- Tests: the receiver's fuzzing harness counts what arrives late (on
+  macOS a datagram on loopback is readable a moment after it is sent) to
+  the input that caused it; the log-hygiene test no longer takes an
+  all-zero "key" (the PSK of a transfer without a secret) for a secret;
+  a UDP proxy and the TCP forward at its port are made again on another
+  port when the number is a TCP socket's already; clippy 1.99's `?`.
+- Loss classification, from what the laboratory of bad networks showed: a
+  round of twenty-odd packets that lost a fifth was congestion, which a
+  path losing 5 per cent at random reached every second or so; the
+  background rate was learnt only from rounds whose losses were not
+  congestion, which kept it low; and its pool froze once the window was
+  below 16 packets, taking it down to two. Now the ceiling (35 per cent)
+  and the excess over the background are judged over the last rounds
+  pooled, the background is learnt from every round with no queue, and
+  the pool moves every round. A path losing 5 per cent at random went
+  from a third of its speed to two thirds and more, one losing a fifth
+  from 2 per cent to a fifth.
+- The policer recogniser checks what it suspects: held to the rate it
+  found, a policer loses next to nothing, random loss as much as before —
+  then it is no policer, and nothing is suspected for a while. Random loss
+  of a fifth used to be taken for one, with the cap lowered four fifths at
+  a time.
+- The RACK reordering window widens when a packet taken for lost turns out
+  to have arrived (RFC 8985, 6.2, without DSACK: acknowledged while queued
+  to be sent again, or its resend acknowledged sooner than half a round
+  trip after it went): reordering by 12 ms on a 20 ms path sent 9.6 per
+  cent of the file twice, now about 1.
+- A receiver that says it holds everything but never sends its verdict
+  no longer keeps the sender for ever by answering its pings: the verdict
+  is waited for `give_up_timeout` plus the time an honest receiver takes to
+  check a file of that size (at 20 MB/s), and the transfer then ends with
+  the reason. Found by a new test, a receiver that lies in every ACK.
+- A UDP policer is recognised by the rate it lets through, as BBR's
+  long-term bandwidth estimate does (`congestion::Policer`), and the
+  pacing rate is capped there: a policer queues nothing, so the round
+  trip never rose, and on a short path even CUBIC's smallest window was
+  far more than it passed — in the carrier laboratory 59 to 85 per cent of
+  what was sent went again, 262 per cent on loopback. Now the sender
+  offers 1.03 times what a 250 kB/s policer passes once it is found
+  (3.6 before); the cap is held 2 s, then raised a quarter at a time, so
+  a policer still there is found again at the first step and one that is
+  gone left behind in seconds. A policer found also makes UDP suspect for
+  the trial on TCP. No false detection on the link-profile bench (0.1 to
+  5 per cent random loss). `TransferSummary::policer_detections`.
+- Version 4 takes the first handshake answer to arrive, whichever attempt
+  it answers: the receiver keeps each handshake apart until a HELLO picks
+  one, so an answer older than the latest attempt — the next address in
+  the rotation tried before a slow one answered — is no longer thrown
+  away for a round trip more (version 3 still adopts only the newest).
+  `TransferSummary::initiations`.
+- A change of network in the middle of a transfer (Wi-Fi to LTE) no
+  longer leaves the session on the relay for good. A sender whose session
+  falls back from a direct path to a server's tests its NAT again (STUN
+  only) and asks the relays again for the receiver, from where it is now;
+  the relay says where the receiver is registered now, and introduces the
+  sender anew, at its new address and with its new NAT's hints, which the
+  receiver takes as a new introduction. While carried, the sender asks
+  every few seconds, and asks the receiver's addresses in turn rather than
+  only the first four (one found late was never asked). The laboratory's
+  new `mobility` scenario: sender, receiver or both move, the sender also
+  into a symmetric NAT — all four back on a direct path in 6 to 21 s, where
+  all four stayed on the relay before.
+- A relay is asked to put a sender through at once, no longer after the
+  sender's NAT tests (1.1 s on IPv6); when the tests then tell the sender
+  more about its addresses, it asks again with the same token, and the
+  receiver, told of the same introduction with other addresses, punches
+  towards them too.
+- `SECURITY.md`: how to report a vulnerability, privately.
+
+### Laboratories and measurements
+- `scripts/netemlab/`: real transfers through the kernel's netem — loss up
+  to 30 per cent, losses in bursts, jitter, reordering, duplication, a
+  600 ms round trip, a narrow way back for the ACKs, a bottleneck with
+  seconds of queue (pings say how much of it the sender fills), a TCP
+  flow sharing the bottleneck, and path MTUs of 1240 and 1000 bytes; each
+  profile says what it must achieve.
+- `scripts/edgelab/`: a full disk, before and in the middle of a transfer
+  (stopped with the reason, resumed when the space is back), and a
+  directory of many files.
+- `scripts/soak/`: a relay and a receiver for as long as asked, senders
+  coming and going (directly, through the relay, cut off and resumed),
+  their memory, descriptors and threads written down.
+- `natlab.py samecgn` (two subscribers behind one carrier-grade NAT, with
+  and without a loop back), `natlab.py nat66` (unique local addresses
+  behind the router's: direct over IPv6 in all three cases, through what
+  the relay sees), `natlab.py dslite` (the receiver's IPv4 through a
+  carrier's AFTR, with the tunnel's MTU), `natlab.py speed` (directly,
+  through a relay, through TURN).
+- Measurements under `--ignored`: registrations a relay takes a second and
+  the memory each holds (`registrations_by_the_thousand`), and what a
+  flood of handshakes gets from a receiver (`a_flood_of_handshakes`).
+- CI's speed job (`.github/workflows/speed.yml`): the link-profile bench in
+  a release build against floors (`tests/bench_floors.tsv`).
+- Tests: a sender whose port changes four times a second, false NAT hints
+  of every kind (bounded), keys moving on to the next epoch in the middle
+  of a transfer, offsets past 4 GiB, a clock set back (three runs of the
+  binary).
+- IPv4 through a DS-Lite tunnel (MTU 1460) is probed at 1387-byte chunks,
+  which fit it; it used to fall to 1187.
+- A path narrower than 1260 bytes (a tunnel) is probed down to a control
+  datagram's 1200 bytes, the size the handshake took, instead of being
+  halved from 1280 bytes: 89 per cent of the bottleneck in the laboratory
+  instead of 23.
+- The log-hygiene test notes only the keys of its own threads: with the
+  rest of the process's tests about, it took minutes looking for theirs.
+
+### Received names and files
+- Names in Unicode's composed form (NFC), single files and every entry of
+  a directory: macOS hands names over decomposed, and "café" in two forms
+  was two files on Linux; two entries that differ only so now collide, as
+  two that differ only in case do on a case-insensitive system. The
+  sender reads its files under the names its system gave.
+- Not through a symbolic link: someone who can write the output directory
+  could put a link where a partial file was about to be, and have the
+  transfer written into (and cut to the size of) whatever file it names.
+  Received files are opened with `O_NOFOLLOW` (on Windows the link itself
+  is opened, and refused), and the file moved into place is the one
+  written and hashed — its device and file number compared before hashing,
+  after, and before the move.
+- A result moved into place before the sender knew (a crash, a lost
+  connection before FIN) is no longer received a second time as
+  `name (1)`: the resume state records it with its hash, and the next
+  attempt hashes it in place and confirms it. Changed since, it is left
+  alone and the transfer is received anew (THREAT_MODEL Р22).
+- On Windows, moves to the final name and the state files' renames go
+  through `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, and directories are
+  flushed through a handle as far as NTFS takes it; still not tested by a
+  power cut (Р23). The direct call takes paths longer than `MAX_PATH`
+  (made verbatim, as the standard library does for its own).
+- Tests of the invariant on every system: two entries this file system
+  would store under one name — differing only in Unicode form anywhere,
+  only in case where names are compared without it — collide.
+
 ### Supply chain
+- The GUI on egui 0.32 (from 0.24) and rfd 0.15: `webbrowser` 1.2.2, with
+  the vulnerability fixed (RUSTSEC-2026-0257; the clippy rule that kept the
+  GUI from outputting links is gone), no `derivative`, `instant` or
+  `memmap2` 0.5, some twenty duplicates in its tree instead of thirty, and
+  file dialogs through the desktop portal (zenity where there is none)
+  instead of GTK 3 — no system library to install for a build, and none in
+  the reproducible one. The GUI needs Rust 1.85; everything else still
+  1.82, and CI checks both. Left: `ttf-parser` (unmaintained; egui 0.34,
+  which needs Rust 1.92, renders fonts without it) and `quick-xml` 0.36
+  (two advisories; parses XML only in `atspi-common`'s tests; the
+  `zbus_xml` without it needs Rust 1.87).
 - Advisories fixed by updates within Rust 1.82: `bytes` (RUSTSEC-2026-0007),
   `crossbeam-epoch` (RUSTSEC-2026-0204), `tracing-subscriber`
   (RUSTSEC-2025-0055: escape sequences from received data reached the
@@ -127,9 +287,7 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   on its own; sources), cargo-audit and cargo-vet (audits imported from
   Mozilla, Google, Bytecode Alliance, ISRG, Zcash and Embark, the rest
   exempted by name) run in CI on every change and every day; each exception
-  says why. Clippy forbids the GUI to output links, which keeps the one
-  vulnerability left, in `webbrowser` 0.8 under egui 0.24, out of reach.
-  See [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md).
+  says why. See [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md).
 - Reproducible Linux builds: `scripts/repro.sh` builds a commit in a
   container pinned by digest; two builds differing in directory, user,
   umask, time zone, locale, host, jobs and registry give the same binaries,

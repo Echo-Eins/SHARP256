@@ -47,7 +47,7 @@
 //! link is created inside it, and set-id bits are never applied. The
 //! finished tree is moved to its final name with a single rename.
 
-use super::{read_exact_at, write_all_at};
+use super::{durable, read_exact_at, write_all_at};
 use crate::protocol::constants::{
     MAX_FILE_NAME_LEN, MAX_MANIFEST_ENTRIES, MAX_MANIFEST_LEN, MAX_TREE_DEPTH, MAX_TREE_PATH,
 };
@@ -189,12 +189,22 @@ impl Manifest {
         out
     }
 
-    /// Where entry `i` lives below `root` on this system (names mapped by
+    /// Where the receiver puts entry `i` below `root` (names mapped by
     /// [`local_name`]).
     pub fn local_path(&self, root: &Path, i: usize) -> PathBuf {
         let mut path = root.to_path_buf();
         for j in self.chain(i) {
             path.push(&*local_name(self.name(j)));
+        }
+        path
+    }
+
+    /// Where the sender reads entry `i` from below `root`: the names as its
+    /// own file system gave them, which is what the manifest holds.
+    pub fn source_path(&self, root: &Path, i: usize) -> PathBuf {
+        let mut path = root.to_path_buf();
+        for j in self.chain(i) {
+            path.push(self.name(j));
         }
         path
     }
@@ -602,18 +612,42 @@ fn valid_name(name: &str) -> bool {
 // Local names
 // ---------------------------------------------------------------------------
 
-/// Maps an entry name to one the local file system can store. On Windows,
-/// reserved characters become `_`, trailing dots and spaces (which Windows
-/// would silently drop) are removed and device names get a `_` prefix; other
-/// systems store every valid name as it is.
+/// Maps an entry name to one the local file system can store: in Unicode's
+/// composed form (NFC) first — macOS reads names back decomposed, and the
+/// same name in two forms is two files on most systems, so two entries
+/// that differ only so collide here as two that differ only in case do on
+/// a case-insensitive one. On Windows, then, reserved characters become
+/// `_`, trailing dots and spaces (which Windows would silently drop) are
+/// removed and device names get a `_` prefix; other systems store every
+/// valid name as it is.
 pub fn local_name(name: &str) -> Cow<'_, str> {
+    let composed = nfc(name);
     #[cfg(windows)]
     {
-        windows_name(name)
+        match windows_name(&composed) {
+            Cow::Borrowed(_) => composed,
+            Cow::Owned(o) => Cow::Owned(o),
+        }
     }
     #[cfg(not(windows))]
     {
-        Cow::Borrowed(name)
+        composed
+    }
+}
+
+/// `name` in Unicode Normalization Form C, borrowed when it is already.
+pub fn nfc(name: &str) -> Cow<'_, str> {
+    use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+    match is_nfc_quick(name.chars()) {
+        IsNormalized::Yes => Cow::Borrowed(name),
+        _ => {
+            let composed: String = name.nfc().collect();
+            if composed == name {
+                Cow::Borrowed(name)
+            } else {
+                Cow::Owned(composed)
+            }
+        }
     }
 }
 
@@ -855,7 +889,7 @@ impl TreeSource {
             let e = &self.manifest.entries()[i as usize];
             let within = off - e.start;
             let n = (out.len() as u64).min(e.size - within) as usize;
-            let path = || self.manifest.local_path(&self.root, i as usize);
+            let path = || self.manifest.source_path(&self.root, i as usize);
             let file = cached(&mut open, i, || {
                 let p = path();
                 File::open(&p)
@@ -883,7 +917,9 @@ impl TreeSource {
 
     /// BLAKE3 of the whole stream, as the receiver computes it.
     pub fn hash(&self) -> io::Result<[u8; 32]> {
-        hash_tree(&self.root, &self.manifest, &self.bytes)
+        hash_files(&self.manifest, &self.bytes, |i| {
+            self.manifest.source_path(&self.root, i)
+        })
     }
 }
 
@@ -908,13 +944,22 @@ fn cached(
     Ok(&lru[0].1)
 }
 
-/// BLAKE3 of a tree's transfer stream: the manifest bytes followed by the
-/// contents of every file below `root`.
+/// BLAKE3 of a received tree's transfer stream: the manifest bytes followed
+/// by the contents of every file below `root`, where the receiver put them.
 pub fn hash_tree(root: &Path, m: &Manifest, manifest_bytes: &[u8]) -> io::Result<[u8; 32]> {
+    hash_files(m, manifest_bytes, |i| m.local_path(root, i))
+}
+
+/// [`hash_tree`], each file found where `path` says.
+fn hash_files(
+    m: &Manifest,
+    manifest_bytes: &[u8],
+    path: impl Fn(usize) -> PathBuf,
+) -> io::Result<[u8; 32]> {
     let mut h = blake3::Hasher::new();
     h.update(manifest_bytes);
     for &i in m.data_files() {
-        let path = m.local_path(root, i as usize);
+        let path = path(i as usize);
         let want = m.entries()[i as usize].size;
         let len = fs::metadata(&path)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path.display(), e)))?
@@ -1039,14 +1084,17 @@ impl TreeSink {
             let e = &self.plan.entries()[idx];
             (e.parent, e.size)
         };
+        // Never through a link at the name (see `durable::no_follow`): the
+        // staging directory is this user's alone, and stays so only while
+        // nothing in it leads elsewhere.
         if self.flags[idx] & CREATED != 0 {
-            return OpenOptions::new()
-                .write(true)
+            return durable::no_follow(OpenOptions::new().write(true))
                 .open(&path)
+                .and_then(|f| durable::not_a_link(f, &path))
                 .map_err(|e| self.context(i, e));
         }
         self.ensure_dir(parent)?;
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match durable::no_follow(OpenOptions::new().write(true).create_new(true)).open(&path) {
             Ok(f) => {
                 if size > 0 {
                     f.set_len(size).map_err(|e| self.context(i, e))?;
@@ -1060,9 +1108,9 @@ impl TreeSink {
                     && e.kind() == io::ErrorKind::AlreadyExists
                     && fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) =>
             {
-                let f = OpenOptions::new()
-                    .write(true)
+                let f = durable::no_follow(OpenOptions::new().write(true))
                     .open(&path)
+                    .and_then(|f| durable::not_a_link(f, &path))
                     .map_err(|e| self.context(i, e))?;
                 if f.metadata()?.len() != size {
                     f.set_len(size).map_err(|e| self.context(i, e))?;
@@ -1149,9 +1197,9 @@ impl TreeSink {
             let path = || plan.local_path(root, i as usize);
             let r = match open.iter().find(|(j, _)| *j == i) {
                 Some((_, f)) => sync_file(f, all),
-                None => OpenOptions::new()
-                    .write(true)
+                None => durable::no_follow(OpenOptions::new().write(true))
                     .open(path())
+                    .and_then(|f| durable::not_a_link(f, &path()))
                     .and_then(|f| sync_file(&f, all)),
             };
             r.map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path().display(), e)))
@@ -1799,6 +1847,85 @@ mod tests {
         assert_eq!(apply_metadata(&staging, &plan, 0o022).unwrap(), 0);
         assert_eq!((mode("d/ro"), mode("d")), (0o400, 0o100));
         fs::set_permissions(staging.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Two entries that differ only in Unicode form — "café" composed and
+    /// decomposed, as macOS hands names over — are one name here, and the
+    /// second collides with the first, as two that differ only in case do
+    /// on a case-insensitive file system. (Only where a file system keeps
+    /// both forms apart can the sender have both: not on Apple's.) The
+    /// sender reads each under the name its system gave.
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn names_that_differ_only_in_unicode_form_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("src");
+        write(&root.join("caf\u{e9}"), b"composed");
+        write(&root.join("cafe\u{301}"), b"decomposed");
+        let src = TreeSource::open(&root).unwrap();
+        let mut stream = vec![0u8; src.size() as usize];
+        src.read_at(0, &mut stream).unwrap();
+        let plan = Arc::new(Manifest::decode(&src.bytes).unwrap());
+        let m0 = src.bytes.len();
+        let staging = tmp.path().join("out.sharp-part");
+        create_private_dir(&staging).unwrap();
+        let mut sink = TreeSink::new(staging.clone(), plan, false);
+        let err = sink.write_at(m0 as u64, &stream[m0..]).unwrap_err();
+        assert!(err.to_string().contains("collides"), "{}", err);
+        let names: Vec<_> = fs::read_dir(&staging)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["caf\u{e9}".to_string()],
+            "written composed, once"
+        );
+    }
+
+    /// The invariant on every system: two entries that this file system
+    /// would store under one name — differing only in Unicode form
+    /// anywhere, only in case where names are compared without it — are a
+    /// collision, never one file over the other.
+    #[test]
+    fn names_one_here_are_a_collision_on_every_system() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("probe"), b"").unwrap();
+        let case_blind = tmp.path().join("PROBE").exists();
+        let pairs = [
+            ("A.txt", "a.txt", case_blind),
+            ("cafe\u{301}", "caf\u{e9}", true),
+        ];
+        for (i, (first, second, collide)) in pairs.into_iter().enumerate() {
+            let mut b = ListingBuilder::new(Meta::default());
+            b.push(0, first, EntryKind::File, 3, Meta::default())
+                .unwrap();
+            b.push(0, second, EntryKind::File, 3, Meta::default())
+                .unwrap();
+            let plan = Arc::new(b.finish().unwrap());
+            let m0 = plan.encode().len() as u64;
+            let staging = tmp.path().join(format!("out{}.sharp-part", i));
+            create_private_dir(&staging).unwrap();
+            let mut sink = TreeSink::new(staging.clone(), plan, false);
+            let wrote = sink.write_at(m0, b"onetwo");
+            if collide {
+                let err = wrote.unwrap_err();
+                assert!(err.to_string().contains("collides"), "{}: {}", second, err);
+                assert_eq!(fs::read_dir(&staging).unwrap().count(), 1, "{}", second);
+            } else {
+                wrote.unwrap();
+                assert_eq!(fs::read_dir(&staging).unwrap().count(), 2, "{}", second);
+            }
+        }
+    }
+
+    #[test]
+    fn local_names_are_composed() {
+        assert_eq!(local_name("cafe\u{301}"), "caf\u{e9}");
+        assert!(matches!(local_name("caf\u{e9}"), Cow::Borrowed(_)));
+        assert!(matches!(local_name("plain.txt"), Cow::Borrowed(_)));
+        // Hangul in jamo, as macOS keeps it, composed into its syllable.
+        assert_eq!(local_name("\u{1100}\u{1161}"), "\u{ac00}");
     }
 
     #[test]

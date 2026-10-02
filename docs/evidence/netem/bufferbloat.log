@@ -1,0 +1,9 @@
+# bufferbloat: 20 Mbit/s with 3 s of queue: what the sender fills of it
+# to the receiver: delay 10ms rate 20mbit limit 5000
+# back: delay 10ms
+# 18.7 Mbit/s of 20 (94%), 0.0% sent again, 7.2 s; ping 24 ms idle, median 381 ms and top 383 ms under it — the queue adds 357 ms (at most 150)
+
+## sender
+2026-10-02T04:25:33.176509Z  INFO sharp256::transport::sender: transfer e5eb65837a08fd8283aff56047c559b6 accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 16777216 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 16.00 MiB in 7.17s (18.7 Mbit/s avg), 0 B retransmitted, 0 loss events, BLAKE3 f1f53443f314badb528f3a5a8622e820d6577c665acd207488f4ad2c805f353b

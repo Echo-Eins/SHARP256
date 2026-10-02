@@ -1,31 +1,32 @@
-# receiver's network: tcp443_only; IPv6; 3.4 s; relay/UDP, receiver over TLS
+# receiver's network: tcp443_only; IPv6; 1.4 s; relay/UDP, receiver over TLS
 
 ## sender
-2026-10-01T23:52:00.976206Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 will not say where the receiver is, and will carry the transfer on [2a0e:aa00:33::2]:50610
-2026-10-01T23:52:01.384053Z  INFO sharp256::transport::sender: no answer over UDP yet; trying the receiver over TCP as well
-2026-10-01T23:52:01.384144Z  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [[2a0e:aa00:32::2]:5555]
-2026-10-01T23:52:01.424614Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 reached over TCP at [2a0e:aa00:33::2]:5560
-2026-10-01T23:52:01.465222Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 will carry the transfer on its port 56891, over TCP; carried from 127.0.0.1:58109
-Connected to [2a0e:aa00:33::2]:50610 (encrypted, AES-256-GCM; chunk 1407 B)
-2026-10-01T23:52:03.136308Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
+2026-10-02T04:31:17.141530Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 will not say where the receiver is, and will carry the transfer on [2a0e:aa00:33::2]:36598
+2026-10-02T04:31:17.387393Z  INFO sharp256::transport::sender: the session fell back from a direct path to a server: asking the relays to introduce us again
+2026-10-02T04:31:17.387452Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560: asked again for the receiver, from where this host is now
+Connected to [2a0e:aa00:33::2]:36598 (encrypted, AES-256-GCM; chunk 1407 B)
+2026-10-02T04:31:18.143325Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560: this host's NAT tests are done; the receiver is told again
+2026-10-02T04:31:18.421037Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
 
 ## receiver
-2026-10-01T23:51:51.455034Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
-2026-10-01T23:51:59.457346Z  INFO sharp256::transport::receiver: relay [2a0e:aa00:33::2]:5560: no registration over UDP; trying TCP
-2026-10-01T23:51:59.810049Z  INFO sharp256::transport::receiver: relay reached over TLS at [2a0e:aa00:33::2]:443
-2026-10-01T23:51:59.850922Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:0 reached; it sees us at [2a0e:aa00:32::2]:50348
-2026-10-01T23:51:59.850953Z  INFO sharp256::transport::receiver: registered with the relay at 2a0e:aa00:33::2 over TCP (it sees us at [2a0e:aa00:32::2]:50348); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
+2026-10-02T04:31:08.670401Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
+2026-10-02T04:31:16.672307Z  INFO sharp256::transport::receiver: relay [2a0e:aa00:33::2]:5560: no registration over UDP; trying TCP
+2026-10-02T04:31:17.025110Z  INFO sharp256::transport::receiver: relay reached over TLS at [2a0e:aa00:33::2]:443
+2026-10-02T04:31:17.065905Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:0 reached; it sees us at [2a0e:aa00:32::2]:46552
+2026-10-02T04:31:17.065926Z  INFO sharp256::transport::receiver: registered with the relay at 2a0e:aa00:33::2 over TCP (it sees us at [2a0e:aa00:32::2]:46552); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
 Relay:       registered with [2a0e:aa00:33::2]:5560; senders can add --relay [2a0e:aa00:33::2]:5560
-2026-10-01T23:52:00.976281Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:0 is introducing [2a0e:aa00:31::2]:41428
-2026-10-01T23:52:01.465203Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:0 is introducing [::]:0
+2026-10-02T04:31:17.141652Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:0 is introducing [2a0e:aa00:31::2]:49665
+2026-10-02T04:31:18.163580Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:0: the sender says more of its NAT
+2026-10-02T04:31:18.163600Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:0 is introducing [2a0e:aa00:31::2]:49665
 
 ## relay
-Receivers: --relay sh-pp2xsaqqmceqq3unbn222lmi7exdnpcq426l6ocvu24yawjfoqbvuc2h@<this host>:5560
+Receivers: --relay sh-l5eemnggwz4r47vq4fqvpxq7w2grni5rhlofzmxproejfhextzggdrbe@<this host>:5560
 Senders:   --relay <this host>:5560
 Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
-2026-10-01T23:51:51.253630Z  INFO sharp256::relay::server: relay listening on [::]:5560
-2026-10-01T23:51:51.253640Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
-2026-10-01T23:51:51.253647Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
-2026-10-01T23:51:59.840756Z  INFO sharp256::relay::server: relay: sh-sxbuly57… registered at [2a0e:aa00:32::2]:50348
-2026-10-01T23:52:00.966087Z  INFO sharp256::relay::server: relay: port 50610 carries [2a0e:aa00:31::2]:41428 <-> [2a0e:aa00:32::2]:50348 (sh-sxbuly57…)
-2026-10-01T23:52:01.455077Z  INFO sharp256::relay::server: relay: port 56891 carries [2a0e:aa00:31::2]:51944 <-> [2a0e:aa00:32::2]:50348 (sh-sxbuly57…)
+2026-10-02T04:31:08.468360Z  INFO sharp256::relay::server: relay listening on [::]:5560
+2026-10-02T04:31:08.468369Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
+2026-10-02T04:31:08.468376Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
+2026-10-02T04:31:17.055781Z  INFO sharp256::relay::server: relay: sh-7geclkcz… registered at [2a0e:aa00:32::2]:46552
+2026-10-02T04:31:17.131452Z  INFO sharp256::relay::server: relay: port 36598 carries [2a0e:aa00:31::2]:49665 <-> [2a0e:aa00:32::2]:46552 (sh-7geclkcz…)
+2026-10-02T04:31:17.397638Z  INFO sharp256::relay::server: relay: port 36598 carries [2a0e:aa00:31::2]:49665 <-> [2a0e:aa00:32::2]:46552 (sh-7geclkcz…)
+2026-10-02T04:31:18.153495Z  INFO sharp256::relay::server: relay: port 36598 carries [2a0e:aa00:31::2]:49665 <-> [2a0e:aa00:32::2]:46552 (sh-7geclkcz…)

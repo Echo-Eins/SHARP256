@@ -1,21 +1,23 @@
 # receiver's network: open; IPv6; 0.4 s; UDP
 
 ## sender
+2026-10-02T04:29:03.572132Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560 says the receiver is at [2a0e:aa00:32::2]:5555, and will carry the transfer on [2a0e:aa00:33::2]:44131
 Connected to [2a0e:aa00:32::2]:5555 (encrypted, AES-256-GCM; chunk 1407 B)
-2026-10-01T23:50:06.377823Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
-2026-10-01T23:50:06.398184Z  INFO sharp256::transport::sender: relay [2a0e:aa00:33::2]:5560: cancelled
+2026-10-02T04:29:03.891465Z  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
 
 ## receiver
-2026-10-01T23:50:05.812628Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
-2026-10-01T23:50:05.884225Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 reached; it sees us at [2a0e:aa00:32::2]:5555
-2026-10-01T23:50:05.884256Z  INFO sharp256::transport::receiver: registered with the relay at [2a0e:aa00:33::2]:5560 (it sees us at [2a0e:aa00:32::2]:5555); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
+2026-10-02T04:29:03.310648Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
+2026-10-02T04:29:03.382103Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 reached; it sees us at [2a0e:aa00:32::2]:5555
+2026-10-02T04:29:03.382129Z  INFO sharp256::transport::receiver: registered with the relay at [2a0e:aa00:33::2]:5560 (it sees us at [2a0e:aa00:32::2]:5555); senders reach us through it with --relay [2a0e:aa00:33::2]:5560
 Relay:       registered with [2a0e:aa00:33::2]:5560; senders can add --relay [2a0e:aa00:33::2]:5560
+2026-10-02T04:29:03.572102Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560 is introducing [2a0e:aa00:31::2]:37445
 
 ## relay
-Receivers: --relay sh-hfycxopranezeyabwxouwftx2sq3mr26odeliqykvznhjpis3m4v2mxh@<this host>:5560
+Receivers: --relay sh-e7b77c6vslezy2dgyqik2hnhiws72pdy25kmms2evy3nvfwjn5osygnq@<this host>:5560
 Senders:   --relay <this host>:5560
 Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
-2026-10-01T23:50:05.610083Z  INFO sharp256::relay::server: relay listening on [::]:5560
-2026-10-01T23:50:05.610093Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
-2026-10-01T23:50:05.610100Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
-2026-10-01T23:50:05.874037Z  INFO sharp256::relay::server: relay: sh-wstfi6vk… registered at [2a0e:aa00:32::2]:5555
+2026-10-02T04:29:03.108718Z  INFO sharp256::relay::server: relay listening on [::]:5560
+2026-10-02T04:29:03.108728Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
+2026-10-02T04:29:03.108735Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
+2026-10-02T04:29:03.371977Z  INFO sharp256::relay::server: relay: sh-cqqewqzd… registered at [2a0e:aa00:32::2]:5555
+2026-10-02T04:29:03.562025Z  INFO sharp256::relay::server: relay: port 44131 carries [2a0e:aa00:31::2]:37445 <-> [2a0e:aa00:32::2]:5555 (sh-cqqewqzd…)

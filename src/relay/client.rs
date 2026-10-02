@@ -183,6 +183,62 @@ pub async fn connect(
     auth: SenderAuth<'_>,
     hints: Hints,
 ) -> Result<Introduction, ConnectError> {
+    connect_with(via, relay, target, incoming, cancel, auth, hints)
+        .await
+        .map(|(i, _)| i)
+}
+
+/// What it takes to ask a relay again for the same pair — a token it gave
+/// us, and our proof if it wanted one: the same port back, and the
+/// receiver introduced again, with what we know of our NAT by then (see
+/// [`Refresh`]).
+#[derive(Clone)]
+pub struct Again {
+    relay: SocketAddr,
+    target: SharpId,
+    token: [u8; TOKEN_LEN],
+    identify: Option<(SharpId, crate::crypto::SecretKey)>,
+}
+
+impl Again {
+    /// The request, and the nonce its answers have to carry back.
+    fn message(&self, hints: Hints) -> ([u8; NONCE_LEN], Vec<u8>) {
+        let nonce: [u8; NONCE_LEN] = rand::rngs::OsRng.gen();
+        let bytes = match &self.identify {
+            Some((id, key)) => signed(
+                key,
+                Message::ConnectAs {
+                    target: self.target,
+                    token: self.token,
+                    hints,
+                    nonce,
+                    id: *id,
+                    proof: [0; PROOF_LEN],
+                },
+            ),
+            None => Message::Connect {
+                target: self.target,
+                token: self.token,
+                hints,
+                nonce,
+            }
+            .encode(),
+        };
+        (nonce, bytes)
+    }
+}
+
+/// [`connect`], and what it takes to ask again ([`Again`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_with(
+    via: impl Into<Via>,
+    relay: SocketAddr,
+    target: SharpId,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    cancel: &CancellationToken,
+    auth: SenderAuth<'_>,
+    hints: Hints,
+) -> Result<(Introduction, Again), ConnectError> {
     let via: Via = via.into();
     let mut token = [0u8; TOKEN_LEN];
     // What every answer to us has to carry back: without it, anybody who
@@ -263,13 +319,21 @@ pub async fn connect(
                 // with [`hold`]: it takes a round trip to the port and
                 // back, and the caller has candidates to be getting on
                 // with meanwhile.
-                return Ok(Introduction {
-                    peer,
-                    relayed,
-                    ticket,
-                    peer_hints: peer_hints.nat,
-                    peer_alt: peer_hints.alt,
-                });
+                return Ok((
+                    Introduction {
+                        peer,
+                        relayed,
+                        ticket,
+                        peer_hints: peer_hints.nat,
+                        peer_alt: peer_hints.alt,
+                    },
+                    Again {
+                        relay,
+                        target,
+                        token,
+                        identify,
+                    },
+                ));
             }
             // A relay that serves only senders on its list: say who we
             // are, if we can prove it to this relay.
@@ -343,8 +407,25 @@ pub async fn hold(
     ticket: [u8; TOKEN_LEN],
     incoming: &mut mpsc::Receiver<Incoming>,
     cancel: &CancellationToken,
+    refresh: Option<Refresh>,
 ) {
     let via: Via = via.into();
+    // What asking again takes, apart from the two things it waits on, so
+    // that each can be waited on while the other is.
+    let (mut again, mut hints, mut nudge) = match refresh {
+        Some(Refresh {
+            again,
+            hints,
+            told,
+            nudge,
+            answers,
+        }) => (Some((again, told, answers)), Some(hints), Some(nudge)),
+        None => (None, None, None),
+    };
+    let mut watch_hints = hints.as_ref().is_some_and(|h| !h.borrow().is_known());
+    // The request out, the nonce its answers carry, until when they are
+    // taken, and the rounds left.
+    let mut pending: Option<([u8; NONCE_LEN], Instant, u32)> = None;
     let ask = Message::Open {
         ticket,
         proof: [0; TOKEN_LEN],
@@ -362,6 +443,41 @@ pub async fn hold(
             }
             m = incoming.recv() => {
                 let Some((pkt, from)) = m else { return };
+                if let (Some((a, told, answers)), Some((nonce, until, rounds))) = (again.as_mut(), pending) {
+                    if from == a.relay && super::echoes(&nonce, &pkt) && Instant::now() < until {
+                        match Message::decode(&pkt) {
+                            // Asked from another address than the token
+                            // was for: a new one, and the request again.
+                            Some(Message::Challenge { token, .. }) if rounds > 1 => {
+                                a.token = token;
+                                let (nonce, msg) = a.message(*told);
+                                let _ = via.send_to(&msg, a.relay).await;
+                                pending = Some((nonce, until, rounds - 1));
+                            }
+                            // Where the receiver is now, by the relay —
+                            // on another port of its, if the receiver's
+                            // address changed: the pair is another then,
+                            // and this one goes on carrying as it did.
+                            Some(Message::Allocated { peer, hints: said, .. }) => {
+                                pending = None;
+                                let peer = (!peer.ip().is_unspecified()).then_some(peer);
+                                let said = match peer {
+                                    Some(seen) => said.screened(seen),
+                                    None => Hints::none(),
+                                };
+                                let _ = answers.send(Introduction {
+                                    peer,
+                                    relayed,
+                                    ticket,
+                                    peer_hints: said.nat,
+                                    peer_alt: said.alt,
+                                });
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                }
                 if from != relayed {
                     continue;
                 }
@@ -370,10 +486,78 @@ pub async fn hold(
                     let _ = via.send_to(&open, relayed).await;
                 }
             }
+            changed = async { hints.as_mut().expect("guarded").changed().await }, if watch_hints => {
+                let (Some((a, told, _)), Some(h)) = (again.as_mut(), hints.as_ref()) else {
+                    watch_hints = false;
+                    continue;
+                };
+                if changed.is_err() {
+                    watch_hints = false;
+                    continue;
+                }
+                let mine = *h.borrow();
+                let now_told = Hints::told_to(&mine, a.relay);
+                if now_told != *told {
+                    tracing::info!(
+                        "relay {}: this host's NAT tests are done; the receiver is told again",
+                        a.relay
+                    );
+                    let (nonce, msg) = a.message(now_told);
+                    let _ = via.send_to(&msg, a.relay).await;
+                    pending = Some((nonce, Instant::now() + AGAIN_WAIT, AGAIN_ROUNDS));
+                    *told = now_told;
+                }
+                if mine.is_known() {
+                    watch_hints = false;
+                }
+            }
+            changed = async { nudge.as_mut().expect("guarded").changed().await }, if nudge.is_some() => {
+                let Some((a, told, _)) = again.as_mut().filter(|_| changed.is_ok()) else {
+                    nudge = None;
+                    continue;
+                };
+                tracing::info!(
+                    "relay {}: asked again for the receiver, from where this host is now",
+                    a.relay
+                );
+                if let Some(h) = &hints {
+                    *told = Hints::told_to(&h.borrow(), a.relay);
+                }
+                let (nonce, msg) = a.message(*told);
+                let _ = via.send_to(&msg, a.relay).await;
+                pending = Some((nonce, Instant::now() + AGAIN_WAIT, AGAIN_ROUNDS));
+            }
             _ = cancel.cancelled() => return,
         }
     }
 }
+
+/// What has [`hold`] ask the relay again for the same pair, and where the
+/// answers go.
+///
+/// * When this end's NAT tests finish after the introduction went out: the
+///   receiver aims its punches by them, and the introduction is not held up
+///   for them (they take a second and more over IPv6).
+/// * When the caller says so (`nudge`): the session fell back from a direct
+///   path to the relay's port, which is what a change of network does to
+///   it — ours, and the receiver punches at where we were; or the
+///   receiver's, and we punch at where it was. Asked again from where we
+///   are now, the relay introduces us to the receiver anew, and says where
+///   the receiver is now (`answers`).
+pub struct Refresh {
+    pub again: Again,
+    pub hints: tokio::sync::watch::Receiver<crate::nat::card::FamilyHints>,
+    /// What the introduction said.
+    pub told: Hints,
+    pub nudge: tokio::sync::watch::Receiver<u64>,
+    pub answers: mpsc::UnboundedSender<Introduction>,
+}
+
+/// How long the answers to asking again are taken after it, and how many
+/// rounds (a challenge from the relay — another address of ours, another
+/// token — and the request again) one nudge may cost.
+const AGAIN_WAIT: Duration = Duration::from_secs(5);
+const AGAIN_ROUNDS: u32 = 3;
 
 /// Registers with a relay and stays registered, introducing senders as they
 /// arrive. Runs until cancelled.
@@ -454,7 +638,7 @@ pub async fn serve(
     // Introductions already acted on — their tickets and ports — so the
     // relay's repeats cost no allowance, and its confirmations can be
     // matched to the port they came from.
-    let mut handled: std::collections::VecDeque<([u8; TOKEN_LEN], u16)> =
+    let mut handled: std::collections::VecDeque<([u8; TOKEN_LEN], u16, Hints, SocketAddr)> =
         std::collections::VecDeque::new();
     // Until the relay answers, ask briskly; once registered, keep the lease
     // and the NAT mapping alive.
@@ -593,7 +777,9 @@ pub async fn serve(
             // for a port we were introduced on, and only with the ticket we
             // were given for it.
             if let Message::Confirm { proof } = msg {
-                if let Some((ticket, _)) = handled.iter().find(|(_, p)| *p == from.port()) {
+                if let Some((ticket, _, _, _)) =
+                    handled.iter().find(|(_, p, _, _)| *p == from.port())
+                {
                     let open = Message::Open {
                         ticket: *ticket,
                         proof,
@@ -680,15 +866,31 @@ pub async fn serve(
                 // again — that goes to the relay's own address and costs
                 // nothing — but it is not a new introduction, and must not
                 // spend the allowance below or punch again.
-                if handled.iter().any(|(t, _)| *t == ticket) {
-                    let via = via.clone();
-                    tokio::spawn(async move { announce(&via, relayed, ticket).await });
-                    continue;
+                // A repeat that says more of the sender's NAT than the first
+                // did is the sender's tests having finished after it asked:
+                // worth punching again, by them, within the same allowance.
+                // So is one from another address: the sender changed
+                // networks, and asked again from where it is now.
+                if let Some(h) = handled.iter_mut().find(|(t, _, _, _)| *t == ticket) {
+                    let (new_hints, moved) = (h.2 != peer_hints, h.3 != peer);
+                    h.2 = peer_hints;
+                    h.3 = peer;
+                    if !new_hints && !moved {
+                        let via = via.clone();
+                        tokio::spawn(async move { announce(&via, relayed, ticket).await });
+                        continue;
+                    }
+                    if moved {
+                        tracing::info!("relay {}: the sender is at {} now", relay, peer);
+                    } else {
+                        tracing::info!("relay {}: the sender says more of its NAT", relay);
+                    }
+                } else {
+                    if handled.len() >= HANDLED_REMEMBERED {
+                        handled.pop_front();
+                    }
+                    handled.push_back((ticket, port, peer_hints, peer));
                 }
-                if handled.len() >= HANDLED_REMEMBERED {
-                    handled.pop_front();
-                }
-                handled.push_back((ticket, port));
                 // Pushing outwards towards the sender means sending a
                 // handful of datagrams at an address the relay chose, so
                 // how often we are willing to do that is our decision, not
@@ -961,6 +1163,116 @@ mod tests {
             n += 1;
         }
         n
+    }
+
+    /// The introduction does not wait for this end's NAT tests: a sender
+    /// holding its side of the pair tells the relay again once they are
+    /// done — a Connect with the same token and what it now knows — and
+    /// says nothing more while that does not change. Nudged (its session
+    /// fell back to the relay's port: a change of network), it asks again,
+    /// and passes on where the relay says the receiver is now; an answer
+    /// that does not carry its nonce back is nobody's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_is_told_again_once_the_nat_tests_are_done() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_at = relay.local_addr().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(0u64);
+        let (answers_tx, mut answers) = mpsc::unbounded_channel();
+        let (hints_tx, hints_rx) =
+            tokio::sync::watch::channel(crate::nat::card::FamilyHints::unknown());
+        let told = Hints::told_to(&crate::nat::card::FamilyHints::unknown(), relay_at);
+        let target = Identity::generate().id();
+        let token = [7u8; TOKEN_LEN];
+        let again = Again {
+            relay: relay_at,
+            target,
+            token,
+            identify: None,
+        };
+        let cancel = CancellationToken::new();
+        // Nothing of the pair's own: the port is nowhere, the relay's
+        // control address only hears the refresh.
+        let pair: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let holding = {
+            let (socket, cancel) = (socket.clone(), cancel.clone());
+            tokio::spawn(async move {
+                hold(
+                    socket,
+                    pair,
+                    [1; TOKEN_LEN],
+                    &mut rx,
+                    &cancel,
+                    Some(Refresh {
+                        again,
+                        hints: hints_rx,
+                        told,
+                        nudge: nudge_rx,
+                        answers: answers_tx,
+                    }),
+                )
+                .await
+            })
+        };
+        assert_eq!(heard(&relay, Duration::from_millis(300)).await, 0);
+        // The tests finish: one Connect, with them and the same token.
+        let mut mine = crate::nat::card::FamilyHints::unknown();
+        mine.v4.mapping = 1;
+        mine.v4.filtering = 3;
+        hints_tx.send(mine).unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), relay.recv_from(&mut buf))
+            .await
+            .expect("the relay is told again")
+            .unwrap();
+        match Message::decode(&buf[..n]) {
+            Some(Message::Connect {
+                target: t,
+                token: k,
+                hints,
+                ..
+            }) => {
+                assert_eq!((t, k), (target, token));
+                assert_eq!(hints, Hints::told_to(&mine, relay_at));
+            }
+            other => panic!("{:?}", other),
+        }
+        // Known now: nothing more, even if the hints change again.
+        mine.v4.delta = 1;
+        let _ = hints_tx.send(mine);
+        assert_eq!(heard(&relay, Duration::from_millis(300)).await, 0);
+
+        // Nudged: asked again, and the answer passed on.
+        nudge_tx.send_modify(|n| *n += 1);
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), relay.recv_from(&mut buf))
+            .await
+            .expect("asked again")
+            .unwrap();
+        let Some(Message::Connect { nonce, .. }) = Message::decode(&buf[..n]) else {
+            panic!("{:?}", Message::decode(&buf[..n]))
+        };
+        let now_at: SocketAddr = "192.0.2.7:4444".parse().unwrap();
+        let answer = |tag| {
+            Message::Allocated {
+                port: pair.port(),
+                peer: now_at,
+                ticket: [1; TOKEN_LEN],
+                hints: Hints::none(),
+                tag,
+            }
+            .encode()
+        };
+        tx.send((answer([9; TAG_LEN]), relay_at)).await.unwrap();
+        tx.send((answer(nonce), relay_at)).await.unwrap();
+        let i = tokio::time::timeout(Duration::from_secs(5), answers.recv())
+            .await
+            .expect("passed on")
+            .unwrap();
+        assert_eq!(i.peer, Some(now_at));
+        assert!(answers.try_recv().is_err(), "the forged one is not");
+        cancel.cancel();
+        holding.await.unwrap();
     }
 
     /// Only what the relay made for this receiver is acted on. An

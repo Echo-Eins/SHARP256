@@ -44,16 +44,24 @@ client.
     scripts/natlab/natlab.py portmap6               # IPv6 pinholes (PCP, UPnP IGD2), with a control
     scripts/natlab/natlab.py lan [--v6]             # multicast DNS on one network (with IPv6 only)
     scripts/natlab/natlab.py samenat                # two hosts behind one NAT, with and without hairpinning
+    scripts/natlab/natlab.py samecgn                # two subscribers behind one carrier-grade NAT, with and without
+    scripts/natlab/natlab.py nat66                  # NAT on IPv6: unique local addresses inside
+    scripts/natlab/natlab.py dslite                 # the receiver's IPv4 in a DS-Lite tunnel to the carrier's NAT
     scripts/natlab/natlab.py dhtplant               # a DHT node that plants an address: what reaches it
     scripts/natlab/natlab.py early                  # a sender that starts before its receiver has registered
     scripts/natlab/natlab.py fallback               # a direct path that dies: back to the relay or TURN server
     scripts/natlab/natlab.py cgn                    # a carrier-grade NAT in front of the home router: two NATs in a row
+    scripts/natlab/natlab.py mobility               # one end or both change networks mid-transfer: back to a direct path
+    scripts/natlab/natlab.py speed [--mb 100]       # how fast directly, through a relay, through TURN
     scripts/natlab/natlab.py v6                     # IPv6 firewalls, and both families together
     scripts/natlab/natlab.py probe port_restricted symmetric_random   # sharp-probe on both hosts
     scripts/natlab/natlab.py probe --all --wait 12  # ... for every pair: does its verdict match what a transfer does,
                                                     #     and is what each host says of its own NAT true?
     scripts/natlab/natlab.py probe --v6 --wait 12   # ... over IPv6, for every pair of firewalls
     scripts/natlab/natlab.py probe --all --addr --wait 45   # ... with addresses swapped instead of cards
+
+NATLAB_LOG sets the binaries' log level (default info); NATLAB_KEEP keeps a
+mobility case's laboratory directory, logs and all.
 """
 
 import argparse
@@ -498,6 +506,11 @@ class Topo:
         self.v6_ip = {}
         for (host, gw, iface, _kind, _cgn, n), fw in zip(sides, kinds):
             lan, wan = f"2a0e:aa00:{n}:1", f"2a0e:aa00:{n}:e"
+            # Behind NAT66 (`nat66`): a unique local prefix inside, which
+            # nobody outside has a route to, and the router's own global
+            # address on everything that leaves.
+            if fw == "nat66":
+                lan = f"fd00:aa00:{n}:1"
             lab.addr6(host, "eth0", f"{lan}::2/64")
             lab.addr6(gw, "lan", f"{lan}::1/64")
             # The default route of the host is the router's link-local
@@ -510,12 +523,21 @@ class Topo:
             lab.addr6(gw, "wan", f"{wan}::1/64")
             lab.addr6("I", iface, f"{wan}::254/64")
             lab.x(gw, "ip", "-6", "route", "add", "default", "via", f"{wan}::254")
-            lab.x("I", "ip", "-6", "route", "add", f"{lan}::/64", "via", f"{wan}::1")
+            if fw != "nat66":
+                lab.x("I", "ip", "-6", "route", "add", f"{lan}::/64", "via", f"{wan}::1")
             lab.x(gw, "sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
             lab.nft(gw, v6_input())
-            rules = fw6_rules(fw)
+            rules = fw6_rules("stateful6" if fw == "nat66" else fw)
             if rules:
                 lab.nft(gw, rules)
+            if fw == "nat66":
+                lab.nft(gw, """table ip6 nat66 {
+  chain post {
+    type nat hook postrouting priority srcnat;
+    oifname "wan" masquerade
+  }
+}
+""")
             self.v6_ip[host] = f"{lan}::2"
         lab.addr6("S", "s0", f"{S61}/64")
         lab.x("S", "ip", "-6", "addr", "add", f"{S62}/64", "dev", "s0", "nodad")
@@ -840,7 +862,7 @@ def relay_may_only_introduce(lab, v6):
 
 
 def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=False, verbose=False,
-             via="relay", human_delay=2.0, v6=None, v4=True, isolate=False, during=None):
+             via="relay", human_delay=2.0, v6=None, v4=True, isolate=False, during=None, prepare=None):
     """One real transfer, sender behind `a_nat`, receiver behind `b_nat`.
 
     `via` is how the two find each other: "relay" (a relay introduces them),
@@ -862,6 +884,8 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
     lab = Lab(keep=keep)
     try:
         topo = Topo(lab, a_nat, b_nat, a_cgn, b_cgn, v6=v6, v4=v4, isolate=isolate)
+        if prepare:
+            prepare(lab, topo)
         d = lab.dir
         srv = server_arg(topo)
         if v6 and os.environ.get("NATLAB_DIAG"):
@@ -903,7 +927,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         recv_args = [
             f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
             "--identity", f"{d}/r.key", "--bind", "[::]:5555" if v6 else "0.0.0.0:5555", *stun_args(topo),
-            "--relay", f"{rid}@{srv}:5560", "--log-level", "info",
+            "--relay", f"{rid}@{srv}:5560", "--log-level", os.environ.get("NATLAB_LOG", "info"),
         ]
         lab.spawn("B", recv_args, "receiver.log")
         m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+)", 15)
@@ -922,7 +946,7 @@ def transfer(a_nat, b_nat, a_cgn=None, b_cgn=None, carry=True, timeout=45, keep=
         send_args = [
             f"{BIN}/sharp-sender", data, address, "--relay", f"{srv}:5560", "--headless",
             *stun_args(topo), *rate_args(),
-            "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info",
+            "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info"),
         ]
         sender = lab.spawn("A", send_args, "sender.log")
         end = time.time() + timeout
@@ -979,7 +1003,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False, p
         "B",
         [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
          "--identity", f"{d}/r.key", "--bind", "[::]:5555" if topo.v6 else "0.0.0.0:5555",
-         *stun_args(topo), *turn_args, "--log-level", "info"],
+         *stun_args(topo), *turn_args, "--log-level", os.environ.get("NATLAB_LOG", "info")],
         "receiver.log",
         stdin=subprocess.PIPE,
     )
@@ -1009,7 +1033,7 @@ def transfer_by_cards(lab, topo, d, human_delay, timeout, verbose, turn=False, p
          # With only an address to go by the sender says nothing of itself
          # unless asked: this is how a person is told what to type.
          *(["--card"] if plain else []), *rate_args(),
-         "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+         "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info")],
         "sender.log",
     )
     if turn:
@@ -1091,7 +1115,7 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
         "B",
         [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
          "--identity", f"{d}/r.key", "--bind", "[::]:5555" if topo.v6 else "0.0.0.0:5555",
-         *stun_args(topo), *dht_args, "--log-level", "info"],
+         *stun_args(topo), *dht_args, "--log-level", os.environ.get("NATLAB_LOG", "info")],
         "receiver.log",
     )
     m = wait_for(lab, "receiver.log", r"Receiver ID: (sh4?-\S+)", 15)
@@ -1102,7 +1126,7 @@ def transfer_by_dht(lab, topo, d, timeout, verbose):
     sender = lab.spawn(
         "A",
         [f"{BIN}/sharp-sender", data, rid, "--headless", *stun_args(topo), *dht_args, *rate_args(),
-         "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+         "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info")],
         "sender.log",
     )
     try:
@@ -1263,7 +1287,7 @@ def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True, by="card"):
             procs[name] = lab.spawn(
                 ns,
                 [f"{BIN}/sharp-probe", *stun_args(topo), "--no-port-mapping", "--stdin",
-                 "--identity", f"{d}/{name}.key", "--wait", str(args.wait), "--log-level", "info", *extra],
+                 "--identity", f"{d}/{name}.key", "--wait", str(args.wait), "--log-level", os.environ.get("NATLAB_LOG", "info"), *extra],
                 f"probe_{name}.log",
                 stdin=subprocess.PIPE,
             )
@@ -1459,6 +1483,69 @@ def cmd_v6(args):
     return 0 if not bad or args.allow_failures else 1
 
 
+# A network behind NAT66 (RFC 6296's stateful cousin, which RFC 5902 counts
+# against): its hosts have unique local addresses, and what leaves has the
+# router's. (scenario, sender's IPv4 NAT, receiver's, IPv4 at all, the two
+# IPv6 networks, what the session has to end on)
+NAT66_CASES = [
+    ("IPv6 only, the receiver behind NAT66", "open", "open", False, ("stateful6", "nat66"), "direct-v6"),
+    ("IPv6 only, both behind NAT66", "open", "open", False, ("nat66", "nat66"), "direct-v6"),
+    ("dual stack, the receiver behind NAT66 and a port-restricted NAT", "port_restricted", "port_restricted",
+     True, ("stateful6", "nat66"), "direct"),
+]
+
+
+def cmd_nat66(args):
+    """NAT on IPv6 (THREAT_MODEL Р16): an address of the host's own that
+    leads nowhere from outside, the router's in what leaves. Nothing
+    measures it — the NAT tests over IPv6 run only where a host has a global
+    address — but a relay sees where a registration comes from, introduces
+    each end to the other at that address, and the two punch at it as they
+    would through an IPv4 NAT."""
+    ok_all = True
+    print(f"{'case':66} result")
+    for name, an, bn, has_v4, v6, want in NAT66_CASES:
+        ok, path, took, detail = transfer(an, bn, timeout=args.timeout, v6=v6, v4=has_v4, verbose=args.verbose)
+        good = ok and path.startswith(want)
+        ok_all &= good
+        print(f"{name:66} {'ok  ' if good else 'FAIL'} {path} in {took:.1f}s", flush=True)
+        if args.verbose or not good:
+            print(detail, flush=True)
+    return 0 if ok_all else 1
+
+
+def dslite(lab, topo):
+    """The receiver's carrier link as DS-Lite (RFC 6333) looks to the two
+    ends: the home router translates nothing, the carrier's AFTR does
+    (`Topo`'s "route" kind behind a carrier NAT), and the IPv4-in-IPv6
+    tunnel between them takes 40 bytes of every packet — a path MTU of
+    1460 for IPv4. The tunnel itself is not built: where the kernel's
+    ip6_tunnel module is loaded, `ip -6 tunnel add ... mode ipip6` would
+    carry it, but a user namespace cannot load a module, and what the two
+    ends see of it is its MTU."""
+    for ns, ifn in (("RB", "wan"), ("CB", "cl")):
+        lab.x(ns, "ip", "link", "set", "dev", ifn, "mtu", "1460")
+
+
+def cmd_dslite(args):
+    """The receiver behind DS-Lite: its IPv4 in a tunnel to the carrier's
+    NAT. Expected: the transfer as through any carrier NAT of that kind,
+    and the sender's chunk the size that fits the tunnel (1387), not the
+    one below it (1187)."""
+    ok_all = True
+    print(f"{'sender behind':18} {'receiver: DS-Lite to':22} result")
+    for a, cgn, want in (("port_restricted", "port_restricted", "direct"), ("symmetric_random", "port_restricted", "direct")):
+        ok, path, took, detail = transfer(a, "route", b_cgn=cgn, timeout=args.timeout, verbose=True, prepare=dslite)
+        m = re.search(r"chunk (\d+) B\)", detail)
+        chunk = int(m.group(1)) if m else None
+        good = ok and path.startswith(want) and chunk == 1387
+        ok_all &= good
+        print(f"{a:18} {cgn:22} {'ok  ' if good else 'FAIL'} {path} in {took:.1f}s, chunk {chunk}", flush=True)
+        if args.verbose or not good:
+            print(detail, flush=True)
+    return 0 if ok_all else 1
+
+
 def cmd_lan(args):
     """Two hosts on one network, no address given: the receiver announces
     itself with multicast DNS, the sender asks for it by ID. And the other
@@ -1500,7 +1587,7 @@ def cmd_lan(args):
                 [f"{BIN}/sharp-receiver", "--headless", "--output", out, "--state-dir", f"{d}/rst-{name}",
                  "--identity", f"{d}/r-{name}.key", "--bind", "[::]:5555" if v6 else "0.0.0.0:5555", "--no-nat"]
                 + (["--announce-lan"] if announce else [])
-                + ["--log-level", "info"],
+                + ["--log-level", os.environ.get("NATLAB_LOG", "info")],
                 f"receiver-{name}.log",
             )
             m = wait_for(lab, f"receiver-{name}.log", r"Receiver ID: (sh4?-\S+)", 15)
@@ -1513,7 +1600,7 @@ def cmd_lan(args):
                 "A",
                 [f"{BIN}/sharp-sender", data, m.group(1), "--headless", "--no-nat"]
                 + (["--lan"] if ask else [])
-                + ["--identity", f"{d}/s-{name}.key", "--state-dir", f"{d}/sst-{name}", "--log-level", "info"],
+                + ["--identity", f"{d}/s-{name}.key", "--state-dir", f"{d}/sst-{name}", "--log-level", os.environ.get("NATLAB_LOG", "info")],
                 f"sender-{name}.log",
             )
             try:
@@ -1774,7 +1861,7 @@ def cmd_portmap(args):
                         "B",
                         [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
                          "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
-                         "--log-level", "info"],
+                         "--log-level", os.environ.get("NATLAB_LOG", "info")],
                         "receiver.log",
                     )
                     m = wait_for(lab, "receiver.log", r"reachable from outside at (\S+) \(port forward\)", 25)
@@ -1791,7 +1878,7 @@ def cmd_portmap(args):
                     sender = lab.spawn(
                         "A",
                         [f"{BIN}/sharp-sender", data, f"{rid}@{forwarded}", "--headless", "--no-nat",
-                         "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+                         "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info")],
                         "sender.log",
                     )
                     try:
@@ -1961,7 +2048,7 @@ def cmd_portmap6(args):
             lab.spawn(
                 "B",
                 [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
-                 "--identity", f"{d}/r.key", "--bind", "[::]:5555", *stun_args(topo), "--log-level", "info"],
+                 "--identity", f"{d}/r.key", "--bind", "[::]:5555", *stun_args(topo), "--log-level", os.environ.get("NATLAB_LOG", "info")],
                 "receiver.log",
             )
             rid = wait_for(lab, "receiver.log", r"Receiver ID: (sh4?-\S+)", 15)
@@ -1990,7 +2077,7 @@ def cmd_portmap6(args):
             sender = lab.spawn(
                 "A",
                 [f"{BIN}/sharp-sender", data, target, "--headless", "--no-nat",
-                 "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+                 "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info")],
                 "sender.log",
             )
             try:
@@ -2142,7 +2229,7 @@ def cmd_samenat(args):
                 "A2",
                 [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
                  "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
-                 "--relay", f"{rid_m.group(1)}@{S1}:5560", *extra, "--log-level", "info"],
+                 "--relay", f"{rid_m.group(1)}@{S1}:5560", *extra, "--log-level", os.environ.get("NATLAB_LOG", "info")],
                 "receiver.log",
             )
             m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+@[\d\[]\S*)", 30)
@@ -2154,7 +2241,7 @@ def cmd_samenat(args):
             sender = lab.spawn(
                 "A",
                 [f"{BIN}/sharp-sender", data, address, "--relay", f"{S1}:5560", "--headless", "--stun", f"{S1}:3478",
-                 "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+                 "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info")],
                 "sender.log",
             )
             try:
@@ -2174,6 +2261,134 @@ def cmd_samenat(args):
             print(f"{name:56} {'ok  ' if ok else 'FAIL'} {path} in {took:.1f}s (the NAT says: {hairpin})", flush=True)
             if not ok:
                 print(lab.log("sender.log")[-1500:])
+                print(log[-1500:])
+        finally:
+            lab.close()
+    return 0 if ok_all else 1
+
+
+# A carrier's NAT that loops back what its subscribers send to its own
+# address: the receiver's port to the receiver's home router, the ports a
+# sender's router hands out to the sender's.
+CGN_HAIRPIN = """table ip hairpin {
+  chain pre {
+    type nat hook prerouting priority dstnat - 1; policy accept;
+    iifname "cl" ip daddr 11.1.0.1 udp dport 5555 dnat to 100.64.0.3
+    iifname "cl" ip daddr 11.1.0.1 udp dport 32768-60999 dnat to 100.64.0.2
+  }
+  chain post {
+    type nat hook postrouting priority srcnat - 1; policy accept;
+    ip saddr 100.64.0.0/24 ip daddr 100.64.0.0/24 ct status dnat snat to 11.1.0.1
+  }
+}
+"""
+
+
+def cmd_samecgn(args):
+    """Two subscribers of one carrier, each behind a home router of their
+    own, the two routers behind the same carrier-grade NAT (RFC 6598): the
+    public address a relay names is the carrier's for both, and the two
+    meet there only if the carrier's NAT loops back (RFC 4787 REQ-9), which
+    a Linux NAT does not do by itself. Otherwise only a relay gets the
+    transfer across — and if it only introduces, nothing does. Each case
+    also checks what the receiver measured of the loop."""
+    ok_all = True
+    print(f"{'case':58} result")
+    for name, carry, loops, want in (
+        ("the carrier's NAT does not loop back, and the relay carries", True, False, "relay"),
+        ("...and the relay only introduces", False, False, "none"),
+        ("the carrier's NAT loops back", False, True, "direct-via-nat"),
+    ):
+        lab = Lab()
+        try:
+            # "I", the internet, is this process's own namespace (see `Topo`).
+            for ns in ("A", "B", "RA", "RB", "C", "S"):
+                lab.mk(ns)
+            lab.link("A", "eth0", "RA", "lan")
+            lab.link("B", "eth0", "RB", "lan")
+            # The carrier's access network: a segment both home routers'
+            # outside ports are on, with the carrier's NAT as its gateway.
+            lab.link("RA", "wan", "C", "pa")
+            lab.link("RB", "wan", "C", "pb")
+            lab.link("C", "cw", "I", "iC")
+            lab.link("S", "s0", "I", "iS")
+            lab.x("C", "ip", "link", "add", "cl", "type", "bridge")
+            for ifn in ("pa", "pb"):
+                lab.x("C", "ip", "link", "set", ifn, "master", "cl")
+                lab.x("C", "ip", "link", "set", ifn, "up")
+            lab.x("C", "sysctl", "-qw", "net.bridge.bridge-nf-call-iptables=0", check=False)
+            lab.addr("C", "cl", "100.64.0.1/24")
+            for host, gw, n, wan in (("A", "RA", 1, "100.64.0.2"), ("B", "RB", 2, "100.64.0.3")):
+                lab.addr(host, "eth0", f"10.{n}.0.2/24", f"10.{n}.0.1")
+                lab.addr(gw, "lan", f"10.{n}.0.1/24")
+                lab.addr(gw, "wan", f"{wan}/24", "100.64.0.1")
+                lab.x(gw, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+                lab.nft(gw, gateway_input())
+                lab.nft(gw, nat_rules("port_restricted", f"10.{n}.0.2").replace("$WANIP", wan))
+            lab.addr("C", "cw", "11.1.0.1/24", "11.1.0.254")
+            lab.addr("I", "iC", "11.1.0.254/24")
+            lab.addr("S", "s0", f"{S1}/24", "11.9.0.254")
+            lab.x("S", "ip", "addr", "add", f"{S2}/24", "dev", "s0")
+            lab.addr("I", "iS", "11.9.0.254/24")
+            lab.x("I", "sysctl", "-qw", "net.ipv4.ip_forward=1")
+            lab.x("C", "sysctl", "-qw", "net.ipv4.ip_forward=1")
+            lab.nft("C", gateway_input("cw"))
+            lab.nft("C", nat_rules("port_restricted", "100.64.0.0/24", lan="cl", wan="cw")
+                    .replace("$WANIP", "11.1.0.1"))
+            if loops:
+                lab.nft("C", CGN_HAIRPIN)
+            d = lab.dir
+            if not carry:
+                lab.nft("S", """table ip filter {
+  chain in {
+    type filter hook input priority filter;
+    udp dport { 5560, 3478, 3479 } accept
+    ip protocol udp drop
+  }
+}
+""")
+            lab.spawn("S", [f"{BIN}/sharp-relay", "--bind", "0.0.0.0:5560", "--stun", S1, "--stun", S2,
+                            "--identity", f"{d}/relay.key", "--log", "info"], "relay.log")
+            rid_m = wait_for(lab, "relay.log", r"Receivers: --relay (sh4?-\S+?)@", 10)
+            data = os.path.join(d, "payload.bin")
+            with open(data, "wb") as f:
+                f.write(os.urandom(1 << 20))
+            want_hash = hashlib.sha256(open(data, "rb").read()).hexdigest()
+            os.makedirs(f"{d}/out", exist_ok=True)
+            lab.spawn("B", [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
+                            "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
+                            "--relay", f"{rid_m.group(1)}@{S1}:5560", "--no-lan-addresses",
+                            "--log-level", os.environ.get("NATLAB_LOG", "info")], "receiver.log")
+            m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+@[\d\[]\S*)", 30)
+            log = lab.log("receiver.log")
+            hairpin = ("no hairpinning" if "no hairpinning" in log
+                       else ("hairpinning works" if "hairpinning works" in log else "unmeasured"))
+            rid = re.search(r"Receiver ID: (sh4?-\S+)", log).group(1)
+            address = m.group(1) if m else f"{rid}@{S1}:9"
+            start = time.time()
+            sender = lab.spawn("A", [f"{BIN}/sharp-sender", data, address, "--relay", f"{S1}:5560", "--headless",
+                                     "--stun", f"{S1}:3478", "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst",
+                                     "--log-level", os.environ.get("NATLAB_LOG", "info")], "sender.log")
+            try:
+                sender.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                sender.kill()
+            took = time.time() - start
+            got = None
+            for f in os.listdir(f"{d}/out"):
+                if not f.endswith(".sharp-part"):
+                    got = hashlib.sha256(open(f"{d}/out/{f}", "rb").read()).hexdigest()
+            slog = lab.log("sender.log")
+            proven = re.findall(r"receiver address (\S+) proven", slog)
+            conn = re.search(r"Connected to (\S+)", slog)
+            last = proven[-1] if proven else (conn.group(1) if conn else None)
+            topo = type("Topo", (), {"wan_ip": {"C": "11.1.0.1"}})()
+            path = classify(last, topo, 5560) if got == want_hash else "none"
+            ok = path == want and hairpin == ("hairpinning works" if loops else "no hairpinning")
+            ok_all &= ok
+            print(f"{name:58} {'ok  ' if ok else 'FAIL'} {path} in {took:.1f}s (the NAT says: {hairpin})", flush=True)
+            if not ok or args.verbose:
+                print(slog[-1500:])
                 print(log[-1500:])
         finally:
             lab.close()
@@ -2237,7 +2452,7 @@ def cmd_dhtplant(args):
             if there:
                 lab.spawn("B", [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out",
                                 "--state-dir", f"{d}/rst", "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555",
-                                "--stun", f"{S1}:3478", *dht_args, "--log-level", "info"], "receiver.log")
+                                "--stun", f"{S1}:3478", *dht_args, "--log-level", os.environ.get("NATLAB_LOG", "info")], "receiver.log")
                 rid = wait_for(lab, "receiver.log", r"Receiver ID: (sh4?-\S+)", 15).group(1)
             else:
                 shown = lab.x("B", f"{BIN}/sharp-receiver", "--identity", f"{d}/r.key", "--id").stdout
@@ -2245,7 +2460,7 @@ def cmd_dhtplant(args):
             start = time.time()
             sender = lab.spawn("A", [f"{BIN}/sharp-sender", data, rid, "--headless", "--stun", f"{S1}:3478",
                                      *dht_args, "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst",
-                                     "--log-level", "info"], "sender.log")
+                                     "--log-level", os.environ.get("NATLAB_LOG", "info")], "sender.log")
             limit = args.timeout if there else args.wait
             try:
                 sender.wait(timeout=limit)
@@ -2308,7 +2523,7 @@ def cmd_early(args):
             sender = lab.spawn(
                 "A",
                 [f"{BIN}/sharp-sender", data, f"{receiver_id}@{S1}:9", "--relay", f"{S1}:5560", "--headless",
-                 "--stun", f"{S1}:3478", "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+                 "--stun", f"{S1}:3478", "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info")],
                 "sender.log",
             )
             time.sleep(args.delay)
@@ -2316,7 +2531,7 @@ def cmd_early(args):
                 "B",
                 [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
                  "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
-                 "--relay", f"{rid}@{S1}:5560", "--log-level", "info"],
+                 "--relay", f"{rid}@{S1}:5560", "--log-level", os.environ.get("NATLAB_LOG", "info")],
                 "receiver.log",
             )
             try:
@@ -2377,7 +2592,7 @@ def cmd_timeout(args):
             "B",
             [f"{BIN}/sharp-receiver", "--headless", "--output", f"{d}/out", "--state-dir", f"{d}/rst",
              "--identity", f"{d}/r.key", "--bind", "0.0.0.0:5555", "--stun", f"{S1}:3478",
-             "--relay", f"{rid_m.group(1)}@{S1}:5560", "--log-level", "info"],
+             "--relay", f"{rid_m.group(1)}@{S1}:5560", "--log-level", os.environ.get("NATLAB_LOG", "info")],
             "receiver.log",
         )
         m = wait_for(lab, "receiver.log", r"Senders use: (sh4?-\S+@[\d\[]\S*)", 30)
@@ -2407,7 +2622,7 @@ def cmd_timeout(args):
         sender = lab.spawn(
             "A",
             [f"{BIN}/sharp-sender", data, address, "--relay", f"{S1}:5560", "--headless", "--stun", f"{S1}:3478",
-             "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "info"],
+             "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", os.environ.get("NATLAB_LOG", "info")],
             "sender.log",
         )
         try:
@@ -2541,6 +2756,179 @@ def cmd_fallback(args):
     return 0 if ok_all else 1
 
 
+class Move:
+    """Moves hosts from their network to a second one in the middle of a
+    transfer — Wi-Fi to LTE: once the sender's session runs directly, the
+    first network's link goes down and the default route goes to the
+    second network's router, whose NAT (`kind`) every packet leaves through
+    from then on. The sockets stay as they are, as a phone's do when it
+    changes networks. Then follows where the session goes: the receiver's
+    log says when it moved to the sender's new address, the sender's when
+    it proved the receiver's."""
+
+    TOLD = re.compile(r"Connected to|answered at|proven|claims address|NAT let|runs from|carried by|"
+                      r"punching towards|no packets from|receiver is back|birthday|registered|"
+                      r"moving the session|No answer|waiting")
+
+    def __init__(self, hosts, kind):
+        self.hosts, self.kind = hosts, kind
+        self.started = time.time()
+        self.ready = False
+        self.at = None        # when the hosts moved
+        self.direct = None    # seconds from the start to the direct path
+        self.offsets = {}     # how much of each log came before the move
+        self.trail = []       # the sender's paths after the move, in order
+        self.followed = None  # seconds from the move to the other end following
+        self.told = []
+
+    def second_network(self, lab, topo, host):
+        """A second router for `host`, its link up and addressed but not
+        routed through: the LTE a phone holds while on Wi-Fi."""
+        n = 3 if host == "A" else 4
+        gw, lan, wan = f"R{host}2", f"10.{n}.0", f"11.{n}.0"
+        lab.mk(gw)
+        lab.link(host, "eth1", gw, "lan")
+        lab.x(host, "ip", "addr", "add", f"{lan}.2/24", "dev", "eth1")
+        lab.x(host, "ip", "link", "set", "eth1", "up")
+        lab.addr(gw, "lan", f"{lan}.1/24")
+        lab.link(gw, "wan", "I", f"i{host}2")
+        lab.addr(gw, "wan", f"{wan}.1/24", f"{wan}.254")
+        lab.addr("I", f"i{host}2", f"{wan}.254/24")
+        lab.x(gw, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+        lab.nft(gw, gateway_input())
+        lab.nft(gw, nat_rules(self.kind, f"{lan}.2").replace("$WANIP", f"{wan}.1"))
+        topo.wan_ip[f"{host}2"] = f"{wan}.1"
+
+    def switch(self, lab, host):
+        n = 3 if host == "A" else 4
+        lab.x(host, "ip", "link", "set", "eth0", "down")
+        lab.x(host, "ip", "route", "replace", "default", "via", f"10.{n}.0.1", "dev", "eth1")
+
+    def __call__(self, lab, topo):
+        if not self.ready:
+            for host in self.hosts:
+                self.second_network(lab, topo, host)
+            self.ready = True
+        slog = lab.log("sender.log")
+        self.told = [l[:220] for name in ("sender.log", "receiver.log")
+                     for l in lab.log(name).splitlines() if self.TOLD.search(l)]
+        paths = [classify(next(g for g in m.groups() if g), topo, 5560) for m in re.finditer(Cut.PATH, slog)]
+        if self.at is None:
+            if paths and paths[-1].startswith("direct"):
+                for host in self.hosts:
+                    self.switch(lab, host)
+                self.at = time.time()
+                self.direct = self.at - self.started
+                self.offsets = {name: len(lab.log(name)) for name in ("sender.log", "receiver.log")}
+            return
+        self.trail = [classify(next(g for g in m.groups() if g), topo, 5560)
+                      for m in re.finditer(Cut.PATH, slog[self.offsets["sender.log"]:])]
+        if self.followed is None:
+            # The other end has followed: the receiver proved the sender's
+            # new address, the sender the receiver's.
+            rlog = lab.log("receiver.log")[self.offsets["receiver.log"]:]
+            slog_after = slog[self.offsets["sender.log"]:]
+            sender_followed = "A" not in self.hosts or re.search(r"sender address \S+ proven", rlog)
+            receiver_followed = "B" not in self.hosts or re.search(
+                r"receiver address \S*" + re.escape(topo.wan_ip["B2"]) + r"\S* proven", slog_after)
+            if sender_followed and receiver_followed:
+                self.followed = time.time() - self.at
+
+
+# Who moves, from which networks, to a second network of which kind.
+# (sender's network, receiver's network, who moves, the second network)
+MOBILITY_CASES = [
+    ("port_restricted", "port_restricted", ("A",), "port_restricted"),
+    ("port_restricted", "port_restricted", ("A",), "symmetric_random"),
+    ("port_restricted", "port_restricted", ("B",), "port_restricted"),
+    ("port_restricted", "port_restricted", ("A", "B"), "port_restricted"),
+]
+
+
+def cmd_mobility(args):
+    """One end, or both, changes networks in the middle of a transfer that
+    runs directly (Wi-Fi to LTE). Expected: the transfer finishes, and on a
+    direct path again — not left on the relay, not broken off. Long enough
+    for that: a receiver learns its new address at its next keepalive to
+    the relay (every 7.5 to 25 s, by what its NAT keeps)."""
+    os.environ.setdefault("NATLAB_SIZE_MB", "80")
+    os.environ.setdefault("NATLAB_MAX_RATE", "16M")
+    ok_all = True
+    print(f"{'sender behind':18} {'receiver behind':18} {'moves':6} {'to':18} result")
+    cases = [c for i, c in enumerate(MOBILITY_CASES) if not args.case or i + 1 in args.case]
+    for a, b, hosts, kind in cases:
+        move = Move(hosts, kind)
+        ok, path, took, detail = transfer(a, b, timeout=args.timeout, via="relay", verbose=True, during=move,
+                                          keep=bool(os.environ.get("NATLAB_KEEP")))
+        trail = [p for i, p in enumerate(move.trail) if i == 0 or p != move.trail[i - 1]]
+        if move.at is None:
+            good, verdict = False, "the session never ran directly: nobody moved"
+        else:
+            # Where the session ended: the last path the sender went to
+            # after the move, or — the sender moving alone, its receiver's
+            # address the same — the path it was on, if the receiver
+            # followed it there directly.
+            if trail:
+                end = trail[-1]
+            elif move.followed is not None:
+                end = "direct (followed)"
+            else:
+                end = "nowhere new"
+            good = ok and is_direct(end)
+            verdict = (f"direct after {move.direct:.1f}s, then moved; "
+                       + (f"followed {move.followed:.1f}s later" if move.followed is not None else "not followed")
+                       + f"; ended {end} (after the move: {' -> '.join(trail) or 'the same path'})")
+        ok_all &= good
+        who = "+".join("sender" if h == "A" else "receiver" for h in hosts)
+        print(f"{a:18} {b:18} {who:6} {kind:18} {'ok  ' if good else 'FAIL'} "
+              f"{'delivered' if ok else 'NOT delivered'} in {took:.1f}s; {verdict}", flush=True)
+        if args.verbose or not good:
+            print("--- what the two said of their path\n" + "\n".join(move.told[-80:]), flush=True)
+            if not good:
+                print(detail, flush=True)
+    return 0 if ok_all else 1
+
+
+# How fast each way carries, with nothing capping it: straight between two
+# public hosts, through a relay's port, through a TURN server — the two
+# networks unable to reach each other for the last two, so the server
+# carries all of it. (name, sender's network, receiver's, how they meet,
+# isolated)
+SPEED_PATHS = [
+    ("direct", "open", "open", "relay", False),
+    ("relay", "port_restricted", "port_restricted", "relay", True),
+    ("TURN", "port_restricted", "port_restricted", "turn", True),
+]
+
+
+def cmd_speed(args):
+    """What a transfer gets through each kind of path on this machine
+    (ROADMAP E6). The laboratory's links have no limit of their own: what
+    is measured is the programs — the relay's forwarding, coturn's, the two
+    ends — on the CPU they share with each other, in whatever build
+    SHARP_BIN_DIR holds (a debug build is several times slower)."""
+    os.environ["NATLAB_SIZE_MB"] = str(args.mb)
+    os.environ.pop("NATLAB_MAX_RATE", None)
+    ok_all = True
+    print(f"{'path':8} {'carried by':16} result")
+    for name, a, b, via, isolate in SPEED_PATHS:
+        ok, path, took, detail = transfer(a, b, timeout=args.timeout, via=via, isolate=isolate, verbose=True)
+        m = re.search(r"Done: \S+ \S+ in ([\d.]+)(m?s) \(([\d.]+) (k|M|G)bit/s avg\)", detail)
+        if m:
+            secs = float(m.group(1)) / (1000.0 if m.group(2) == "ms" else 1.0)
+            rate = float(m.group(3)) * {"k": 1e-3, "M": 1.0, "G": 1e3}[m.group(4)]
+            said = f"{rate:.1f} Mbit/s ({args.mb} MB in {secs:.1f} s)"
+        else:
+            said = f"no summary ({took:.1f} s)"
+        wanted = {"direct": is_direct, "relay": lambda p: p.startswith("relay"), "TURN": lambda p: p.startswith("turn")}
+        good = ok and m is not None and wanted[name](path)
+        ok_all &= good
+        print(f"{name:8} {path:16} {'ok  ' if good else 'FAIL'} {said}", flush=True)
+        if args.verbose or not good:
+            print(detail, flush=True)
+    return 0 if ok_all else 1
+
+
 # A carrier-grade NAT (RFC 6598) in front of a home router: two NATs in a
 # row, and what a peer meets is what the two do together — the outer one's
 # numbering of ports, and whatever filtering is stricter. (sender's router,
@@ -2657,6 +3045,22 @@ def main():
     cg = sub.add_parser("cgn")
     cg.add_argument("--timeout", type=int, default=60)
     cg.add_argument("-v", "--verbose", action="store_true")
+    ds = sub.add_parser("dslite")
+    ds.add_argument("--timeout", type=int, default=45)
+    ds.add_argument("-v", "--verbose", action="store_true")
+    n66 = sub.add_parser("nat66")
+    n66.add_argument("--timeout", type=int, default=45)
+    n66.add_argument("-v", "--verbose", action="store_true")
+    sc = sub.add_parser("samecgn")
+    sc.add_argument("-v", "--verbose", action="store_true")
+    sp = sub.add_parser("speed")
+    sp.add_argument("--mb", type=int, default=100, help="the file's size in megabytes")
+    sp.add_argument("--timeout", type=int, default=300)
+    sp.add_argument("-v", "--verbose", action="store_true")
+    mob = sub.add_parser("mobility")
+    mob.add_argument("--timeout", type=int, default=150)
+    mob.add_argument("--case", type=int, nargs="*", help="only these cases, counted from 1")
+    mob.add_argument("-v", "--verbose", action="store_true")
     fb = sub.add_parser("fallback")
     fb.add_argument("--via", choices=["relay", "turn"], default=None, help="only the cases through this server")
     fb.add_argument("--timeout", type=int, default=150)
@@ -2688,7 +3092,9 @@ def main():
     matrix.add_argument("-v", "--verbose", action="store_true", help="the logs of every pair that was not as expected")
     args = ap.parse_args()
     sh("ip", "link", "set", "lo", "up")
-    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "dhtplant": cmd_dhtplant, "timeout": cmd_timeout, "lan": cmd_lan, "early": cmd_early, "fallback": cmd_fallback, "cgn": cmd_cgn}[args.cmd](args))
+    sys.exit({"oracle": cmd_oracle, "pair": cmd_pair, "probe": cmd_probe, "matrix": cmd_matrix, "v6": cmd_v6, "portmap": cmd_portmap, "portmap6": cmd_portmap6, "samenat": cmd_samenat, "dhtplant": cmd_dhtplant, "timeout": cmd_timeout, "lan": cmd_lan, "early": cmd_early, "fallback": cmd_fallback, "cgn": cmd_cgn, "mobility": cmd_mobility,
+              "speed": cmd_speed, "samecgn": cmd_samecgn, "nat66": cmd_nat66,
+              "dslite": cmd_dslite}[args.cmd](args))
 
 
 if __name__ == "__main__":

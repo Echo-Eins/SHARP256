@@ -13,6 +13,9 @@ description = "SHARP-256: Swift Hash Assurance Rust Protocol - encrypted, reliab
 tokio = { version = "1.37", features = ["full"] }
 # CancellationToken only, which needs none of its features
 tokio-util = "0.7"
+# Received names in one Unicode form (NFC): macOS hands its own over
+# decomposed, and the same name in two forms is two files elsewhere
+unicode-normalization = "0.1.24"
 
 # Integrity: whole-file hashes, MACs and key derivation
 blake3 = { version = "1.5", features = ["mmap", "rayon", "zeroize"] }
@@ -70,10 +73,13 @@ quinn-udp = { version = "0.5.14", default-features = false, features = ["tracing
 rand = { version = "0.8.6", default-features = false, features = ["getrandom", "alloc"] }
 parking_lot = "0.12"
 
-# GUI (optional)
-eframe = { version = "0.24", optional = true }
-egui = { version = "0.24", optional = true }
-rfd = { version = "0.12", optional = true }
+# GUI (optional). It needs Rust 1.85 (egui 0.32, and webbrowser 1.2.2,
+# whose Unix BROWSER handling is fixed: RUSTSEC-2026-0257); everything else
+# 1.82, the rust-version above. File dialogs through the desktop portal
+# (rfd 0.15), with no GTK to link.
+eframe = { version = "0.32", optional = true }
+egui = { version = "0.32", optional = true }
+rfd = { version = "0.15", optional = true }
 
 # NAT traversal (optional)
 if-addrs = { version = "0.6", optional = true }
@@ -105,10 +111,7 @@ libc = "0.2"
 security-framework = "2"
 
 [target.'cfg(windows)'.dependencies]
-# "winuser" is not used by this crate directly: eframe 0.24 imports
-# winapi::um::winuser for the window icon without enabling that feature
-# itself, so the GUI build on Windows depends on it being enabled here.
-winapi = { version = "0.3.9", features = ["fileapi", "ntdef", "winnt", "winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "netioapi", "inaddr", "in6addr", "minwinbase", "winbase", "winuser", "memoryapi", "sysinfoapi", "processthreadsapi", "winerror", "dpapi", "wincrypt"] }
+winapi = { version = "0.3.9", features = ["fileapi", "ntdef", "winnt", "winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "netioapi", "inaddr", "in6addr", "minwinbase", "winbase", "memoryapi", "sysinfoapi", "processthreadsapi", "winerror", "dpapi", "wincrypt"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -30,7 +30,9 @@ Clippy с `-D warnings` в CI проверяет Linux, Windows, macOS и FreeBS
 | `crypto/secret.rs`: `mod os` | `sysconf`, `mlock`, `munlock`, `madvise`; `GetSystemInfo`, `VirtualLock`, `VirtualUnlock`, размеры рабочего множества | Unix, Windows | В std нет |
 | `crypto/keystore.rs`: `mod dpapi` | `CryptProtectData`, `CryptUnprotectData`, `LocalFree` | Windows | В std нет |
 | `file/mod.rs`: `available_space` | `statvfs`, `GetDiskFreeSpaceExW` | Unix, Windows | В std нет |
-| `file/mod.rs`: `system_rename_no_replace` | `renameat2` (системный вызов), `renamex_np`, `MoveFileExW` | Linux, macOS, Windows | Переименование без замены: в std его нет |
+| `file/mod.rs`: `system_rename_no_replace` | `renameat2` (системный вызов), `renamex_np` | Linux, macOS | Переименование без замены: в std его нет |
+| `file/durable.rs`: `move_file` | `MoveFileExW` | Windows | Переименование без замены (в std его нет) и с `MOVEFILE_WRITE_THROUGH` — перенос на диске до возврата (Р23) |
+| `file/durable.rs`: `windows_file_index` | `GetFileInformationByHandle` | Windows | Номер тома и файла — какой файл лежит под именем (в std их чтение нестабильно) |
 | `nat/birthday.rs`: `descriptor_limit` | `getrlimit` | Unix | В std нет |
 | `transport/socket.rs`: `set_int_option`, `v6_only`, `set_dont_fragment`, `disable_udp_connreset` | `setsockopt`, `getsockopt`, `WSAIoctl` | Unix, Windows | В `socket2` нет `SO_RCVBUFFORCE`, `IP_MTU_DISCOVER`, `IPV6_DONTFRAG`, `SIO_UDP_CONNRESET`. Его `only_v6` на Windows читает ответ в неинициализированные четыре байта и проверяет, что их пришло четыре, только в отладочной сборке; здесь ответ ложится в обнулённые, сколько бы из них система ни заполнила |
 | `tests/e2e.rs`: `mod netns` (только тесты) | `ioctl` интерфейсов | Linux | Тест сам поднимает интерфейс в своём сетевом пространстве имён |

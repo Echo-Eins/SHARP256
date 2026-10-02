@@ -77,8 +77,11 @@ characters, with a checksum of its own,
 `BLAKE3-derive_key("sharp256 id checksum v4", public_key)[0..3]`. The form
 of the ID says which version a sender speaks: to `sh4-` version 4 and
 nothing else, to `sh-` version 3. A version 4 receiver prints the `sh4-`
-form and answers both; a sender never falls back from version 4 to version
-3, so nobody on the way can talk it down to the classical handshake by
+form and answers version 4 only, unless told to answer version 3 as well
+(`sharp-receiver --accept-v3`, while IDs in the old form are still in use):
+otherwise whoever has the old form talks to it classically, without ML-KEM
+and with the transfer's name and size in the first message. A sender never
+falls back from version 4 to version 3, so nobody on the way can talk it down to the classical handshake by
 dropping what it sends, and a `4` lost in copying is a checksum error, not
 the other version. A contact card says the same in flag bit 2.
 
@@ -261,14 +264,22 @@ Every handshake attempt uses a new ephemeral key and a new `sender_cid`.
 The sender goes round its candidate addresses 250 ms apart, then retries
 with exponential backoff (250 ms, doubling to 4 s) until
 `handshake_timeout`; a single address counts as a complete round. It keeps
-its last four attempts, but **only the newest may be adopted**: the
-receiver's replay guard keeps the newest initiation it saw, and adopting an
-older answer would leave the two sides with different keys. An answer to a
-superseded attempt proves its address answers — the next attempt goes
-straight back there — and gives a round-trip sample, and no retry is sent
-sooner than 1.5 round trips after the last: on a path slower than the retry
-interval, every answer would otherwise arrive after a newer attempt had
-replaced the one it answered.
+its last four attempts.
+
+In version 4 **the first answer to arrive is adopted**, whichever attempt
+it answers: the receiver keeps each handshake it answered apart, keys and
+connection id, until a HELLO under one of them makes the session, and lets
+the others expire. The fastest of the paths tried wins, even when the next
+address in the rotation was tried before its answer came back.
+
+In version 3 **only the newest may be adopted**: the receiver makes the
+session at the initiation, its replay guard keeps the newest it saw, and
+adopting an older answer would leave the two sides with different keys. An
+answer to a superseded attempt proves its address answers — the next
+attempt goes straight back there — and gives a round-trip sample, and no
+retry is sent sooner than 1.5 round trips after the last: on a path slower
+than the retry interval, every answer would otherwise arrive after a newer
+attempt had replaced the one it answered.
 
 A datagram addressed to an attempt is **authenticated before anything is
 used up**: the Noise state restores itself after a failed read, so junk
@@ -521,10 +532,14 @@ the receiver is reached over IPv6, whose header is 20 bytes longer than
 IPv4's, the sender starts from 1407 instead of 1427. It then probes the
 path: PROBE packets of exactly the DATA size of each candidate chunk — the
 negotiated chunk, 1427 (fits a 1500-byte MTU over IPv4), 1407 (fits 1500
-over IPv6, and 1492 over IPv4 — the PPPoE links DSL runs on) and 1187 (fits
-the 1280-byte IPv6 minimum MTU) — are sent largest first, each up to twice,
-waiting `clamp(3·SRTT, 150 ms, 2 s)`; the first size echoed by PROBE_ACK is
-used.
+over IPv6, and 1492 over IPv4 — the PPPoE links DSL runs on), 1387 (IPv4 in
+a DS-Lite tunnel over a 1500-byte link: 1460), 1187 (fits the 1280-byte
+IPv6 minimum MTU) and 1155 (a DATA datagram of a control
+datagram's 1200 bytes, QUIC's base PMTU: what the handshake took, on an IPv4
+path below 1260 bytes — a tunnel, a VPN) — are sent largest first, each up
+to twice, waiting `clamp(3·SRTT, 150 ms, 2 s)`; the first size echoed by
+PROBE_ACK is used. A path narrower than 1228 bytes takes no handshake at
+all (THREAT_MODEL Р7: the floor QUIC has too).
 If nothing answers, the sender uses 1187 and lets the transfer itself find
 out whether the path works. DATA packets are self-describing, so the chunk
 size may change at any time without the receiver noticing.
@@ -544,11 +559,17 @@ a cost in efficiency, not correctness). The kernel ignores what ICMP says
 about the path, so a forged "fragmentation needed" can neither shrink a
 transfer nor make the kernel refuse its control messages. `EMSGSIZE` then
 only ever means the local interface, and costs one step down — from 1427
-to 1407, else to 1187, then by halves to 512 — per size refused: batches built at a larger size than the current one fail
+to 1407, else to 1387, else to 1187, else to 1155, then by halves to 512 — per size
+refused: batches built at a larger size than the current one fail
 without stepping down again, so one event is one step. A real drop of the
 path MTU shows up the way RFC 8899 (section 4.3) describes: full-size
 packets are lost over two retransmission timeouts in a row while the
-receiver's small ones keep arriving. The sender then steps down the same
+receiver's small ones keep arriving. That they arrive is asked outright:
+at each retransmission timeout with nothing acknowledged the sender sends
+a `Ping`, and the next one counts only if something came back after it. A
+path that went quiet altogether answers no small packet either, and is
+left to the liveness rules; it used to be taken for a black hole while
+what had arrived before the cut still counted. The sender then steps down the same
 way, and 30 s later (60 s, …) sends one PROBE of the previous size; only
 its PROBE_ACK, sent under the session keys, brings the size back. No send
 error of any kind ends a transfer: the batch goes back into `pending`, the
@@ -618,9 +639,15 @@ missing byte arrives.
    reported hole is lost when a packet sent at least `reo_wnd` later has
    been delivered, or when it has been outstanding for longer than
    `max(SRTT, latest RTT) + reo_wnd`, where
-   `reo_wnd = clamp(min_rtt / 4, 1 ms, 250 ms)`. Send order, not stream
-   offset, decides, so a fresh retransmission is never condemned by ACKs
-   that predate it. Lost packets return to `pending`.
+   `reo_wnd = clamp(min(m · min_rtt / 4, SRTT), 1 ms, 250 ms)`. The
+   multiple `m` starts at 1 and grows by one (once a round, up to 8) when a
+   packet taken for lost turns out to have arrived — acknowledged while
+   still queued to be sent again, or its resend acknowledged sooner than
+   half a minimum round trip after it went (RFC 8985 widens on a DSACK;
+   this is the same news, without one) — and shrinks by one after 16
+   rounds without. Send order, not stream offset, decides, so a fresh
+   retransmission is never condemned by ACKs that predate it. Lost packets
+   return to `pending`.
 5. **Self-healing.** Any part of a reported hole that is neither in flight
    nor pending is queued again, so no bookkeeping error can leave a gap
    unsent.
@@ -637,15 +664,24 @@ and treats a loss as a congestion signal only if
   round exceeds `min_rtt` by at least `max(min_rtt / 4, 2 ms)` (jitter
   moves single samples, not the minimum of a whole round, so a jittery
   but uncongested path does not qualify); or
-* at least 20 % of the round's packets (with at least 20 sent) were lost;
-  or
+* at least 35 % of what was sent in the last rounds was lost, pooled (the
+  counters halve per round, a memory of about two; at least 60 packets).
+  It used to be 20 % of a single round: in a round of twenty-odd packets a
+  path losing 5 % at random loses a fifth now and then, which was taken for
+  congestion every second or so; and a path losing a fifth at random was
+  congested in every round, its window at its least. Below the ceiling a
+  path that holds to a rate without a queue — a policer, a shallow buffer
+  overdriven — is found by the rate it lets through (see "Congestion
+  control and pacing"); or
 * the round lost clearly more than the path's background rate explains:
   `lost > E + 3·√(E + 1) + 1` with `E = base_loss_rate · sent` (about three
   standard deviations of a Poisson count, so one or two stray losses in a
   small round never qualify).
 
 `base_loss_rate` is the ratio of bytes lost to bytes sent, pooled over
-recent rounds with at least 16 packets and no congestion signal (both
+recent rounds with at least 16 packets and no standing queue — however
+many they lost: counting only rounds without a congestion signal biased it
+low, and kept it there (both
 counters decay by 0.9 per round, a memory of about ten rounds) and capped
 at 15 %. Pooling counts rather than averaging per-round rates lets large
 rounds weigh more, so the estimate settles within a few rounds. Other
@@ -681,6 +717,22 @@ The pacing rate is `gain · cwnd / SRTT` (gain 2 in slow start, 1.25 in
 congestion avoidance, never below 64 chunks per second, optionally capped),
 implemented as a token bucket whose burst is 1 ms worth of data at the
 current rate (the timer granularity), bounded to 16–1024 chunks.
+
+**A policer** is recognised by the rate it lets through, as BBR's
+long-term bandwidth estimate does: it drops what exceeds its rate without
+queueing it, so the RTT never rises, and on a short path even a window of
+two chunks a round trip is far more than it passes. Sampling starts at a
+loss; an interval lasts at least 4 rounds and 50 ms and ends on a loss. Two
+intervals in a row that each lost at least a fifth of what they delivered,
+at delivery rates within an eighth of each other, are a policer, at the
+mean of the two rates. The pacing rate is capped there for 48 rounds and
+2 s at least (a lower rate found meanwhile replaces it); then the cap rises
+by 1.25 every 4 rounds and 200 ms, and is lifted at 16 times the rate
+found. A policer still in place is found again at the first step, losing
+what a quarter over its rate loses; an interval of 16 rounds and 200 ms
+without that much loss starts the sampling over. Only datagram paths are
+sampled, and a change of path forgets it. A recognised policer also makes
+UDP suspect for the trial on a stream ("Carriers other than UDP").
 
 ### Timers
 
@@ -773,12 +825,22 @@ that every moment leaves either the old state or the new one:
   name and before FIN is sent: a sender that heard FIN has a result that
   is on disk under that name.
 
-A cut after the move and before the state is removed leaves both; the
-sender, which heard no FIN, resumes, and the result is stored a second
-time under the next free name (`name (1)`) — a whole copy too, never a
-damaged one. Windows offers no way to flush a directory; there the
-receiver relies on NTFS's journal, which is not tested by a cut
-(`scripts/crashlab/`, docs/evidence/crash).
+Right after the move (and the flush of its directory) the resume state
+records the final name and the result's hash. A transfer cut between
+then and the sender's confirmation — a crash, a lost connection — is
+finished from the result in place when the sender tries again: the
+receiver hashes the file (or tree) under its final name, and if it is
+what was stored, answers FIN with nothing received again; if it has
+changed since, it is left as it is, the state is dropped, and the next
+attempt receives the transfer anew beside it. Only a cut between the
+move and that record still stores the result a second time under the
+next free name (`name (1)`) — a whole copy, never a damaged one.
+
+Windows offers no documented way to flush a directory. There the move
+to the final name is a `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, and
+the directory is flushed through a handle to it as far as NTFS takes
+that; neither is tested by a cut (`scripts/crashlab/`,
+docs/evidence/crash).
 
 **Session lifetime at the receiver.**
 
@@ -877,14 +939,18 @@ against the manifest.
 * The tree is built inside a fresh staging directory `name.sharp-part`
   next to the output, which only its owner may enter. Nothing outside it is
   ever written, and no symbolic link is created inside it.
-* Names are single components by construction. They are stored as they are
-  on Unix; on Windows, reserved characters (`<>:"/\|?*` and control
-  characters) become `_`, trailing dots and spaces are removed and device
-  names (`CON`, `nul.txt`, `COM1`, ...) get a `_` prefix.
+* Names are single components by construction. They are stored in
+  Unicode's composed form (NFC): macOS hands names over decomposed, and
+  the same name in two forms would be two files elsewhere. Otherwise as
+  they are on Unix; on Windows, reserved characters (`<>:"/\|?*` and
+  control characters) become `_`, trailing dots and spaces are removed and
+  device names (`CON`, `nul.txt`, `COM1`, ...) get a `_` prefix. The
+  manifest itself carries the names as the sender's system gave them.
 * Every entry is created with "create new" semantics. Two names that the
   local file system considers the same (case-insensitive file systems,
-  names mapped for Windows) are therefore reported as a collision — the
-  transfer is abandoned — instead of one overwriting the other. Files are
+  names that differ only in Unicode form, names mapped for Windows) are
+  therefore reported as a collision — the transfer is abandoned — instead
+  of one overwriting the other. Files are
   created when their first byte arrives, directories when something inside
   them is created, the rest when the stream is complete.
 * When complete, the receiver hashes the stream from disk, applies
@@ -903,10 +969,16 @@ against the manifest.
 
 ## 7. File handling
 
-* Names of single files from the wire are reduced to a base name; control
-  characters and characters illegal on Windows are replaced, reserved
-  device names are prefixed. The output path is always inside the
+* Names of single files from the wire are reduced to a base name in NFC;
+  control characters and characters illegal on Windows are replaced,
+  reserved device names are prefixed. The output path is always inside the
   configured directory.
+* A received file is never written through a symbolic link at its name
+  (`O_NOFOLLOW`; on Windows the link itself is opened, and refused), so
+  someone else who can write the output directory cannot have the
+  transfer written into another file. The file moved into place is the
+  one written and hashed: its device and file number are compared before
+  hashing, after, and before the move.
 * Partial files are written as `name.sharp-part` (or `name (1).sharp-part`
   if an unrelated partial file already exists) and renamed on success. An
   existing complete `name` is never overwritten unless configured; the new
@@ -1674,7 +1746,24 @@ a TURN server to go back to — its allocations are kept by both ends for as
 long as they run — or nothing, and the transfer then ends after
 `give_up_timeout` with its state kept for a resume. A session back on a
 server asks the receiver's other addresses again, as above, the meeting's
-first.
+first — a few each round, in turn, so that one found late is asked too.
+
+**A change of network.** A session falls back from a direct path to a
+server's also when one end changed networks (Wi-Fi to LTE): its packets
+leave through another NAT now, whose mapping the other end's NAT was never
+sent to and nobody knows. So a sender whose session falls back from a
+direct path to a server's tests its NAT again (STUN only, at most every
+30 s), and asks every relay again for the receiver with the same token,
+from where it is now (at most every 5 s, and every fifth round of asking
+the receiver's addresses while carried). The relay answers where the
+receiver is registered now — a receiver that moved learns its new mapping
+at its next keepalive to the relay and registers it — and that address
+joins the candidates and is punched at; and it introduces the sender to the
+receiver again, at the address it sees the sender at now and with the
+hints of the NAT test, which the receiver punches at as at a new
+introduction (a repeat with another address or other hints is one). The
+answer to asking again counts only if it carries back the request's nonce.
+`natlab.py mobility`: every case back on a direct path.
 
 ### Carriers other than UDP
 
@@ -1787,8 +1876,10 @@ s the sender measures what had to be sent again and what got through. A
 window in which the path went quiet for a second or more is an outage's, not
 a policer's, and is not counted (in the laboratory, a direct path that was
 cut had been taken for a policed one). When a tenth or more was sent again —
-or a hundredth, with at least 30 s still to go at the rate measured — and at
-least 15 s are left, it moves the session to a stream for a trial: one
+or a hundredth, with at least 30 s still to go at the rate measured, or the
+congestion controller recognised a policer and sends at its rate (see
+"Congestion control and pacing") — and at least 15 s are left, it moves
+the session to a stream for a trial: one
 already up, or one dialled now, which the sender proves as a path on its own
 initiative (a packet on the UDP path does not end that asking, as it ends a
 claim the other end made). 4 s are given to the receiver to follow, 6 s are

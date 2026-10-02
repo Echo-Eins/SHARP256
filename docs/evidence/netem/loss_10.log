@@ -1,0 +1,9 @@
+# loss_10: 10 % random loss
+# to the receiver: delay 10ms rate 50mbit limit 1000 loss 10%
+# back: delay 10ms
+# 24.1 Mbit/s of 50 (48%), 11.6% sent again, 4.2 s
+
+## sender
+2026-10-02T04:24:10.610792Z  INFO sharp256::transport::sender: transfer c69bf4bc4dc8ed08a039d0ef6641abc4 accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 12582912 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 12.00 MiB in 4.18s (24.1 Mbit/s avg), 1.39 MiB retransmitted, 5 loss events, BLAKE3 82afeddf252cf690fc6c373d5659f9903acd88811e2163bf76f1cee2b47b2640

@@ -1199,7 +1199,7 @@ pub fn spawn_discovery(
     socket: Arc<UdpSocket>,
     config: NatConfig,
     keepalive: keepalive::SharedKeepalive,
-    hints: tokio::sync::watch::Sender<card::FamilyHints>,
+    hints: impl Into<Arc<tokio::sync::watch::Sender<card::FamilyHints>>>,
     cancel: CancellationToken,
     on_result: impl Fn(&Reachability) + Send + 'static,
 ) -> Option<NatTask> {
@@ -1210,7 +1210,7 @@ pub fn spawn_discovery(
     let (tx, rx) = mpsc::channel::<stun::Incoming>(64);
     // What is found is passed to whoever follows `hints` as it is found,
     // and every result that is reported says it again.
-    let hints = Arc::new(hints);
+    let hints: Arc<_> = hints.into();
     let on_result = {
         let hints = hints.clone();
         move |r: &Reachability| {
@@ -1357,6 +1357,40 @@ pub fn spawn_discovery(
             on_result,
         })
         .await;
+    });
+    Some(NatTask {
+        stun_responses: tx,
+        task,
+    })
+}
+
+/// The NAT tests again, and nothing else — no port mapping, no upkeep — on
+/// a socket whose host may have changed networks since they were first
+/// run (a session that fell back from a direct path: Wi-Fi gone, LTE
+/// there): what they find replaces what `hints` said, and so what a relay
+/// is told next and how punches are aimed. The STUN answers go to the
+/// task's channel while they run; it is let go of when they are done.
+pub fn spawn_retest(
+    socket: Arc<UdpSocket>,
+    servers: Vec<String>,
+    hints: Arc<tokio::sync::watch::Sender<card::FamilyHints>>,
+    cancel: CancellationToken,
+) -> Option<NatTask> {
+    let local = socket.local_addr().ok()?;
+    if crate::address::canonical(local).ip().is_loopback() {
+        return None;
+    }
+    let (tx, mut rx) = mpsc::channel::<stun::Incoming>(64);
+    let task = tokio::spawn(async move {
+        let mut quiet = |_: &Behaviour| {};
+        let tests = discover_families(&socket, &servers, &mut rx, local, &mut quiet);
+        let (b, b6) = tokio::select! {
+            r = tests => r,
+            _ = cancel.cancelled() => return,
+        };
+        let r = reachability(local, &b, b6.as_ref(), &Forwards::default(), false);
+        tracing::info!("NAT, tested again: {}", r.describe());
+        publish_hints(&hints, r.hints());
     });
     Some(NatTask {
         stun_responses: tx,

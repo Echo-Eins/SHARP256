@@ -1,20 +1,20 @@
 # receiver's network: tls_inspected; IPv6; 1.0 s; refused: TLS opened on the way
 
 ## sender
-
+2026-10-02T04:31:47.545815Z  INFO sharp256::relay::client: relay [2a0e:aa00:33::2]:5560: the receiver is not registered there (yet); asking again
 
 ## receiver
-2026-10-01T23:52:19.261389Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
-2026-10-01T23:52:27.262923Z  INFO sharp256::transport::receiver: relay [2a0e:aa00:33::2]:5560: no registration over UDP; trying TCP
-2026-10-01T23:52:32.264184Z  WARN sharp256::transport::receiver: relay: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used (TLS at [2a0e:aa00:33::2]:443: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used; TCP at [2a0e:aa00:33::2]:5560: no answer); not using it
+2026-10-02T04:31:34.469742Z  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [::]:5555
+2026-10-02T04:31:42.471316Z  INFO sharp256::transport::receiver: relay [2a0e:aa00:33::2]:5560: no registration over UDP; trying TCP
+2026-10-02T04:31:47.472478Z  WARN sharp256::transport::receiver: relay: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used (TLS at [2a0e:aa00:33::2]:443: the TLS session is not the relay's own: something on the way opened it (a TLS-inspecting proxy?), so it is not used; TCP at [2a0e:aa00:33::2]:5560: no answer); not using it
 
 ## relay
-Receivers: --relay sh-gg2cp2qgpikauyxwnz7biy7qj432tz2xbhm4d6epka5vgatfbe3qxfda@<this host>:5560
+Receivers: --relay sh-zyhglbaos3koxbyrwmxv5uholfxhtmg3graq5vgnmxgqobxsofpg4zrh@<this host>:5560
 Senders:   --relay <this host>:5560
 Serving:   ANY receiver that proves its identity. Anyone may use this relay as their rendezvous and have transfers carried on this host's bandwidth; limit it with --allow-receiver or --allowed-receivers
-2026-10-01T23:52:18.854107Z  INFO sharp256::relay::server: relay listening on [::]:5560
-2026-10-01T23:52:18.854116Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
-2026-10-01T23:52:18.854123Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
+2026-10-02T04:31:34.062409Z  INFO sharp256::relay::server: relay listening on [::]:5560
+2026-10-02T04:31:34.062417Z  INFO sharp256::relay::server: relay takes clients over TCP at [::]:5560
+2026-10-02T04:31:34.062424Z  INFO sharp256::relay::server: relay takes clients over TLS at [::]:443
 
 ## proxy
 inspecting TLS on port 8443

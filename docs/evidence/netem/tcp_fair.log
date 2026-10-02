@@ -1,0 +1,9 @@
+# tcp_fair: 20 Mbit/s shared with a TCP bulk flow
+# to the receiver: delay 10ms rate 20mbit limit 300
+# back: delay 10ms
+# 15.1 Mbit/s of 20 (76%), 0.1% sent again, 8.9 s; TCP 8.8 Mbit/s alongside: the sender's share 63%
+
+## sender
+2026-10-02T04:25:41.805249Z  INFO sharp256::transport::sender: transfer 2b38a23b695e32619e6837b8dfffb2fe accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 16777216 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 16.00 MiB in 8.87s (15.1 Mbit/s avg), 22.30 KiB retransmitted, 1 loss events, BLAKE3 885292295ccc2e23a218e749d44d8870e0aea34465455a6eafe749e956eb628a

@@ -3552,4 +3552,127 @@ mod wire_tests {
         }
         assert!(m.clients.is_empty());
     }
+
+    /// What a registration costs the relay (ROADMAP D1): `RELAY_LOAD`
+    /// identities (default 20 000) register from one client with the
+    /// limits on a client lifted, a few hundred at a time, each answering
+    /// its challenge and proving itself; what is said is how many a second
+    /// and how much more memory the process holds for each. A measurement,
+    /// not a check: run it in a release build,
+    /// `cargo test --release --lib -- --ignored registrations_by_the_thousand --nocapture`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement (ROADMAP D1)"]
+    async fn registrations_by_the_thousand() {
+        fn resident() -> u64 {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            statm
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                * 4096
+        }
+        let n: usize = std::env::var("RELAY_LOAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let (relay, relay_id, cancel) = start_relay_with(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            max_registrations: 2 * n,
+            registrations_per_client: 2 * n,
+            rate: 1e9,
+            burst: 1e9,
+            ..Config::default()
+        })
+        .await;
+        let made = Instant::now();
+        let ids: Vec<(SharpId, crate::crypto::SecretKey)> = (0..n)
+            .map(|_| {
+                let owner = Identity::generate();
+                let id = owner.id();
+                let key = crate::relay::auth_key(&owner, &relay_id, &id, &relay_id).unwrap();
+                (id, key)
+            })
+            .collect();
+        let made = made.elapsed();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let nonce_of = |i: usize| {
+            let mut nonce = [0u8; 16];
+            nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            nonce
+        };
+        let before = resident();
+        let start = Instant::now();
+        let mut registered = 0usize;
+        let mut buf = vec![0u8; 2048];
+        for chunk in (0..n).collect::<Vec<_>>().chunks(256) {
+            for &i in chunk {
+                let ask = Message::Register {
+                    id: ids[i].0,
+                    token: [0; TOKEN_LEN],
+                    flags: 0,
+                    stamp: 0,
+                    hints: Hints::none(),
+                    nonce: nonce_of(i),
+                    proof: [0; crate::relay::PROOF_LEN],
+                };
+                sock.send_to(&ask.encode(), relay).await.unwrap();
+            }
+            let mut tokens = Vec::with_capacity(chunk.len());
+            while tokens.len() < chunk.len() {
+                let Ok(Ok((len, _))) =
+                    tokio::time::timeout(Duration::from_secs(10), sock.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                if let Some(Message::Challenge { token, tag }) = Message::decode(&buf[..len]) {
+                    let i = u64::from_le_bytes(tag[..8].try_into().unwrap()) as usize;
+                    tokens.push((i, token));
+                }
+            }
+            for &(i, token) in &tokens {
+                let msg = signed(
+                    &ids[i].1,
+                    Message::Register {
+                        id: ids[i].0,
+                        token,
+                        flags: 0,
+                        stamp: 1,
+                        hints: Hints::none(),
+                        nonce: nonce_of(i),
+                        proof: [0; crate::relay::PROOF_LEN],
+                    },
+                );
+                sock.send_to(&msg, relay).await.unwrap();
+            }
+            let mut got = 0;
+            while got < tokens.len() {
+                let Ok(Ok((len, _))) =
+                    tokio::time::timeout(Duration::from_secs(10), sock.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                if let Some(Message::Registered { .. }) = Message::decode(&buf[..len]) {
+                    got += 1;
+                }
+            }
+            registered += got;
+        }
+        let took = start.elapsed();
+        let after = resident();
+        println!(
+            "{} of {} identities registered in {:.2?} ({:.0} a second; {:.2?} to make them): \
+             {:.0} bytes more held for each",
+            registered,
+            n,
+            took,
+            registered as f64 / took.as_secs_f64(),
+            made,
+            after.saturating_sub(before) as f64 / registered.max(1) as f64
+        );
+        assert_eq!(registered, n);
+        cancel.cancel();
+    }
 }

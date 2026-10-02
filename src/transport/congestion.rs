@@ -7,6 +7,8 @@
 //!   start through HyStart++ (RFC 9406) and braking in congestion avoidance
 //!   while a standing queue persists, so that deep buffers do not turn into
 //!   seconds of latency and burst loss;
+//! * [`Policer`] — a token-bucket policer recognised by the rate it lets
+//!   through, which caps the pacing rate (BBR's long-term bandwidth);
 //! * [`Pacer`] — a token bucket that spreads transmissions at the rate the
 //!   congestion controller allows.
 
@@ -440,6 +442,329 @@ impl Cubic {
     }
 }
 
+/// A token-bucket policer on the path, recognised by what it lets through
+/// (BBR's long-term bandwidth: draft-cardwell-iccrg-bbr-congestion-control,
+/// Linux's `tcp_bbr.c`) — and told apart from random loss by what it does
+/// when the sender holds to that.
+///
+/// A policer drops what exceeds its rate at once, without queueing it, so
+/// the round-trip time never rises and nothing that waits for a queue
+/// brakes. Losses alone do not help a window-based controller either: on a
+/// short path its smallest window, two packets a round trip, is far more
+/// than a policer of a few hundred kilobytes a second lets through, and the
+/// sender sends most of what it sends twice (in the laboratory, 59 to 85
+/// per cent; 262 per cent on loopback).
+///
+/// **Suspected** after two sampling intervals in a row — each of at least
+/// [`LT_MIN_ROUNDS`] round trips and [`LT_MIN_TIME`], from a loss on, and
+/// ending on one — that each lost at least [`LT_LOSS`] of what they
+/// delivered, at delivery rates within an eighth of each other. An
+/// interval that goes on for [`LT_MAX_ROUNDS`] and four times
+/// [`LT_MIN_TIME`] without losing that much starts the sampling over.
+///
+/// **Checked**: so does a path that loses a fifth of everything at random,
+/// at whatever rate the sender happens to keep (BBR is fooled by it too).
+/// The difference is what holding to the rate does: through a policer,
+/// sending no faster than it lets through loses next to nothing; random
+/// loss goes on as before. So the sender is paced at the mean of the two
+/// rates for a check, as long as a sampling interval, and if it still loses
+/// [`CHECK_LOSS`] or more, at four fifths of it for another (the mean may
+/// sit a little above the policer's rate, the bucket's first burst counted
+/// in). Losing little at either, it is a policer, held to at that rate;
+/// losing as much at both, it is not, and nothing is suspected again for
+/// [`QUIET`] (twice as long after each such false alarm in a row).
+///
+/// **Held**: [`LT_HOLD_ROUNDS`] round trips and [`LT_HOLD_TIME`] at least.
+///
+/// **Probed** then, a step at a time: the cap rises by [`PROBE_GAIN`] every
+/// [`LT_MIN_ROUNDS`] round trips and [`PROBE_STEP`], and is lifted once it
+/// is [`PROBE_LIMIT`] times the rate held to. A policer that is still there
+/// is suspected again at the first step and checked; one that is gone is
+/// left behind in a few seconds. (Lifting the cap at once would let the
+/// window-based controller overrun it again at its full rate.)
+#[derive(Debug, Clone, Default)]
+pub struct Policer {
+    /// The interval being sampled: when and in which round it began, and
+    /// what was delivered and lost since.
+    sampling: Option<(Instant, u64, u64, u64)>,
+    /// The delivery rate of the previous lossy interval, bytes a second.
+    last: Option<f64>,
+    state: PolicerState,
+    /// Nothing is suspected before this, and how many false alarms in a row
+    /// have put it off.
+    quiet_until: Option<Instant>,
+    false_alarms: u32,
+    detections: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum PolicerState {
+    #[default]
+    Free,
+    /// Paced at `rate` since `since`, round `round`, to see what is lost
+    /// at it: `delivered` and `lost` since; `lowered` once it is four fifths
+    /// of the rate suspected.
+    Checking {
+        rate: f64,
+        lowered: bool,
+        since: Instant,
+        round: u64,
+        delivered: u64,
+        lost: u64,
+    },
+    /// Paced at `rate` since `since`, round `round`.
+    Held {
+        rate: f64,
+        since: Instant,
+        round: u64,
+    },
+    /// Paced at `cap`, raised last at `since`, round `round`, from `base`.
+    Probing {
+        base: f64,
+        cap: f64,
+        since: Instant,
+        round: u64,
+    },
+}
+
+pub const LT_MIN_ROUNDS: u64 = 4;
+pub const LT_MIN_TIME: Duration = Duration::from_millis(50);
+pub const LT_MAX_ROUNDS: u64 = 16;
+/// Lost over delivered (BBR's 50/256).
+pub const LT_LOSS: f64 = 0.2;
+/// Lost over delivered, held to the rate suspected, that says the path is
+/// no policer.
+pub const CHECK_LOSS: f64 = 0.1;
+/// What a check has to have sent at, as a share of the rate checked, to say
+/// anything.
+pub const CHECK_REACH: f64 = 0.7;
+pub const LT_HOLD_ROUNDS: u64 = 48;
+pub const LT_HOLD_TIME: Duration = Duration::from_secs(2);
+pub const PROBE_GAIN: f64 = 1.25;
+pub const PROBE_STEP: Duration = Duration::from_millis(200);
+pub const PROBE_LIMIT: f64 = 16.0;
+/// How long nothing is suspected after a false alarm, doubled for each one
+/// in a row, up to [`QUIET_MAX`].
+pub const QUIET: Duration = Duration::from_secs(30);
+pub const QUIET_MAX: Duration = Duration::from_secs(600);
+
+impl Policer {
+    /// Takes what an acknowledgement delivered and what it showed lost, in
+    /// bytes, in round `round` of the [`RttEstimator`]. Returns the rate,
+    /// when this is what made a policer known (checked).
+    pub fn on_ack(&mut self, now: Instant, round: u64, delivered: u64, lost: u64) -> Option<f64> {
+        self.advance(now, round);
+        if let PolicerState::Checking { .. } = self.state {
+            return self.check(now, round, delivered, lost);
+        }
+        if matches!(self.state, PolicerState::Held { .. })
+            || self.quiet_until.is_some_and(|q| now < q)
+        {
+            return None;
+        }
+        let Some((start, start_round, mut got, mut gone)) = self.sampling else {
+            // Sampling begins at a loss.
+            if lost > 0 {
+                self.sampling = Some((now, round, 0, lost));
+            }
+            return None;
+        };
+        got += delivered;
+        gone += lost;
+        self.sampling = Some((start, start_round, got, gone));
+        let rounds = round.saturating_sub(start_round);
+        let took = now.saturating_duration_since(start);
+        if rounds > LT_MAX_ROUNDS && took > 4 * LT_MIN_TIME {
+            self.sampling = None;
+            self.last = None;
+            return None;
+        }
+        if lost == 0 || rounds < LT_MIN_ROUNDS || took < LT_MIN_TIME {
+            return None;
+        }
+        if (gone as f64) < LT_LOSS * got as f64 {
+            return None;
+        }
+        let rate = got as f64 / took.as_secs_f64();
+        match self.last {
+            Some(last) if (rate - last).abs() <= last / 8.0 => {
+                self.sampling = None;
+                self.last = None;
+                self.state = PolicerState::Checking {
+                    rate: (rate + last) / 2.0,
+                    lowered: false,
+                    since: now,
+                    round,
+                    delivered: 0,
+                    lost: 0,
+                };
+                None
+            }
+            _ => {
+                self.last = Some(rate);
+                self.sampling = Some((now, round, 0, 0));
+                None
+            }
+        }
+    }
+
+    /// A check under way: what is lost at the rate held to.
+    fn check(&mut self, now: Instant, round: u64, got: u64, gone: u64) -> Option<f64> {
+        let PolicerState::Checking {
+            rate,
+            lowered,
+            since,
+            round: from,
+            delivered,
+            lost,
+        } = self.state
+        else {
+            return None;
+        };
+        let (delivered, lost) = (delivered + got, lost + gone);
+        // Long enough for what went out before the pace changed to be
+        // answered, and to say something.
+        if round < from + LT_MIN_ROUNDS
+            || now.saturating_duration_since(since) < LT_MIN_TIME
+            || delivered == 0
+        {
+            self.state = PolicerState::Checking {
+                rate,
+                lowered,
+                since,
+                round: from,
+                delivered,
+                lost,
+            };
+            return None;
+        }
+        // A sender that did not even come up to the rate — held back by its
+        // window, or by what it has to send — says nothing of what the path
+        // does at it: little lost then is no policer's doing, and a cap it
+        // does not reach is no use. (A window shrunk by random loss was
+        // taken for a policer's verdict so.)
+        let offered =
+            (delivered + lost) as f64 / now.saturating_duration_since(since).as_secs_f64();
+        if offered < CHECK_REACH * rate {
+            self.state = PolicerState::Free;
+            return None;
+        }
+        if (lost as f64) < CHECK_LOSS * delivered as f64 {
+            // Little lost where the path was held to: a policer.
+            self.state = PolicerState::Held {
+                rate,
+                since: now,
+                round,
+            };
+            self.detections += 1;
+            self.false_alarms = 0;
+            return Some(rate);
+        }
+        if !lowered {
+            self.state = PolicerState::Checking {
+                rate: rate * 0.8,
+                lowered: true,
+                since: now,
+                round,
+                delivered: 0,
+                lost: 0,
+            };
+            return None;
+        }
+        // As much lost at four fifths of the rate: random loss, which no
+        // pace avoids. Nothing is suspected for a while.
+        self.false_alarms += 1;
+        let quiet = QUIET
+            .saturating_mul(1 << (self.false_alarms - 1).min(5))
+            .min(QUIET_MAX);
+        self.quiet_until = Some(now + quiet);
+        self.state = PolicerState::Free;
+        None
+    }
+
+    /// Moves from holding to probing, and the probe a step up, when due.
+    fn advance(&mut self, now: Instant, round: u64) {
+        match self.state {
+            PolicerState::Free | PolicerState::Checking { .. } => {}
+            PolicerState::Held {
+                rate,
+                since,
+                round: from,
+            } => {
+                if round >= from + LT_HOLD_ROUNDS
+                    && now.saturating_duration_since(since) >= LT_HOLD_TIME
+                {
+                    self.state = PolicerState::Probing {
+                        base: rate,
+                        cap: rate * PROBE_GAIN,
+                        since: now,
+                        round,
+                    };
+                }
+            }
+            PolicerState::Probing {
+                base,
+                cap,
+                since,
+                round: from,
+            } => {
+                if round >= from + LT_MIN_ROUNDS
+                    && now.saturating_duration_since(since) >= PROBE_STEP
+                {
+                    let cap = cap * PROBE_GAIN;
+                    self.state = if cap > base * PROBE_LIMIT {
+                        PolicerState::Free
+                    } else {
+                        PolicerState::Probing {
+                            base,
+                            cap,
+                            since: now,
+                            round,
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    /// The pacing rate's cap in bytes a second: the rate being checked or
+    /// held to, the probe's after.
+    pub fn rate(&self) -> Option<f64> {
+        match self.state {
+            PolicerState::Free => None,
+            PolicerState::Checking { rate, .. } | PolicerState::Held { rate, .. } => Some(rate),
+            PolicerState::Probing { cap, .. } => Some(cap),
+        }
+    }
+
+    /// Whether a policer's rate is being held to (checked).
+    pub fn holding(&self) -> bool {
+        matches!(self.state, PolicerState::Held { .. })
+    }
+
+    /// Whether a policer has been found and not let go of: held to, or
+    /// probed above — what makes UDP suspect for a trial on a stream.
+    pub fn found(&self) -> bool {
+        matches!(
+            self.state,
+            PolicerState::Held { .. } | PolicerState::Probing { .. }
+        )
+    }
+
+    /// How many times a policer was found (checked).
+    pub fn detections(&self) -> u64 {
+        self.detections
+    }
+
+    /// Forgets everything but the count: the path changed.
+    pub fn reset(&mut self) {
+        *self = Self {
+            detections: self.detections,
+            ..Self::default()
+        };
+    }
+}
+
 /// Token-bucket pacer: smooths transmission to the configured rate while
 /// permitting bounded bursts (important because timers are ~1 ms coarse).
 #[derive(Debug, Clone)]
@@ -714,6 +1039,132 @@ mod tests {
             t += Duration::from_millis(5);
         }
         assert!(c.cwnd() > w);
+    }
+
+    /// A sender far faster than a 250 kB/s policer on a path with a round
+    /// trip of a millisecond, acknowledged every millisecond: what it
+    /// sends beyond the policer's rate is lost.
+    fn policed(p: &mut Policer, t: &mut Instant, round: &mut u64, ms: u64, offered: f64) {
+        let rate = 250_000.0;
+        for _ in 0..ms {
+            *t += Duration::from_millis(1);
+            *round += 1;
+            let cap = p.rate().unwrap_or(f64::MAX).min(offered);
+            let sent = cap / 1000.0;
+            let got = sent.min(rate / 1000.0);
+            p.on_ack(*t, *round, got as u64, (sent - got) as u64);
+        }
+    }
+
+    #[test]
+    fn a_policer_is_found_at_its_rate_and_held_to() {
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        policed(&mut p, &mut t, &mut round, 300, 10e6);
+        let rate = p.rate().expect("found");
+        assert!((rate - 250_000.0).abs() < 250_000.0 / 16.0, "{}", rate);
+        assert!(p.holding());
+        assert_eq!(p.detections(), 1);
+        // Held to: nothing lost meanwhile, and the cap stays.
+        policed(&mut p, &mut t, &mut round, 1500, 10e6);
+        assert_eq!(p.rate(), Some(rate));
+    }
+
+    #[test]
+    fn a_policer_still_there_is_found_again_at_the_first_step() {
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        policed(&mut p, &mut t, &mut round, 300, 10e6);
+        let rate = p.rate().unwrap();
+        // The hold runs out after two seconds...
+        let mut held = 0;
+        while p.holding() {
+            policed(&mut p, &mut t, &mut round, 1, 10e6);
+            held += 1;
+        }
+        assert!((1700..2300).contains(&held), "{} ms", held);
+        // ...the probe goes a quarter higher, loses a fifth of it, and the
+        // policer is found again before the next step.
+        assert!(p.rate().unwrap() > rate * 1.2);
+        let mut probed = 0;
+        while !p.holding() {
+            policed(&mut p, &mut t, &mut round, 1, 10e6);
+            probed += 1;
+        }
+        assert!(probed < 400, "{} ms", probed);
+        assert_eq!(p.detections(), 2);
+    }
+
+    #[test]
+    fn a_policer_gone_is_left_behind_a_step_at_a_time() {
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        policed(&mut p, &mut t, &mut round, 300, 10e6);
+        let rate = p.rate().unwrap();
+        // The policer is lifted: nothing is lost any more.
+        let mut caps = vec![];
+        for _ in 0..80 {
+            t += Duration::from_millis(100);
+            round += 100;
+            p.on_ack(t, round, 1000, 0);
+            caps.push(p.rate());
+        }
+        assert!(caps.windows(2).all(|w| match (w[0], w[1]) {
+            (Some(a), Some(b)) => b >= a && b <= a * 1.25 + 1.0,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        }));
+        assert_eq!(p.rate(), None, "lifted after {:?}", caps);
+        assert!(caps.contains(&Some(rate)));
+    }
+
+    /// A fifth of everything lost at random, whatever is sent, by a sender
+    /// that keeps a steady rate — which looks like a policer to the
+    /// sampling (as it does to BBR's): checked, losing as much held to the
+    /// rate as before, it is let go of, and not suspected again for a while.
+    /// (Before the check, a "lower rate found" replaced the one held to,
+    /// four fifths at a time: 0.8 Mbit/s on a 50 Mbit/s path in the
+    /// laboratory of bad networks.)
+    #[test]
+    fn steady_random_loss_is_checked_and_let_go_of() {
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        let mut capped_ms = 0;
+        for _ in 0..10_000 {
+            t += Duration::from_millis(1);
+            round += 1;
+            let sent = p.rate().unwrap_or(f64::MAX).min(4e6) / 1000.0;
+            p.on_ack(t, round, (sent * 0.8) as u64, (sent * 0.2) as u64);
+            capped_ms += p.rate().is_some() as u32;
+        }
+        assert_eq!(p.detections(), 0);
+        assert!(!p.found());
+        assert!(capped_ms < 1000, "{} ms of ten seconds capped", capped_ms);
+    }
+
+    #[test]
+    fn losses_at_rising_rates_are_no_policer() {
+        // A fifth lost at random while the rate climbs (a slow start on a
+        // lossy link): the intervals' rates never agree.
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        let mut rate = 100_000.0;
+        for _ in 0..2000 {
+            t += Duration::from_millis(1);
+            round += 1;
+            rate *= 1.003;
+            let sent = rate / 1000.0;
+            p.on_ack(t, round, (sent * 0.75) as u64, (sent * 0.25) as u64);
+        }
+        assert_eq!(p.detections(), 0);
+        // And a little loss at a steady rate is none either.
+        let mut p = Policer::default();
+        for _ in 0..2000 {
+            t += Duration::from_millis(1);
+            round += 1;
+            p.on_ack(t, round, 950, 50);
+        }
+        assert_eq!(p.detections(), 0);
     }
 
     #[test]

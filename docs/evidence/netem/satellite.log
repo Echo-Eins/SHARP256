@@ -1,0 +1,9 @@
+# satellite: 600 ms round trip, 20 Mbit/s, 0.5 % loss (geostationary)
+# to the receiver: delay 300ms rate 20mbit limit 2000 loss 0.5%
+# back: delay 300ms
+# 11.3 Mbit/s of 20 (56%), 0.3% sent again, 11.9 s
+
+## sender
+2026-10-02T04:25:15.077959Z  INFO sharp256::transport::sender: transfer 4ae062ecf79cbd702619e4ccf964aec1 accepted by [::ffff:10.61.2.2]:5555: chunk 1427 B, 0 B already at receiver, 16777216 B to send
+Connected to [::ffff:10.61.2.2]:5555 (encrypted, AES-256-GCM; chunk 1427 B)
+Done: 16.00 MiB in 11.93s (11.2 Mbit/s avg), 57.14 KiB retransmitted, 3 loss events, BLAKE3 3c70a6c9a6f7f4d7d5481f1a94fb783e52adc56ca6875d4ec03065f430be04f1

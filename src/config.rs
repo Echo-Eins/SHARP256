@@ -48,6 +48,11 @@ pub struct TransportConfig {
     pub session_ttl: Duration,
     /// Emit a progress event at most this often.
     pub progress_interval: Duration,
+    /// The number a session's own packets begin at: 0, but for the tests,
+    /// which begin just short of the end of a key epoch (2^22 packets) to
+    /// see the keys move on within a transfer of a few megabytes.
+    #[doc(hidden)]
+    pub first_packet_number: u64,
 }
 
 impl Default for TransportConfig {
@@ -70,6 +75,7 @@ impl Default for TransportConfig {
             writer_capacity_bytes: 64 << 20,
             session_ttl: Duration::from_secs(600),
             progress_interval: Duration::from_millis(250),
+            first_packet_number: 0,
         }
     }
 }
@@ -274,7 +280,7 @@ impl SenderConfig {
             alternate_peers: Vec::new(),
             peer_names: Vec::new(),
             receiver_id,
-            receiver_version: crate::crypto::handshake::Version::V3,
+            receiver_version: crate::crypto::handshake::Version::V4,
             file_path,
             transport: TransportConfig::default(),
             state_dir: None,
@@ -391,10 +397,16 @@ pub struct ReceiverConfig {
     /// an address. Off unless asked for: the announcement tells everybody on
     /// the network that this host receives SHARP-256 transfers.
     pub announce_lan: bool,
-    /// Answer version 4 handshakes (the hybrid one, `sh4-` IDs) as well as
-    /// version 3 ones. On; off only to stand in for a receiver that knows
-    /// no version 4 (the tests do).
+    /// Answer version 4 handshakes (the hybrid one, `sh4-` IDs). On; off
+    /// only to stand in for a receiver that knows no version 4 (the tests
+    /// do).
     pub speak_v4: bool,
+    /// Answer version 3 handshakes too: senders given this receiver's ID in
+    /// the old form (`sh-…`), from before version 4. Off: whoever has the
+    /// old form would talk to the receiver without ML-KEM, and with the
+    /// transfer's name and size in the first message (THREAT_MODEL.md,
+    /// Р25). On only while old IDs are still in use (`--accept-v3`).
+    pub speak_v3: bool,
     /// TURN servers this receiver is reached through when nothing direct
     /// works: `USER:PASSWORD@HOST[:PORT]` (see `nat::turn`). The address
     /// each gives is published with the others, and a sender is let in once
@@ -446,6 +458,7 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("stun_servers", &self.stun_servers)
             .field("announce_lan", &self.announce_lan)
             .field("speak_v4", &self.speak_v4)
+            .field("speak_v3", &self.speak_v3)
             .field("turn_servers", &self.turn_servers.len())
             .field("dht", &self.dht)
             .field("accept", &self.accept)
@@ -518,6 +531,7 @@ impl ReceiverConfig {
             stun_servers: Vec::new(),
             announce_lan: false,
             speak_v4: true,
+            speak_v3: false,
             turn_servers: Vec::new(),
             dht: false,
             dht_bootstrap: Vec::new(),

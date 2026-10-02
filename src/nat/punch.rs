@@ -752,6 +752,69 @@ mod tests {
         );
     }
 
+    /// Whatever either end says of its NAT — every value a hint can take,
+    /// true or not (THREAT_MODEL Н6: false hints) — what a punch sends is
+    /// bounded: no plan sends more than the birthday method's probes and a
+    /// prediction window, or opens more sockets than the birthday method's,
+    /// every port aimed at is a real one, and all of it goes to the one
+    /// address the peer was seen at (`base`), never elsewhere.
+    #[test]
+    fn whatever_a_peer_says_of_its_nat_costs_no_more_than_the_budget() {
+        let allocations = [
+            Allocation::Unknown,
+            Allocation::Preserved,
+            Allocation::Sequential,
+            Allocation::Random,
+        ];
+        let deltas = [i16::MIN, -1000, -1, 0, 1, 2, 7, 1000, i16::MAX];
+        let bases: [SocketAddr; 4] = [
+            "11.9.0.9:1".parse().unwrap(),
+            "11.9.0.9:65535".parse().unwrap(),
+            "11.9.0.9:40000".parse().unwrap(),
+            "[2a0e:aa00:1::2]:5555".parse().unwrap(),
+        ];
+        let mut said = vec![NatHints::unknown()];
+        for mapping in 0..=4u8 {
+            for filtering in 0..=4u8 {
+                for &allocation in &allocations {
+                    for &delta in &deltas {
+                        said.push(NatHints {
+                            mapping,
+                            filtering,
+                            allocation,
+                            delta,
+                            ..NatHints::unknown()
+                        });
+                    }
+                }
+            }
+        }
+        let mut plans = 0;
+        for mine in said.iter().step_by(7) {
+            for theirs in &said {
+                for &base in &bases {
+                    let total: usize = schedule(mine, theirs, base)
+                        .iter()
+                        .inspect(|p| {
+                            assert!(p.sockets <= BIRTHDAY_SOCKETS, "{:?}", p);
+                            assert!(p.ports.iter().all(|&port| port != 0), "{:?}", p);
+                            plans += 1;
+                        })
+                        .map(|p| p.ports.len() + p.spray)
+                        .sum();
+                    assert!(
+                        total <= BIRTHDAY_PROBES + 3 * PREDICT_WINDOW,
+                        "{} datagrams for {:?} / {:?}",
+                        total,
+                        mine,
+                        theirs
+                    );
+                }
+            }
+        }
+        assert!(plans > 10_000, "{} plans", plans);
+    }
+
     #[test]
     fn a_counting_peer_is_aimed_at_its_next_ports() {
         let p = plan(

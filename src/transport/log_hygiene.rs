@@ -174,8 +174,21 @@ async fn receive_one(cfg: ReceiverConfig, mut send: impl FnMut(SocketAddr) -> Se
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_key_and_no_content_reaches_the_log() {
+/// On a runtime of its own, whose threads (and this one) note the keys
+/// they make (see `crypto::secret::keylog`).
+#[test]
+fn no_key_and_no_content_reaches_the_log() {
+    keylog::this_thread();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .on_thread_start(keylog::this_thread)
+        .build()
+        .unwrap()
+        .block_on(transfers_leave_no_key_in_the_log());
+}
+
+async fn transfers_leave_no_key_in_the_log() {
     capture_everything();
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = (

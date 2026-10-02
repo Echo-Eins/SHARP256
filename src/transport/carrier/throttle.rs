@@ -11,7 +11,9 @@
 //! **When UDP is suspect**, over a window of [`WINDOW`]: a tenth or more of
 //! what was sent had to be sent again; or a hundredth, with at least
 //! [`LONG_LEFT`] still to go at the rate measured — a trial costs a few
-//! seconds, worth spending on a long transfer even on a hunch. Not before
+//! seconds, worth spending on a long transfer even on a hunch; or the
+//! congestion controller found a policer (`congestion::Policer`), and
+//! sends at its rate, losing little. Not before
 //! the transfer has a window's worth behind it, and not when too little is
 //! left for the trial to pay.
 //!
@@ -75,6 +77,8 @@ pub struct Sample {
     pub on_stream: bool,
     /// How long since anything came from the other end.
     pub quiet: Duration,
+    /// Whether the session is paced at a policer's rate.
+    pub policed: bool,
 }
 
 /// What has to be done, or said.
@@ -289,8 +293,8 @@ impl Throttle {
         } else {
             Duration::MAX
         };
-        let suspect =
-            left >= SHORT_LEFT && (loss >= HEAVY_LOSS || (loss >= SOME_LOSS && left >= LONG_LEFT));
+        let suspect = left >= SHORT_LEFT
+            && (s.policed || loss >= HEAVY_LOSS || (loss >= SOME_LOSS && left >= LONG_LEFT));
         if !suspect {
             return Verdict::Nothing;
         }
@@ -327,6 +331,7 @@ mod tests {
                     left: size,
                     on_stream: false,
                     quiet: Duration::ZERO,
+                    policed: false,
                 },
             }
         }
@@ -432,6 +437,19 @@ mod tests {
         let mut r = Run::new(3_600_000_000);
         assert!(matches!(
             r.carry(6.0, 1.0 * MB, 0.02)[..],
+            [Verdict::Try { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_policer_found_is_suspect_though_little_is_lost() {
+        // Paced at a policer's rate, half a per cent lost, 25 MB left at
+        // 250 kB/s (well over the quarter of a minute a trial needs).
+        let mut r = Run::new(25_000_000);
+        assert!(r.carry(6.0, 0.25 * MB, 0.005).is_empty());
+        r.s.policed = true;
+        assert!(matches!(
+            r.carry(6.0, 0.25 * MB, 0.005)[..],
             [Verdict::Try { .. }]
         ));
     }

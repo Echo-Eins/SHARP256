@@ -18,9 +18,11 @@
 #
 # REPRO_VARIANT picks what is built:
 #   headless (default)  the four binaries without the GUI, for servers
-#   gui                 sharp-sender and sharp-receiver with it, against
-#                       GTK 3 from Debian's archive as it was on the day the
-#                       image was made (snapshot.debian.org)
+#   gui                 sharp-sender and sharp-receiver with it (which
+#                       links no system library but the C library's: the
+#                       windowing and graphics libraries are loaded at run
+#                       time, the file dialogs go through the desktop
+#                       portal)
 #
 # Only the commit is built — `git archive`, not the working tree — and only
 # Docker is needed on the host. A release publishes the same SHA256SUMS
@@ -30,8 +32,6 @@ set -eu
 
 # rust:1.95.0-slim-bookworm (the index: linux/amd64 among others).
 IMAGE="rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082"
-# The Debian snapshot that image was made from (its debian.sources says so).
-SNAPSHOT="20260518T000000Z"
 
 cd "$(dirname "$0")/.."
 VARIANT="${REPRO_VARIANT:-headless}"
@@ -55,18 +55,8 @@ build_in() {
   # shellcheck disable=SC2086 # $1 is a list of options
   docker run --rm -i $1 \
     -e BUILD_UID="$2" -e SRC="$3" -e CARGO_HOME="$4" -e JOBS="$5" -e MASK="$6" \
-    -e FEATURES="$FEATURES" -e BINS="$BINS" -e VARIANT="$VARIANT" -e SNAPSHOT="$SNAPSHOT" \
+    -e FEATURES="$FEATURES" -e BINS="$BINS" \
     "$IMAGE" sh -euc '
-      if [ "$VARIANT" = gui ]; then
-        rm -f /etc/apt/sources.list.d/debian.sources
-        {
-          echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$SNAPSHOT bookworm main"
-          echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$SNAPSHOT bookworm-updates main"
-          echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/$SNAPSHOT bookworm-security main"
-        } > /etc/apt/sources.list
-        apt-get -q update >&2
-        apt-get -q install -y --no-install-recommends libgtk-3-dev >&2
-      fi
       mkdir -p "$SRC" "$CARGO_HOME"
       chown "$BUILD_UID:$BUILD_UID" "$SRC" "$CARGO_HOME"
       exec setpriv --reuid="$BUILD_UID" --regid="$BUILD_UID" --clear-groups sh -euc "

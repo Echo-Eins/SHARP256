@@ -30,8 +30,19 @@ pub const DEFAULT_CHUNK: u16 = (UDP_PAYLOAD_IPV4_1500 - DATA_OVERHEAD) as u16;
 /// The same over IPv6, whose header is 20 bytes longer. It is also what a
 /// 1492-byte PPPoE link carries over IPv4, the most common MTU below 1500.
 pub const DEFAULT_CHUNK_V6: u16 = (UDP_PAYLOAD_IPV6_1500 - DATA_OVERHEAD) as u16;
+/// UDP payload of IPv4 inside an IPv4-in-IPv6 tunnel over a 1500-byte link
+/// (1500 - 40 - 20 - 8): DS-Lite (RFC 6333), which many cable and fibre
+/// subscribers' IPv4 goes through.
+pub const UDP_PAYLOAD_DSLITE: usize = 1432;
+/// The chunk that fits it.
+pub const DSLITE_CHUNK: u16 = (UDP_PAYLOAD_DSLITE - DATA_OVERHEAD) as u16;
 /// Chunk that is safe without path-MTU probing.
 pub const SAFE_CHUNK: u16 = (UDP_PAYLOAD_SAFE - DATA_OVERHEAD) as u16;
+/// Chunk whose DATA datagram is no larger than a control datagram (1200
+/// bytes of UDP payload, QUIC's base PMTU): what a path the handshake got
+/// through is expected to carry when not even [`SAFE_CHUNK`] fits — an
+/// IPv4 path below 1260 bytes (a tunnel, a VPN).
+pub const BASE_CHUNK: u16 = (MAX_CONTROL_DATAGRAM - DATA_OVERHEAD) as u16;
 /// Smallest chunk we ever negotiate.
 pub const MIN_CHUNK: u16 = 512;
 /// Largest chunk we ever negotiate (jumbo frames).

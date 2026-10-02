@@ -305,7 +305,7 @@ impl eframe::App for ReceiverApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("Receiver ID: {}", sh.receiver_id));
                     if ui.small_button("Copy").clicked() {
-                        ui.output_mut(|o| o.copied_text = sh.receiver_id.clone());
+                        ui.ctx().copy_text(sh.receiver_id.clone());
                     }
                 });
                 ui.label(format!("Listening on {}", sh.listen));
