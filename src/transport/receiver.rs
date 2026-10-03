@@ -906,6 +906,13 @@ impl Receiver {
         self.shared.socket.local_addr()
     }
 
+    /// Whether senders can reach this receiver over TCP too, at the port
+    /// number of its UDP port: asked for (`ReceiverConfig::tcp`), and that
+    /// port was free for TCP.
+    pub fn takes_tcp(&self) -> bool {
+        self.listener.is_some()
+    }
+
     /// Where a peer's contact card is handed to this receiver while it
     /// runs: it starts punching towards every address on the card at once,
     /// which is what lets a sender behind a NAT that filters unasked

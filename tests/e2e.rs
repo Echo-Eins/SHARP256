@@ -91,17 +91,26 @@ async fn start_receiver(
     mut cfg_fn: impl FnMut(&mut ReceiverConfig),
 ) -> TestReceiver {
     init_test_logging();
-    let mut cfg = ReceiverConfig::new("127.0.0.1:0".parse().unwrap(), out.to_path_buf());
-    cfg.state_dir = Some(state.to_path_buf());
-    cfg.transport = fast_transport();
-    cfg.identity = Some(Identity::generate());
-    let (tx, rx) = mpsc::unbounded_channel();
-    cfg.events = Some(Arc::new(move |ev| {
-        let _ = tx.send(ev);
-    }));
-    cfg_fn(&mut cfg);
-    let identity = cfg.identity.clone().expect("identity");
-    let receiver = Receiver::new(cfg).await.expect("receiver");
+    let fresh = Identity::generate();
+    // A receiver that is to take TCP too is made again on another port
+    // when its UDP port's number is a TCP socket's already: it took UDP
+    // only, and a test of TCP failed for it (CI, `AddrInUse`).
+    let (receiver, rx, identity) = loop {
+        let mut cfg = ReceiverConfig::new("127.0.0.1:0".parse().unwrap(), out.to_path_buf());
+        cfg.state_dir = Some(state.to_path_buf());
+        cfg.transport = fast_transport();
+        cfg.identity = Some(fresh.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        cfg.events = Some(Arc::new(move |ev| {
+            let _ = tx.send(ev);
+        }));
+        cfg_fn(&mut cfg);
+        let (tcp, identity) = (cfg.tcp, cfg.identity.clone().expect("identity"));
+        let receiver = Receiver::new(cfg).await.expect("receiver");
+        if !tcp || receiver.takes_tcp() {
+            break (receiver, rx, identity);
+        }
+    };
     let addr = receiver.local_addr().unwrap();
     let cancel = receiver.cancel_token();
     let task = tokio::spawn(async move {
