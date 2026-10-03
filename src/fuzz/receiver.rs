@@ -59,8 +59,14 @@ impl World {
             .enable_all()
             .build()
             .expect("a runtime");
-        let root =
-            std::env::temp_dir().join(format!("sharp256-fuzz-receiver-{}", std::process::id()));
+        // One directory for each: a test makes a world of its own besides
+        // the fuzzing targets'.
+        static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "sharp256-fuzz-receiver-{}-{}",
+            std::process::id(),
+            MADE.fetch_add(1, Ordering::Relaxed)
+        ));
         let out = root.join("out");
         let state = root.join("state");
         let _ = std::fs::remove_dir_all(&root);
@@ -666,4 +672,225 @@ pub fn session(data: &[u8]) {
         }
         run.finish();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::constants::HELLO_ACCEPTED;
+
+    /// A sender's next attempt, come while the session of its last is
+    /// ending — the cancelled one's ABORT ahead of it in that session's
+    /// queue — is answered. A new handshake of a transfer the dispatcher
+    /// serves goes to the transfer's session, which moves to it; one that
+    /// had stopped reading took it along when it ended, and the attempt,
+    /// its handshake answered and its HELLO going nowhere, waited out its
+    /// timeout (on Windows in CI, where putting the last transfer away
+    /// outlasted the half second the test gave it).
+    #[test]
+    fn an_attempt_come_as_the_last_session_ends_is_answered() {
+        attempt_as_the_last_ends(Version::V4, When::Ending);
+    }
+
+    /// The same, the attempt of version 3: answered at once, not only once
+    /// the sender has sent its initiation again.
+    #[test]
+    fn an_attempt_of_version_3_come_as_the_last_session_ends_is_answered() {
+        attempt_as_the_last_ends(Version::V3, When::Ending);
+    }
+
+    /// And come once the session has closed its queue, before the
+    /// dispatcher has heard that it has ended: here it waits to say so
+    /// behind another session's end.
+    #[test]
+    fn an_attempt_come_as_the_last_session_has_ended_is_answered() {
+        attempt_as_the_last_ends(Version::V4, When::Ended);
+        attempt_as_the_last_ends(Version::V3, When::Ended);
+    }
+
+    /// Whether an attempt has had the answer it waits for, by what came
+    /// to its address.
+    type Answered = Box<dyn FnMut(&[Vec<u8>]) -> bool>;
+
+    /// When the second attempt reaches the dispatcher.
+    #[derive(PartialEq)]
+    enum When {
+        /// Before the first attempt's session runs again: in its queue
+        /// behind the ABORT.
+        Ending,
+        /// Once that session has closed its queue, while it waits to tell
+        /// the dispatcher so.
+        Ended,
+    }
+
+    fn attempt_as_the_last_ends(version: Version, when: When) {
+        let w = World::new();
+        w.accept.store(true, Ordering::Relaxed);
+        let mut run = Run::new(&w);
+        let mut g = Gen::new(&[]);
+        if when == When::Ended {
+            // Room for one end, taken by another sender's transfer.
+            run.h = {
+                let _in_runtime = w.rt.enter();
+                DispatcherHarness::with_ends(&w.receiver, 1)
+            };
+            // Its limits on handshakes count from its making.
+            run.now = Instant::now();
+            let other = wire::Hello {
+                transfer_id: [8; 16],
+                timestamp: 1,
+                file_size: 100_000,
+                file_mtime: 0,
+                max_chunk: 1400,
+                capabilities: 0,
+                tree: None,
+                file_name: "other.bin".into(),
+            };
+            let mut other = run.handshake_v4(&mut g, 1, 0, other).expect("a session");
+            run.packet(
+                &mut other,
+                wire::type_byte(MsgType::Abort, 0),
+                &abort_body(),
+                0,
+                None,
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while run.h.ending() == 0 {
+                assert!(Instant::now() < deadline, "the other session never ends");
+                run.settle();
+                w.rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+            }
+            run.now += Duration::from_secs(2);
+        }
+        let hello = wire::Hello {
+            transfer_id: [7; 16],
+            timestamp: 1,
+            file_size: 100_000,
+            file_mtime: 0,
+            max_chunk: 1400,
+            capabilities: 0,
+            tree: None,
+            file_name: "attempt.bin".into(),
+        };
+        let mut last = run
+            .handshake_v4(&mut g, 0, 0, hello.clone())
+            .expect("the first attempt's session");
+
+        // What follows reaches the dispatcher before the session runs
+        // again: the first attempt's ABORT, then the second's handshake
+        // (and HELLO). (Under load no more: initiations a second apart.)
+        let _in_runtime = w.rt.enter();
+        let to = w.addrs[0];
+        let mut pkt = Vec::new();
+        begin_packet(
+            &mut pkt,
+            last.rcid,
+            wire::type_byte(MsgType::Abort, 0),
+            last.next_pn,
+        );
+        last.next_pn += 1;
+        pkt.extend_from_slice(&abort_body());
+        last.keys.send.seal(&mut pkt).expect("sealed");
+        run.h.datagram(&pkt, to, run.now);
+        if when == When::Ended {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // (The other session's handle is gone: it had finished when
+            // this one was started.)
+            while run.h.ending() == 0 {
+                assert!(Instant::now() < deadline, "the first session never ends");
+                run.settle();
+                w.rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+            }
+        }
+        run.now += Duration::from_secs(2);
+
+        let mut answered: Answered = if version == Version::V3 {
+            let mut att = Initiator::new(&w.senders[0], &w.id, &no_psk()).expect("an initiator");
+            let payload = wire::encode_initiation(&wire::Initiation {
+                timestamp: hs::initiation_timestamp(),
+                suites: 1,
+                hardware_aes: false,
+                hello_flags: 0,
+                hello,
+            });
+            let pkt = att.initiation(&payload, None).expect("an initiation");
+            run.h.datagram(&pkt, to, run.now);
+            Box::new(move |inbox| inbox.iter().any(|d| att.read_response(d).is_ok()))
+        } else {
+            let mut att = Initiator::new_v4(&w.senders[0], &w.id, &no_psk()).expect("an initiator");
+            let payload = wire::encode_initiation_v4(&wire::InitiationV4 {
+                timestamp: hs::initiation_timestamp(),
+                suites: 1,
+                hardware_aes: false,
+            });
+            for frag in att.initiation_datagrams(&payload, None).expect("fragments") {
+                run.h.datagram(&frag, to, run.now);
+            }
+            run.inbox[0].clear();
+            run.fence();
+            let (rcid, payload, split) = run.inbox[0]
+                .iter()
+                .find_map(|d| att.read_response(d).ok())
+                .expect("the second attempt's handshake answered");
+            let suite = Suite::from_u8(
+                wire::decode_response_v4(&payload)
+                    .expect("a response")
+                    .suite,
+            )
+            .expect("a suite");
+            let keys = SessionKeys::derive(&split, true, suite);
+            let mut body = Vec::new();
+            wire::encode_body(&wire::Message::Hello(hello), &mut body, usize::MAX);
+            let mut pkt = Vec::new();
+            begin_packet(&mut pkt, rcid, wire::type_byte(MsgType::Hello, 0), 0);
+            pkt.extend_from_slice(&body);
+            keys.send.seal(&mut pkt).expect("sealed");
+            run.h.datagram(&pkt, to, run.now);
+            // Its HELLO accepted (after the user was asked).
+            Box::new(move |inbox| {
+                inbox.iter().any(|d| {
+                    let mut d = d.clone();
+                    let Ok((tb, _, body)) = keys.recv.open(&mut d) else {
+                        return false;
+                    };
+                    matches!(wire::parse_type_byte(tb), Ok((MsgType::HelloAck, _)))
+                        && matches!(
+                            wire::decode_body(MsgType::HelloAck, body),
+                            Ok(wire::Message::HelloAck(a)) if a.status == HELLO_ACCEPTED
+                        )
+                })
+            })
+        };
+
+        // The first session ends; the second attempt is answered.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut done = false;
+        while !done && Instant::now() < deadline {
+            run.settle();
+            run.h.ended(run.now);
+            run.settle();
+            run.inbox[0].clear();
+            run.fence();
+            done = answered(&run.inbox[0]);
+            w.rt.block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
+        }
+        assert!(done, "the second attempt ({:?}) is not answered", version);
+        // The first session's end comes after the second's start, and
+        // leaves it be.
+        run.h.ended(run.now);
+        run.settle();
+        run.h.ended(run.now);
+        assert_eq!(run.h.counts().0, 1);
+        drop(_in_runtime);
+        run.finish();
+    }
+    fn abort_body() -> Vec<u8> {
+        let abort = wire::Message::Abort(wire::Abort {
+            code: 2,
+            reason: "cancelled".into(),
+        });
+        let mut body = Vec::new();
+        wire::encode_body(&abort, &mut body, usize::MAX);
+        body
+    }
 }

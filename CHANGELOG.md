@@ -273,6 +273,37 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   again fit a release build, whose short transfers are mostly slow start;
   the registration measurement's socket has room for a chunk's answers
   (its own buffer lost the last thirty-five of every 256).
+- A policer's check could find what the sender itself had done: the
+  pacer may save up sixteen datagrams, and they went out at once when the
+  check began — at 200 kB/s, as much again as a check of a tenth of a
+  second allowed. The policer dropped them, the check counted them lost,
+  and a 250 kB/s policer was let go of as random loss for half a minute,
+  most of the file sent twice (CI, now and then, on every system). The
+  pacer is emptied when a check begins, and a check the sender went more
+  than an eighth over is void, as one it did not come up to was.
+- A sender's next attempt could go unanswered when it came while the
+  receiver was putting its last one away: the dispatcher hands a new
+  handshake of a transfer it serves to that transfer's session, and a
+  session that had stopped reading took it along when it ended. A version
+  4 attempt, its handshake answered, then waited for an answer to its
+  HELLO until its timeout (Windows in CI, a cancelled directory transfer
+  started again half a second later). A session that ends now closes its
+  queue and hands back what came meanwhile, from the newest handshake on,
+  and the next session starts with it.
+- Back from a stream to UDP, UDP went on at a twentieth of its pace for as
+  long as the stream drained what it held: what the session had sent over
+  the stream came out of its buffers for seconds yet, at the rate of the
+  TCP it had left for being slower, and the round trips of those packets,
+  seconds long, were taken for UDP's and paced it at the least the pacer
+  allows. A round trip now counts only for a packet sent since the
+  session moved.
+- Tests: what an end-to-end test's sessions logged is printed with its
+  failure, and with no other test's (`SHARP_TEST_LOG`, set in CI); the
+  trial that goes back to UDP measures against a TCP of 150 kB/s rather
+  than 500 (TCP was the faster under MemorySanitizer), and asks that UDP
+  be back at its pace, not that the stream carry nothing while it drains;
+  the slow address of the handshake test answers after 300 ms, between
+  the second initiation and the third (Windows).
 - `SECURITY.md`: how to report a vulnerability, privately.
 
 ### Test vectors, from a second implementation

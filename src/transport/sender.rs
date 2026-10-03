@@ -1255,6 +1255,13 @@ const VERIFY_FLOOR: f64 = 20e6;
 const REINTRODUCE_ROUNDS: u32 = 5;
 #[cfg(feature = "nat-traversal")]
 const REINTRODUCE_SPACING: Duration = Duration::from_secs(5);
+
+/// How long after the session moved between a stream and a datagram path
+/// a packet sent the old way may still come out of it (see
+/// [`Sender::on_this_path`]): a stream's buffers, drained at the rate of a
+/// slow TCP, hold that much at most. Well short of the hour and more the
+/// microsecond clock of a packet's timestamp takes to come round.
+const OLD_PATH_DRAINS: Duration = Duration::from_secs(60);
 /// The NAT is tested again at most this often (see `test_nat_again`).
 #[cfg(feature = "nat-traversal")]
 const NAT_AGAIN_SPACING: Duration = Duration::from_secs(30);
@@ -1803,6 +1810,9 @@ struct Engine {
     /// it has no answer.
     hello_due: Option<Instant>,
     clock: Clock,
+    /// When the session last moved between a stream and a datagram path,
+    /// and the clock then (see [`Sender::on_this_path`]).
+    moved: Option<(Instant, u32)>,
     events: Option<EventCallback>,
     cancel: CancellationToken,
 
@@ -2086,6 +2096,7 @@ impl Engine {
             resuming: false,
             hello_due: None,
             clock: Clock::new(),
+            moved: None,
             events,
             cancel,
             auth,
@@ -4319,9 +4330,11 @@ impl Engine {
                 }
             }
             Message::Pong(p) => {
-                let sample = self.clock.since_us(p.echo);
-                self.rtt.on_sample(Duration::from_micros(sample as u64));
-                self.update_pacer();
+                if self.on_this_path(p.echo, Instant::now()) {
+                    let sample = self.clock.since_us(p.echo);
+                    self.rtt.on_sample(Duration::from_micros(sample as u64));
+                    self.update_pacer();
+                }
             }
             Message::HelloAck(ack) => {
                 // While negotiating every answer counts; later only answers
@@ -4533,7 +4546,7 @@ impl Engine {
         self.max_ack_received = ack.received_bytes;
         self.rwnd = ack.rwnd;
         self.received_bytes = self.received_bytes.max(ack.received_bytes.min(self.size));
-        if ack.echo_ts != 0 {
+        if ack.echo_ts != 0 && self.on_this_path(ack.echo_ts, now) {
             let raw = self.clock.since_us(ack.echo_ts);
             if raw < 60_000_000 {
                 let sample = raw.saturating_sub(ack.ack_delay_us).max(1);
@@ -4739,7 +4752,17 @@ impl Engine {
             } else {
                 (acked, lost_bytes)
             };
-            if let Some(rate) = self.policer.on_ack(now, self.rtt.round(), delivered, gone) {
+            let found = self.policer.on_ack(now, self.rtt.round(), delivered, gone);
+            // A check begun is paced at its rate from its first byte: what
+            // the pacer had saved up would go out at once, over the rate.
+            if self
+                .policer
+                .checking_since()
+                .is_some_and(|c| checking != Some(c))
+            {
+                self.pacer.empty(now);
+            }
+            if let Some(rate) = found {
                 if !was {
                     tracing::info!(
                         "the path lets {:.2} Mbit/s through and drops the rest, as a policer \
@@ -5096,8 +5119,10 @@ impl Engine {
     /// The session has moved from `old`, last heard from at `old_heard`, to
     /// `self.peer`. Between a stream and a datagram path nothing carries
     /// over: the round trip over a stream includes its buffers, and its
-    /// window is its own. What was in flight on a path that had gone quiet
-    /// is lost, and goes again now rather than when a timer says.
+    /// window is its own; nor do the round trips of what went the old way
+    /// and is answered later (see [`Self::on_this_path`]). What was in
+    /// flight on a path that had gone quiet is lost, and goes again now
+    /// rather than when a timer says.
     fn peer_moved(&mut self, old: SocketAddr, old_heard: Instant, now: Instant) {
         // Another path, another policer or none.
         self.policer.reset();
@@ -5134,6 +5159,7 @@ impl Engine {
         let ack_delay = self.rtt.max_ack_delay();
         self.rtt = RttEstimator::new(self.cfg.min_rto, self.cfg.max_rto);
         self.rtt.set_max_ack_delay(ack_delay);
+        self.moved = Some((now, self.clock.now_us()));
         self.cc = Cubic::new(
             self.chunk,
             self.cfg.initial_cwnd_chunks,
@@ -5141,6 +5167,25 @@ impl Engine {
         );
         self.tail_probes = 0;
         self.update_pacer();
+    }
+
+    /// Whether the echo of a timestamp `ts` measures the path the session
+    /// is on: stamped since it moved there between a stream and a datagram
+    /// path, or long enough after that. A packet sent the old way says
+    /// nothing of the new one's round trip. Out of a stream left for UDP,
+    /// what the session had sent came for seconds yet, as fast as the
+    /// stream's buffers drained — at the rate of the TCP left for being
+    /// slower — and its round trips of seconds, taken for UDP's, paced UDP
+    /// at the least the pacer allows: after a trial on a TCP of 150 kB/s,
+    /// 85 kB/s, a twentieth of what UDP had carried, for as long as the
+    /// stream drained.
+    fn on_this_path(&self, ts: u32, now: Instant) -> bool {
+        match self.moved {
+            Some((at, then)) if now.saturating_duration_since(at) < OLD_PATH_DRAINS => {
+                self.clock.since_us(ts) <= self.clock.since_us(then)
+            }
+            _ => true,
+        }
     }
 
     /// While a session is carried by a relay, asks the receiver's other

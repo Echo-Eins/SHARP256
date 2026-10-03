@@ -16,6 +16,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # What the sessions of an end-to-end test logged, printed with its
+  # failure and with no other test's (tests/e2e.rs, init_test_logging).
+  SHARP_TEST_LOG: sharp256=info
 
 jobs:
   lint:

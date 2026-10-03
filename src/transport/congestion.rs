@@ -481,7 +481,14 @@ impl Cubic {
 /// machine, it was most of what a check of fifty milliseconds saw — the
 /// sender looked as if it had sent at one and a half times the rate it
 /// was held to, and lost a third of it, and a policer of 250 kB/s was let
-/// go of as random loss.
+/// go of as random loss. Nor does a check say anything if the sender did
+/// not come up to the rate, or went more than [`CHECK_OVER`] over it — what
+/// it sends beyond the rate a policer drops, whatever the path does at the
+/// rate: the check is void then, and the sampling begins again. So the
+/// sender's pacer is emptied when a check begins ([`Pacer::empty`]): the
+/// sixteen datagrams it may save up went out at once, at 200 kB/s as much
+/// again as a check of a tenth of a second allowed, and a policer was let
+/// go of as random loss so too.
 ///
 /// **Held**: [`LT_HOLD_ROUNDS`] round trips and [`LT_HOLD_TIME`] at least.
 ///
@@ -548,6 +555,9 @@ pub const CHECK_LOSS: f64 = 0.1;
 /// What a check has to have sent at, as a share of the rate checked, to say
 /// anything.
 pub const CHECK_REACH: f64 = 0.7;
+/// What a check may have sent at, as a share of the rate checked, and still
+/// say anything: the eighth the rates of two intervals may differ by.
+pub const CHECK_OVER: f64 = 1.125;
 /// What a check has to have seen answered, delivered or lost, to say
 /// anything: two dozen full datagrams.
 pub const CHECK_MIN_BYTES: u64 = 32 * 1024;
@@ -601,6 +611,11 @@ impl Policer {
         let rate = got as f64 / took.as_secs_f64();
         match self.last {
             Some(last) if (rate - last).abs() <= last / 8.0 => {
+                tracing::debug!(
+                    "policer suspected: delivered {:.0} and {:.0} B/s, losing a fifth or more; checking",
+                    last,
+                    rate
+                );
                 self.sampling = None;
                 self.last = None;
                 self.state = PolicerState::Checking {
@@ -660,10 +675,25 @@ impl Policer {
         // does not reach is no use. (A window shrunk by random loss was
         // taken for a policer's verdict so.)
         let offered = sent as f64 / now.saturating_duration_since(since).as_secs_f64();
-        if offered < CHECK_REACH * rate {
+        // Nor does one that went over it: what it sent beyond the rate a
+        // policer drops whatever its rate, and that is no loss of the path's.
+        if !(CHECK_REACH * rate..=CHECK_OVER * rate).contains(&offered) {
+            tracing::debug!(
+                "policer check at {:.0} B/s void: {:.0} B/s offered",
+                rate,
+                offered
+            );
             self.state = PolicerState::Free;
             return None;
         }
+        tracing::debug!(
+            "policer check at {:.0} B/s{}: {:.0} B/s offered, {} delivered, {} lost",
+            rate,
+            if lowered { " (lowered)" } else { "" },
+            offered,
+            delivered,
+            lost
+        );
         if (lost as f64) < CHECK_LOSS * delivered as f64 {
             // Little lost where the path was held to: a policer.
             self.state = PolicerState::Held {
@@ -694,6 +724,10 @@ impl Policer {
             .saturating_mul(1 << (self.false_alarms - 1).min(5))
             .min(QUIET_MAX);
         self.quiet_until = Some(now + quiet);
+        tracing::debug!(
+            "not a policer: random loss; nothing suspected for {:?}",
+            quiet
+        );
         self.state = PolicerState::Free;
         None
     }
@@ -824,6 +858,13 @@ impl Pacer {
     pub fn set_burst(&mut self, burst: f64) {
         self.burst = burst.max(1.0);
         self.tokens = self.tokens.min(self.burst);
+    }
+
+    /// Spends what was saved up: from `now` on, no more goes out than the
+    /// rate lets.
+    pub fn empty(&mut self, now: Instant) {
+        self.tokens = 0.0;
+        self.last = now;
     }
 
     pub fn rate(&self) -> f64 {
@@ -1174,6 +1215,38 @@ mod tests {
         assert_eq!(p.detections(), 0);
         assert!(!p.found());
         assert!(capped_ms < 1000, "{} ms of ten seconds capped", capped_ms);
+    }
+
+    /// A check the sender did not hold to says nothing of the path: here
+    /// the first two begin with sixteen datagrams the sender had saved up,
+    /// sent at once and dropped by the policer. Taken for random loss, a
+    /// 250 kB/s policer was put out of mind for half a minute, and most of
+    /// the file sent twice (in CI, now and then); void, it is found at the
+    /// next check.
+    #[test]
+    fn a_check_the_sender_went_over_says_nothing() {
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        let (mut checks, mut since) = (0, None);
+        for _ in 0..2000 {
+            t += Duration::from_millis(1);
+            round += 1;
+            let mut sent = p.rate().unwrap_or(f64::MAX).min(10e6) / 1000.0;
+            if p.checking_since().is_some() && p.checking_since() != since {
+                since = p.checking_since();
+                checks += 1;
+                if checks <= 2 {
+                    sent += 16.0 * 1427.0;
+                }
+            }
+            let got = sent.min(250.0);
+            p.on_sent(sent as u64);
+            p.on_ack(t, round, got as u64, (sent - got) as u64);
+        }
+        assert_eq!(p.detections(), 1, "{} checks", checks);
+        assert!(checks > 2);
+        let rate = p.rate().expect("held to");
+        assert!((rate - 250_000.0).abs() < 250_000.0 / 16.0, "{}", rate);
     }
 
     #[test]

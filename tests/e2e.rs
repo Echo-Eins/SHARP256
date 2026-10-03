@@ -45,9 +45,22 @@ fn make_file(dir: &Path, name: &str, size: usize, seed: u64) -> PathBuf {
     path
 }
 
+/// With `SHARP_TEST_LOG` set to a filter (`sharp256=info`), what the
+/// sessions log, through libtest's capture: printed for a test that fails,
+/// next to its panic, and for no other (with `--nocapture`, as it comes).
+/// A test's runtime spawns its threads from the test's own, and they write
+/// where it does. CI sets it: a failure that happens only there, now and
+/// then, has to tell what went on.
 fn init_test_logging() {
+    use tracing_subscriber::{filter::Targets, fmt, prelude::*};
     if let Ok(filter) = std::env::var("SHARP_TEST_LOG") {
-        sharp256::init_logging(&filter);
+        let filter = filter
+            .parse::<Targets>()
+            .unwrap_or_else(|_| Targets::new().with_default(tracing::Level::INFO));
+        let _ = tracing_subscriber::registry()
+            .with(fmt::layer().with_test_writer().with_ansi(false))
+            .with(filter)
+            .try_init();
     }
 }
 
@@ -5920,10 +5933,15 @@ async fn a_policer_is_not_overrun() {
     stop_receiver(r).await;
 }
 
-/// Two addresses for the receiver: one answers after 400 ms, the other
+/// Two addresses for the receiver: one answers after 300 ms, the other
 /// never. The handshake tries the second while the first is still on its
 /// way; the first one's answer, older than that attempt, is taken
 /// (version 4), instead of the first address being asked again.
+///
+/// The second initiation goes at 250 ms, the third would at 500: the
+/// answer has to be in between, crypto of both ends in a debug build
+/// included. After 400 ms it was not always, on Windows in CI, and a third
+/// initiation went though the answer was taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5932,7 +5950,7 @@ async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
     let slow = start_proxy(
         r.addr,
         Impairment {
-            reverse_delay: Duration::from_millis(400),
+            reverse_delay: Duration::from_millis(300),
             ..Impairment::none()
         },
     )
@@ -5949,13 +5967,17 @@ async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
     wait_completed(&mut r.events, Duration::from_secs(10)).await;
     // One to each: with only the newest attempt adopted, as version 3
     // must, the slow address is asked again once its answer is in, and the
-    // transfer takes a round trip longer (2.5 s here, rather than 2.0).
+    // transfer takes a round trip longer.
     assert_eq!(summary.initiations, 2, "{} sent", summary.initiations);
     stop_receiver(r).await;
 }
 
 /// UDP that loses a share of what it carries, but still outruns TCP: the
-/// trial on a stream finds TCP slower, and the session goes back to UDP.
+/// trial on a stream finds TCP slower, and the session goes back to UDP —
+/// at its old pace at once, and stays there. (The pace came back only as
+/// the stream drained what it held: the session's packets in it held the
+/// window, and their round trips, seconds out of the stream's buffers, the
+/// pacing. UDP went on at a fifteenth of its pace for seconds.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5968,35 +5990,76 @@ async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
             ..Impairment::none()
         },
         r.addr,
-        Some(500_000),
+        // UDP carries 0.6 to 1.8 MB/s here, more than a quarter above
+        // TCP's at any speed a sanitizer leaves it: at 500 kB/s, TCP was
+        // faster under MemorySanitizer, and kept.
+        Some(150_000),
     )
     .await;
     // At 2 MB/s, a third of it lost: enough left after the first window
-    // for a trial to be worth making.
-    let size = 36_000_000;
+    // for a trial to be worth making, and after the trial for the rest.
+    let size = 64_000_000;
     let path = make_file(&src, "lossy.bin", size, 15);
     let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
     cfg.transport.max_rate_bytes = Some(2_000_000);
     let sender = tokio::spawn(run_sender(cfg));
     let (udp, streamed) = (&proxy.to_target_bytes, &tcp.to_target_bytes);
-    eventually("a trial on TCP", || {
-        streamed.load(Ordering::Relaxed) > 500_000
-    })
-    .await;
-    let udp_then = udp.load(Ordering::Relaxed);
+    let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+
+    // UDP's pace before the trial: its best second. Nothing but a stream's
+    // opening goes over TCP before the trial; UDP carries next to nothing
+    // during it.
+    let mut seen = std::collections::VecDeque::new();
+    let mut pace = 0.0f64;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while load(streamed) < 200_000 {
+        assert!(
+            Instant::now() < deadline,
+            "a trial on TCP did not happen in time"
+        );
+        let now = (Instant::now(), load(udp));
+        while seen
+            .front()
+            .is_some_and(|&(t, _): &(Instant, u64)| now.0 - t > Duration::from_secs(1))
+        {
+            let (t, u) = seen.pop_front().unwrap();
+            pace = pace.max((now.1 - u) as f64 / (now.0 - t).as_secs_f64());
+        }
+        seen.push_back(now);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pace > 0.0, "UDP carried nothing before the trial");
+    let udp_then = load(udp);
     // The trial takes ten seconds.
     eventually_within(
         "the session going back to UDP",
-        Duration::from_secs(30),
-        || udp.load(Ordering::Relaxed) > udp_then + 4_000_000,
+        Duration::from_secs(60),
+        || load(udp) > udp_then + 200_000,
     )
     .await;
-    // And stays there. (That the file arrives whole across such moves is
-    // `a_transfer_moves_to_tcp_when_udp_stops_and_back_when_it_returns`'s.)
-    let streamed_then = streamed.load(Ordering::Relaxed);
+    let (at, udp_back) = (Instant::now(), load(udp));
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let more = streamed.load(Ordering::Relaxed) - streamed_then;
-    assert!(more < 100_000, "{} B more over TCP once back on UDP", more);
+    let pace_back = (load(udp) - udp_back) as f64 / at.elapsed().as_secs_f64();
+    assert!(
+        pace_back > pace / 2.0,
+        "UDP back at {:.0} kB/s, where it carried {:.0} kB/s before the trial",
+        pace_back / 1e3,
+        pace / 1e3
+    );
+    // And stays there, once what the stream held has come out of it (the
+    // session sent it again over UDP when it left).
+    let mut quiet = (Instant::now(), load(streamed));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while quiet.0.elapsed() < Duration::from_secs(1) {
+        assert!(Instant::now() < deadline, "the stream never drained");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if load(streamed) != quiet.1 {
+            quiet = (Instant::now(), load(streamed));
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let more = load(streamed) - quiet.1;
+    assert!(more < 20_000, "{} B more over TCP once back on UDP", more);
     assert!(!sender.is_finished(), "the file is longer than this");
     sender.abort();
     stop_receiver(r).await;

@@ -186,6 +186,8 @@ struct Established {
     len: usize,
     answered: usize,
     hello: Hello,
+    /// Where the HELLO came from.
+    hello_from: SocketAddr,
 }
 
 struct SessionHandle {
@@ -200,6 +202,16 @@ struct SessionHandle {
     /// Asks it to let go of its transfer; once asked, it is on its way out
     /// and no longer counts against the limits on sessions.
     release: Release,
+}
+
+/// A session's end, for the dispatcher (see [`Dispatcher::ended`]): its
+/// transfer, its channel — which tells its handle from a later session's —
+/// and what it was handed once it had stopped taking anything: a new
+/// handshake of its transfer, and what came after it.
+struct Ended {
+    key: TransferKey,
+    tx: mpsc::Sender<Incoming>,
+    next: Vec<Incoming>,
 }
 
 struct Shared {
@@ -1129,7 +1141,7 @@ impl Receiver {
 
         let socket = shared.socket.clone();
         let cancel = shared.cancel.clone();
-        let (done_tx, mut done_rx) = mpsc::channel::<TransferKey>(256);
+        let (done_tx, mut done_rx) = mpsc::channel::<Ended>(256);
         let mut d = Dispatcher::new(shared.clone(), done_tx);
         let mut bufs = recv_buffers(RECV_BATCH);
         let mut got = vec![
@@ -1169,7 +1181,7 @@ impl Receiver {
                         d.flush();
                     }
                 }
-                Some(key) = done_rx.recv() => d.forget(&key),
+                Some(ended) = done_rx.recv() => d.ended(ended, Instant::now()),
                 Some(card) = cards_rx.recv() => {
                     #[cfg(feature = "nat-traversal")]
                     meet_card(&shared, &puncher, card);
@@ -1265,12 +1277,12 @@ struct Dispatcher {
     /// Datagrams collected for sessions during the current receive call.
     outbox: Vec<(TransferKey, Vec<Datagrams>)>,
     at: Instant,
-    done_tx: mpsc::Sender<TransferKey>,
+    done_tx: mpsc::Sender<Ended>,
     dropped: u64,
 }
 
 impl Dispatcher {
-    fn new(shared: Arc<Shared>, done_tx: mpsc::Sender<TransferKey>) -> Self {
+    fn new(shared: Arc<Shared>, done_tx: mpsc::Sender<Ended>) -> Self {
         let cfg = &shared.cfg;
         let responder = Responder::new(
             shared.identity.clone(),
@@ -1512,6 +1524,7 @@ impl Dispatcher {
 
         // A new handshake of a transfer we already serve (the sender lost the
         // session after an outage, or restarted): move the session over.
+        let mut handshake = handshake;
         if let Some(s) = self.sessions.get_mut(&key) {
             if !s.task.is_finished() {
                 s.heard = now;
@@ -1519,23 +1532,38 @@ impl Dispatcher {
                 // has the handshake: if its queue is full, moving the
                 // routing anyway left it deaf to both ids until the next
                 // handshake. Dropped instead, the handshake is repeated.
-                if s.tx.try_send(Incoming::Handshake(handshake)).is_ok() {
-                    self.by_cid.remove(&s.cid);
-                    s.cid = cid;
-                    self.by_cid.insert(cid, key);
+                match s.tx.try_send(Incoming::Handshake(handshake)) {
+                    Ok(()) => {
+                        self.by_cid.remove(&s.cid);
+                        s.cid = cid;
+                        self.by_cid.insert(cid, key);
+                        return;
+                    }
+                    // It has ended, and takes nothing more: the next
+                    // session does (see `ended`).
+                    Err(mpsc::error::TrySendError::Closed(Incoming::Handshake(h))) => {
+                        handshake = h;
+                    }
+                    Err(_) => return,
                 }
-                return;
             }
             self.drop_session(&key);
         }
+        self.admit_v3(key, handshake, now);
+    }
 
+    /// Starts a session for a version 3 handshake of `key`, if there is room
+    /// for it; refuses it otherwise. Whether it was started.
+    fn admit_v3(&mut self, key: TransferKey, handshake: Box<Handshake>, now: Instant) -> bool {
+        let (from, cid, len) = (handshake.from, handshake.cid, handshake.len);
         self.prune();
-        if let Err(message) = self.room_for(&sender, from, now) {
+        if let Err(message) = self.room_for(&key.0, from, now) {
             let Handshake { incoming, init, .. } = *handshake;
-            self.reject(incoming, &init, (from, pkt.len()), REASON_BUSY, message);
-            return;
+            self.reject(incoming, &init, (from, len), REASON_BUSY, message);
+            return false;
         }
         self.spawn_session(key, from, cid, Incoming::Handshake(handshake), now);
+        true
     }
 
     /// Whether a new session for `sender` fits: the limit on sessions, and
@@ -1622,8 +1650,8 @@ impl Dispatcher {
                 session_queued,
                 session_release,
             );
-            let key = session.run(rx).await;
-            let _ = done_tx.send(key).await;
+            let ended = session.run(rx).await;
+            let _ = done_tx.send(ended).await;
         });
         self.by_cid.insert(cid, key);
         self.sessions.insert(
@@ -1775,7 +1803,7 @@ impl Dispatcher {
         };
         let p = self.pending.remove(&cid).expect("present");
         let key = (p.sender, hello.transfer_id);
-        let established = Box::new(Established {
+        let mut established = Box::new(Established {
             keys: p.keys.clone(),
             cid,
             peer_cid: p.peer_cid,
@@ -1784,6 +1812,7 @@ impl Dispatcher {
             len: p.len,
             answered: p.answered,
             hello: hello.clone(),
+            hello_from: from,
         });
         let delivery = Datagrams {
             buf: pkt.to_vec(),
@@ -1795,16 +1824,34 @@ impl Dispatcher {
         if let Some(s) = self.sessions.get_mut(&key) {
             if !s.task.is_finished() {
                 s.heard = now;
-                if s.tx.try_send(Incoming::Established(established)).is_ok() {
-                    self.by_cid.remove(&s.cid);
-                    s.cid = cid;
-                    self.by_cid.insert(cid, key);
-                    self.queue(key, delivery);
+                match s.tx.try_send(Incoming::Established(established)) {
+                    Ok(()) => {
+                        self.by_cid.remove(&s.cid);
+                        s.cid = cid;
+                        self.by_cid.insert(cid, key);
+                        self.queue(key, delivery);
+                        return;
+                    }
+                    // It has ended, and takes nothing more: the next
+                    // session does (see `ended`).
+                    Err(mpsc::error::TrySendError::Closed(Incoming::Established(e))) => {
+                        established = e;
+                    }
+                    Err(_) => return,
                 }
-                return;
             }
             self.drop_session(&key);
         }
+        if self.admit_v4(key, established, now) {
+            self.queue(key, delivery);
+        }
+    }
+
+    /// Starts a session for a version 4 handshake of `key`, if the transfer
+    /// was not declined and there is room for it; refuses it otherwise.
+    /// Whether it was started.
+    fn admit_v4(&mut self, key: TransferKey, established: Box<Established>, now: Instant) -> bool {
+        let from = established.hello_from;
         let refusal = {
             let mut declined = self.shared.declined.lock();
             declined.retain(|_, at| now.saturating_duration_since(*at) < DECLINE_MEMORY);
@@ -1813,28 +1860,30 @@ impl Dispatcher {
         .then_some((REASON_DECLINED, "declined by user"));
         self.prune();
         let refusal = refusal.or_else(|| {
-            self.room_for(&p.sender, from, now)
+            self.room_for(&key.0, from, now)
                 .err()
                 .map(|message| (REASON_BUSY, message))
         });
+        let e = &established;
         if let Some((reason, message)) = refusal {
             // Sealed under the handshake's keys, and only to the address
             // the HELLO has just proven: a transport packet from where the
             // answer went.
-            if from == p.from {
+            if from == e.from {
                 let mut out = Vec::with_capacity(MAX_CONTROL_DATAGRAM);
-                begin_packet(&mut out, p.peer_cid, type_byte(MsgType::HelloAck, 0), 0);
-                let ack = rejection(hello.timestamp, reason, message);
+                begin_packet(&mut out, e.peer_cid, type_byte(MsgType::HelloAck, 0), 0);
+                let ack = rejection(e.hello.timestamp, reason, message);
                 wire::encode_body(&Message::HelloAck(ack), &mut out, MAX_CONTROL_BODY);
-                if p.keys.send.seal(&mut out).is_ok() {
+                if e.keys.send.seal(&mut out).is_ok() {
                     let _ = self.shared.send(from, &out);
                 }
             }
-            tracing::info!("transfer from {} ({}) refused: {}", from, p.sender, message);
-            return;
+            tracing::info!("transfer from {} ({}) refused: {}", from, key.0, message);
+            return false;
         }
-        self.spawn_session(key, p.from, cid, Incoming::Established(established), now);
-        self.queue(key, delivery);
+        let (peer, cid) = (e.from, e.cid);
+        self.spawn_session(key, peer, cid, Incoming::Established(established), now);
+        true
     }
 
     /// Answers an authenticated initiation of `len` bytes with a rejection;
@@ -1865,10 +1914,42 @@ impl Dispatcher {
         }
     }
 
-    /// Drops the routing of a session whose task ended.
-    fn forget(&mut self, key: &TransferKey) {
-        if self.sessions.get(key).is_some_and(|s| s.task.is_finished()) {
-            self.drop_session(key);
+    /// A session has ended: its handle goes (unless a later session has its
+    /// transfer already). If it was handed a new handshake of its transfer
+    /// once it had stopped taking anything — the sender's next attempt,
+    /// come while the session was putting the last one away — the next
+    /// session starts with that, and with what came after it. Lost with
+    /// the session, a version 4 attempt, its handshake answered, waited for
+    /// an answer to its HELLO until its own timeout.
+    fn ended(&mut self, ended: Ended, now: Instant) {
+        let Ended { key, tx, next } = ended;
+        if !self
+            .sessions
+            .get(&key)
+            .is_some_and(|s| s.tx.same_channel(&tx))
+        {
+            return;
+        }
+        self.drop_session(&key);
+        if self.shared.cancel.is_cancelled() {
+            return;
+        }
+        let mut next = next.into_iter();
+        let started = match next.next() {
+            Some(Incoming::Handshake(h)) => self.admit_v3(key, h, now),
+            Some(Incoming::Established(e)) => self.admit_v4(key, e, now),
+            _ => false,
+        };
+        if started {
+            for m in next {
+                if let Incoming::Datagrams { runs, .. } = m {
+                    for d in runs {
+                        self.queue(key, d);
+                    }
+                }
+            }
+            self.at = now;
+            self.flush();
         }
     }
 
@@ -1900,7 +1981,7 @@ impl Dispatcher {
 #[cfg(any(test, fuzzing))]
 pub struct DispatcherHarness {
     d: Dispatcher,
-    _done: mpsc::Receiver<TransferKey>,
+    done: mpsc::Receiver<Ended>,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -1909,11 +1990,18 @@ impl DispatcherHarness {
     /// user declined forgotten). Made within a tokio runtime, whose tasks
     /// the sessions become.
     pub fn new(receiver: &Receiver) -> Self {
+        Self::with_ends(receiver, 64)
+    }
+
+    /// The same, told of `n` ended sessions at most until it takes them
+    /// ([`ended`](Self::ended)): one that ends beyond that waits, its queue
+    /// closed, until it does.
+    pub fn with_ends(receiver: &Receiver, n: usize) -> Self {
         receiver.shared.declined.lock().clear();
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(n);
         Self {
             d: Dispatcher::new(receiver.shared.clone(), tx),
-            _done: rx,
+            done: rx,
         }
     }
 
@@ -1923,6 +2011,24 @@ impl DispatcherHarness {
         self.d.at = now;
         self.d.on_datagram(pkt, from, now);
         self.d.flush();
+    }
+
+    /// Sessions that have closed their channels, ending, and whose ends
+    /// the dispatcher has not taken yet.
+    pub fn ending(&self) -> usize {
+        self.d
+            .sessions
+            .values()
+            .filter(|s| s.tx.is_closed())
+            .count()
+    }
+
+    /// Takes the ends of the sessions that ended since the last look, and
+    /// what they left behind, as the receiver's loop does.
+    pub fn ended(&mut self, now: Instant) {
+        while let Ok(ended) = self.done.try_recv() {
+            self.d.ended(ended, now);
+        }
     }
 
     /// Sends `mark` to `to` from the receiver's socket, after everything
@@ -2868,6 +2974,9 @@ struct Session {
     cfg: TransportConfig,
     events: Option<EventCallback>,
     self_tx: mpsc::Sender<Incoming>,
+    /// What came once the session was ending, from the newest handshake of
+    /// its transfer on: the next session's (see [`Ended`]).
+    aside: Vec<Incoming>,
     /// Bytes of datagrams the dispatcher queued for us.
     queued: Arc<AtomicU64>,
     /// Deliveries being decrypted, or decrypted and waiting for their turn.
@@ -2973,6 +3082,7 @@ impl Session {
             cfg,
             events,
             self_tx,
+            aside: Vec::new(),
             queued,
             opening: OpenPipe::new(),
             transfer_id: key.1,
@@ -3073,29 +3183,56 @@ impl Session {
 
     // ----- lifecycle -------------------------------------------------------
 
-    /// Runs the session; returns its key when it ends.
-    async fn run(mut self, mut rx: mpsc::Receiver<Incoming>) -> TransferKey {
+    /// Runs the session; when it ends, closes its channel, and says so with
+    /// what it was handed meanwhile.
+    async fn run(mut self, mut rx: mpsc::Receiver<Incoming>) -> Ended {
+        self.serve(&mut rx).await;
+        // Whatever comes from now on goes to the next session; whatever
+        // came while the session was ending goes there with it.
+        rx.close();
+        while let Ok(msg) = rx.try_recv() {
+            self.set_aside(msg);
+        }
+        Ended {
+            key: self.key(),
+            tx: self.self_tx.clone(),
+            next: std::mem::take(&mut self.aside),
+        }
+    }
+
+    /// Keeps what came once the session was ending: from the newest
+    /// handshake of its transfer on. What came before that was the old
+    /// connection's.
+    fn set_aside(&mut self, msg: Incoming) {
+        match msg {
+            Incoming::Handshake(_) | Incoming::Established(_) => self.aside = vec![msg],
+            Incoming::Datagrams { .. } if !self.aside.is_empty() => self.aside.push(msg),
+            _ => {}
+        }
+    }
+
+    async fn serve(&mut self, rx: &mut mpsc::Receiver<Incoming>) {
         // The session was created for its first handshake.
         let decision = loop {
             match rx.recv().await {
                 Some(Incoming::Handshake(h)) => {
                     if !self.let_go_first(&h.init.hello).await {
-                        return self.key();
+                        return;
                     }
                     break self.start(*h);
                 }
                 Some(Incoming::Established(e)) => {
                     if !self.let_go_first(&e.hello).await {
-                        return self.key();
+                        return;
                     }
                     break self.start_v4(*e);
                 }
                 Some(_) => {}
-                None => return self.key(),
+                None => return,
             }
         };
         let Some(mut decision) = decision else {
-            return self.key();
+            return;
         };
 
         let cancel = self.shared.cancel.clone();
@@ -3110,17 +3247,17 @@ impl Session {
             tokio::select! {
                 msg = rx.recv() => {
                     let Some(msg) = msg else {
-                        self.stop(&mut rx, "dispatcher dropped the session").await;
-                        return self.key();
+                        self.stop(rx, "dispatcher dropped the session").await;
+                        return;
                     };
                     if self.handle(msg).await.is_break() {
-                        return self.key();
+                        return;
                     }
                     // Drain what is already queued before looking at timers.
                     for _ in 0..SESSION_BATCH {
                         let Ok(msg) = rx.try_recv() else { break };
                         if self.handle(msg).await.is_break() {
-                            return self.key();
+                            return;
                         }
                     }
                 }
@@ -3129,14 +3266,14 @@ impl Session {
                         self.opening.in_pool -= 1;
                         self.opening.ready.insert(msg.seq, msg);
                         if self.process_ready().await.is_break() {
-                            return self.key();
+                            return;
                         }
                     }
                 }
                 accepted = decided(&mut decision) => {
                     decision = None;
                     if self.on_decision(accepted).is_break() {
-                        return self.key();
+                        return;
                     }
                 }
                 _ = tokio::time::sleep(ack_wait.unwrap_or(Duration::from_secs(3600))), if ack_wait.is_some() => {
@@ -3144,19 +3281,19 @@ impl Session {
                 }
                 _ = tick.tick() => {
                     if self.housekeeping(Instant::now()).await.is_break() {
-                        return self.key();
+                        return;
                     }
                 }
                 _ = progress.tick() => {
                     self.emit_progress(Instant::now());
                 }
                 _ = cancel.cancelled() => {
-                    self.stop(&mut rx, "receiver shutting down").await;
-                    return self.key();
+                    self.stop(rx, "receiver shutting down").await;
+                    return;
                 }
                 _ = release.cancelled() => {
-                    self.let_go(&mut rx).await;
-                    return self.key();
+                    self.let_go(rx).await;
+                    return;
                 }
             }
         }
@@ -3209,9 +3346,12 @@ impl Session {
         let why = self.holding.release.why();
         if matches!(self.phase, Phase::Verifying) {
             while let Some(msg) = rx.recv().await {
-                if let Incoming::Verified(r) = msg {
-                    let _ = self.on_verified(r);
-                    break;
+                match msg {
+                    Incoming::Verified(r) => {
+                        let _ = self.on_verified(r);
+                        break;
+                    }
+                    msg => self.set_aside(msg),
                 }
             }
         }
