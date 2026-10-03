@@ -316,7 +316,9 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   failure, and with no other test's (`SHARP_TEST_LOG`, set in CI); the
   trial that goes back to UDP measures against a TCP of 150 kB/s rather
   than 500 (TCP was the faster under MemorySanitizer), and asks that UDP
-  be back at its pace, not that the stream carry nothing while it drains;
+  be back at a third of its best three seconds before the trial (a
+  twentieth, before the fix; its best second alone was too much to ask of
+  macOS), not that the stream carry nothing while it drains;
   the handshake test whose slow address answers after 300 ms counts the
   initiations of the handshake alone (a ping's answer, 300 ms late, had
   the sender take the receiver for stalled while it put the file in place
@@ -326,7 +328,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   times, against 1.02 to 1.05 on Linux); the relay that comes up late takes
   a port outside every system's ephemeral range, which no other test's
   socket can take in the seconds it waits; the test of the ending session
-  waits for the receiver's answers (macOS).
+  waits for the receiver's answers (macOS); the NAT laboratory takes two
+  NATs that count their ports up as right either way where the relay only
+  introduces — the prediction of both next ports is a race it wins now and
+  then (CI once), as docs/NAT.md says.
 - `SECURITY.md`: how to report a vulnerability, privately.
 
 ### Test vectors, from a second implementation

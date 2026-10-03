@@ -1229,10 +1229,10 @@ def cmd_probe(args):
                 for fb in FW6_KINDS:
                     ok, want_ok, said = probe_pair(an, bn, args.wait, quiet=True, v6=(fa, fb), v4=has_v4, by=by)
                     total += 1
-                    bad += ok != want_ok
+                    bad += not meets(ok, want_ok)
                     wrong += sum(1 for w in said.values() if w)
                     print(f"{name:46} {fa:12} {fb:12} {'a packet got through both ways' if ok else 'nothing got through':32} "
-                          f"{'as expected' if ok == want_ok else 'UNEXPECTED':11} {reports_line(said)}", flush=True)
+                          f"{'as expected' if meets(ok, want_ok) else 'UNEXPECTED':11} {reports_line(said)}", flush=True)
         print(f"\n{total - bad} of {total} as they must be")
         print(f"{2 * total - wrong} of {2 * total} reports of a host's own network true to the laboratory")
         return 1 if bad or wrong else 0
@@ -1241,16 +1241,16 @@ def cmd_probe(args):
             raise SystemExit("name two NAT kinds, or --all")
         ok, want_ok, said = probe_pair(args.a, args.b, args.wait, by=by)
         print(f"what each host said of its network: {reports_line(said)}")
-        return 0 if ok == want_ok and not any(said.values()) else 1
+        return 0 if meets(ok, want_ok) and not any(said.values()) else 1
     print(f"{'host A behind':18} {'host B behind':18} {'punch test':44} what each host said of its network")
     bad = wrong = 0
     for a in NAT_KINDS:
         for b in NAT_KINDS:
             ok, want_ok, said = probe_pair(a, b, args.wait, quiet=True, by=by)
-            bad += ok != want_ok
+            bad += not meets(ok, want_ok)
             wrong += sum(1 for w in said.values() if w)
             print(f"{a:18} {b:18} {'a packet got through both ways' if ok else 'nothing got through':32} "
-                  f"{'as expected' if ok == want_ok else 'UNEXPECTED':11} {reports_line(said)}", flush=True)
+                  f"{'as expected' if meets(ok, want_ok) else 'UNEXPECTED':11} {reports_line(said)}", flush=True)
     print(f"\n{len(NAT_KINDS) ** 2 - bad} of {len(NAT_KINDS) ** 2} as the theory says they must")
     print(f"{2 * len(NAT_KINDS) ** 2 - wrong} of {2 * len(NAT_KINDS) ** 2} reports of a host's own network true to the laboratory")
     return 1 if bad or wrong else 0
@@ -1328,7 +1328,7 @@ def probe_pair(a_nat, b_nat, wait, quiet=False, v6=None, v4=True, by="card"):
                 tail = lab.log(f"probe_{name}.log").split("Sending at")[-1]
                 print(f"--- punch test, host {name.upper()}\nSending at{tail[-700:]}")
             print(f"punch test: {'a packet got through both ways' if ok else 'nothing got through'} "
-                  f"({'as expected' if ok == want_ok else 'UNEXPECTED'})")
+                  f"({'as expected' if meets(ok, want_ok) else 'UNEXPECTED'})")
         return ok, want_ok, said
     finally:
         lab.close()
@@ -1355,7 +1355,8 @@ def expected(a, b, carry, via="relay", isolate=False):
     Cards name no relay (unless the receiver was started with one), so two
     hard NATs have nothing to fall back on there. With the networks isolated
     from each other nothing is direct: only a server that carries gets
-    anything across."""
+    anything across. `connects` is None where either outcome is the one
+    meant (see `meets`)."""
     if isolate:
         if via == "turn":
             return True, "turn"
@@ -1368,13 +1369,19 @@ def expected(a, b, carry, via="relay", isolate=False):
         # which takes a few passes. Two NATs that both draw ports at random
         # are out of reach, as they are for every method but a relay.
         if a in HARD and b in HARD:
-            return False, "none"
+            return (None, "either") if a == b == "symmetric_seq" else (False, "none")
         return True, "direct"
     if a in HARD and b in HARD:
         if via == "turn":
             # A TURN server carries, whatever the relay is allowed to do.
             return True, "turn"
-        return (True, "relay") if carry and via == "relay" else (False, "none")
+        if carry and via == "relay":
+            return True, "relay"
+        # Two NATs that count their ports up: the punch aims at the next ones
+        # of both, which is a race — every probe takes a port of its own NAT
+        # — won now and then (docs/NAT.md: tried, not counted on; CI once,
+        # in the cells by a relay that only introduces). Either is right.
+        return (None, "either") if a == b == "symmetric_seq" else (False, "none")
     if (carry and via == "relay") or via == "turn":
         # Whoever answers first carries a short transfer, and a server's
         # answer may beat a direct path that needs a meeting of many sockets
@@ -1382,6 +1389,11 @@ def expected(a, b, carry, via="relay", isolate=False):
         # moved off it.
         return True, "direct" if long_transfers() else "either"
     return True, "direct"
+
+
+def meets(ok, want_ok):
+    """Whether a pair connecting, or not, is what `expected` said."""
+    return want_ok is None or ok == want_ok
 
 
 def is_direct(path):
@@ -1405,7 +1417,7 @@ def cmd_matrix(args):
             ok, path, took, detail = transfer(a, b, carry=carry, timeout=args.timeout, via=args.via, isolate=args.isolate,
                                               verbose=args.verbose)
             want_ok, want_path = expected(a, b, carry, args.via, args.isolate)
-            met = ok == want_ok and (
+            met = meets(ok, want_ok) and (
                 not ok
                 or want_path == "either"
                 or is_carried(path.split(" ")[0]) == is_carried(want_path) and (is_carried(want_path) or is_direct(path))
