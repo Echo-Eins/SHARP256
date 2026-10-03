@@ -1338,7 +1338,7 @@ async fn burst_loss_with_hundreds_of_holes_recovers_quickly() {
 // Benchmarks (run with: cargo test --release --test e2e -- --ignored --nocapture)
 // ---------------------------------------------------------------------------
 
-async fn bench_profile(name: &str, size: usize, imp: Impairment, cap: Option<u64>) {
+async fn bench_profile(name: &str, size: usize, imp: Option<Impairment>, cap: Option<u64>) {
     // SHARP_BENCH=<substring> runs only the matching profiles.
     if let Ok(filter) = std::env::var("SHARP_BENCH") {
         if !name.contains(filter.as_str()) {
@@ -1353,7 +1353,15 @@ async fn bench_profile(name: &str, size: usize, imp: Impairment, cap: Option<u64
     );
     std::fs::create_dir_all(&src).unwrap();
     let mut r = start_receiver(&out, &state, |_| {}).await;
-    let proxy = start_proxy(r.addr, imp).await;
+    // `None`: no UDP at all, and TCP to the receiver as it comes.
+    let (proxy, _tcp) = match imp {
+        Some(imp) => (start_proxy(r.addr, imp).await, None),
+        None => {
+            let (proxy, tcp) = proxy_with_tcp(r.addr, Impairment::none(), r.addr, None).await;
+            proxy.blackhole.store(true, Ordering::Relaxed);
+            (proxy, Some(tcp))
+        }
+    };
     let path = make_file(&src, "bench.bin", size, 99);
     let mut cfg = sender_cfg(&path, proxy.addr, r.id, &state);
     cfg.transport.max_rate_bytes = cap;
@@ -1421,17 +1429,26 @@ async fn bench_link_profiles() {
         seed: 5,
         ..Impairment::none()
     };
-    bench_profile("clean, rtt 20 ms", 64 * mb, rtt(20), None).await;
-    bench_profile("0.1% loss, rtt 100 ms", 32 * mb, lossy(0.001, 100), None).await;
-    bench_profile("1% loss, rtt 20 ms", 32 * mb, lossy(0.01, 20), None).await;
-    bench_profile("5% loss, rtt 20 ms", 16 * mb, lossy(0.05, 20), None).await;
+    bench_profile("clean, rtt 20 ms", 64 * mb, Some(rtt(20)), None).await;
+    bench_profile(
+        "0.1% loss, rtt 100 ms",
+        32 * mb,
+        Some(lossy(0.001, 100)),
+        None,
+    )
+    .await;
+    bench_profile("1% loss, rtt 20 ms", 32 * mb, Some(lossy(0.01, 20)), None).await;
+    bench_profile("5% loss, rtt 20 ms", 16 * mb, Some(lossy(0.05, 20)), None).await;
     bench_profile(
         "1% loss, rtt 20 ms, cap 100 Mbit/s",
         16 * mb,
-        lossy(0.01, 20),
+        Some(lossy(0.01, 20)),
         Some(12_500_000),
     )
     .await;
+    // What goes over a stream is held to what it delivers (`Sender::window`):
+    // that must not hold back a fast one.
+    bench_profile("over TCP, UDP blocked", 64 * mb, None, None).await;
 }
 
 /// A hand-driven sender: performs a real handshake, then sends single frames.
@@ -5989,11 +6006,11 @@ async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
     let mut cfg = sender_cfg(&path, slow.addr, r.id, &state);
     cfg.alternate_peers = vec![dead.local_addr().unwrap()];
     cfg.carriers = false;
-    // A silence the sender takes for a stall sends an initiation too, and
-    // one comes easily here: a ping goes after half a second of quiet, and
-    // its answer takes 300 ms more, past the tests' 800 ms. On Windows the
-    // receiver was quiet that long putting the file in place (1.6 s for
-    // 20 kB), and a third initiation went once the transfer was done.
+    // What is counted is the handshake's: a stall sends an initiation too,
+    // and the tests' 800 ms leave a path of 300 ms little room (on Windows
+    // the receiver was quiet for 1.6 s putting the file in place, and its
+    // answer to a ping came past them; see
+    // `a_quiet_receiver_on_a_slow_path_is_not_taken_for_gone`).
     cfg.transport.stall_timeout = Duration::from_secs(5);
     let summary = tokio::time::timeout(Duration::from_secs(30), run_sender(cfg))
         .await
@@ -6007,12 +6024,61 @@ async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
     stop_receiver(r).await;
 }
 
+/// A receiver with nothing to say on a slow path — a sender held to a
+/// datagram every second and a half, a round trip of 400 ms — is not taken
+/// for gone: the ping goes early enough for its answer to be back before
+/// the silence counts. It went after half a second and more of it, the
+/// answer came past the stall timeout (the tests' 800 ms), and the sender
+/// paused, asked the relays again and sent an initiation, every time —
+/// as it did while a receiver put a file in place on Windows (1.6 s), or
+/// checked a large one on any system with the defaults' 3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quiet_receiver_on_a_slow_path_is_not_taken_for_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, out, state) = dirs(&tmp);
+    let mut r = start_receiver(&out, &state, |cfg| cfg.tcp = false).await;
+    let slow = start_proxy(
+        r.addr,
+        Impairment {
+            reverse_delay: Duration::from_millis(400),
+            ..Impairment::none()
+        },
+    )
+    .await;
+    // Twenty chunks: the pacer's first sixteen at once, then one every
+    // 1.4 s.
+    let path = make_file(&src, "quiet.bin", 20 * 1427, 18);
+    let mut cfg = sender_cfg(&path, slow.addr, r.id, &state);
+    cfg.carriers = false;
+    cfg.transport.max_rate_bytes = Some(1000);
+    let stalls = Arc::new(AtomicU64::new(0));
+    cfg.events = Some({
+        let stalls = stalls.clone();
+        Arc::new(move |ev| {
+            if matches!(ev, TransferEvent::Stalled { .. }) {
+                stalls.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+    let summary = tokio::time::timeout(Duration::from_secs(60), run_sender(cfg))
+        .await
+        .expect("finished in time")
+        .expect("send");
+    wait_completed(&mut r.events, Duration::from_secs(10)).await;
+    assert_eq!(stalls.load(Ordering::Relaxed), 0, "stalls");
+    // The handshake's own: the second goes after 250 ms, the answer to the
+    // first takes 400. None for a stall.
+    assert!(summary.initiations <= 2, "{} sent", summary.initiations);
+    stop_receiver(r).await;
+}
+
 /// UDP that loses a share of what it carries, but still outruns TCP: the
 /// trial on a stream finds TCP slower, and the session goes back to UDP —
 /// at its old pace at once, and stays there. (The pace came back only as
-/// the stream drained what it held: the session's packets in it held the
-/// window, and their round trips, seconds out of the stream's buffers, the
-/// pacing. UDP went on at a fifteenth of its pace for seconds.)
+/// the stream drained what it held: the round trips of the session's
+/// packets, seconds out of the stream's buffers, paced UDP at a twentieth
+/// of it. And the stream held seconds' worth: what it was given beyond
+/// its round trips waited in the socket's buffers.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6074,8 +6140,16 @@ async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
         || load(udp) > udp_then + 200_000,
     )
     .await;
+    // Over the next two seconds: UDP's pace, and when the stream last
+    // carried anything.
     let (at, udp_back) = (Instant::now(), load(udp));
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut last_tcp = (at, load(streamed));
+    while at.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if load(streamed) != last_tcp.1 {
+            last_tcp = (Instant::now(), load(streamed));
+        }
+    }
     let pace_back = (load(udp) - udp_back) as f64 / at.elapsed().as_secs_f64();
     // At a twentieth of it while the stream drained.
     assert!(
@@ -6084,19 +6158,19 @@ async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
         pace_back / 1e3,
         pace / 1e3
     );
-    // And stays there, once what the stream held has come out of it (the
-    // session sent it again over UDP when it left).
-    let mut quiet = (Instant::now(), load(streamed));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while quiet.0.elapsed() < Duration::from_secs(1) {
-        assert!(Instant::now() < deadline, "the stream never drained");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if load(streamed) != quiet.1 {
-            quiet = (Instant::now(), load(streamed));
-        }
-    }
+    // What the stream held came out of it soon after: two round trips and
+    // a tenth of a second at its rate, where the socket's buffers held
+    // seven seconds' worth.
+    let drained = last_tcp.0 - at;
+    assert!(
+        drained < Duration::from_secs(1),
+        "the stream went on for {:?} after the session left it",
+        drained
+    );
+    // And it stays there.
+    let quiet = load(streamed);
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let more = load(streamed) - quiet.1;
+    let more = load(streamed) - quiet;
     assert!(more < 20_000, "{} B more over TCP once back on UDP", more);
     assert!(!sender.is_finished(), "the file is longer than this");
     sender.abort();

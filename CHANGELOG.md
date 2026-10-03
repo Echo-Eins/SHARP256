@@ -312,6 +312,23 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   has been heard on in the last two seconds stays its own, and a later
   hit's gives way. Either made the cell pass ten runs in ten; with both,
   twenty in twenty.
+- What a stream was given had no bound but the socket's buffers, which
+  the kernel grows to megabytes: seconds of a slow TCP, behind which
+  everything the session sent waited, and which went on coming out of the
+  stream for seconds once the session had left it for UDP (two and more,
+  with a TCP of 150 kB/s). A stream is now given up to two round trips at
+  the most it was seen to deliver at, and a tenth of a second more (256 kB
+  before it has delivered anything, 32 kB at least): it drains within a
+  tenth of a second of being left, and a fast one is not held back (330
+  Mbit/s on loopback either way, release build). The speed bench has a
+  profile for a stream.
+- A receiver with nothing to say on a slow path was taken for gone: the
+  sender pinged after half a second and more of silence, the answer came
+  back past the stall timeout, and the sender paused, asked the relays
+  again and sent an initiation — every time the receiver was quiet that
+  long: putting a file in place (1.6 s on Windows), checking a large one,
+  waiting for what a slow sender has yet to send. A ping now goes early
+  enough for its answer to be back before the silence counts.
 - Tests: what an end-to-end test's sessions logged is printed with its
   failure, and with no other test's (`SHARP_TEST_LOG`, set in CI); the
   trial that goes back to UDP measures against a TCP of 150 kB/s rather

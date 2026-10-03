@@ -38,7 +38,9 @@ use crate::protocol::wire::{
 };
 use crate::protocol::RangeSet;
 use crate::state::{hex16, parse_hex16, SenderState, StateStore};
-use crate::transport::congestion::{burst_for_rate, Cubic, Pacer, Policer, RttEstimator};
+use crate::transport::congestion::{
+    burst_for_rate, Cubic, DeliveryRate, Pacer, Policer, RttEstimator,
+};
 use crate::transport::io::{
     is_no_buffer_error, recv_buffers, BatchSocket, Received, MAX_SEND_BYTES,
 };
@@ -1767,6 +1769,14 @@ const STREAM_RTO: Duration = Duration::from_secs(10);
 /// The pace on a stream with no rate set: none to speak of. The stream
 /// takes what it has room for.
 const STREAM_PACE: f64 = 5e9;
+/// What a stream may have in flight before its rate is known: the first
+/// round trips of a fast one, a second of a slow one's.
+const STREAM_START: u64 = 256 << 10;
+/// What a stream may have in flight at least.
+const STREAM_FLOOR: u64 = 32 << 10;
+/// What a stream may have queued, as time at its rate, beyond its two
+/// round trips' worth (see `Sender::window`).
+const STREAM_QUEUE: Duration = Duration::from_millis(100);
 /// How long to wait when a stream's queue would take no more.
 const STREAM_FULL_BACKOFF: Duration = Duration::from_millis(1);
 /// How long a relay's port, once the relay has named it over UDP, has the
@@ -1953,6 +1963,8 @@ struct Engine {
     /// A policer on the path, once its rate is known: the pacing rate's cap
     /// (see `congestion::Policer`).
     policer: Policer,
+    /// What the stream the session runs on delivers (see `window`).
+    stream_rate: DeliveryRate,
     pacer: Pacer,
     rwnd: u64,
 
@@ -2163,6 +2175,7 @@ impl Engine {
             rtt,
             cc,
             policer: Policer::default(),
+            stream_rate: DeliveryRate::default(),
             pacer,
             rwnd: u64::MAX,
             received_bytes: 0,
@@ -3858,9 +3871,26 @@ impl Engine {
         let floor = 2 * self.chunk as u64;
         if let Some(stream) = &self.stream {
             // A stream carries what it is given, in order, at the rate its
-            // own congestion control finds: it gets what it has room for.
+            // own congestion control finds: it gets what it has room for —
+            // up to two round trips at the most it was seen to deliver at,
+            // and a tenth of a second more. What it is given beyond that
+            // waits in the socket's buffers, which the kernel grows to
+            // megabytes: seconds of a slow TCP, during which everything
+            // the session sends waits behind it, and which went on coming
+            // out of the stream once the session had left it for UDP.
+            // Twice the round trip leaves TCP room to double its rate.
             let room = crate::transport::carrier::STREAM_ROOM.saturating_sub(stream.queued());
-            return (self.inflight_bytes + room).min(self.rwnd).max(floor);
+            let bound = match self.stream_rate.max() {
+                None => STREAM_START,
+                Some(rate) => {
+                    let ahead = self.rtt.min_rtt() * 2 + STREAM_QUEUE;
+                    ((rate * ahead.as_secs_f64()) as u64).max(STREAM_FLOOR)
+                }
+            };
+            return (self.inflight_bytes + room)
+                .min(bound)
+                .min(self.rwnd)
+                .max(floor);
         }
         self.cc.cwnd().min(self.rwnd).max(floor)
     }
@@ -4782,6 +4812,9 @@ impl Engine {
         if acked > 0 && window_used {
             self.cc.on_ack(acked, now, &self.rtt);
         }
+        if self.stream.is_some() {
+            self.stream_rate.on_ack(now, self.rtt.round(), acked);
+        }
         if acked > 0 {
             self.rtt.reset_backoff();
             self.last_ack_progress = now;
@@ -5185,6 +5218,8 @@ impl Engine {
         }
         let was_stream = self.stream.is_some();
         self.stream = self.carriers.shims.stats(self.peer);
+        // What one stream delivered says nothing of another.
+        self.stream_rate.reset();
         if was_stream == self.stream.is_some() {
             return;
         }
@@ -5752,7 +5787,20 @@ impl Engine {
         let ping_interval = if self.stalled {
             Duration::from_secs(1 << self.ping_backoff.min(2))
         } else {
-            (self.rtt.rto() * 2).clamp(Duration::from_millis(500), Duration::from_secs(3))
+            // Early enough for the answer to be back before the silence
+            // counts (`quiet_for_alternatives`, which is never longer than
+            // the stall timeout): a receiver with nothing to say — one
+            // putting a file in place, checking a large one, waiting for
+            // data a slow sender has yet to send — was taken for gone on
+            // a slow path, every time, and the sender paused, asked the
+            // relays again and sent an initiation.
+            let answered_by = self
+                .quiet_for_alternatives()
+                .saturating_sub(self.rtt.rto())
+                .max(Duration::from_millis(100));
+            (self.rtt.rto() * 2)
+                .clamp(Duration::from_millis(500), Duration::from_secs(3))
+                .min(answered_by)
         };
         if since_rx >= ping_interval
             && now.saturating_duration_since(self.last_ping) >= ping_interval

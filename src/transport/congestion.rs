@@ -831,6 +831,59 @@ impl Policer {
     }
 }
 
+/// What a path delivers, in bytes a second: the most of the last
+/// [`RATE_ROUNDS`] rounds of the [`RttEstimator`], each counted from its
+/// first acknowledgement to the next round's (BBR's filter of the
+/// bottleneck's bandwidth, by rounds). The most and not the mean: a round
+/// the sender had little to send in says nothing of what the path takes.
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryRate {
+    /// The round being counted: its number, when its first acknowledgement
+    /// came, and what was delivered since.
+    current: Option<(u64, Instant, u64)>,
+    /// The rates of the rounds before it, the newest last.
+    rounds: std::collections::VecDeque<(u64, f64)>,
+}
+
+/// Rounds a [`DeliveryRate`] remembers.
+pub const RATE_ROUNDS: u64 = 10;
+
+impl DeliveryRate {
+    /// Takes what an acknowledgement in round `round` delivered, in bytes.
+    pub fn on_ack(&mut self, now: Instant, round: u64, delivered: u64) {
+        match self.current {
+            Some((r, since, got)) if r == round => {
+                self.current = Some((r, since, got + delivered));
+            }
+            Some((r, since, got)) => {
+                let took = now.saturating_duration_since(since).as_secs_f64();
+                if took > 0.0 && got > 0 {
+                    self.rounds.push_back((r, got as f64 / took));
+                }
+                while self
+                    .rounds
+                    .front()
+                    .is_some_and(|&(old, _)| old + RATE_ROUNDS < round)
+                {
+                    self.rounds.pop_front();
+                }
+                self.current = Some((round, now, delivered));
+            }
+            None => self.current = Some((round, now, delivered)),
+        }
+    }
+
+    /// The most a recent round delivered at, once one has been counted.
+    pub fn max(&self) -> Option<f64> {
+        self.rounds.iter().map(|&(_, r)| r).reduce(f64::max)
+    }
+
+    /// Forgets everything: another path.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Token-bucket pacer: smooths transmission to the configured rate while
 /// permitting bounded bursts (important because timers are ~1 ms coarse).
 #[derive(Debug, Clone)]
@@ -1272,6 +1325,40 @@ mod tests {
             p.on_ack(t, round, 950, 50);
         }
         assert_eq!(p.detections(), 0);
+    }
+
+    #[test]
+    fn a_delivery_rate_is_the_most_of_the_last_rounds() {
+        let mut d = DeliveryRate::default();
+        let mut t = Instant::now();
+        assert_eq!(d.max(), None);
+        // 10 kB in each of rounds 0..=4, a round every 100 ms: 100 kB/s;
+        // round 5 slower (the sender had little to send).
+        for round in 0..6u64 {
+            let per_ack = if round == 5 { 500 } else { 1000 };
+            for _ in 0..10 {
+                d.on_ack(t, round, per_ack);
+                t += Duration::from_millis(10);
+            }
+        }
+        d.on_ack(t, 6, 1000);
+        let rate = d.max().expect("rounds counted");
+        assert!((rate - 100_000.0).abs() < 1.0, "{}", rate);
+        // A faster round counts at once; one older than the last ten is
+        // forgotten.
+        for _ in 0..10 {
+            d.on_ack(t, 6, 3000);
+            t += Duration::from_millis(10);
+        }
+        d.on_ack(t, 7, 0);
+        assert!(d.max().unwrap() > 250_000.0);
+        for round in 8..30u64 {
+            d.on_ack(t, round, 100);
+            t += Duration::from_millis(100);
+        }
+        assert!(d.max().unwrap() < 2_000.0, "{:?}", d.max());
+        d.reset();
+        assert_eq!(d.max(), None);
     }
 
     #[test]
