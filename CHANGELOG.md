@@ -327,7 +327,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   above the rate found out in about a second on Windows (1.18 to 1.20
   times, against 1.02 to 1.05 on Linux); the relay that comes up late takes
   a port outside every system's ephemeral range, which no other test's
-  socket can take in the seconds it waits; the test of the ending session
+  socket can take in the seconds it waits, and a receiver that is to take
+  TCP is made again on another port when its UDP port's number is a TCP
+  socket's already (`Receiver::takes_tcp` says which it got); the test of
+  the ending session
   waits for the receiver's answers (macOS); the NAT laboratory takes two
   NATs that count their ports up as right either way where the relay only
   introduces — the prediction of both next ports is a race it wins now and
