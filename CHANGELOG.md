@@ -303,7 +303,9 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   than 500 (TCP was the faster under MemorySanitizer), and asks that UDP
   be back at its pace, not that the stream carry nothing while it drains;
   the slow address of the handshake test answers after 300 ms, between
-  the second initiation and the third (Windows).
+  the second initiation and the third (Windows); the relay that comes up
+  late takes a port outside every system's ephemeral range, which no other
+  test's socket can take in the seconds it waits.
 - `SECURITY.md`: how to report a vulnerability, privately.
 
 ### Test vectors, from a second implementation

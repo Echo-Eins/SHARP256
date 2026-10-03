@@ -3558,6 +3558,27 @@ async fn a_sender_that_starts_before_its_receiver_is_put_through_when_it_registe
     stop_receiver(r).await;
 }
 
+/// A loopback address free for UDP and TCP, its port outside every
+/// system's ephemeral range (Linux's from 32768, macOS's and Windows' from
+/// 49152): no `bind` to port 0 and no `connect` takes it meanwhile, so it
+/// can be left unbound for seconds and bound then. Taken from that range,
+/// a relay's port that was to come up late went to another test first
+/// (CI, `AddrInUse`).
+#[cfg(feature = "nat-traversal")]
+async fn port_nobody_takes() -> SocketAddr {
+    loop {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 20_000 + rand::random::<u16>() % 12_000));
+        let Ok(udp) = UdpSocket::bind(addr).await else {
+            continue;
+        };
+        let Ok(tcp) = tokio::net::TcpListener::bind(addr).await else {
+            continue;
+        };
+        drop((udp, tcp));
+        return addr;
+    }
+}
+
 /// The relay is not up when the sender starts (it is restarting, or the
 /// network is coming up): a relay that does not answer is asked again, and
 /// used once it does — with the receiver reachable only through it.
@@ -3573,9 +3594,7 @@ async fn a_relay_that_comes_up_after_the_sender_started_is_used_when_it_does() {
 
     // The relay's address and identity are settled before it runs.
     let relay_identity = Identity::generate();
-    let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let relay_addr = probe.local_addr().unwrap();
-    drop(probe);
+    let relay_addr = port_nobody_takes().await;
     let (receiver_mapping, refused, mapping_task) = one_way_mapping(relay_addr).await;
     let r = start_receiver(&out, &state, |cfg| {
         cfg.relays = vec![format!("{}@{}", relay_identity.id(), receiver_mapping)];
