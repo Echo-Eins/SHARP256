@@ -495,8 +495,9 @@ impl Cubic {
 /// **Probed** then, a step at a time: the cap rises by [`PROBE_GAIN`] every
 /// [`LT_MIN_ROUNDS`] round trips and [`PROBE_STEP`], and is lifted once it
 /// is [`PROBE_LIMIT`] times the rate held to. A policer that is still there
-/// is suspected again at the first step and checked; one that is gone is
-/// left behind in a few seconds. (Lifting the cap at once would let the
+/// is suspected again at the first step and checked — the step is not left
+/// while it loses as much as a policer makes it; one that is gone is left
+/// behind in a few seconds. (Lifting the cap at once would let the
 /// window-based controller overrun it again at its full rate.)
 #[derive(Debug, Clone, Default)]
 pub struct Policer {
@@ -758,7 +759,15 @@ impl Policer {
                 since,
                 round: from,
             } => {
-                if round >= from + LT_MIN_ROUNDS
+                // A step that loses as through a policer is the one it is
+                // suspected and checked at: going on up meanwhile, the probe
+                // was half as fast again above it by then where round trips
+                // are long (Windows, on loopback).
+                let losing = self
+                    .sampling
+                    .is_some_and(|(_, _, got, gone)| gone as f64 >= LT_LOSS * got as f64);
+                if !losing
+                    && round >= from + LT_MIN_ROUNDS
                     && now.saturating_duration_since(since) >= PROBE_STEP
                 {
                     let cap = cap * PROBE_GAIN;
@@ -1171,7 +1180,20 @@ mod tests {
     /// trip of a millisecond, acknowledged every millisecond: what it
     /// sends beyond the policer's rate is lost.
     fn policed(p: &mut Policer, t: &mut Instant, round: &mut u64, ms: u64, offered: f64) {
+        policed_rounds(p, t, round, ms, offered, 1)
+    }
+
+    /// The same, a round trip lasting `round_ms`.
+    fn policed_rounds(
+        p: &mut Policer,
+        t: &mut Instant,
+        round: &mut u64,
+        ms: u64,
+        offered: f64,
+        round_ms: u64,
+    ) {
         let rate = 250_000.0;
+        // `round` counts milliseconds; the policer is told of round trips.
         for _ in 0..ms {
             *t += Duration::from_millis(1);
             *round += 1;
@@ -1179,7 +1201,7 @@ mod tests {
             let sent = cap / 1000.0;
             let got = sent.min(rate / 1000.0);
             p.on_sent(sent as u64);
-            p.on_ack(*t, *round, got as u64, (sent - got) as u64);
+            p.on_ack(*t, *round / round_ms, got as u64, (sent - got) as u64);
         }
     }
 
@@ -1220,6 +1242,65 @@ mod tests {
         }
         assert!(probed < 400, "{} ms", probed);
         assert_eq!(p.detections(), 2);
+    }
+
+    /// The same with round trips of 40 ms, as Windows' coarser timers make
+    /// them on loopback: suspecting and checking take longer than a step,
+    /// and the probe went on rising while they did — found again two or
+    /// three steps up, half as fast again as the policer and more (in CI on
+    /// Windows, 1.26 to 1.36 times what it passed, against 1.02 to 1.05 on
+    /// Linux). A step that is losing as through a policer is not left.
+    #[test]
+    fn a_policer_still_there_is_found_at_the_first_step_on_long_round_trips() {
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        policed_rounds(&mut p, &mut t, &mut round, 2000, 10e6, 40);
+        let rate = p.rate().expect("found");
+        assert!(p.holding());
+        while p.holding() {
+            policed_rounds(&mut p, &mut t, &mut round, 1, 10e6, 40);
+        }
+        let mut most = 0.0f64;
+        let mut probed = 0;
+        while !p.holding() {
+            policed_rounds(&mut p, &mut t, &mut round, 1, 10e6, 40);
+            most = most.max(p.rate().unwrap_or(f64::MAX));
+            probed += 1;
+            assert!(probed < 5000, "never found again");
+        }
+        assert!(
+            most <= rate * PROBE_GAIN * 1.001,
+            "probed up to {:.2} times the rate",
+            most / rate
+        );
+        assert_eq!(p.detections(), 2);
+    }
+
+    /// A policer gone on a path that loses a little at random, round trips
+    /// of 40 ms: the probe does not stop at every loss (sampled until it
+    /// starts over, 16 round trips, at each step), and the cap is lifted
+    /// in as many steps as without loss.
+    #[test]
+    fn a_policer_gone_is_left_behind_through_a_little_random_loss() {
+        let mut p = Policer::default();
+        let (mut t, mut round) = (Instant::now(), 0);
+        policed_rounds(&mut p, &mut t, &mut round, 2000, 10e6, 40);
+        assert!(p.holding());
+        let mut lifted = None;
+        for ms in 0..30_000 {
+            t += Duration::from_millis(1);
+            round += 1;
+            let sent = p.rate().unwrap_or(f64::MAX).min(10e6) / 1000.0;
+            p.on_sent(sent as u64);
+            p.on_ack(t, round / 40, (sent * 0.98) as u64, (sent * 0.02) as u64);
+            if p.rate().is_none() {
+                lifted = Some(ms);
+                break;
+            }
+        }
+        let ms = lifted.expect("the cap never lifted");
+        // Held 2 s, then twelve steps of 200 ms.
+        assert!(ms < 6_000, "lifted after {} ms", ms);
     }
 
     #[test]

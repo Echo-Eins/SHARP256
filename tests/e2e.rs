@@ -5968,12 +5968,13 @@ async fn a_policer_is_not_overrun() {
     );
     // Paced without regard to the policer: offered 3.6 times what passed,
     // 2.7 times the file sent again. Held to it, the sender still probes a
-    // quarter above it every two seconds, until it is found there again:
-    // at the first step on Linux (1.02 to 1.05 times offered), in about a
-    // second on Windows, whose timers are coarser (1.18 to 1.20).
+    // quarter above it every two seconds, and is found there again at the
+    // first step (on Windows, whose round trips on loopback are longer, the
+    // probe went on up while it was, to 1.36 times; see `congestion`'s
+    // `a_policer_still_there_is_found_at_the_first_step_on_long_round_trips`).
     assert!(summary.policer_detections >= 1);
     assert!(
-        over < 1.25,
+        over < 1.15,
         "offered {:.2} times what the policer passed",
         over
     );

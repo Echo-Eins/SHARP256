@@ -322,6 +322,13 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   tenth of a second of being left, and a fast one is not held back (330
   Mbit/s on loopback either way, release build). The speed bench has a
   profile for a stream.
+- A policer still there was found again two or three steps up the probe
+  where round trips are long, the probe going on up while the policer was
+  suspected and checked: half as fast again as it and more (CI on
+  Windows, whose round trips on loopback are longer, 1.18 to 1.36 times
+  what the policer passed, against 1.02 to 1.05 on Linux). A step that
+  loses as through a policer is not left until the check has said; one
+  that loses a little at random still is, as the steps go.
 - A receiver with nothing to say on a slow path was taken for gone: the
   sender pinged after half a second and more of silence, the answer came
   back past the stall timeout, and the sender paused, asked the relays
@@ -337,12 +344,8 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   twentieth, before the fix; its best second alone was too much to ask of
   macOS), not that the stream carry nothing while it drains;
   the handshake test whose slow address answers after 300 ms counts the
-  initiations of the handshake alone (a ping's answer, 300 ms late, had
-  the sender take the receiver for stalled while it put the file in place
-  — 1.6 s for 20 kB on Windows — and initiate again); the policer test
-  lets the sender offer a quarter more than the policer passes, its probes
-  above the rate found out in about a second on Windows (1.18 to 1.20
-  times, against 1.02 to 1.05 on Linux); the relay that comes up late takes
+  initiations of the handshake alone (a stall sends one too); the relay
+  that comes up late takes
   a port outside every system's ephemeral range, which no other test's
   socket can take in the seconds it waits, and a receiver that is to take
   TCP is made again on another port when its UDP port's number is a TCP
