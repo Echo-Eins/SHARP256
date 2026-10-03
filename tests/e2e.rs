@@ -5941,10 +5941,13 @@ async fn a_policer_is_not_overrun() {
         over
     );
     // Paced without regard to the policer: offered 3.6 times what passed,
-    // 2.7 times the file sent again.
+    // 2.7 times the file sent again. Held to it, the sender still probes a
+    // quarter above it every two seconds, until it is found there again:
+    // at the first step on Linux (1.02 to 1.05 times offered), in about a
+    // second on Windows, whose timers are coarser (1.18 to 1.20).
     assert!(summary.policer_detections >= 1);
     assert!(
-        over < 1.15,
+        over < 1.25,
         "offered {:.2} times what the policer passed",
         over
     );
@@ -5958,9 +5961,7 @@ async fn a_policer_is_not_overrun() {
 /// (version 4), instead of the first address being asked again.
 ///
 /// The second initiation goes at 250 ms, the third would at 500: the
-/// answer has to be in between, crypto of both ends in a debug build
-/// included. After 400 ms it was not always, on Windows in CI, and a third
-/// initiation went though the answer was taken.
+/// answer comes in between.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5979,6 +5980,12 @@ async fn a_slow_answer_is_taken_though_another_address_was_tried_since() {
     let mut cfg = sender_cfg(&path, slow.addr, r.id, &state);
     cfg.alternate_peers = vec![dead.local_addr().unwrap()];
     cfg.carriers = false;
+    // A silence the sender takes for a stall sends an initiation too, and
+    // one comes easily here: a ping goes after half a second of quiet, and
+    // its answer takes 300 ms more, past the tests' 800 ms. On Windows the
+    // receiver was quiet that long putting the file in place (1.6 s for
+    // 20 kB), and a third initiation went once the transfer was done.
+    cfg.transport.stall_timeout = Duration::from_secs(5);
     let summary = tokio::time::timeout(Duration::from_secs(30), run_sender(cfg))
         .await
         .expect("finished in time")

@@ -297,15 +297,36 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   seconds long, were taken for UDP's and paced it at the least the pacer
   allows. A round trip now counts only for a packet sent since the
   session moved.
+- A sender behind a simple NAT and a receiver behind one that draws ports
+  at random found each other by the birthday method and still did not
+  talk, now and then (the NAT laboratory's restricted × symmetric_random,
+  four runs in ten here, two cells of one CI run): the receiver's many
+  sockets let sixteen datagrams through at once, the sender answered each
+  with an attempt of its own and kept the last four, and the answer that
+  came back was to one of the twelve dropped; and every introduction of
+  the sender is a meeting of its own — the relay introduces it again when
+  it says more of its NAT — whose hit took the place of the last one and
+  closed the socket the handshake was going through. A burst like that is
+  answered with one initiation, the attempt remembering every address it
+  went to, and an answer proving the one it came from; a socket the peer
+  has been heard on in the last two seconds stays its own, and a later
+  hit's gives way. Either made the cell pass ten runs in ten; with both,
+  twenty in twenty.
 - Tests: what an end-to-end test's sessions logged is printed with its
   failure, and with no other test's (`SHARP_TEST_LOG`, set in CI); the
   trial that goes back to UDP measures against a TCP of 150 kB/s rather
   than 500 (TCP was the faster under MemorySanitizer), and asks that UDP
   be back at its pace, not that the stream carry nothing while it drains;
-  the slow address of the handshake test answers after 300 ms, between
-  the second initiation and the third (Windows); the relay that comes up
-  late takes a port outside every system's ephemeral range, which no other
-  test's socket can take in the seconds it waits.
+  the handshake test whose slow address answers after 300 ms counts the
+  initiations of the handshake alone (a ping's answer, 300 ms late, had
+  the sender take the receiver for stalled while it put the file in place
+  — 1.6 s for 20 kB on Windows — and initiate again); the policer test
+  lets the sender offer a quarter more than the policer passes, its probes
+  above the rate found out in about a second on Windows (1.18 to 1.20
+  times, against 1.02 to 1.05 on Linux); the relay that comes up late takes
+  a port outside every system's ephemeral range, which no other test's
+  socket can take in the seconds it waits; the test of the ending session
+  waits for the receiver's answers (macOS).
 - `SECURITY.md`: how to report a vulnerability, privately.
 
 ### Test vectors, from a second implementation

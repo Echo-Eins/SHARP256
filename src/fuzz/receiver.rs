@@ -727,7 +727,6 @@ mod tests {
         let w = World::new();
         w.accept.store(true, Ordering::Relaxed);
         let mut run = Run::new(&w);
-        let mut g = Gen::new(&[]);
         if when == When::Ended {
             // Room for one end, taken by another sender's transfer.
             run.h = {
@@ -746,7 +745,8 @@ mod tests {
                 tree: None,
                 file_name: "other.bin".into(),
             };
-            let mut other = run.handshake_v4(&mut g, 1, 0, other).expect("a session");
+            let mut other = attempt_v4(&mut run, 1, &other);
+            run.settle();
             run.packet(
                 &mut other,
                 wire::type_byte(MsgType::Abort, 0),
@@ -772,15 +772,13 @@ mod tests {
             tree: None,
             file_name: "attempt.bin".into(),
         };
-        let mut last = run
-            .handshake_v4(&mut g, 0, 0, hello.clone())
-            .expect("the first attempt's session");
+        let mut last = attempt_v4(&mut run, 0, &hello);
+        run.settle();
 
         // What follows reaches the dispatcher before the session runs
         // again: the first attempt's ABORT, then the second's handshake
         // (and HELLO). (Under load no more: initiations a second apart.)
         let _in_runtime = w.rt.enter();
-        let to = w.addrs[0];
         let mut pkt = Vec::new();
         begin_packet(
             &mut pkt,
@@ -791,7 +789,7 @@ mod tests {
         last.next_pn += 1;
         pkt.extend_from_slice(&abort_body());
         last.keys.send.seal(&mut pkt).expect("sealed");
-        run.h.datagram(&pkt, to, run.now);
+        hand(&mut run, &pkt);
         if when == When::Ended {
             let deadline = Instant::now() + Duration::from_secs(5);
             // (The other session's handle is gone: it had finished when
@@ -814,38 +812,10 @@ mod tests {
                 hello,
             });
             let pkt = att.initiation(&payload, None).expect("an initiation");
-            run.h.datagram(&pkt, to, run.now);
+            hand(&mut run, &pkt);
             Box::new(move |inbox| inbox.iter().any(|d| att.read_response(d).is_ok()))
         } else {
-            let mut att = Initiator::new_v4(&w.senders[0], &w.id, &no_psk()).expect("an initiator");
-            let payload = wire::encode_initiation_v4(&wire::InitiationV4 {
-                timestamp: hs::initiation_timestamp(),
-                suites: 1,
-                hardware_aes: false,
-            });
-            for frag in att.initiation_datagrams(&payload, None).expect("fragments") {
-                run.h.datagram(&frag, to, run.now);
-            }
-            run.inbox[0].clear();
-            run.fence();
-            let (rcid, payload, split) = run.inbox[0]
-                .iter()
-                .find_map(|d| att.read_response(d).ok())
-                .expect("the second attempt's handshake answered");
-            let suite = Suite::from_u8(
-                wire::decode_response_v4(&payload)
-                    .expect("a response")
-                    .suite,
-            )
-            .expect("a suite");
-            let keys = SessionKeys::derive(&split, true, suite);
-            let mut body = Vec::new();
-            wire::encode_body(&wire::Message::Hello(hello), &mut body, usize::MAX);
-            let mut pkt = Vec::new();
-            begin_packet(&mut pkt, rcid, wire::type_byte(MsgType::Hello, 0), 0);
-            pkt.extend_from_slice(&body);
-            keys.send.seal(&mut pkt).expect("sealed");
-            run.h.datagram(&pkt, to, run.now);
+            let keys = attempt_v4(&mut run, 0, &hello).keys;
             // Its HELLO accepted (after the user was asked).
             Box::new(move |inbox| {
                 inbox.iter().any(|d| {
@@ -884,6 +854,62 @@ mod tests {
         drop(_in_runtime);
         run.finish();
     }
+    /// A version 4 handshake of sender `s` from the target's first
+    /// address, and its HELLO, handed to the dispatcher with no session
+    /// running meanwhile: what the sender holds of the session after. The
+    /// answer is waited for (on macOS a datagram on loopback is readable a
+    /// moment after it is sent, and was not there yet).
+    fn attempt_v4(run: &mut Run, s: usize, hello: &wire::Hello) -> Held {
+        let w = run.w;
+        let mut att = Initiator::new_v4(&w.senders[s], &w.id, &no_psk()).expect("an initiator");
+        let payload = wire::encode_initiation_v4(&wire::InitiationV4 {
+            timestamp: hs::initiation_timestamp(),
+            suites: 1,
+            hardware_aes: false,
+        });
+        for frag in att.initiation_datagrams(&payload, None).expect("fragments") {
+            hand(run, &frag);
+        }
+        run.inbox[0].clear();
+        run.fence();
+        let (rcid, payload, split) = run.inbox[0]
+            .iter()
+            .find_map(|d| att.read_response(d).ok())
+            .expect("the handshake answered");
+        let suite = wire::decode_response_v4(&payload)
+            .expect("a response")
+            .suite;
+        let suite = Suite::from_u8(suite).expect("a suite");
+        let mut held = Held {
+            keys: SessionKeys::derive(&split, true, suite),
+            rcid,
+            next_pn: 1,
+            peer: 0,
+            hello: hello.clone(),
+            sent: Vec::new(),
+        };
+        let mut body = Vec::new();
+        wire::encode_body(&wire::Message::Hello(hello.clone()), &mut body, usize::MAX);
+        let mut pkt = Vec::new();
+        begin_packet(&mut pkt, rcid, wire::type_byte(MsgType::Hello, 0), 0);
+        pkt.extend_from_slice(&body);
+        held.keys.send.seal(&mut pkt).expect("sealed");
+        held.sent.push(pkt.clone());
+        hand(run, &pkt);
+        // A packet under the session's keys: the address has proven itself.
+        run.proven[0] = true;
+        held
+    }
+
+    /// One datagram from the target's first address to the dispatcher, and
+    /// nothing run after it; counted as `Run::deliver` counts it.
+    fn hand(run: &mut Run, pkt: &[u8]) {
+        let w = run.w;
+        let _in_runtime = w.rt.enter();
+        run.got[0] += pkt.len() as u64;
+        run.h.datagram(pkt, w.addrs[0], run.now);
+    }
+
     fn abort_body() -> Vec<u8> {
         let abort = wire::Message::Abort(wire::Abort {
             code: 2,

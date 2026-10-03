@@ -1819,8 +1819,13 @@ struct Engine {
     auth: Peer,
     secure: Option<Secure>,
     /// Handshake attempts waiting for an answer, with their send times and
-    /// the address each was sent to.
-    attempts: VecDeque<(Initiator, Instant, SocketAddr)>,
+    /// the addresses each was sent to (several: see `on_punch`).
+    attempts: VecDeque<(Initiator, Instant, Vec<SocketAddr>)>,
+    /// The newest attempt's connection id and datagrams, and when they
+    /// went, if they went with no cookie (which is good at one address
+    /// only): what an address a punch shows is answered with while it is
+    /// fresh (see `on_punch`).
+    last_initiation: Option<(u64, Instant, Vec<Vec<u8>>)>,
     /// Latest cookie, with the address that issued it: a cookie proves our
     /// address to one receiver and is worthless anywhere else.
     cookie: Option<([u8; 16], Instant, SocketAddr)>,
@@ -2102,6 +2107,7 @@ impl Engine {
             auth,
             secure: None,
             attempts: VecDeque::new(),
+            last_initiation: None,
             cookie: None,
             candidates,
             next_candidate: 0,
@@ -2776,7 +2782,35 @@ impl Engine {
             }
             return Ok(());
         }
-        self.send_initiation_to(self.reach.native(from))
+        // A meeting of the receiver's very many sockets lets as many
+        // datagrams through at once, a port each, and each is answered —
+        // with the initiation just sent while it is fresh, not one of its
+        // own: only the last few attempts are kept, and the answer through
+        // the one port the receiver keeps was to an attempt dropped long
+        // since (sixteen at once, four kept: no answer for 45 s, now and
+        // then, in the NAT laboratory's restricted × symmetric_random).
+        // The attempt goes down as sent there too: an answer from there is
+        // the round trip that proves the address.
+        let to = self.reach.native(from);
+        let fresh = self
+            .last_initiation
+            .as_ref()
+            .filter(|(_, at, _)| now.saturating_duration_since(*at) < CANDIDATE_PROBE)
+            .map(|(cid, _, datagrams)| (*cid, datagrams.clone()));
+        if let (Some(to), Some((cid, datagrams))) = (to, fresh) {
+            if let Some(attempt) = self.attempts.iter_mut().find(|a| a.0.cid() == cid) {
+                if !attempt.2.contains(&to) {
+                    attempt.2.push(to);
+                }
+                for pkt in &datagrams {
+                    let _ = self.send_datagram(to, pkt);
+                }
+                self.initiations += 1;
+                tracing::debug!("handshake initiation sent to {} too", to);
+                return Ok(());
+            }
+        }
+        self.send_initiation_to(to)
     }
 
     /// A punch came from `ip`: whatever the DHT named there is backed by it
@@ -2926,7 +2960,9 @@ impl Engine {
         if self.attempts.len() >= MAX_ATTEMPTS {
             self.attempts.pop_front();
         }
-        self.attempts.push_back((attempt, now, to));
+        let cid = attempt.cid();
+        self.attempts.push_back((attempt, now, vec![to]));
+        self.last_initiation = cookie.is_none().then_some((cid, now, datagrams));
         self.initiations += 1;
         self.probes_sent += 1;
         tracing::debug!(
@@ -2945,7 +2981,15 @@ impl Engine {
         pkt: &[u8],
         from: SocketAddr,
     ) -> Result<(), SendError> {
-        let (sent_at, target) = (self.attempts[idx].1, self.attempts[idx].2);
+        let sent_at = self.attempts[idx].1;
+        // The address it went to that answers: the one the answer came
+        // from, if it is one of them.
+        let targets = &self.attempts[idx].2;
+        let target = if targets.contains(&from) {
+            from
+        } else {
+            targets[0]
+        };
         if pkt.len() == COOKIE_REPLY_LEN {
             // A cookie proves our address to the receiver we sent to, so
             // only a reply from there is worth keeping. Anybody who saw the
@@ -3087,6 +3131,7 @@ impl Engine {
         });
         // Older attempts are obsolete now.
         self.attempts.clear();
+        self.last_initiation = None;
         // We sent this attempt to `target` and got back an answer bound to
         // it, so `target` is reachable and is the receiver: that round trip
         // is the proof, and it settles which of the candidate addresses a

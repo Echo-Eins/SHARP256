@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -242,6 +242,14 @@ pub async fn meet(
 /// oldest goes when there are too many, and all of them when the receiver
 /// does.
 ///
+/// A route the peer is talking through stays its route: a meeting with the
+/// same peer that ends later — the relay introduces a sender again when it
+/// says more of its NAT, and each introduction is a meeting — gives up its
+/// socket instead, passing on what came to it. It used to take the place,
+/// and the socket the handshake was going through was closed under it (the
+/// NAT laboratory's restricted × symmetric_random, now and then: no answer
+/// for 45 s). One the peer has gone quiet on is taken over as before.
+///
 /// [`adopt`]: Routes::adopt
 /// [`send`]: Routes::send
 pub struct Routes {
@@ -249,17 +257,36 @@ pub struct Routes {
     /// almost always there is nothing.
     active: AtomicBool,
     map: RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>,
-    order: Mutex<Vec<(SocketAddr, tokio::task::JoinHandle<()>)>>,
+    order: Mutex<Vec<Route>>,
     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    /// What `Route::heard` counts from, and how long a route stays the
+    /// peer's once the peer was heard on it.
+    born: Instant,
+    in_use: Duration,
+}
+
+/// A peer's socket of its own: the task that reads it, and when the peer
+/// was last heard on it (milliseconds from `Routes::born`).
+struct Route {
+    peer: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+    heard: Arc<AtomicU64>,
 }
 
 /// Peers answered from a socket of their own at once.
 const MAX_ROUTES: usize = 16;
+/// How long a route stays a peer's once the peer was heard on it.
+const ROUTE_IN_USE: Duration = Duration::from_secs(2);
 
 impl Routes {
     /// The datagrams that arrive on adopted sockets come out of the receiver
     /// returned with it.
     pub fn new() -> (Arc<Self>, mpsc::Receiver<(Vec<u8>, SocketAddr)>) {
+        Self::keeping_for(ROUTE_IN_USE)
+    }
+
+    /// The same, a route staying a peer's for `in_use` after it was heard.
+    fn keeping_for(in_use: Duration) -> (Arc<Self>, mpsc::Receiver<(Vec<u8>, SocketAddr)>) {
         let (tx, rx) = mpsc::channel(256);
         (
             Arc::new(Self {
@@ -267,9 +294,15 @@ impl Routes {
                 map: RwLock::new(HashMap::new()),
                 order: Mutex::new(Vec::new()),
                 tx,
+                born: Instant::now(),
+                in_use,
             }),
             rx,
         )
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.born.elapsed().as_millis() as u64
     }
 
     /// Answers `hit.from` from `hit.socket` from now on, and passes on what
@@ -281,8 +314,28 @@ impl Routes {
             datagram,
         } = hit;
         let tx = self.tx.clone();
+        let now = self.now_ms();
+        let mut order = self.order.lock();
+        let in_use = order.iter().any(|r| {
+            r.peer == from
+                && !r.task.is_finished()
+                && now.saturating_sub(r.heard.load(Ordering::Relaxed))
+                    < self.in_use.as_millis() as u64
+        });
+        if in_use {
+            tracing::debug!(
+                "birthday: {} is talking through a socket of its own already; \
+                 the one it reached now is let go",
+                from
+            );
+            tokio::spawn(async move {
+                let _ = tx.send((datagram, from)).await;
+            });
+            return;
+        }
+        let heard = Arc::new(AtomicU64::new(now));
         let reader = {
-            let socket = socket.clone();
+            let (socket, heard, routes) = (socket.clone(), heard.clone(), Arc::downgrade(self));
             tokio::spawn(async move {
                 let _ = tx.send((datagram, from)).await;
                 let mut buf = vec![0u8; 2048];
@@ -290,24 +343,32 @@ impl Routes {
                     let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
                         return;
                     };
+                    if peer == from {
+                        if let Some(routes) = routes.upgrade() {
+                            heard.store(routes.now_ms(), Ordering::Relaxed);
+                        }
+                    }
                     if tx.send((buf[..n].to_vec(), peer)).await.is_err() {
                         return;
                     }
                 }
             })
         };
-        let mut order = self.order.lock();
         let mut map = self.map.write();
-        if let Some(i) = order.iter().position(|(a, _)| *a == from) {
-            order.remove(i).1.abort();
+        if let Some(i) = order.iter().position(|r| r.peer == from) {
+            order.remove(i).task.abort();
         }
         while order.len() >= MAX_ROUTES {
-            let (old, task) = order.remove(0);
-            task.abort();
-            map.remove(&old);
+            let old = order.remove(0);
+            old.task.abort();
+            map.remove(&old.peer);
         }
         map.insert(from, socket);
-        order.push((from, reader));
+        order.push(Route {
+            peer: from,
+            task: reader,
+            heard,
+        });
         self.active.store(true, Ordering::Release);
     }
 
@@ -324,8 +385,8 @@ impl Routes {
 
 impl Drop for Routes {
     fn drop(&mut self) {
-        for (_, task) in self.order.get_mut().drain(..) {
-            task.abort();
+        for route in self.order.get_mut().drain(..) {
+            route.task.abort();
         }
     }
 }
@@ -401,6 +462,55 @@ mod tests {
             "{}",
             total
         );
+    }
+
+    /// Two meetings with one peer, each hit: while the peer is talking
+    /// through the first one's socket, the second's gives way — what came
+    /// to it is passed on, and answers go from the first. Once the peer has
+    /// been quiet on it, the next one takes over.
+    #[tokio::test]
+    async fn a_route_in_use_stays_the_peers() {
+        async fn hit(peer: SocketAddr, datagram: &[u8]) -> Hit {
+            Hit {
+                socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+                from: peer,
+                datagram: datagram.to_vec(),
+            }
+        }
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let at = peer.local_addr().unwrap();
+        let answered_from = |routes: Arc<Routes>| {
+            let peer = &peer;
+            async move {
+                routes.send(at, b"answer").expect("a route").unwrap();
+                let mut buf = [0u8; 64];
+                let (_, from) =
+                    tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+                        .await
+                        .expect("an answer")
+                        .unwrap();
+                from
+            }
+        };
+        for (in_use, kept) in [(Duration::from_secs(60), true), (Duration::ZERO, false)] {
+            let (routes, mut rx) = Routes::keeping_for(in_use);
+            let first = hit(at, b"first").await;
+            let second = hit(at, b"second").await;
+            let (one, two) = (
+                first.socket.local_addr().unwrap(),
+                second.socket.local_addr().unwrap(),
+            );
+            routes.adopt(first);
+            assert_eq!(rx.recv().await.unwrap(), (b"first".to_vec(), at));
+            routes.adopt(second);
+            assert_eq!(rx.recv().await.unwrap(), (b"second".to_vec(), at));
+            assert_eq!(
+                answered_from(routes.clone()).await,
+                if kept { one } else { two },
+                "kept: {}",
+                kept
+            );
+        }
     }
 
     #[tokio::test]
