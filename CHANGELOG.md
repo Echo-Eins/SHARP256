@@ -344,7 +344,16 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   most of it the order of a round — each end looked for the other before
   it announced itself (14 s on), and paused 20 s after a lookup of up to
   12 s rather than from its start. Both now go at once, and a round starts
-  every 20 s.
+  every 20 s. Run a third time: no connection in five minutes. The DHT
+  client kept no routing table: every lookup walked from the bootstrap
+  routers, and in the real DHT each walk ended somewhere else, the first
+  after a start often short of the nodes nearest the infohash — where the
+  sender, looking and announcing at once, had announced itself, to six
+  nodes nobody looking would ask. A lookup now starts from the nodes that
+  answered before, nearest the infohash first (from here, against the real
+  DHT: the same answer every lookup but the first, where it had varied),
+  says whether it got to the nearest nodes, and an announcement made from
+  a walk that did not is made again the next round.
 - The tests' relay that is to take TCP is made again on another port when
   its UDP port's number is a TCP socket's already, as their receiver is
   (`Relay::takes_tcp`).

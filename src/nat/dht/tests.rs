@@ -42,6 +42,8 @@ struct Net {
     /// Whether the nodes answer at all: a network not reached yet, as at
     /// a start before the client has found its way in.
     awake: Arc<AtomicBool>,
+    /// The same for the bootstrap node alone.
+    boot_awake: Arc<AtomicBool>,
 }
 
 impl Net {
@@ -79,6 +81,7 @@ impl Net {
         let cancel = CancellationToken::new();
         let queries = Arc::new(AtomicUsize::new(0));
         let awake = Arc::new(AtomicBool::new(true));
+        let boot_awake = Arc::new(AtomicBool::new(true));
         for (rank, &i) in order.iter().enumerate() {
             let mut table: Vec<(NodeId, SocketAddr)> = vec![
                 addrs[order[(rank + 1) % n]],
@@ -98,6 +101,7 @@ impl Net {
                 queries.clone(),
                 plant.filter(|_| i == 0),
                 awake.clone(),
+                (i == 0).then(|| boot_awake.clone()),
             ));
         }
         Some(Net {
@@ -105,7 +109,13 @@ impl Net {
             cancel,
             queries,
             awake,
+            boot_awake,
         })
+    }
+
+    /// From now on the bootstrap node answers nothing.
+    fn sleep_bootstrap(&self) {
+        self.boot_awake.store(false, Ordering::Relaxed);
     }
 
     /// From now on the nodes answer nothing, until [`Net::wake`].
@@ -128,6 +138,7 @@ impl Drop for Net {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn node_loop(
     id: NodeId,
     sock: Arc<UdpSocket>,
@@ -136,6 +147,7 @@ async fn node_loop(
     queries: Arc<AtomicUsize>,
     plant: Option<SocketAddr>,
     awake: Arc<AtomicBool>,
+    boot_awake: Option<Arc<AtomicBool>>,
 ) {
     let mut stored: HashMap<NodeId, Vec<SocketAddr>> = HashMap::new();
     let mut buf = vec![0u8; 2048];
@@ -144,7 +156,11 @@ async fn node_loop(
             _ = cancel.cancelled() => return,
             r = sock.recv_from(&mut buf) => match r { Ok(r) => r, Err(_) => continue },
         };
-        if !awake.load(Ordering::Relaxed) {
+        if !awake.load(Ordering::Relaxed)
+            || boot_awake
+                .as_ref()
+                .is_some_and(|b| !b.load(Ordering::Relaxed))
+        {
             continue;
         }
         let Some(v) = bencode::decode(&buf[..n]) else {
@@ -264,6 +280,57 @@ async fn what_one_client_announces_another_finds() {
         .await
         .peers
         .is_empty());
+    cancel.cancel();
+}
+
+/// A walk says whether it got to the nodes nearest the infohash: one given
+/// all the time it needs does, one cut short does not — and what that one
+/// announces, the rendezvous announces again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_says_whether_it_got_there() {
+    let net = Net::start(30, 6).await;
+    let cancel = CancellationToken::new();
+    let dht = Dht::start(net.bootstrap(), cancel.clone()).unwrap();
+    assert!(
+        dht.lookup(&hash(0x61), Duration::from_secs(10))
+            .await
+            .converged
+    );
+    assert!(
+        !dht.lookup(&hash(0x62), Duration::from_millis(1))
+            .await
+            .converged
+    );
+    cancel.cancel();
+}
+
+/// A lookup starts from the nodes that have answered the client before,
+/// the nearest the infohash first — not from the bootstrap alone, as every
+/// one did: a rendezvous looks up one infohash every 20 s, and in the real
+/// DHT each walk from the routers ended somewhere else, the first one after
+/// a start often nowhere (a sender's announcement, which six nodes took,
+/// was never found by the receiver in five minutes of looking).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_starts_from_the_nodes_that_answered_before() {
+    let net = Net::start(30, 6).await;
+    let cancel = CancellationToken::new();
+    let (a, b) = (
+        Dht::start(net.bootstrap(), cancel.clone()).unwrap(),
+        Dht::start(net.bootstrap(), cancel.clone()).unwrap(),
+    );
+    let ih = hash(0x51);
+    let first = a.lookup(&ih, Duration::from_secs(10)).await;
+    assert!(a.announce(&first, &ih, |_| Some(4242)).await >= 1);
+    let here: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    assert!(b
+        .lookup(&ih, Duration::from_secs(10))
+        .await
+        .peers
+        .contains(&here));
+    // The routers gone quiet: what the client has heard from is enough.
+    net.sleep_bootstrap();
+    let again = b.lookup(&ih, Duration::from_secs(10)).await;
+    assert!(again.peers.contains(&here), "{:?}", again.peers);
     cancel.cancel();
 }
 

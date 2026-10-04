@@ -69,6 +69,11 @@ const ANNOUNCE_WAIT: Duration = Duration::from_millis(1500);
 /// Bounds on one lookup, whatever the nodes say.
 const MAX_QUERIES: usize = 60;
 const MAX_CANDIDATES: usize = 256;
+/// Nodes that answered remembered, to start lookups from (see
+/// [`Dht::lookup`]); and how many of them, nearest the infohash, a lookup
+/// starts from.
+const KNOWN: usize = 512;
+const KNOWN_FIRST: usize = 3 * K;
 const MAX_PEERS: usize = 64;
 /// Nodes and peers read from one reply.
 const MAX_PER_REPLY: usize = 32;
@@ -121,6 +126,9 @@ pub struct Lookup {
     /// The nodes closest to it that answered, with their tokens: where an
     /// announcement goes.
     closest: Vec<(SocketAddr, Vec<u8>)>,
+    /// Whether the walk got there: the nodes nearest the infohash it knew
+    /// of all dealt with, rather than its time or its queries run out.
+    pub converged: bool,
 }
 
 impl Lookup {
@@ -140,6 +148,9 @@ struct Inner {
     id: NodeId,
     bootstrap: Vec<String>,
     pending: parking_lot::Mutex<HashMap<[u8; 4], Pending>>,
+    /// Nodes that have answered, the latest last: a routing table's worth,
+    /// kept as plainly as a lookup needs it.
+    known: parking_lot::Mutex<std::collections::VecDeque<(NodeId, SocketAddr)>>,
 }
 
 /// A client of the DHT.
@@ -169,6 +180,7 @@ impl Dht {
             id,
             bootstrap,
             pending: parking_lot::Mutex::new(HashMap::new()),
+            known: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         });
         tokio::spawn(read_replies(inner.clone(), cancel));
         Ok(Self { inner })
@@ -188,9 +200,24 @@ impl Dht {
                 }
             }
         }
+        // And from the nodes that have answered before, the nearest the
+        // infohash first. From the bootstrap alone, as every lookup went,
+        // each walk through the real DHT ended somewhere else — the first
+        // one after a start often nowhere — and a rendezvous, which looks
+        // up one infohash every 20 s, never found what six nodes had taken
+        // in five minutes.
+        {
+            let known = self.inner.known.lock();
+            let mut near: Vec<&(NodeId, SocketAddr)> = known.iter().collect();
+            near.sort_by_key(|(id, _)| distance(Some(id), info_hash));
+            for (id, addr) in near.into_iter().take(KNOWN_FIRST) {
+                add_candidate(&mut cands, Some(*id), *addr);
+            }
+        }
         let mut peers: Vec<SocketAddr> = Vec::new();
         let mut sources: Vec<(SocketAddr, IpAddr)> = Vec::new();
         let mut queries = 0usize;
+        let mut converged = false;
         loop {
             if Instant::now() >= deadline || queries >= MAX_QUERIES {
                 break;
@@ -211,7 +238,11 @@ impl Dht {
                 .iter()
                 .take(K)
                 .any(|&i| matches!(cands[i].state, State::New | State::Asked));
-            if order.is_empty() || (!unsettled && known.len() >= K) {
+            if !unsettled && known.len() >= K {
+                converged = true;
+                break;
+            }
+            if order.is_empty() {
                 break;
             }
             let batch: Vec<usize> = order.into_iter().take(ALPHA).collect();
@@ -226,6 +257,7 @@ impl Dht {
                 let Ok((i, reply)) = done else { continue };
                 match reply {
                     Some(r) => {
+                        self.heard_from(r.id, cands[i].addr);
                         cands[i].id = Some(r.id);
                         cands[i].state = State::Answered(r.token);
                         let node = canonical(cands[i].addr).ip();
@@ -241,7 +273,10 @@ impl Dht {
                             add_candidate(&mut cands, Some(id), addr);
                         }
                     }
-                    None => cands[i].state = State::Failed,
+                    None => {
+                        self.forget(cands[i].addr);
+                        cands[i].state = State::Failed;
+                    }
                 }
             }
         }
@@ -261,7 +296,23 @@ impl Dht {
                 .take(K)
                 .map(|(c, t)| (c.addr, t))
                 .collect(),
+            converged,
         }
+    }
+
+    /// Remembers a node that answered, as the latest.
+    fn heard_from(&self, id: NodeId, addr: SocketAddr) {
+        let mut known = self.inner.known.lock();
+        known.retain(|(_, a)| *a != addr);
+        if known.len() >= KNOWN {
+            known.pop_front();
+        }
+        known.push_back((id, addr));
+    }
+
+    /// Forgets a node that did not answer.
+    fn forget(&self, addr: SocketAddr) {
+        self.inner.known.lock().retain(|(_, a)| *a != addr);
     }
 
     /// Announces that `port` (of this host's address, as the nodes see it)
@@ -646,6 +697,7 @@ pub fn spawn_rendezvous(
                     return None;
                 }
                 let l = dht.lookup(&mine, LOOKUP_WITHIN).await;
+                let converged = l.converged;
                 let agreed = dht
                     .announce(
                         &l,
@@ -659,7 +711,7 @@ pub fn spawn_rendezvous(
                         },
                     )
                     .await;
-                Some(agreed)
+                Some((agreed, converged))
             };
             let agreed = tokio::select! {
                 (_, agreed) = async { tokio::join!(look, announce) } => agreed,
@@ -668,10 +720,20 @@ pub fn spawn_rendezvous(
             // One that no node took is made again next round, not
             // [`ANNOUNCE_EVERY`] later: the first, before this host has
             // found its way into the DHT, reached nobody (in the field, and
-            // the next went out seven minutes on).
+            // the next went out seven minutes on). So is one made from a
+            // walk that did not get to the nodes nearest the infohash —
+            // the first after a start, often: what it told nodes elsewhere,
+            // nobody looking finds (a sender's, in the field, taken by six
+            // nodes and never found by the receiver).
             match agreed {
-                Some(0) => tracing::debug!("no DHT node took the announcement; again next round"),
-                Some(agreed) => {
+                Some((0, _)) => {
+                    tracing::debug!("no DHT node took the announcement; again next round")
+                }
+                Some((agreed, false)) => tracing::debug!(
+                    "announced to {} DHT node(s), not the nearest; again next round",
+                    agreed
+                ),
+                Some((agreed, true)) => {
                     tracing::info!(
                         "announced on the DHT to {} node(s) (port {:?}/{:?})",
                         agreed,
