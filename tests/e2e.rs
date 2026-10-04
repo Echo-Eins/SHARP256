@@ -4765,6 +4765,57 @@ async fn transfers_share_one_memory_budget() {
     stop_receiver(r).await;
 }
 
+/// The resume state, saved after each flush while data arrives, is saved
+/// in the background: a save that takes its time does not keep the session
+/// from acknowledging what arrives meanwhile. It was saved in the session's
+/// own loop, and on a Windows runner a save — a file written, fsynced and
+/// renamed over the last — held a session long enough that a sender heard
+/// nothing for 400 ms. Here every save takes a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_save_of_the_resume_state_holds_no_ack() {
+    use sharp256::protocol::wire::{Data, Message};
+    use sharp256::state::StateStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_src, out, state) = dirs(&tmp);
+    let r = start_receiver(&out, &state, |cfg| {
+        // Its handshakes are made by hand, in version 3.
+        cfg.speak_v3 = true;
+        cfg.transport.persist_interval = Duration::from_millis(50);
+        cfg.transport.slow_state_saves = Duration::from_secs(1);
+    })
+    .await;
+    let tid: [u8; 16] = rand::random();
+    let (mut fake, status) = FakeSender::connect(&r, tid, "slow.bin").await;
+    assert_eq!(status, sharp256::protocol::constants::HELLO_ACCEPTED);
+    // The first chunk, acknowledged; a flush and a save of the state follow
+    // within 50 ms or so, and the save takes until a second on.
+    let _ = rwnd_of(&mut fake).await;
+    fake.send(&Message::Data(Data {
+        offset: 1000,
+        timestamp: 2,
+        payload: &[7u8; 1000],
+    }))
+    .await;
+    let acks = fake.acks(Duration::from_millis(400)).await;
+    assert!(
+        acks.iter().any(|a| a.received_bytes == 2000),
+        "the second chunk was not acknowledged while the state was saved: {:?}",
+        acks.iter().map(|a| a.received_bytes).collect::<Vec<_>>()
+    );
+    // And the save was made: the state says the first chunk is on disk.
+    let hex: String = tid.iter().map(|b| format!("{:02x}", b)).collect();
+    let store = StateStore::open(Some(state.clone())).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store
+        .load_receiver(&hex)
+        .is_none_or(|s| s.durable.is_empty())
+    {
+        assert!(Instant::now() < deadline, "the state was never saved");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop_receiver(r).await;
+}
+
 // ----- IPv6 ----------------------------------------------------------------
 
 /// Whether this host can do IPv6 at all. Where it cannot — some containers

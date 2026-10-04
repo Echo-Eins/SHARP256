@@ -124,6 +124,8 @@ pub struct SenderState {
 #[derive(Debug, Clone)]
 pub struct StateStore {
     dir: PathBuf,
+    /// See `TransportConfig::slow_state_saves`.
+    slow: std::time::Duration,
 }
 
 impl StateStore {
@@ -138,7 +140,16 @@ impl StateStore {
                 .join("states"),
         };
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            slow: std::time::Duration::ZERO,
+        })
+    }
+
+    /// The same store, its receiver states saved no faster than `by`.
+    #[doc(hidden)]
+    pub fn slowed(self, by: std::time::Duration) -> Self {
+        Self { slow: by, ..self }
     }
 
     pub fn dir(&self) -> &Path {
@@ -192,6 +203,9 @@ impl StateStore {
         state.format = STATE_FORMAT_VERSION;
         state.updated_unix = now_unix();
         let json = serde_json::to_string_pretty(&state).map_err(io::Error::other)?;
+        if !self.slow.is_zero() {
+            std::thread::sleep(self.slow);
+        }
         Self::write_atomic(&self.receiver_path(&state.transfer_id), &json)
     }
 

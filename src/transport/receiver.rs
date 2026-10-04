@@ -149,6 +149,9 @@ enum Incoming {
     Established(Box<Established>),
     /// The writer finished an fsync requested for persistence.
     FlushDone(io::Result<()>),
+    /// The resume state that fsync made true was saved (see
+    /// [`Session::on_flush_done`]).
+    Saved(io::Result<()>),
     /// Background close + hash + rename finished.
     Verified(Result<([u8; 32], PathBuf), String>),
 }
@@ -833,7 +836,7 @@ impl Receiver {
                         tracing::info!("removed {} stale resume state file(s)", n);
                     }
                 }
-                Some(s)
+                Some(s.slowed(cfg.transport.slow_state_saves))
             }
             Err(e) => {
                 tracing::warn!("resume state disabled: {}", e);
@@ -3041,8 +3044,14 @@ struct Session {
 
     persist_dirty: bool,
     last_persist_at: Instant,
+    /// A flush for persistence requested, and the save of the state it
+    /// makes true not done yet: one at a time.
     flush_in_progress: bool,
     flush_snapshot: Option<RangeSet>,
+    /// Orders what is done to this transfer's resume state: the epoch of
+    /// it, under the lock a save in the background holds while it writes
+    /// (see [`Session::on_flush_done`] and [`settle`]).
+    state_epoch: Arc<parking_lot::Mutex<u64>>,
 
     start: Instant,
     last_rx: Instant,
@@ -3123,6 +3132,7 @@ impl Session {
             last_persist_at: now,
             flush_in_progress: false,
             flush_snapshot: None,
+            state_epoch: Arc::new(parking_lot::Mutex::new(0)),
             start: now,
             last_rx: now,
             heard_peer_at: now,
@@ -3432,6 +3442,14 @@ impl Session {
             }
             Incoming::FlushDone(result) => {
                 self.on_flush_done(result);
+                ControlFlow::Continue(())
+            }
+            Incoming::Saved(result) => {
+                self.flush_in_progress = false;
+                self.last_persist_at = Instant::now();
+                if let Err(e) = result {
+                    tracing::warn!("cannot save resume state: {}", e);
+                }
                 ControlFlow::Continue(())
             }
             Incoming::Verified(result) => self.on_verified(result),
@@ -4842,6 +4860,8 @@ impl Session {
     /// Persists `received` as durable. Only valid when everything in it is
     /// known to be on disk (right after open, or after the writer closed).
     fn persist_state_now(&mut self) {
+        let lock = self.state_epoch.clone();
+        let _settled = settle(&lock);
         if let Some(store) = &self.shared.store {
             match store.save_receiver(&self.state(&self.received)) {
                 // The state of the transfer this one continues is this
@@ -4874,23 +4894,48 @@ impl Session {
         });
     }
 
+    /// What was received is on disk: the resume state says so, saved in
+    /// the background. It was saved here, and a save — a file written,
+    /// fsynced and renamed over the last — held the session: no packet
+    /// read and no ACK sent until it was done. On a Windows runner, one
+    /// took long enough that a sender heard nothing for 400 ms.
+    ///
+    /// Nothing else done to the state may overtake it, or be overtaken:
+    /// whatever else is done to it ([`settle`]) moves its epoch on, and the
+    /// save, under the same lock, is made only if the epoch is the one it
+    /// was asked in. One under way is waited for; one not yet begun is not
+    /// made.
     fn on_flush_done(&mut self, result: io::Result<()>) {
-        self.flush_in_progress = false;
         let snapshot = self.flush_snapshot.take();
-        match (result, snapshot) {
-            (Ok(()), Some(snapshot)) => {
-                if matches!(self.phase, Phase::Receiving) {
-                    if let Some(store) = &self.shared.store {
-                        if let Err(e) = store.save_receiver(&self.state(&snapshot)) {
-                            tracing::warn!("cannot save resume state: {}", e);
+        match (result, snapshot, &self.shared.store) {
+            (Ok(()), Some(snapshot), Some(_)) if matches!(self.phase, Phase::Receiving) => {
+                let state = self.state(&snapshot);
+                let (shared, lock, tx) = (
+                    self.shared.clone(),
+                    self.state_epoch.clone(),
+                    self.self_tx.clone(),
+                );
+                let epoch = *lock.lock();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let now = lock.lock();
+                        match &shared.store {
+                            Some(store) if *now == epoch => store.save_receiver(&state),
+                            _ => Ok(()),
                         }
-                    }
-                }
-                self.last_persist_at = Instant::now();
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(io::Error::other(e)));
+                    let _ = tx.send(Incoming::Saved(result)).await;
+                });
+                // Done when it is saved.
+                return;
             }
-            (Err(e), _) => tracing::warn!("fsync failed: {}", e),
-            _ => {}
+            (Ok(()), _, _) => {}
+            (Err(e), _, _) => tracing::warn!("fsync failed: {}", e),
         }
+        self.flush_in_progress = false;
+        self.last_persist_at = Instant::now();
     }
 
     // ----- housekeeping ----------------------------------------------------
@@ -5015,6 +5060,7 @@ impl Session {
         }
         let _ = tree::remove_partial(&self.part_path);
         if let Some(store) = &self.shared.store {
+            let _settled = settle(&self.state_epoch);
             store.remove_receiver(&self.tid_hex());
         }
         self.emit_failed(why.to_string(), false);
@@ -5035,6 +5081,7 @@ impl Session {
             let _ = writer.close().await;
         }
         if let Some(store) = &self.shared.store {
+            let _settled = settle(&self.state_epoch);
             store.remove_receiver(&self.tid_hex());
         }
         let _ = tree::remove_partial(&self.part_path);
@@ -5047,6 +5094,9 @@ impl Session {
         if !matches!(self.phase, Phase::Receiving) {
             return;
         }
+        // What the finishing saves of the state, and removes, comes after
+        // any save of it under way.
+        drop(settle(&self.state_epoch));
         if let Some(hash) = self.placed {
             self.check_placed(hash);
             return;
@@ -5182,6 +5232,7 @@ impl Session {
         // Everything is on disk: nothing of the budget is ours any more.
         self.receiving = None;
         if let Some(store) = &self.shared.store {
+            let _settled = settle(&self.state_epoch);
             store.remove_receiver(&self.tid_hex());
         }
         let stats = self.stats(Instant::now());
@@ -5212,6 +5263,7 @@ impl Session {
 
     fn fail_mismatch(&mut self, ours: [u8; 32], theirs: [u8; 32]) {
         if let Some(store) = &self.shared.store {
+            let _settled = settle(&self.state_epoch);
             store.remove_receiver(&self.tid_hex());
         }
         let msg = format!(
@@ -5329,6 +5381,16 @@ impl Session {
         self.last_progress_bytes = stats.bytes_done;
         emit(&self.events, TransferEvent::Progress(stats));
     }
+}
+
+/// Whatever is done to a session's resume state but its saves in the
+/// background (see [`Session::on_flush_done`]) is done holding this: a save
+/// under way is waited for, and one asked for before and not yet begun is
+/// not made.
+fn settle(lock: &parking_lot::Mutex<u64>) -> parking_lot::MutexGuard<'_, u64> {
+    let mut epoch = lock.lock();
+    *epoch += 1;
+    epoch
 }
 
 #[cfg(all(test, feature = "nat-traversal"))]

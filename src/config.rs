@@ -53,6 +53,12 @@ pub struct TransportConfig {
     /// see the keys move on within a transfer of a few megabytes.
     #[doc(hidden)]
     pub first_packet_number: u64,
+    /// How long, at the least, a receiver's save of its resume state takes:
+    /// nothing, but for the tests, which make it slow to see the session
+    /// keep acknowledging data meanwhile, as on a disk that takes its time
+    /// over an fsync.
+    #[doc(hidden)]
+    pub slow_state_saves: Duration,
 }
 
 impl Default for TransportConfig {
@@ -76,6 +82,7 @@ impl Default for TransportConfig {
             session_ttl: Duration::from_secs(600),
             progress_interval: Duration::from_millis(250),
             first_packet_number: 0,
+            slow_state_saves: Duration::ZERO,
         }
     }
 }

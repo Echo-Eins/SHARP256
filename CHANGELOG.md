@@ -365,6 +365,15 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   level, not that the log run to more than ten debug lines: how many there
   are goes with how long the transfers take, and two done in 66 and
   100 ms under MemorySanitizer left ten.
+- A receiving session saves its resume state, after each flush, in the
+  background. It saved it in its own loop — a file written, fsynced and
+  renamed over the last — and read no packet and sent no ACK until that
+  was done: on a Windows runner long enough that a sender in a test heard
+  nothing for 400 ms; on a disk busy with the file itself, an fsync can
+  take longer. What else is done to the state (at the open, the finish,
+  the end or the suspension of a transfer) waits for a save under way, and
+  one asked for before it and not yet begun is not made: no older state
+  over a newer one, nor a state left behind a finished transfer.
 - A sender through a relay could wait out its handshake timeout for
   nothing: the relay had let a quiet pair go to make room, the system
   gave the next pair the same port number, and the receiver answered the
