@@ -599,38 +599,7 @@ pub fn spawn_rendezvous(
         let mut round = 0u32;
         loop {
             round += 1;
-            // The other end first: the sooner it is found the sooner the
-            // punching starts.
-            let found = tokio::select! {
-                l = dht.lookup(&theirs, LOOKUP_WITHIN) => l,
-                _ = cancel.cancelled() => return,
-            };
-            for (p, node) in found.sources {
-                if vouchers.len() < REMEMBERED_PEERS || vouchers.contains_key(&p) {
-                    vouchers.entry(p).or_default().insert(node);
-                }
-            }
-            for p in found.peers {
-                let sure = vouchers.get(&p).is_some_and(|n| n.len() >= VOUCHERS);
-                if seen.insert(p) {
-                    tracing::info!(
-                        "the DHT says the other end is at {}{}",
-                        p,
-                        if sure {
-                            ""
-                        } else {
-                            " (one node says so, so far)"
-                        }
-                    );
-                    if sure {
-                        vouched.insert(p);
-                    }
-                    on_peer(p, PeerNews::Found { vouched: sure });
-                } else if sure && vouched.insert(p) {
-                    tracing::info!("the DHT's nodes agree that the other end is at {}", p);
-                    on_peer(p, PeerNews::Vouched);
-                }
-            }
+            let started = tokio::time::Instant::now();
             let (v4, v6) = {
                 let a = aims.borrow();
                 (a.aim4.map(|a| a.port()), a.aim6.map(|a| a.port()))
@@ -639,11 +608,44 @@ pub fn spawn_rendezvous(
                 Some((p4, p6, at)) => (*p4, *p6) != (v4, v6) || at.elapsed() >= ANNOUNCE_EVERY,
                 None => true,
             };
-            if due && (v4.is_some() || v6.is_some()) {
-                let l = tokio::select! {
-                    l = dht.lookup(&mine, LOOKUP_WITHIN) => l,
-                    _ = cancel.cancelled() => return,
-                };
+            // The other end looked for, and this one announced, at once: the
+            // other end lets this one in only once it has found it, and one
+            // after the other kept the announcement a lookup behind (14 s,
+            // in the field). What turns up is passed on as soon as it does.
+            let look = async {
+                let found = dht.lookup(&theirs, LOOKUP_WITHIN).await;
+                for (p, node) in found.sources {
+                    if vouchers.len() < REMEMBERED_PEERS || vouchers.contains_key(&p) {
+                        vouchers.entry(p).or_default().insert(node);
+                    }
+                }
+                for p in found.peers {
+                    let sure = vouchers.get(&p).is_some_and(|n| n.len() >= VOUCHERS);
+                    if seen.insert(p) {
+                        tracing::info!(
+                            "the DHT says the other end is at {}{}",
+                            p,
+                            if sure {
+                                ""
+                            } else {
+                                " (one node says so, so far)"
+                            }
+                        );
+                        if sure {
+                            vouched.insert(p);
+                        }
+                        on_peer(p, PeerNews::Found { vouched: sure });
+                    } else if sure && vouched.insert(p) {
+                        tracing::info!("the DHT's nodes agree that the other end is at {}", p);
+                        on_peer(p, PeerNews::Vouched);
+                    }
+                }
+            };
+            let announce = async {
+                if !due || (v4.is_none() && v6.is_none()) {
+                    return None;
+                }
+                let l = dht.lookup(&mine, LOOKUP_WITHIN).await;
                 let agreed = dht
                     .announce(
                         &l,
@@ -657,11 +659,19 @@ pub fn spawn_rendezvous(
                         },
                     )
                     .await;
-                // One that no node took is made again next round, not
-                // [`ANNOUNCE_EVERY`] later: the first, before this host has
-                // found its way into the DHT, reached nobody (in the field,
-                // and the next went out seven minutes on).
-                if agreed > 0 {
+                Some(agreed)
+            };
+            let agreed = tokio::select! {
+                (_, agreed) = async { tokio::join!(look, announce) } => agreed,
+                _ = cancel.cancelled() => return,
+            };
+            // One that no node took is made again next round, not
+            // [`ANNOUNCE_EVERY`] later: the first, before this host has
+            // found its way into the DHT, reached nobody (in the field, and
+            // the next went out seven minutes on).
+            match agreed {
+                Some(0) => tracing::debug!("no DHT node took the announcement; again next round"),
+                Some(agreed) => {
                     tracing::info!(
                         "announced on the DHT to {} node(s) (port {:?}/{:?})",
                         agreed,
@@ -669,20 +679,21 @@ pub fn spawn_rendezvous(
                         v6
                     );
                     announced = Some((v4, v6, Instant::now()));
-                } else {
-                    tracing::debug!("no DHT node took the announcement; again next round");
                 }
+                None => {}
             }
             // Soon at first, while the other end may be about to announce,
-            // then every [`SEARCH_EVERY`], for as long as this end runs.
-            // Not less often once an address the nodes agree on has turned
-            // up: a receiver has its next sender to find (which waited up
-            // to two minutes so), and an address two nodes agree on is not
-            // even sure to be anybody's — in the field, two named one for
-            // an infohash nobody had announced under.
+            // then every [`SEARCH_EVERY`] from the start of the last round,
+            // for as long as this end runs (from its end, the twelve
+            // seconds a lookup may take came on top: a round every 32 s in
+            // the field). Not less often once an address the nodes agree
+            // on has turned up: a receiver has its next sender to find
+            // (which waited up to two minutes so), and an address two nodes
+            // agree on is not even sure to be anybody's — in the field, two
+            // named one for an infohash nobody had announced under.
             let pause = (Duration::from_secs(2) * 2u32.pow((round - 1).min(4))).min(SEARCH_EVERY);
             tokio::select! {
-                _ = tokio::time::sleep(pause) => {}
+                _ = tokio::time::sleep_until(started + pause) => {}
                 // Where this host is outside has become known or changed.
                 _ = aims.changed() => {}
                 _ = cancel.cancelled() => return,

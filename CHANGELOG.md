@@ -340,7 +340,11 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   minutes instead of every twenty seconds; and its first announcement,
   before it had found any node, reached none and was not made again for
   five minutes. It looks every 20 s for as long as it runs, and an
-  announcement no node took is made again the next round.
+  announcement no node took is made again the next round. Run again: 75 s,
+  most of it the order of a round — each end looked for the other before
+  it announced itself (14 s on), and paused 20 s after a lookup of up to
+  12 s rather than from its start. Both now go at once, and a round starts
+  every 20 s.
 - The tests' relay that is to take TCP is made again on another port when
   its UDP port's number is a TCP socket's already, as their receiver is
   (`Relay::takes_tcp`).
