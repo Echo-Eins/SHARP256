@@ -1314,8 +1314,16 @@ async fn burst_loss_with_hundreds_of_holes_recovers_quickly() {
         summary.retransmitted_bytes > 64 * 1432,
         "the burst must have caused many retransmissions"
     );
+    // The stall this guards against lasted until the receiver's session
+    // expired (`session_ttl`, ten minutes; the timeout above catches it).
+    // Here the transfer takes a quarter of a second. On Windows' long
+    // round trips on loopback the burst lasts longer — the 1200 datagrams
+    // it drops from took 2.25 s at 127 kB/s, a third lost, in the tag's CI
+    // of rc.3 — and a path that loses a steady share at a steady rate for
+    // that long looks like a policer: the sender took it for one and came
+    // back from it as from one (held 2 s, then probing up), 11.3 s in all.
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(20),
         "took {:?}",
         started.elapsed()
     );

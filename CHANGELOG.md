@@ -471,6 +471,12 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   the kill comes 150 ms in, and at 40 Mbit/s a file under some 750 KiB was
   all there by then — in rc.3's soak 40 of 365, sent again as a second
   copy rather than resumed.
+- The test of a burst loss that leaves hundreds of holes allows 20 s, not
+  10: the tag's CI of rc.3, on Windows, took 11.3. The burst — a third of
+  1200 datagrams dropped — lasted 2.25 s there (a quarter of a second
+  here), long enough to look like a policer, and the sender came back from
+  it as from one. The stall the test guards against lasted until the
+  receiver's session expired, ten minutes.
 - `natlab.py samecgn` (two subscribers behind one carrier-grade NAT, with
   and without a loop back), `natlab.py nat66` (unique local addresses
   behind the router's: direct over IPv6 in all three cases, through what
