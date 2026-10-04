@@ -353,7 +353,8 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   answered before, nearest the infohash first (from here, against the real
   DHT: the same answer every lookup but the first, where it had varied),
   says whether it got to the nearest nodes, and an announcement made from
-  a walk that did not is made again the next round.
+  a walk that did not is made again the next round. Run a fourth time:
+  connected 35 s after the sender started (105, 75, none, 35).
 - The tests' relay that is to take TCP is made again on another port when
   its UDP port's number is a TCP socket's already, as their receiver is
   (`Relay::takes_tcp`).
