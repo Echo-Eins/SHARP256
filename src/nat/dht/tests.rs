@@ -284,23 +284,22 @@ async fn what_one_client_announces_another_finds() {
 }
 
 /// A walk says whether it got to the nodes nearest the infohash: one given
-/// all the time it needs does, one cut short does not — and what that one
-/// announces, the rendezvous announces again.
+/// the time it needs does; one whose time ran out, or that nobody answered,
+/// does not — and what that one announces, the rendezvous announces again.
+/// (Cut short by time alone, not by a short time: on loopback a whole walk
+/// takes a millisecond or so, and from the nodes that answered before less.
+/// One given a millisecond got there, run on its own.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lookup_says_whether_it_got_there() {
     let net = Net::start(30, 6).await;
     let cancel = CancellationToken::new();
     let dht = Dht::start(net.bootstrap(), cancel.clone()).unwrap();
-    assert!(
-        dht.lookup(&hash(0x61), Duration::from_secs(10))
-            .await
-            .converged
-    );
-    assert!(
-        !dht.lookup(&hash(0x62), Duration::from_millis(1))
-            .await
-            .converged
-    );
+    let full = dht.lookup(&hash(0x61), Duration::from_secs(10)).await;
+    assert!(full.converged && full.announceable() >= 1);
+    assert!(!dht.lookup(&hash(0x62), Duration::ZERO).await.converged);
+    net.sleep();
+    let unanswered = dht.lookup(&hash(0x63), Duration::from_secs(1)).await;
+    assert!(!unanswered.converged && unanswered.announceable() == 0);
     cancel.cancel();
 }
 
