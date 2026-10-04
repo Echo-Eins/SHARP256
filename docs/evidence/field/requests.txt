@@ -1,0 +1,3 @@
+# Field tests with a network of GitHub's (.github/workflows/field.yml): a
+# line added here asks for a run. Date, what is fetched, how the two meet.
+2026-10-04	Wikipedia (Fronalpstock_big.jpg, 14.7 MB) -> a home network behind a NAT	DHT, the receiver's ID alone

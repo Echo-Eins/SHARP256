@@ -1,0 +1,116 @@
+# A field test with a network of GitHub's (docs/FIELD.md, scenario 6): a
+# runner fetches a file over HTTPS — from Wikipedia, say — and sends it to a
+# receiver somewhere else on the internet, behind its own NAT, found through
+# the Mainline DHT by its ID alone. With the receiver up and announced
+# (`sharp-receiver --dht --secret …`), a run is asked for by a line added to
+# docs/evidence/field/requests.txt (by hand, from a branch: dispatching takes
+# the workflow on the default branch), or dispatched.
+#
+# The repository is public, and so is what a run prints: the receiver's
+# address must not be in it. The run is given the receiver's ID and no
+# address (the repository variable FIELD_RECEIVER, or the input); the shared
+# secret is the repository secret SHARP_FIELD_SECRET (both set for a test,
+# deleted after); what is printed has its IP addresses masked; and the
+# sender's whole log goes into the run's artifact sealed to FIELD_LOG_KEY (a
+# PEM public key, RSA, base64 on one line), which only whoever holds the
+# private key can open:
+#
+#   openssl pkeyutl -decrypt -inkey key.pem -in k.enc -out k \
+#     -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+#   openssl enc -d -aes-256-cbc -pbkdf2 -in sender.log.enc -out sender.log -pass file:k
+#
+# Actions are pinned by commit.
+name: Field test
+
+on:
+  push:
+    paths:
+      - docs/evidence/field/requests.txt
+  workflow_dispatch:
+    inputs:
+      receiver:
+        description: "The receiver's ID (sh4-…), found through the DHT"
+      url:
+        description: "What to fetch over HTTPS and send"
+      log_key:
+        description: "PEM public key (RSA, base64 on one line) the sender's log is sealed to"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  send:
+    name: Fetch, then send through the DHT
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: field-${{ hashFiles('Cargo.lock') }}
+      - name: Build
+        run: cargo build --release --locked --no-default-features --features nat-traversal,tls --bin sharp-sender --bin sharp-probe
+      - name: Fetch
+        env:
+          URL: ${{ inputs.url || vars.FIELD_URL || 'https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg' }}
+        run: |
+          mkdir -p field
+          curl -fsSL -A "SHARP-256 field test (https://github.com/Echo-Eins/SHARP256)" "$URL" -o "field/$(basename "$URL")"
+          ls -l field
+          sha256sum field/* | tee field.sha256
+      - name: This runner's network
+        run: |
+          # The runner's own addresses are GitHub's, not anybody's to hide.
+          timeout 90 ./target/release/sharp-probe --no-port-mapping --identity field-probe.key < /dev/null 2>&1 \
+            | grep -E '^(IPv4|IPv6|Port forwarding|Network):' || true
+      - name: Send
+        env:
+          RECEIVER: ${{ inputs.receiver || vars.FIELD_RECEIVER }}
+          URL: ${{ inputs.url || vars.FIELD_URL || 'https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg' }}
+          SHARP256_SECRET: ${{ secrets.SHARP_FIELD_SECRET }}
+        run: |
+          file="field/$(basename "$URL")"
+          set +e
+          started=$(date +%s)
+          timeout 900 ./target/release/sharp-sender "$file" "$RECEIVER" --dht --headless \
+            --identity field-sender.key --state-dir field-state --log-level debug > sender.log 2>&1
+          code=$?
+          set -e
+          echo "exit $code after $(( $(date +%s) - started )) s"
+          # What may be printed: no address of anybody's.
+          mask() { sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<ip>/g; s/\[[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\]/[<ip6>]/g'; }
+          grep -E '^(Done:|Transfer failed|Connected to)|the receiver|receiver answered|relay|DHT|punch' sender.log \
+            | grep -vE ' DEBUG ' | mask | cut -c1-200 | tail -40
+          echo "$code" > sender.code
+      - name: Seal the sender's log
+        if: always()
+        env:
+          LOG_KEY: ${{ inputs.log_key || vars.FIELD_LOG_KEY }}
+        run: |
+          [ -f sender.log ] || exit 0
+          echo "$LOG_KEY" | base64 -d > log_key.pem
+          openssl rand -out k 32
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in sender.log -out sender.log.enc -pass file:k
+          openssl pkeyutl -encrypt -pubin -inkey log_key.pem -in k -out k.enc \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          rm -f k sender.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: field-sender-log
+          path: |
+            sender.log.enc
+            k.enc
+            field.sha256
+          retention-days: 3
+      - name: Verdict
+        run: exit "$(cat sender.code)"
