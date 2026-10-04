@@ -495,8 +495,9 @@ impl Cubic {
 /// **Probed** then, a step at a time: the cap rises by [`PROBE_GAIN`] every
 /// [`LT_MIN_ROUNDS`] round trips and [`PROBE_STEP`], and is lifted once it
 /// is [`PROBE_LIMIT`] times the rate held to. A policer that is still there
-/// is suspected again at the first step and checked — the step is not left
-/// while it loses as much as a policer makes it; one that is gone is left
+/// is suspected again at the first step — one interval that loses as
+/// through it is enough there — and checked, the step not left while it
+/// loses as much as a policer makes it; one that is gone is left
 /// behind in a few seconds. (Lifting the cap at once would let the
 /// window-based controller overrun it again at its full rate.)
 #[derive(Debug, Clone, Default)]
@@ -610,17 +611,28 @@ impl Policer {
             return None;
         }
         let rate = got as f64 / took.as_secs_f64();
-        match self.last {
-            Some(last) if (rate - last).abs() <= last / 8.0 => {
+        // Probing above a policer found before, one interval that loses as
+        // through it is enough to check it again: the second, which tells
+        // a policer from a rate still climbing when nothing is known, kept
+        // the probe a quarter above the policer four round trips longer
+        // (on Windows' long round trips on loopback, most of a second of
+        // every two and a half).
+        let probing = matches!(self.state, PolicerState::Probing { .. });
+        let suspected = match self.last {
+            Some(last) if (rate - last).abs() <= last / 8.0 => Some((rate + last) / 2.0),
+            _ if probing => Some(rate),
+            _ => None,
+        };
+        match suspected {
+            Some(suspected) => {
                 tracing::debug!(
-                    "policer suspected: delivered {:.0} and {:.0} B/s, losing a fifth or more; checking",
-                    last,
+                    "policer suspected: delivered {:.0} B/s, losing a fifth or more; checking",
                     rate
                 );
                 self.sampling = None;
                 self.last = None;
                 self.state = PolicerState::Checking {
-                    rate: (rate + last) / 2.0,
+                    rate: suspected,
                     lowered: false,
                     since: now,
                     round,
@@ -630,7 +642,7 @@ impl Policer {
                 };
                 None
             }
-            _ => {
+            None => {
                 self.last = Some(rate);
                 self.sampling = Some((now, round, 0, 0));
                 None
@@ -1273,6 +1285,9 @@ mod tests {
             "probed up to {:.2} times the rate",
             most / rate
         );
+        // And found in an interval and a check, eight round trips: two
+        // intervals took twelve.
+        assert!(probed <= 10 * 40, "{} ms above it", probed);
         assert_eq!(p.detections(), 2);
     }
 

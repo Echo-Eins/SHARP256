@@ -18,8 +18,11 @@ second half of the run — where a leak shows as a steady rise.
 
 Weeks of it are a server's job (the same script, `--minutes 40320`); here
 it runs for minutes. The binaries are SHARP_BIN_DIR's (by default
-target/debug). Needs unshare (the script re-executes itself under
-`unshare -rn`).
+target/debug), logging at SOAK_LOG's level (by default warn; the senders at
+SOAK_SENDER_LOG's, by default the same). With
+`--csv`, the laboratory's directory is kept, with the relay's and the
+receiver's logs and each failed sender's whole output (`failures/N.log`).
+Needs unshare (the script re-executes itself under `unshare -rn`).
 """
 
 import argparse
@@ -36,6 +39,8 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.environ.get("SHARP_BIN_DIR", os.path.join(ROOT, "target", "debug"))
+LOG = os.environ.get("SOAK_LOG", "warn")
+SENDER_LOG = os.environ.get("SOAK_SENDER_LOG", LOG)
 
 
 def wait_for(path, pattern, seconds):
@@ -87,7 +92,7 @@ def main():
     os.makedirs(out)
     relay_log, recv_log = os.path.join(d, "relay.log"), os.path.join(d, "receiver.log")
     relay = subprocess.Popen(
-        [f"{BIN}/sharp-relay", "--bind", "127.0.0.1:5560", "--identity", f"{d}/relay.key", "--log", "warn"],
+        [f"{BIN}/sharp-relay", "--bind", "127.0.0.1:5560", "--identity", f"{d}/relay.key", "--log", LOG],
         stdout=open(relay_log, "w"), stderr=subprocess.STDOUT)
     m = wait_for(relay_log, r"Receivers: --relay (sh4?-\S+?)@", 15)
     if not m:
@@ -97,7 +102,7 @@ def main():
     receiver = subprocess.Popen(
         [f"{BIN}/sharp-receiver", "--headless", "--output", out, "--state-dir", f"{d}/rst",
          "--identity", f"{d}/r.key", "--bind", "127.0.0.1:5555", "--no-nat", "--no-tcp",
-         "--no-lan-addresses", "--relay", f"{relay_id}@127.0.0.1:5560", "--log-level", "warn"],
+         "--no-lan-addresses", "--relay", f"{relay_id}@127.0.0.1:5560", "--log-level", LOG],
         stdout=open(recv_log, "w"), stderr=subprocess.STDOUT)
     m = wait_for(recv_log, r"Senders use: (sh4?-[a-z0-9]+)", 15)
     if not m:
@@ -126,7 +131,7 @@ def main():
             want = hashlib.sha256(open(data, "rb").read()).hexdigest()
             target = f"{rid}@127.0.0.1:5555" if kind != "relay" else rid
             cmd = [f"{BIN}/sharp-sender", data, target, "--headless", "--no-nat", "--no-tcp",
-                   "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", "warn",
+                   "--identity", f"{d}/s.key", "--state-dir", f"{d}/sst", "--log-level", SENDER_LOG,
                    "--max-rate", "40M"]
             if kind == "relay":
                 cmd += ["--relay", f"{relay_id}@127.0.0.1:5560"]
@@ -143,6 +148,9 @@ def main():
             else:
                 failed += 1
                 failures.append(f"#{n} {kind}: exit {r.returncode}, whole {whole}: {(r.stdout + r.stderr)[-300:]}")
+                os.makedirs(os.path.join(d, "failures"), exist_ok=True)
+                with open(os.path.join(d, "failures", f"{n}.log"), "w") as f:
+                    f.write(f"{' '.join(cmd)}\n{time.strftime('%H:%M:%S')} exit {r.returncode}\n{r.stdout}{r.stderr}")
             for path in (data, got):
                 try:
                     os.remove(path)
@@ -184,7 +192,7 @@ def main():
     if not args.csv:
         shutil.rmtree(d, ignore_errors=True)
     else:
-        print(f"measurements in {csv_path}")
+        print(f"measurements in {csv_path}, logs in {d}")
     return 0 if failed == 0 and samples else 1
 
 

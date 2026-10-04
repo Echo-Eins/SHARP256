@@ -329,6 +329,21 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   what the policer passed, against 1.02 to 1.05 on Linux). A step that
   loses as through a policer is not left until the check has said; one
   that loses a little at random still is, as the steps go.
+- A sender through a relay could wait out its handshake timeout for
+  nothing: the relay had let a quiet pair go to make room, the system
+  gave the next pair the same port number, and the receiver answered the
+  new port's confirmations with the ticket of the pair it had been
+  introduced on before — which that port does not take. Its side was
+  never bound, and where the relay's port is the only way in, nothing got
+  through (the soak laboratory: twice in some six thousand transfers, on
+  a port carried a minute before). An introduction on a port forgets the
+  ones before it on that port.
+- Probing above a policer found before, one interval losing as through it
+  is enough to check it again: the second one, which tells a policer from
+  a rate still climbing when nothing is known, kept the probe above the
+  policer four round trips longer — most of a second on Windows' long
+  round trips on loopback (the tag's CI: 1.16 times what the policer
+  passed).
 - A receiver with nothing to say on a slow path was taken for gone: the
   sender pinged after half a second and more of silence, the answer came
   back past the stall timeout, and the sender paused, asked the relays
@@ -404,7 +419,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   directory of many files.
 - `scripts/soak/`: a relay and a receiver for as long as asked, senders
   coming and going (directly, through the relay, cut off and resumed),
-  their memory, descriptors and threads written down.
+  their memory, descriptors and threads written down; logging at
+  `SOAK_LOG`'s level (`SOAK_SENDER_LOG`'s for the senders), and with
+  `--csv` the laboratory's directory kept, with each failed sender's whole
+  output.
 - `natlab.py samecgn` (two subscribers behind one carrier-grade NAT, with
   and without a loop back), `natlab.py nat66` (unique local addresses
   behind the router's: direct over IPv6 in all three cases, through what

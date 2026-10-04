@@ -784,7 +784,8 @@ pub async fn serve(
         if from != relay {
             // An allocated port asking us to prove we receive here. Only
             // for a port we were introduced on, and only with the ticket we
-            // were given for it.
+            // were given for it (the last time: see the introductions
+            // below).
             if let Message::Confirm { proof } = msg {
                 if let Some((ticket, _, _, _)) =
                     handled.iter().find(|(_, p, _, _)| *p == from.port())
@@ -895,6 +896,14 @@ pub async fn serve(
                         tracing::info!("relay {}: the sender says more of its NAT", relay);
                     }
                 } else {
+                    // A port introduced on before, with another ticket, is
+                    // another pair's now: the relay let the last one go to
+                    // make room, and the system gave the next its number.
+                    // Its confirmations were answered with the old ticket,
+                    // which the new pair's port does not take, and the
+                    // sender, with no other way in, waited out its
+                    // handshake timeout.
+                    handled.retain(|(_, p, _, _)| *p != port);
                     if handled.len() >= HANDLED_REMEMBERED {
                         handled.pop_front();
                     }
@@ -1485,6 +1494,121 @@ mod tests {
             heard(&spare, Duration::from_millis(500)).await > 0,
             "the receiver did not take its side of the relay's port"
         );
+
+        cancel.cancel();
+        let _ = serving.await;
+        reader.abort();
+    }
+    /// A port the relay gives out again — the pair it carried released to
+    /// make room, and the system handing the next one its number — is
+    /// bound with the ticket of the newest introduction to it. Answered
+    /// with the oldest's, the new pair's port took nothing from the
+    /// receiver, which was its only way in, and the sender waited out its
+    /// handshake timeout (the soak laboratory: twice in some six thousand
+    /// transfers, on a port carried a minute before).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_port_given_out_again_is_bound_with_its_new_ticket() {
+        let relay = FakeRelay {
+            sock: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            identity: Identity::generate(),
+        };
+        let relay_addr = relay.sock.local_addr().unwrap();
+        let relay_id = relay.identity.id();
+        let receiver = Identity::generate();
+        let rid = receiver.id();
+        let key = auth_key(&relay.identity, &rid, &rid, &relay_id).unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let reader = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    if tx.send((buf[..n].to_vec(), from)).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let cancel = CancellationToken::new();
+        let serving = tokio::spawn(serve(
+            socket.clone(),
+            vec![relay_addr],
+            relay_id,
+            receiver,
+            false,
+            rx,
+            cancel.clone(),
+            Arc::new(parking_lot::Mutex::new(
+                crate::nat::keepalive::Keepalive::new(Duration::from_secs(15)),
+            )),
+            Arc::new(Puncher::without_hints(socket.clone())),
+            tokio::sync::watch::channel(false).0,
+            |_, _| {},
+        ));
+        let (nonce, from) = relay.registration().await;
+        let registered = Message::Registered {
+            lease: 60,
+            observed: from,
+            tag: [0; TAG_LEN],
+        };
+        relay
+            .sock
+            .send_to(&tagged(&key, &nonce, &registered), from)
+            .await
+            .unwrap();
+
+        // The relay's port, and a sender to introduce.
+        let port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The next Open at the port: its ticket and proof, and where from.
+        async fn open(port: &UdpSocket) -> ([u8; TOKEN_LEN], [u8; TOKEN_LEN], SocketAddr) {
+            let mut buf = [0u8; 512];
+            loop {
+                let (n, at) =
+                    tokio::time::timeout(Duration::from_secs(2), port.recv_from(&mut buf))
+                        .await
+                        .expect("an Open at the port")
+                        .unwrap();
+                if let Some(Message::Open { ticket, proof }) = Message::decode(&buf[..n]) {
+                    return (ticket, proof, at);
+                }
+            }
+        }
+        for ticket in [[3; TOKEN_LEN], [4; TOKEN_LEN]] {
+            let intro = Message::Incoming {
+                port: port.local_addr().unwrap().port(),
+                peer: sender.local_addr().unwrap(),
+                ticket,
+                hints: Hints::none(),
+                tag: [0; TAG_LEN],
+            };
+            relay
+                .sock
+                .send_to(&tagged(&key, &nonce, &intro), from)
+                .await
+                .unwrap();
+            // The receiver says which side it is; the port asks it to show
+            // it receives there; it answers with the proof, and the ticket.
+            let (said, _, at) = loop {
+                let (said, proof, at) = open(&port).await;
+                if said == ticket && proof == [0; TOKEN_LEN] {
+                    break (said, proof, at);
+                }
+            };
+            assert_eq!(said, ticket);
+            let confirm = Message::Confirm {
+                proof: [9; TOKEN_LEN],
+            };
+            port.send_to(&confirm.encode(), at).await.unwrap();
+            let answered = loop {
+                let (said, proof, _) = open(&port).await;
+                if proof == [9; TOKEN_LEN] {
+                    break said;
+                }
+            };
+            assert_eq!(answered, ticket, "bound with another introduction's ticket");
+        }
 
         cancel.cancel();
         let _ = serving.await;
