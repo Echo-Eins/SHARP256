@@ -3449,7 +3449,7 @@ async fn one_way_mapping(
 #[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
 
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
@@ -3457,7 +3457,7 @@ async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
     let file = make_file(&src, "through-a-relay.bin", size, 0xBEEF);
 
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             ..Config::default()
@@ -3520,7 +3520,7 @@ async fn a_relay_carries_the_transfer_when_no_direct_path_works() {
 #[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sender_that_starts_before_its_receiver_is_put_through_when_it_registers() {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
 
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
@@ -3528,7 +3528,7 @@ async fn a_sender_that_starts_before_its_receiver_is_put_through_when_it_registe
     let file = make_file(&src, "early-bird.bin", size, 0xEA51);
 
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             ..Config::default()
@@ -3611,7 +3611,7 @@ async fn port_nobody_takes() -> SocketAddr {
 #[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_that_comes_up_after_the_sender_started_is_used_when_it_does() {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
 
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
@@ -3643,7 +3643,7 @@ async fn a_relay_that_comes_up_after_the_sender_started_is_used_when_it_does() {
         "the sender is still waiting for its relay"
     );
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: relay_addr,
             identity: relay_identity.clone(),
@@ -3784,7 +3784,7 @@ async fn forged_cookie_replies_cannot_spin_the_sender() {
 #[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_introduction_is_repeated() {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
     use sharp256::relay::Message;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3793,7 +3793,7 @@ async fn a_lost_introduction_is_repeated() {
     let file = make_file(&src, "reintroduced.bin", size, 0x2E12);
 
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             ..Config::default()
@@ -3970,7 +3970,7 @@ async fn junk_addressed_to_a_handshake_attempt_does_not_stop_it() {
 #[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receiver_can_be_reached_by_its_id_and_a_relay_alone() {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
 
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
@@ -3978,7 +3978,7 @@ async fn a_receiver_can_be_reached_by_its_id_and_a_relay_alone() {
     let file = make_file(&src, "hidden.bin", size, 0x41DE);
 
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             ..Config::default()
@@ -4864,7 +4864,7 @@ async fn one_dual_stack_receiver_serves_both_families_at_once() {
 #[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_carries_a_pair_across_address_families() {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
     if !ipv6_or_skip("a_relay_carries_a_pair_across_address_families") {
         return;
     }
@@ -4873,7 +4873,7 @@ async fn a_relay_carries_a_pair_across_address_families() {
     let size = 512 << 10;
     let file = make_file(&src, "across-families.bin", size, 0x46);
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "[::]:0".parse().unwrap(),
             ..Config::default()
@@ -5057,12 +5057,12 @@ async fn forgetful_nat(
 #[cfg(feature = "nat-traversal")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keepalives_keep_a_receiver_behind_a_forgetful_nat_reachable() {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
     let file = make_file(&src, "kept-alive.bin", 256 << 10, 0x4b41);
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             lease: Duration::from_secs(60),
@@ -5173,9 +5173,8 @@ async fn relay_only_receiver(
     CancellationToken,
     Vec<tokio::task::JoinHandle<()>>,
 ) {
-    use sharp256::relay::server::Relay;
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(cfg, cancel.clone())
+    let relay = relay_bind(cfg, cancel.clone())
         .await
         .expect("the relay binds");
     let relay_addr = relay.local_addr().unwrap();
@@ -6182,15 +6181,32 @@ async fn udp_that_loses_but_outruns_tcp_is_gone_back_to() {
 // carriers: a relay over TCP
 // ---------------------------------------------------------------------------
 
+/// A relay as `Relay::bind` makes it — and made again on another port when
+/// it was to take TCP too and its UDP port's number was a TCP socket's
+/// already: it took UDP only, and a test that reaches it over TCP failed
+/// for it (CI, `AddrInUse`). A port asked for by number is not changed.
+#[cfg(feature = "nat-traversal")]
+async fn relay_bind(
+    cfg: sharp256::relay::server::Config,
+    cancel: CancellationToken,
+) -> std::io::Result<sharp256::relay::server::Relay> {
+    loop {
+        let relay = sharp256::relay::server::Relay::bind(cfg.clone(), cancel.clone()).await?;
+        if !cfg.tcp || cfg.bind.port() != 0 || relay.takes_tcp() {
+            return Ok(relay);
+        }
+    }
+}
+
 /// A relay on loopback, carrying under `quotas`: its address and identity,
 /// and what stops it.
 #[cfg(feature = "nat-traversal")]
 async fn start_relay_with(
     quotas: sharp256::relay::server::Quotas,
 ) -> (SocketAddr, SharpId, CancellationToken) {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             quotas,
@@ -6390,9 +6406,9 @@ async fn a_relay_on_this_host_carries_for_a_sender_bound_to_every_address() {
 /// address, and what stops it.
 #[cfg(feature = "tls")]
 async fn start_tls_relay() -> (SocketAddr, SharpId, SocketAddr, CancellationToken) {
-    use sharp256::relay::server::{Config, Relay};
+    use sharp256::relay::server::Config;
     let cancel = CancellationToken::new();
-    let relay = Relay::bind(
+    let relay = relay_bind(
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             tls: Some("127.0.0.1:0".parse().unwrap()),

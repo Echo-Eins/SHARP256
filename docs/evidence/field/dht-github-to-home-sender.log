@@ -1,0 +1,25 @@
+10:57:04.263  INFO sharp256::transport::sender: sender bound to [<ip6>]:43419 (up to 64 datagrams per send), file field/Fronalpstock_big.jpg (14679474 bytes)
+10:57:04.263  INFO sharp256::transport::sender: no direct address for the receiver; asking the DHT and the relays
+10:57:04.263  INFO sharp256::transport::sender: looking for the receiver in the DHT: every node asked learns this host's address
+10:57:04.297  INFO sharp256::nat: NAT: seen from outside at <ip>:49161, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairp
+10:57:05.765  INFO sharp256::transport::sender: no answer over UDP yet; trying the receiver over TCP as well
+10:57:13.924  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:37854
+10:57:13.925  INFO sharp256::nat::punch: [::ffff:<ip>]:37854 is vouched for: punching at it in earnest
+10:57:13.925  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:37854: the peer's address as told
+10:57:16.022  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [<ip>:37854]
+10:57:21.023  INFO sharp256::transport::carrier::dial: the receiver does not answer over TCP either
+10:57:23.891  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:37854: the ports the peer's NAT will hand out next (it counts up)
+10:57:28.141  INFO sharp256::nat::dht: announced on the DHT to 7 node(s) (port Some(49161)/None)
+10:57:33.860  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:37854: very many ports at the peer, which opens very many sockets at us
+10:57:36.278  INFO sharp256::transport::sender: [::ffff:<ip>]:37854: as many initiations as an address the DHT alone vouches for gets; more once a punch from its host backs it
+10:57:52.284  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [<ip>:37854]
+10:57:57.285  INFO sharp256::transport::carrier::dial: the receiver does not answer over TCP either
+10:58:28.294  INFO sharp256::transport::carrier::dial: trying the receiver over TCP at [<ip>:37854]
+10:58:33.295  INFO sharp256::transport::carrier::dial: the receiver does not answer over TCP either
+10:58:49.149  INFO sharp256::transport::sender: the receiver's NAT let a datagram through from [::ffff:<ip>]:37854; answering it there
+10:58:49.353  INFO sharp256::transport::sender: receiver answered at [::ffff:<ip>]:37854
+10:58:49.565  INFO sharp256::transport::sender: transfer e4d91dd18b5e23736491b79ec3dfd705 accepted by [::ffff:<ip>]:37854: chunk 1427 B, 0 B already at receiver, 14679474 B to send
+10:58:49.773  INFO sharp256::transport::sender: sending to [::ffff:<ip>]:37854 (sh-<id>), encrypted with AES-256-GCM
+Connected to [::ffff:<ip>]:37854 (encrypted, AES-256-GCM; chunk 1427 B)
+10:58:53.754  INFO sharp256::transport::sender: receiver reported completion; whole-file hash matches
+Done: 14.00 MiB in 4.19s (28.1 Mbit/s avg), 242.48 KiB retransmitted, 1 loss events, BLAKE3 8e9c9018f18ddb4485832b04935716563d02dd8da31f23b6370b497f6f2c49fc

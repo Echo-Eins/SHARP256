@@ -559,13 +559,12 @@ pub fn info_hash(key: &[u8; 32], role: Role) -> NodeId {
     crate::crypto::keyed_mac(key, &[tag])
 }
 
-/// How long between one round of asking and the next while nobody has
-/// been found, and once somebody has.
+/// How long between one round of asking and the next, once the first
+/// rounds are behind.
 #[cfg(not(test))]
 const SEARCH_EVERY: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const SEARCH_EVERY: Duration = Duration::from_millis(500);
-const KEEP_EVERY: Duration = Duration::from_secs(120);
 /// Tokens and stored peers age out after some minutes; announce again
 /// within them.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(300);
@@ -658,23 +657,30 @@ pub fn spawn_rendezvous(
                         },
                     )
                     .await;
-                tracing::info!(
-                    "announced on the DHT to {} node(s) (port {:?}/{:?})",
-                    agreed,
-                    v4,
-                    v6
-                );
-                announced = Some((v4, v6, Instant::now()));
+                // One that no node took is made again next round, not
+                // [`ANNOUNCE_EVERY`] later: the first, before this host has
+                // found its way into the DHT, reached nobody (in the field,
+                // and the next went out seven minutes on).
+                if agreed > 0 {
+                    tracing::info!(
+                        "announced on the DHT to {} node(s) (port {:?}/{:?})",
+                        agreed,
+                        v4,
+                        v6
+                    );
+                    announced = Some((v4, v6, Instant::now()));
+                } else {
+                    tracing::debug!("no DHT node took the announcement; again next round");
+                }
             }
             // Soon at first, while the other end may be about to announce,
-            // then every [`SEARCH_EVERY`] — for as long as nothing the nodes
-            // agree on has turned up: an address one node made up is no
-            // reason to look less often for the real one.
-            let pause = if vouched.is_empty() {
-                (Duration::from_secs(2) * 2u32.pow((round - 1).min(4))).min(SEARCH_EVERY)
-            } else {
-                KEEP_EVERY
-            };
+            // then every [`SEARCH_EVERY`], for as long as this end runs.
+            // Not less often once an address the nodes agree on has turned
+            // up: a receiver has its next sender to find (which waited up
+            // to two minutes so), and an address two nodes agree on is not
+            // even sure to be anybody's — in the field, two named one for
+            // an infohash nobody had announced under.
+            let pause = (Duration::from_secs(2) * 2u32.pow((round - 1).min(4))).min(SEARCH_EVERY);
             tokio::select! {
                 _ = tokio::time::sleep(pause) => {}
                 // Where this host is outside has become known or changed.

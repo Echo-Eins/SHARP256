@@ -736,6 +736,13 @@ impl Relay {
         self.socket.local_addr()
     }
 
+    /// Whether clients can reach this relay over TCP too, at the port
+    /// number of its UDP port: asked for (`Config::tcp`), and that port was
+    /// free for TCP.
+    pub fn takes_tcp(&self) -> bool {
+        self.listener.is_some()
+    }
+
     /// What receivers write to register here: `ID@host:port`.
     pub fn id(&self) -> SharpId {
         self.identity.id()

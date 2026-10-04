@@ -7,7 +7,7 @@
 //! work.
 
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const SECRET: &[u8; 32] = b"a token secret, thirty-two bytes";
 
@@ -39,6 +39,9 @@ struct Net {
     nodes: Vec<(NodeId, SocketAddr)>,
     cancel: CancellationToken,
     queries: Arc<AtomicUsize>,
+    /// Whether the nodes answer at all: a network not reached yet, as at
+    /// a start before the client has found its way in.
+    awake: Arc<AtomicBool>,
 }
 
 impl Net {
@@ -75,6 +78,7 @@ impl Net {
             .collect();
         let cancel = CancellationToken::new();
         let queries = Arc::new(AtomicUsize::new(0));
+        let awake = Arc::new(AtomicBool::new(true));
         for (rank, &i) in order.iter().enumerate() {
             let mut table: Vec<(NodeId, SocketAddr)> = vec![
                 addrs[order[(rank + 1) % n]],
@@ -93,13 +97,24 @@ impl Net {
                 cancel.clone(),
                 queries.clone(),
                 plant.filter(|_| i == 0),
+                awake.clone(),
             ));
         }
         Some(Net {
             nodes: addrs,
             cancel,
             queries,
+            awake,
         })
+    }
+
+    /// From now on the nodes answer nothing, until [`Net::wake`].
+    fn sleep(&self) {
+        self.awake.store(false, Ordering::Relaxed);
+    }
+
+    fn wake(&self) {
+        self.awake.store(true, Ordering::Relaxed);
     }
 
     fn bootstrap(&self) -> Vec<String> {
@@ -120,6 +135,7 @@ async fn node_loop(
     cancel: CancellationToken,
     queries: Arc<AtomicUsize>,
     plant: Option<SocketAddr>,
+    awake: Arc<AtomicBool>,
 ) {
     let mut stored: HashMap<NodeId, Vec<SocketAddr>> = HashMap::new();
     let mut buf = vec![0u8; 2048];
@@ -128,6 +144,9 @@ async fn node_loop(
             _ = cancel.cancelled() => return,
             r = sock.recv_from(&mut buf) => match r { Ok(r) => r, Err(_) => continue },
         };
+        if !awake.load(Ordering::Relaxed) {
+            continue;
+        }
         let Some(v) = bencode::decode(&buf[..n]) else {
             continue;
         };
@@ -618,6 +637,140 @@ async fn an_address_one_node_names_is_not_vouched_for() {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = receiver.await;
         let _ = sender.await;
+    })
+    .await;
+}
+
+/// A rendezvous of `role` at 127.0.0.1:`port` on `net`, and what it finds.
+fn rendezvous(
+    net: &Net,
+    key: &crate::crypto::SecretKey,
+    role: Role,
+    port: u16,
+    cancel: &CancellationToken,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<crate::nat::card::FamilyHints>,
+    tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, PeerNews)>,
+) {
+    let mut h = crate::nat::card::FamilyHints::unknown();
+    h.aim4 = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port));
+    let (aims_tx, aims) = tokio::sync::watch::channel(h);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = spawn_rendezvous(
+        Dht::start(net.bootstrap(), cancel.clone()).unwrap(),
+        key.clone(),
+        role,
+        aims,
+        cancel.clone(),
+        move |p, n| {
+            let _ = tx.send((p, n));
+        },
+    );
+    (task, aims_tx, rx)
+}
+
+/// Whether `rx` says `want` within `within`, and, if `vouched`, that the
+/// nodes agree on it.
+async fn finds(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, PeerNews)>,
+    want: SocketAddr,
+    within: Duration,
+    vouched: bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while let Ok(Some((p, n))) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        let sure = matches!(n, PeerNews::Vouched | PeerNews::Found { vouched: true });
+        if p == want && (sure || !vouched) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A receiver that announced itself before the DHT answered anybody — the
+/// first minute after it starts, in the field — announces itself again as
+/// soon as it can, not five minutes later: one that told no node was found
+/// by no sender until then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_announcement_no_node_took_is_made_again_at_once() {
+    let net = Net::start(30, 6).await;
+    net.sleep();
+    let cancel = CancellationToken::new();
+    let key = rendezvous_key(&crate::crypto::Identity::generate().id(), None);
+    let (receiver, _aims, _found) = rendezvous(&net, &key, Role::Receiver, 5555, &cancel);
+    // Its first round: a lookup and an announcement nobody answers.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    net.wake();
+    let (sender, _aims2, mut found) = rendezvous(&net, &key, Role::Sender, 6666, &cancel);
+    assert!(
+        finds(
+            &mut found,
+            "127.0.0.1:5555".parse().unwrap(),
+            Duration::from_secs(20),
+            false
+        )
+        .await,
+        "the sender never found the receiver"
+    );
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = receiver.await;
+        let _ = sender.await;
+    })
+    .await;
+}
+
+/// A receiver that has found a sender, which the nodes agree on, goes on
+/// looking at its pace for the next: a sender later than the first was
+/// found two minutes on at worst — and an address two nodes agree on is
+/// not even sure to be anybody's (in the field, two named one for an
+/// infohash nobody had announced under, and the receiver took it for its
+/// sender and looked less often).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receiver_that_has_found_one_sender_finds_the_next_at_its_pace() {
+    // Nodes at addresses of their own, so that two can agree (127.0.0.10
+    // and on; macOS has 127.0.0.1 alone).
+    let Some(net) = Net::start_at(
+        30,
+        6,
+        |i| Ipv4Addr::new(127, 0, 0, 10 + i as u8).into(),
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let cancel = CancellationToken::new();
+    let key = rendezvous_key(&crate::crypto::Identity::generate().id(), None);
+    let (receiver, _aims, mut found) = rendezvous(&net, &key, Role::Receiver, 5555, &cancel);
+    let (first, _a1, _f1) = rendezvous(&net, &key, Role::Sender, 6666, &cancel);
+    assert!(
+        finds(
+            &mut found,
+            "127.0.0.1:6666".parse().unwrap(),
+            Duration::from_secs(40),
+            true
+        )
+        .await,
+        "the first sender was never vouched for"
+    );
+    let (second, _a2, _f2) = rendezvous(&net, &key, Role::Sender, 7777, &cancel);
+    assert!(
+        finds(
+            &mut found,
+            "127.0.0.1:7777".parse().unwrap(),
+            Duration::from_secs(20),
+            false
+        )
+        .await,
+        "the second sender was not found in time"
+    );
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = receiver.await;
+        let _ = first.await;
+        let _ = second.await;
     })
     .await;
 }

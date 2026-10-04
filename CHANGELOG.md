@@ -329,6 +329,21 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   what the policer passed, against 1.02 to 1.05 on Linux). A step that
   loses as through a policer is not left until the check has said; one
   that loses a little at random still is, as the steps go.
+- The first test between two real networks (docs/evidence/field): a
+  machine of GitHub's fetches a file from Wikipedia over HTTPS and sends
+  it to a receiver behind a home router, found in the real Mainline DHT by
+  its ID alone (`.github/workflows/field.yml`). It went through directly,
+  14 MiB in 4.2 s, the same bytes as Wikipedia's — but 105 s after the
+  sender started, and the field showed why. The receiver, once two DHT
+  nodes had agreed on an address for its senders (one nobody had
+  announced: the public DHT's nodes do that), looked for senders every two
+  minutes instead of every twenty seconds; and its first announcement,
+  before it had found any node, reached none and was not made again for
+  five minutes. It looks every 20 s for as long as it runs, and an
+  announcement no node took is made again the next round.
+- The tests' relay that is to take TCP is made again on another port when
+  its UDP port's number is a TCP socket's already, as their receiver is
+  (`Relay::takes_tcp`).
 - A sender through a relay could wait out its handshake timeout for
   nothing: the relay had let a quiet pair go to make room, the system
   gave the next pair the same port number, and the receiver answered the

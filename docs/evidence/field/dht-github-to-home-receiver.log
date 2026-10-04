@@ -1,0 +1,28 @@
+10:49:30.854  INFO sharp256::transport::receiver: receiver sh-<id> listening on [<ip6>]:5555 (up to 64 datagrams per send), output <dir>/Fronalpstock_big.jpg
+10:49:30.854  INFO sharp256::transport::receiver: receiver also takes senders over TCP at [<ip6>]:5555
+10:49:30.857  INFO sharp256::transport::receiver: announcing in the DHT: every node asked learns this host's address
+10:49:32.561  INFO sharp256::nat: NAT: seen from outside at <ip>:37854, but inbound packets are filtered: a sender has to be let in first (NAT: one port for every destination, unknown filtering, hairp
+10:49:49.093  INFO sharp256::nat::dht: announced on the DHT to 0 node(s) (port Some(37854)/None)
+10:50:18.411  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:35532 (one node says so, so far)
+10:50:18.411  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:35532: plainly, until it is vouched for (it came from the DHT)
+10:50:37.465  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:35532 (one node says so, so far)
+10:50:37.465  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:35532: plainly, until it is vouched for (it came from the DHT)
+10:51:02.016  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:35532 (one node says so, so far)
+10:51:02.016  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:35532: plainly, until it is vouched for (it came from the DHT)
+10:51:32.481  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:35532 (one node says so, so far)
+10:51:32.481  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:35532: plainly, until it is vouched for (it came from the DHT)
+10:51:56.792  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:31902
+10:51:56.792  INFO sharp256::nat::punch: [::ffff:<ip>]:31902 is vouched for: punching at it in earnest
+10:51:56.792  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:31902: the peer's address as told
+10:52:06.762  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:31902: the ports the peer's NAT will hand out next (it counts up)
+10:52:16.738  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:31902: very many ports at the peer, which opens very many sockets at us
+10:56:36.313  INFO sharp256::nat::dht: announced on the DHT to 8 node(s) (port Some(37854)/None)
+10:58:49.125  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:49161
+10:58:49.125  INFO sharp256::nat::dht: the DHT says the other end is at <ip>:35532 (one node says so, so far)
+10:58:49.125  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:35532: plainly, until it is vouched for (it came from the DHT)
+10:58:49.125  INFO sharp256::nat::punch: [::ffff:<ip>]:49161 is vouched for: punching at it in earnest
+10:58:49.125  INFO sharp256::nat::punch: punching towards [::ffff:<ip>]:49161: the peer's address as told
+10:58:49.548  INFO sharp256::transport::receiver: transfer e4d91dd18b5e23736491b79ec3dfd705 from [::ffff:<ip>]:49161 (sh-<id>): Fronalpstock_big.jpg (14679474 bytes) -> <dir>/Fronalpstock_big.jpg
+10:58:53.726  INFO sharp256::transport::receiver: transfer e4d91dd18b5e23736491b79ec3dfd705: all 14679474 bytes received; verifying
+10:58:53.734  INFO sharp256::transport::receiver: transfer e4d91dd18b5e23736491b79ec3dfd705 stored as <dir>/Fronalpstock_big.jpg
+10:58:53.936  INFO sharp256::transport::receiver: transfer e4d91dd18b5e23736491b79ec3dfd705 finished: <dir>/Fronalpstock_big.jpg
