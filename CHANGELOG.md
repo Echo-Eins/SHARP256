@@ -467,7 +467,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   their memory, descriptors and threads written down; logging at
   `SOAK_LOG`'s level (`SOAK_SENDER_LOG`'s for the senders), and with
   `--csv` the laboratory's directory kept, with each failed sender's whole
-  output.
+  output. A transfer to be cut off is long enough to be:
+  the kill comes 150 ms in, and at 40 Mbit/s a file under some 750 KiB was
+  all there by then — in rc.3's soak 40 of 365, sent again as a second
+  copy rather than resumed.
 - `natlab.py samecgn` (two subscribers behind one carrier-grade NAT, with
   and without a loop back), `natlab.py nat66` (unique local addresses
   behind the router's: direct over IPv6 in all three cases, through what

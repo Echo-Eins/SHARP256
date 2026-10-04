@@ -24,6 +24,9 @@ name: Field test
 
 on:
   push:
+    # Branches only: a tag's push is not path-filtered, and a release
+    # candidate's set off a run with no receiver to send to.
+    branches: ["**"]
     paths:
       - docs/evidence/field/requests.txt
   workflow_dispatch:

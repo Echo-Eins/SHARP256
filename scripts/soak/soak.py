@@ -124,7 +124,11 @@ def main():
         while time.time() < end:
             n += 1
             kind = ("direct", "relay", "cut")[n % 3]
-            size = rng.randint(200, 4000) * 1024
+            # One to be cut off is long enough to be cut: at 40 Mbit/s a file
+            # under some 750 KiB is all there in the 150 ms before the kill,
+            # and its sending again was a second copy, not a resumption (in
+            # rc.3's soak, 40 of 365).
+            size = rng.randint(1500 if kind == "cut" else 200, 4000) * 1024
             data = os.path.join(d, f"f{n}.bin")
             with open(data, "wb") as f:
                 f.write(os.urandom(size))
