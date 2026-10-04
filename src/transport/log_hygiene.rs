@@ -291,9 +291,16 @@ async fn transfers_leave_no_key_in_the_log() {
         found(&log, control.expose()).is_some(),
         "the search does not find a key logged on purpose"
     );
-    // Both transfers were logged, in detail.
+    // Both transfers were logged, in detail: each says at debug level that
+    // its session was established. (How many debug lines there are besides
+    // goes with how long they take — the progress, every 100 ms — and two
+    // transfers done in 66 and 100 ms left ten, one short of the eleven
+    // this used to ask for, under MemorySanitizer in CI.)
     assert!(
-        log.lines().filter(|l| l.contains(" DEBUG ")).count() > 10
+        log.lines()
+            .filter(|l| l.contains(" DEBUG ") && l.contains(" established ("))
+            .count()
+            == 2
             && log.matches("whole-file hash matches").count() == 2,
         "the transfers were not logged in detail:\n{}",
         log

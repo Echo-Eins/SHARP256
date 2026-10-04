@@ -358,6 +358,10 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - The tests' relay that is to take TCP is made again on another port when
   its UDP port's number is a TCP socket's already, as their receiver is
   (`Relay::takes_tcp`).
+- The log-hygiene test asks that each transfer log its session at debug
+  level, not that the log run to more than ten debug lines: how many there
+  are goes with how long the transfers take, and two done in 66 and
+  100 ms under MemorySanitizer left ten.
 - A sender through a relay could wait out its handshake timeout for
   nothing: the relay had let a quiet pair go to make room, the system
   gave the next pair the same port number, and the receiver answered the
