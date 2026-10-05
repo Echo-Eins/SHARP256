@@ -3697,7 +3697,7 @@ async fn dead_relays_do_not_slow_down_a_direct_transfer() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, out, state) = dirs(&tmp);
     let file = make_file(&src, "direct.bin", 256 << 10, 0xD1EC);
-    let r = start_receiver(&out, &state, |_| {}).await;
+    let mut r = start_receiver(&out, &state, |_| {}).await;
 
     // Three addresses with nothing behind them.
     let mut dead = Vec::new();
@@ -3709,14 +3709,26 @@ async fn dead_relays_do_not_slow_down_a_direct_transfer() {
     let mut cfg = sender_cfg(&file, r.addr, r.id, &state);
     cfg.relays = dead;
     let started = Instant::now();
-    let summary = run_sender(cfg).await.expect("the direct path is used");
-    let elapsed = started.elapsed();
+    let sending = tokio::spawn(run_sender(cfg));
+    // What relays could cost is the start: the time to the receiver's
+    // `Started`. Measured to the sender's end, it took in the receiver's
+    // finish as well — its fsyncs and renames, 1.3 s of a Windows runner's
+    // in CI, which no relay has any part in.
+    let began = loop {
+        let left = Duration::from_secs(20).saturating_sub(started.elapsed());
+        match tokio::time::timeout(left, r.events.recv()).await {
+            Ok(Some(TransferEvent::Started { .. })) => break started.elapsed(),
+            Ok(Some(_)) => continue,
+            _ => panic!("the transfer did not start"),
+        }
+    };
+    let summary = sending.await.unwrap().expect("the direct path is used");
     assert_eq!(summary.file_size, (256 << 10) as u64);
     assert_same(&file, &out.join("direct.bin"));
     assert!(
-        elapsed < Duration::from_secs(2),
-        "three unanswering relays cost {:?}; they should cost nothing",
-        elapsed
+        began < Duration::from_secs(2),
+        "three unanswering relays held the start up {:?}; they should hold up nothing",
+        began
     );
     stop_receiver(r).await;
 }

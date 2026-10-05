@@ -477,6 +477,12 @@ version is bound into the handshake). See [docs/PROTOCOL.md](docs/PROTOCOL.md).
   here), long enough to look like a policer, and the sender came back from
   it as from one. The stall the test guards against lasted until the
   receiver's session expired, ten minutes.
+- The test that dead relays do not slow a direct transfer down measures
+  the start — the time to the receiver's `Started` — not the whole
+  transfer: on Windows in CI the receiver's finish (fsyncs and renames of
+  a 256 KiB file and its state) took 1.3 s, and the whole went over 2 s
+  with no relay in it. What relays cost, asked in turn, was the start:
+  2.25 s each before the first packet.
 - `natlab.py samecgn` (two subscribers behind one carrier-grade NAT, with
   and without a loop back), `natlab.py nat66` (unique local addresses
   behind the router's: direct over IPv6 in all three cases, through what
